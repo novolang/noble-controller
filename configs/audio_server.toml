@@ -1,0 +1,6 @@
+# The Controller's part of the profile configs/audio_server.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/audio_server.toml`).  orbit/ble/configs/audio_server.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_cis = 2
+ctl_cigs = 1

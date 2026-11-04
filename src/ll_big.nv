@@ -1,0 +1,2036 @@
+// src/ll_big.nv — Broadcast Isochronous Groups of the Link Layer: the group table, the access addresses and CRC
+// seeds of its streams, the derivation of its parameters from the Host's request, the BIGInfo that announces it in a
+// periodic advertising train, the subevent program of a BIG event, and the BIS Data and BIG Control PDUs.
+//
+// [Vol 6] Part B, Sections 2.1.2, 2.6, 3.1.1, 4.4.6 and 5.6; Part E, Sections 1 and 2; Part G, Sections 2.1 and 3.
+//
+// A BIG is a sequence of BIG events ISO_Interval apart.  Each event holds, for every one of Num_BIS streams (BIS), NSE
+// subevents Sub_Interval apart; the BIS anchor points are BIS_Spacing apart, so the BISes are either in sequence (all the
+// subevents of a BIS together) or interleaved (the first subevents of all the BISes, then the second subevents).  Nothing is
+// acknowledged: a BIS PDU is sent once in each subevent, the Isochronous Broadcaster repeats a payload in the NSE / BN groups
+// of BN subevents, IRC groups of them carrying the payloads of the event itself and the rest, PTO events early, those of
+// later events.  A control subevent after the last BIS event carries a BIG Control PDU (the BIG_TERMINATE_IND of the BIG
+// Termination procedure) in the events that announce a change.
+//
+// A Synchronized Receiver learns the BIG from the BIGInfo in the ACAD of the AUX_SYNC_IND PDUs of the periodic advertising
+// train the BIG belongs to, and from then on listens to the subevents of the BISes it wants at the times the BIGInfo gives.
+//
+// The payload of a BIS is held, as the payload of a CIS is, in the ring of a `ll_iso.Cis`: the BIS streams are `Cis` values
+// of their own table with the fields that mean the same set from the group (`bis_config`), so that the cutting of SDUs into
+// payloads, the credits of the Host and the recombination of received payloads are the code of `ll_iso.nv`.
+//
+// This module holds no radio and no clock; the radio program (`ll_air.nv`) gives the times in microseconds.  The state is a
+// value with inline storage; no function here allocates.  The slots and the switch under "The profile" are `ctl_limits.big_slots()`, `bis_slots()` and `big_on()`.
+
+use ctl_limits
+use std.test
+use ll_pdu
+use ll_data
+use ll_phy
+use ll_iso
+use ll_link
+use ll_radio
+use ll_cipher
+use ll_init
+
+// ── The profile ─────────────────────────────────────────────────────
+
+// The groups this Controller holds at once (as broadcaster or as receiver), the streams of all of them, and whether the build has
+// broadcast isochronous streams at all (0 when the profile has none).
+
+// The connection handle of the stream in slot `s` of the table is `BIS_HANDLE_BASE` + `s`, kept for the slot (the Host is given it
+// by the LE Create BIG Complete and LE BIG Sync Established events).
+const BIS_HANDLE_BASE = 0x0200
+
+// ── Statuses, limits and times ──────────────────────────────────────
+
+const OK = 0
+const E_UNKNOWN_CONNECTION = 0x02
+const E_MEMORY = 0x07
+const E_DISALLOWED = 0x0C
+const E_LIMITED = 0x0D
+const E_UNSUPPORTED = 0x11
+const E_INVALID = 0x12
+const E_SYNC_TIMEOUT = 0x3E
+const E_TOO_LONG = 0x45
+const E_UNKNOWN_ID = 0x42
+const E_ENCRYPTION_MODE = 0x25
+const E_CANCELLED = 0x44
+const REASON_TIMEOUT = 0x08
+const REASON_REMOTE_TERMINATED = 0x13
+const REASON_LOCAL_HOST = 0x16
+const REASON_MIC_FAILURE = 0x3D
+
+// Section 4.4.6.5: BIS_Spacing and Sub_Interval are at least T_MSS_150 + MPT.
+const T_MSS_US = 150
+
+// Num_BIS, BN, NSE, IRC and PTO at their largest ([Vol 6] Part B, Section 4.4.6.3), the largest Max_PDU, and the range of the
+// ISO_Interval in units of 1.25 ms (5 ms to 4 s).
+const NUM_BIS_MAX = 31
+const BN_MAX = 7
+const NSE_MAX = 31
+const IRC_MAX = 15
+const PTO_MAX = 15
+const PDU_MAX = 251
+const ISO_MIN = 4
+const ISO_MAX = 0xC80
+const UNIT_US = 1250
+
+// A control PDU is sent in six consecutive BIG events (Section 5.6), and the instant is set at least six events after the first.
+const CTRL_EVENTS = 6
+
+// BIG Control PDU opcodes (Section 2.6.3).
+const CTRL_CHANNEL_MAP = 0
+const CTRL_TERMINATE = 1
+
+// The BIS Data PDU LLIDs and the BIG Control one (Section 2.6.2).
+const LLID_UNFRAMED_END = 0
+const LLID_UNFRAMED_START = 1
+const LLID_FRAMED = 2
+const LLID_CONTROL = 3
+
+// The type of the AD structure that carries the BIGInfo (0x2C in the Assigned Numbers; 0x2D is the Broadcast_Code), and the sizes of the BIGInfo (Section 4.4.6.11).
+const AD_BIGINFO = 0x2C
+const INFO_PLAIN = 33
+const INFO_ENC = 57
+const INFO_AD_MAX = 59
+
+// The microseconds ahead of the BIG anchor point that the BIGInfo's AUX_SYNC_IND has to start at least, so that the offset is
+// over 600 microseconds and the PDU is over before the first BIS PDU (Section 4.4.6.11).
+const INFO_LEAD_US = 3000
+
+// The microseconds taken off the offset of a BIGInfo before it is rounded down to its unit: the error of the start of the AUX_SYNC_IND
+// that carries it, which can only be late, so that the anchor point is not earlier than the offset by more than that error and
+// is not more than that error later than the offset and a unit.  The receivers' windows are wider than either.
+const INFO_PHASE_US = 3
+
+// The offset unit of the BIGInfo and the offset under which the unit of 30 microseconds is the only one allowed.
+const OFFSET_UNIT_FINE_US = 30
+const OFFSET_UNIT_COARSE_US = 300
+const OFFSET_FINE_MAX_US = 491460
+
+// A synchronization that hears no BIS PDU in this many BIG events from the first it listens for ends with Connection Failed to be
+// Established / Synchronization Timeout (Section 5.4.5 / HCI 7.8.106), and the least timeout (in BIG events) a synchronization has.
+const SYNC_EVENTS = 6
+
+// ── The states of a group ───────────────────────────────────────────
+
+const B_FREE = 0
+// The broadcaster: LE Create BIG was accepted and the first event has not run.
+const B_CREATE = 1
+// The group runs: events go out (broadcaster), or the receiver is synchronized.
+const B_UP = 2
+// The BIG_TERMINATE_IND goes out in the control subevents until the instant.
+const B_TERM = 3
+// The receiver: the BIG is awaited in the train (no BIGInfo seen yet).
+const B_WAIT = 4
+// The receiver: the BIGInfo was taken and the first BIS PDU is awaited.
+const B_SYNC = 5
+// The group has ended or was stopped and the Host is owed its event; no event is sent or listened for.
+const B_STOP = 6
+
+// What a group owes the Host.
+const EV_COMPLETE = 1
+const EV_TERMINATED = 2
+const EV_BIGINFO = 4
+const EV_COMPLETED = 8
+
+// ── The group ───────────────────────────────────────────────────────
+
+// `state`, `owed` (the events the Host is owed: the complete or established event, the terminated or lost one), `status` of the
+// first and `reason` of the second.  `broadcaster` says which end this is; `handle` is the BIG_Handle the Host gave, `set` the slot
+// of the periodic advertising train (broadcaster) or of the synchronization (receiver) the group belongs to, `bis0` the first
+// of its `num_bis` slots in the table of streams (a receiver holds `nrx` of them: the BISes it wanted, `bis_mask` bit n - 1 for
+// the BIS_Number n), `mse` the Host's limit of subevents per BIS event.
+//
+// The parameters of Section 4.4.6.3: `nse`, `bn`, `irc`, `pto`, `iso_int` (units of 1.25 ms), `sub_int` and `bis_sp` (microseconds),
+// `phy` (as HCI numbers it), `max_pdu`, `max_sdu`, `sdu_int`, `framed`, `unseg`, `packed` (interleaved) and `enc`.  `sync_delay` is
+// BIG_Sync_Delay, `latency` the transport latency of the BIG, both in microseconds.  `saa` is the Seed Access Address, `crc` the
+// BaseCRCInit, `chmap` the channel map (`n_used` of its 37 bits are used).  The key: `ek` holds the Group Session Key as `sk` and
+// the GIV as `iv`, `gskd` the GSKD of the BIGInfo, `code` the Broadcast_Code until `key_ok` says the key was derived from it.
+//
+// The schedule: BIG event `ev` is under way or next (`ev_open`), its anchor point is `anchor`; `pos` is the position of the next
+// subevent in the event's program.  `first_us` is the time of the first anchor, `last_rx` the time of the last PDU a receiver
+// heard, `synced` and `ev_synced` say a PDU arrived (ever, in this event), `sup_us` is the synchronization timeout and `win` the
+// width the window of the first PDU has (the offset unit of the BIGInfo).  `cssn` is the Control Subevent Sequence Number; the BIG
+// Termination procedure: `term_req`, `term_reason`, `term_instant` (the event counter, 16 bits, at which the BIG ends) and
+// `ctl_first` (the first event the PDU is sent in).  The BIG Channel Map Update procedure: `cm_req`, `cm_map` (the new channel map),
+// and `cm_instant` (the event the map takes effect in, six events after the first its BIG_CHANNEL_MAP_IND is sent in; a receiver keeps the 16 bits
+// the PDU carries, the broadcaster the event counter).  `info` is the BIGInfo AD structure of the broadcaster, `info_n` its octets.
+// The counters follow.
+@value
+struct Big
+    state: Int
+    owed: Int
+    status: Int
+    reason: Int
+    broadcaster: Bool
+    handle: Int
+    set: Int
+    bis0: Int
+    num_bis: Int
+    nrx: Int
+    bis_mask: Int
+    mse: Int
+    nse: Int
+    bn: Int
+    irc: Int
+    pto: Int
+    iso_int: Int
+    sub_int: Int
+    bis_sp: Int
+    phy: Int
+    max_pdu: Int
+    max_sdu: Int
+    sdu_int: Int
+    framed: Bool
+    unseg: Bool
+    packed: Bool
+    enc: Bool
+    sync_delay: Int
+    latency: Int
+    saa: Int
+    crc: Int
+    chmap: Int
+    n_used: Int
+    ek: EncKey
+    gskd: Vec[u8; 16]
+    code: Vec[u8; 16]
+    key_ok: Bool
+    anchor: Int
+    ev: Int
+    ev_open: Bool
+    pos: Int
+    first_us: Int
+    last_rx: Int
+    synced: Bool
+    ev_synced: Bool
+    sup_us: Int
+    win: Int
+    cssn: Int
+    term_req: Bool
+    term_reason: Int
+    term_instant: Int
+    ctl_first: Int
+    info: Vec[u8; 64]
+    info_n: Int
+    n_events: Int
+    n_missed: Int
+    n_late: Int
+    n_pdus: Int
+    n_good: Int
+    n_crc: Int
+    ppm: Int
+    host_enc: Bool
+    cm_req: Bool
+    cm_map: Int
+    cm_instant: Int
+    cstf: Bool
+    last_cssn: Int
+    silent: Int
+
+@tier(embedded)
+fn big_new() -> Big
+    var b = Big {
+        state: B_FREE, owed: 0, status: 0, reason: 0, broadcaster: false, handle: 0, set: -1, bis0: 0, num_bis: 0, nrx: 0, bis_mask: 0, mse: 0,
+        nse: 1, bn: 1, irc: 1, pto: 0, iso_int: 8, sub_int: 0, bis_sp: 0, phy: 1, max_pdu: 0, max_sdu: 0, sdu_int: 0,
+        framed: false, unseg: false, packed: false, enc: false, sync_delay: 0, latency: 0, saa: 0, crc: 0, chmap: 0, n_used: 37,
+        ek: ll_cipher.enc_key_new(), gskd: Vec.new(), code: Vec.new(), key_ok: false, anchor: 0, ev: 0, ev_open: false, pos: 0,
+        first_us: 0, last_rx: 0, synced: false, ev_synced: false, sup_us: 0, win: 0, cssn: 0, term_req: false, term_reason: 0,
+        term_instant: 0, ctl_first: 0, info: Vec.new(), info_n: 0, n_events: 0, n_missed: 0, n_late: 0, n_pdus: 0, n_good: 0, n_crc: 0,
+        ppm: 500, host_enc: false, cm_req: false, cm_map: 0, cm_instant: 0, cstf: false, last_cssn: -1, silent: 0 }
+    for _ in 0..16
+        let _a = b.gskd.push(0)
+        let _b = b.code.push(0)
+    for _ in 0..64
+        let _c = b.info.push(0)
+    b
+
+// Octet `j` of the Broadcast_Code, in the order the Host's command carries it.
+@tier(embedded)
+fn code_put(var b: Big, j: Int, v: Int)
+    b.code[j] = (v & 0xFF) as u8
+
+// The GSKD and the GIV of an encrypted group from 24 random octets: the first 16 and the last 8.
+@tier(embedded)
+fn key_random(var b: Big, var rnd: Vec[u8; 24])
+    for j in 0..16
+        b.gskd[j] = rnd[j]
+    for j in 0..8
+        b.ek.iv[j] = rnd[16 + j]
+
+// The group forgotten.
+@tier(embedded)
+fn big_clear(var b: Big)
+    b.state = B_FREE
+    b.owed = 0
+    b.status = 0
+    b.reason = 0
+    b.broadcaster = false
+    b.set = -1
+    b.num_bis = 0
+    b.nrx = 0
+    b.bis_mask = 0
+    b.key_ok = false
+    b.ev = 0
+    b.ev_open = false
+    b.pos = 0
+    b.synced = false
+    b.ev_synced = false
+    b.cssn = 0
+    b.term_req = false
+    b.info_n = 0
+    b.n_events = 0
+    b.n_missed = 0
+    b.n_late = 0
+    b.n_pdus = 0
+    b.n_good = 0
+    b.n_crc = 0
+    b.ppm = 500
+    b.host_enc = false
+    b.cm_req = false
+    b.cstf = false
+    b.last_cssn = -1
+    b.silent = 0
+    b.win = 0
+    b.term_reason = 0
+    for k in 0..16
+        b.code[k] = 0
+        b.gskd[k] = 0
+        b.ek.sk[k] = 0
+    for k in 0..8
+        b.ek.iv[k] = 0
+
+// ── The parameters in microseconds ──────────────────────────────────
+
+// ISO_Interval in microseconds.
+@tier(embedded)
+fn iso_us(var b: Big) -> Int
+    b.iso_int * UNIT_US
+
+// The groups of NSE / BN subevents a BIS event holds (GC).
+@tier(embedded)
+fn groups(var b: Big) -> Int
+    if b.bn == 0
+        return 0
+    b.nse / b.bn
+
+// The events early the pre-transmitted payloads are sent: PTO x (GC - IRC), 0 when IRC = GC (Section 4.4.6.6).
+@tier(embedded)
+fn pre_events(var b: Big) -> Int
+    if b.irc >= groups(var b)
+        return 0
+    b.pto * (groups(var b) - b.irc)
+
+// MPT: the longest packet a BIS PDU of Max_PDU octets takes on the BIG's PHY, the MIC counted when the BIG is encrypted, the coding
+// S=8 on LE Coded.
+@tier(embedded)
+fn mpt_us(phy: Int, pdu: Int, enc: Bool) -> Int
+    var mic = 0
+    if enc
+        mic = ll_phy.MIC_OCTETS
+    ll_phy.air_us(phy, true, 2 + pdu + mic)
+
+// The microseconds from the BIG anchor point to the start of BIS `n`'s subevent `s` (both from 1): (n - 1) x BIS_Spacing +
+// (s - 1) x Sub_Interval, for the sequential and the interleaved arrangement alike (Section 4.4.6.4).
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn sub_offset(var b: Big, n: Int, s: Int) -> Int
+    (n - 1) * b.bis_sp + (s - 1) * b.sub_int
+
+// The BIS and the subevent of position `p` of the event's program, which runs in time order: a sequential BIG goes through the
+// subevents of a BIS before the next BIS, an interleaved one through the BISes before the next subevent.  The answer is
+// `bis * 64 + sub`, both from 1.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn program_at(var b: Big, p: Int) -> Int
+    if b.packed
+        let n = b.num_bis
+        return ((p % n) + 1) * 64 + (p / n + 1)
+    ((p / b.nse) + 1) * 64 + (p % b.nse + 1)
+
+// The subevents in an event's program.
+@tier(embedded)
+fn program_len(var b: Big) -> Int
+    b.num_bis * b.nse
+
+// The offset of the control subevent from the anchor point (Section 4.4.6.7): Num_BIS x BIS_Spacing, or NSE x Sub_Interval
+// interleaved.
+@tier(embedded)
+fn control_offset(var b: Big) -> Int
+    if b.packed
+        return b.nse * b.sub_int
+    b.num_bis * b.bis_sp
+
+// The air time of a BIG Control PDU: the header and the 4 octets of a BIG_TERMINATE_IND (opcode, reason, instant) and its MIC.
+@tier(embedded)
+fn control_air_us(phy: Int, enc: Bool) -> Int
+    mpt_us(phy, 4, enc)
+
+// The most radio time a BIG event takes from its anchor point: the data subevents and the control subevent.
+@tier(embedded)
+fn event_len_us(var b: Big) -> Int
+    control_offset(var b) + control_air_us(b.phy, b.enc)
+
+// The payload and the position in the burst of subevent `s` (from 1) of the event `ev` (Section 4.4.6.6): the subevents are in
+// groups of BN; the first IRC groups carry the payloads of the event, E x BN to E x BN + BN - 1, and group g from IRC on the
+// payloads of event E + PTO x (g - IRC + 1).  The answer is the payload number.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn payload_of(var b: Big, ev: Int, s: Int) -> Int
+    let g = (s - 1) / b.bn
+    let j = (s - 1) % b.bn
+    if g < b.irc
+        return ev * b.bn + j
+    (ev + b.pto * (g - b.irc + 1)) * b.bn + j
+
+// ── Access addresses and CRC seeds ──────────────────────────────────
+
+// The diversifier word of BIS_Number `n` (0 for the BIG Control logical link): D = (35 n + 42) mod 128 and
+// DW = D0 x6, D1, D6 | D1, 0, D5, D4, 0, D3, D2, 0 | 0 | 0 (Section 2.1.2).
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn bis_dw(n: Int) -> Int
+    let d = (35 * n + 42) % 128
+    let d0 = d & 1
+    let d1 = (d >>> 1) & 1
+    let d2 = (d >>> 2) & 1
+    let d3 = (d >>> 3) & 1
+    let d4 = (d >>> 4) & 1
+    let d5 = (d >>> 5) & 1
+    let d6 = (d >>> 6) & 1
+    var hi = 0
+    for _ in 0..6
+        hi = (hi << 1) | d0
+    hi = (hi << 1) | d1
+    hi = (hi << 1) | d6
+    let mid = (d1 << 7) | (d5 << 5) | (d4 << 4) | (d3 << 2) | (d2 << 1)
+    (hi << 24) | (mid << 16)
+
+// The Access Address of BIS_Number `n` of a BIG with the Seed Access Address `saa`: the seed XOR the diversifier word.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn bis_aa(saa: Int, n: Int) -> Int
+    (saa ^ bis_dw(n)) & 0xFFFFFFFF
+
+// The CRC seed of BIS_Number `n` (0 for BIG Control): the BaseCRCInit in the two most significant octets and the number in the
+// least significant octet (Section 3.1.1).
+@tier(embedded)
+fn bis_crc(base: Int, n: Int) -> Int
+    ((base & 0xFFFF) << 8) | (n & 0xFF)
+
+// Whether `saa` meets the requirements of a Seed Access Address (Section 2.1.2) for `num_bis` streams: SAA19 equals SAA15, SAA22
+// equals SAA16 and differs from SAA15, SAA25 is 0 and SAA23 is 1, and the seed, the Access Address of each BIS and that of the BIG
+// Control logical link are valid access addresses.  On the LE Coded PHY the least significant octet also has three ones and the
+// 16 least significant bits at most eleven transitions.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn saa_valid(saa: Int, num_bis: Int, coded: Bool) -> Bool
+    let b15 = (saa >>> 15) & 1
+    if ((saa >>> 19) & 1) != b15 or ((saa >>> 22) & 1) != ((saa >>> 16) & 1) or ((saa >>> 22) & 1) == b15
+        return false
+    if ((saa >>> 25) & 1) != 0 or ((saa >>> 23) & 1) != 1
+        return false
+    for n in 0..(num_bis + 1)
+        let aa = bis_aa(saa, n)
+        if not ll_init.aa_valid(aa)
+            return false
+        if coded
+            if popcount_octet(aa & 0xFF) < 3 or transitions16(aa) > 11
+                return false
+    true
+
+@tier(embedded)
+fn popcount_octet(v: Int) -> Int
+    var n = 0
+    for k in 0..8
+        n = n + ((v >>> k) & 1)
+    n
+
+// The transitions in the 16 least significant bits of `aa`.
+@tier(embedded)
+fn transitions16(aa: Int) -> Int
+    var n = 0
+    for k in 1..16
+        if ((aa >>> k) & 1) != ((aa >>> (k - 1)) & 1)
+            n = n + 1
+    n
+
+// Whether the 16 least significant bits of `a` and `b` differ in at least two bits (a pair of BIGs of one device, Section 2.1.2).
+@tier(embedded)
+fn saa_apart(a: Int, b: Int) -> Bool
+    var n = 0
+    let x = (a ^ b) & 0xFFFF
+    for k in 0..16
+        n = n + ((x >>> k) & 1)
+    n >= 2
+
+// A Seed Access Address for `num_bis` streams from the random numbers `draw` supplies (an `rng_step` generator), and the number of
+// draws it took; the 64 draws are a bound a working generator does not reach.  `avoid` is the seed of another BIG of the device, -1
+// for none.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn make_saa(seed: Int, num_bis: Int, coded: Bool, avoid: Int) -> Int
+    var x = seed
+    var saa = 0
+    for _ in 0..256
+        x = rng_next(x)
+        let lo = x
+        x = rng_next(x)
+        saa = (lo ^ (x << 16)) & 0xFFFFFFFF
+        // Force the bits the requirements fix, and let the draws find the rest.
+        saa = (saa & (0xFFFFFFFF ^ ((1 << 25) | (1 << 23) | (1 << 22) | (1 << 19)))) | (1 << 23)
+        let b15 = (saa >>> 15) & 1
+        saa = saa | (b15 << 19)
+        saa = saa | ((1 - b15) << 22)
+        if ((saa >>> 16) & 1) == b15
+            saa = saa ^ (1 << 16)
+        if saa_valid(saa, num_bis, coded) and (avoid < 0 or saa_apart(saa, avoid))
+            return saa
+    0
+
+// One step of a xorshift generator (the one `ll_adv.rng_step` is).
+@tier(embedded)
+fn rng_next(x: Int) -> Int
+    var v = x & 0xFFFFFFFF
+    if v == 0
+        v = 0x9E3779B9
+    v = v ^ ((v << 13) & 0xFFFFFFFF)
+    v = v ^ (v >>> 17)
+    v = v ^ ((v << 5) & 0xFFFFFFFF)
+    v & 0xFFFFFFFF
+
+// ── The derivation of a group ───────────────────────────────────────
+
+// What a BIG is made of once derived or checked: the PHY, the numbers of Section 4.4.6.3, Sub_Interval and BIS_Spacing,
+// BIG_Sync_Delay and the transport latency.
+@value
+struct BigPlan
+    phy: Int
+    nse: Int
+    bn: Int
+    irc: Int
+    pto: Int
+    iso: Int
+    pdu: Int
+    sub_int: Int
+    bis_sp: Int
+    sync: Int
+    latency: Int
+
+@tier(embedded)
+fn plan_new() -> BigPlan
+    BigPlan { phy: 1, nse: 1, bn: 1, irc: 1, pto: 0, iso: 8, pdu: 0, sub_int: 0, bis_sp: 0, sync: 0, latency: 0 }
+
+// The spacing the subevents of a BIG need beyond the packet: T_MSS and, for a radio that was asked, the ramp-up its start uses with
+// the margin and the program's own work.  The next PDU is made while the last one is on air, so no octet-dependent work is added.
+@tier(embedded)
+fn sub_gap_us(prof: ll_radio.RadioProfile, phy: Int) -> Int
+    if not prof.known
+        return T_MSS_US
+    ll_phy.greater(T_MSS_US, ll_radio.subevent_gap_us(prof, phy))
+
+// Sub_Interval and BIS_Spacing for `num_bis` streams of `nse` subevents with PDUs of `pdu` octets on `phy`, the BIG_Sync_Delay of
+// the arrangement and the transport latency (Part G, Section 3.2.1 and 3.2.2), into `p`.  The smallest values the specification
+// allows are used (Section 4.4.6.4: Sub_Interval and BIS_Spacing at least T_MSS + MPT, the other spacing of the arrangement a
+// multiple of them).  The status is 0, or 0x12 when the event and its control subevent do not leave T_MSS before the next anchor
+// point.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn arrange(var p: BigPlan, num_bis: Int, packed: Bool, enc: Bool, sdu_int: Int, framed: Bool, prof: ll_radio.RadioProfile) -> Int
+    let mpt = mpt_us(p.phy, p.pdu, enc)
+    let least = mpt + sub_gap_us(prof, p.phy)
+    if packed and num_bis > 1
+        p.bis_sp = least
+        p.sub_int = num_bis * least
+    else
+        p.sub_int = least
+        p.bis_sp = p.nse * least
+    p.sync = (num_bis - 1) * p.bis_sp + (p.nse - 1) * p.sub_int + mpt
+    var span = num_bis * p.bis_sp
+    if packed and num_bis > 1
+        span = p.nse * p.sub_int
+    let iso = p.iso * UNIT_US
+    if span + mpt_us(p.phy, 4, enc) + T_MSS_US > iso
+        return E_INVALID
+    let gc = p.nse / p.bn
+    var pre = 0
+    if p.irc < gc
+        pre = p.pto * (gc - p.irc)
+    var sdu = 0 - sdu_int
+    if framed
+        sdu = sdu_int
+    p.latency = p.sync + pre * iso + iso + sdu
+    OK
+
+// The payloads one SDU of `max_sdu` octets takes in PDUs of `pdu` octets (UPPS, Part G, Section 2.1).
+@tier(embedded)
+fn upps_of(max_sdu: Int, pdu: Int) -> Int
+    ll_iso.upps(max_sdu, pdu, 1)
+
+// The PHY a mask of the Host's choices names, as HCI numbers it: LE 2M when it is allowed, then LE 1M, then LE Coded when the
+// radio has it; 0 when none.
+@tier(embedded)
+fn pick_phy(mask: Int, coded_ok: Bool) -> Int
+    if (mask & ll_phy.MASK_2M) != 0
+        return ll_phy.PHY_2M
+    if (mask & ll_phy.MASK_1M) != 0
+        return ll_phy.PHY_1M
+    if (mask & ll_phy.MASK_CODED) != 0 and coded_ok
+        return ll_phy.PHY_CODED
+    0
+
+// LE Create BIG ([Vol 4] Part E, Section 7.8.103): the BIG the Controller derives from the Host's request: framed in Segmentable mode (`framing` 1: the ISO interval
+// the shortest multiple of 1.25 ms of at least 5 ms that is not under the SDU interval, the PDUs and BN from `ll_iso.framed_pdu` and `framed_bn`) or unframed (Part G, Table 2.1
+// lets an unframed BIG serve Framing 2, Unsegmented mode, when the ISO interval is a multiple of the SDU interval, as
+// the unframed derivation makes it): PDUs of the SDU's size up to 251 octets, ISO_Interval the shortest multiple of the SDU interval and of
+// 1.25 ms of at least 5 ms, BN the payloads of the SDUs of one interval, IRC from the RTN the Host recommended less as many as
+// the event needs to fit, no pre-transmission.  The status is 0, 0x11 for a PHY the Controller lacks, or 0x12 for a request that is
+// out of range or cannot be met (more than 7 payloads in an interval, an event that does not fit the interval, a latency over
+// the Host's limit).
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn plan_big(var p: BigPlan, num_bis: Int, sdu_int: Int, max_sdu: Int, max_lat: Int, rtn: Int, phys: Int, packing: Int, framing: Int, enc: Bool, coded_ok: Bool, prof: ll_radio.RadioProfile) -> Int
+    if num_bis < 1 or num_bis > NUM_BIS_MAX or sdu_int < 0xFF or sdu_int > 0xFFFFF or max_sdu < 1 or max_sdu > 0xFFF
+        return E_INVALID
+    if max_lat < 5 or max_lat > 0xFA0 or rtn > 0x1E or packing > 1 or framing > 2 or phys == 0 or (phys & 0xF8) != 0
+        return E_INVALID
+    let phy = pick_phy(phys, coded_ok)
+    if phy == 0
+        return E_UNSUPPORTED
+    p.phy = phy
+    var iso_us = 0
+    if framing == 1
+        // Framed PDUs in Segmentable mode (Part G, Section 2.2): the interval is no multiple of the SDU interval, the PDUs and BN carry the segments of F SDUs.
+        iso_us = ll_iso.framed_interval_for(sdu_int, 0)
+        p.pdu = ll_iso.framed_pdu(max_sdu, sdu_int, iso_us)
+        p.bn = ll_iso.framed_bn(max_sdu, sdu_int, iso_us, p.pdu)
+        if iso_us == 0 or iso_us / UNIT_US > ISO_MAX or p.pdu == 0 or p.bn == 0 or p.bn > BN_MAX
+            return E_INVALID
+    else
+        p.pdu = ll_phy.lesser(max_sdu, PDU_MAX)
+        let up = upps_of(max_sdu, p.pdu)
+        iso_us = ll_iso.iso_interval_for(sdu_int, 0)
+        if iso_us == 0 or iso_us / UNIT_US > ISO_MAX
+            return E_INVALID
+        p.bn = up * (iso_us / sdu_int)
+        if p.bn > BN_MAX
+            return E_INVALID
+    p.iso = iso_us / UNIT_US
+    p.pto = 0
+    var irc = rtn + 1
+    if irc > IRC_MAX
+        irc = IRC_MAX
+    if p.bn * irc > NSE_MAX
+        irc = NSE_MAX / p.bn
+    var st = E_INVALID
+    for _ in 0..IRC_MAX
+        if irc < 1
+            break
+        p.irc = irc
+        p.nse = p.bn * irc
+        st = arrange(var p, num_bis, packing == 1, enc, sdu_int, framing == 1, prof)
+        if st == OK
+            break
+        irc = irc - 1
+    if st != OK
+        return st
+    if p.latency > max_lat * 1000
+        return E_INVALID
+    OK
+
+// LE Create BIG Test (Section 7.8.104): the numbers the Host gave, checked.  The status is 0x11 for a value out of its range, a PHY
+// the Controller lacks, an NSE that is no multiple of BN or is under IRC x BN, framed PDUs in Unsegmented mode (not built) and a pre-transmission the
+// ring of payloads cannot hold; 0x12 for a combination that is incompatible: for unframed PDUs an ISO interval that is no multiple of the SDU
+// interval and a BN that is not the payloads of the SDUs of an interval, for framed PDUs (Segmentable mode) a BN and Max_PDU that do not carry the segments of the SDUs of an interval
+// (BN x (Max_PDU - 2) under F x (5 + Max_SDU)), an event that does not fit.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn check_big_test(var p: BigPlan, num_bis: Int, sdu_int: Int, iso: Int, nse: Int, max_sdu: Int, max_pdu: Int, phys: Int, packing: Int, framing: Int, bn: Int, irc: Int, pto: Int, enc: Bool, coded_ok: Bool, prof: ll_radio.RadioProfile) -> Int
+    if num_bis < 1 or num_bis > NUM_BIS_MAX or sdu_int < 0xFF or sdu_int > 0xFFFFF or iso < ISO_MIN or iso > ISO_MAX
+        return E_UNSUPPORTED
+    if nse < 1 or nse > NSE_MAX or max_sdu < 1 or max_sdu > 0xFFF or max_pdu < 1 or max_pdu > PDU_MAX or packing > 1 or framing > 2
+        return E_UNSUPPORTED
+    if bn < 1 or bn > BN_MAX or irc < 1 or irc > IRC_MAX or pto > PTO_MAX or phys == 0 or (phys & 0xF8) != 0
+        return E_UNSUPPORTED
+    if framing > 1 or nse % bn != 0 or nse < irc * bn
+        return E_UNSUPPORTED
+    let phy = ll_phy.phy_of_mask(phys)
+    if phy == 0 or (phy == ll_phy.PHY_CODED and not coded_ok)
+        return E_UNSUPPORTED
+    p.phy = phy
+    p.nse = nse
+    p.bn = bn
+    p.irc = irc
+    p.pto = pto
+    if irc >= nse / bn
+        p.pto = 0
+    p.iso = iso
+    p.pdu = max_pdu
+    let pre = p.pto * (nse / bn - irc)
+    if bn * (pre + 1) > ll_iso.PAYLOAD_SLOTS
+        return E_UNSUPPORTED
+    let iso_us = iso * UNIT_US
+    if framing == 1
+        // A framed group carries F SDUs of Max_SDU in an interval, each with its Segmentation Header and Time_Offset; the interval is any multiple of 1.25 ms.
+        if max_pdu < ll_iso.FR_START_MIN or bn * (max_pdu - ll_iso.FR_HEADER) < ll_iso.framed_octets(max_sdu, sdu_int, iso_us) or iso_us < sdu_int
+            return E_INVALID
+        return arrange(var p, num_bis, packing == 1, enc, sdu_int, true, prof)
+    if iso_us % sdu_int != 0
+        return E_INVALID
+    let up = upps_of(max_sdu, max_pdu)
+    if bn % up != 0 or bn != up * (iso_us / sdu_int)
+        return E_INVALID
+    arrange(var p, num_bis, packing == 1, enc, sdu_int, false, prof)
+
+// ── The BIGInfo ─────────────────────────────────────────────────────
+
+// Set the `width` bits from bit `bit` (counted from the least significant bit of octet `base`, octets least significant first) of
+// the octets of `v` to `val`.
+@tier(embedded)
+fn set_bits(var v: Vec[u8; 64], base: Int, bit: Int, width: Int, val: Int)
+    for k in 0..width
+        let at = bit + k
+        let o = base + at / 8
+        let m = 1 << (at % 8)
+        var cur = v[o] as Int
+        if ((val >>> k) & 1) == 1
+            cur = cur | m
+        else
+            cur = cur & (0xFF ^ m)
+        v[o] = cur as u8
+
+// The same read from a received PDU.
+@tier(embedded)
+fn get_bits(var p: Pdu, base: Int, bit: Int, width: Int) -> Int
+    var v = 0
+    for k in 0..width
+        let at = bit + k
+        let o = base + at / 8
+        v = v | ((((p.b[o] as Int) >>> (at % 8)) & 1) << k)
+    v
+
+// The octets of the BIGInfo: 33, or 57 with the GIV and the GSKD of an encrypted BIG.
+@tier(embedded)
+fn info_octets(enc: Bool) -> Int
+    if enc
+        return INFO_ENC
+    INFO_PLAIN
+
+// The unit a BIG_Offset of `off_us` microseconds is written in: 30 microseconds under 491,460 and 300 above (Section 4.4.6.11).  The
+// count is rounded down, so that the anchor point is no earlier than the offset and less than a unit later.
+@tier(embedded)
+fn offset_unit(off_us: Int) -> Int
+    if off_us < OFFSET_FINE_MAX_US
+        return OFFSET_UNIT_FINE_US
+    OFFSET_UNIT_COARSE_US
+
+// Write the part of the BIGInfo AD structure that does not change in `b.info`: the AD header, the numbers of the BIG, the seed
+// Access Address, the SDU interval and size, the BaseCRCInit, the channel map and PHY, the framing, and the GIV and GSKD of an
+// encrypted BIG.  `info_at` adds the BIG_Offset and the bisPayloadCount of the event the offset leads to.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn info_static(var b: Big)
+    let n = info_octets(b.enc)
+    for k in 0..64
+        b.info[k] = 0
+    b.info_n = n + 2
+    b.info[0] = (n + 1) as u8
+    b.info[1] = AD_BIGINFO as u8
+    set_bits(var b.info, 2, 15, 12, b.iso_int)
+    set_bits(var b.info, 2, 27, 5, b.num_bis)
+    set_bits(var b.info, 2, 32, 5, b.nse)
+    set_bits(var b.info, 2, 37, 3, b.bn)
+    set_bits(var b.info, 2, 40, 20, b.sub_int)
+    set_bits(var b.info, 2, 60, 4, b.pto)
+    set_bits(var b.info, 2, 64, 20, b.bis_sp)
+    set_bits(var b.info, 2, 84, 4, b.irc)
+    set_bits(var b.info, 2, 88, 8, b.max_pdu)
+    set_bits(var b.info, 2, 104, 32, b.saa)
+    set_bits(var b.info, 2, 136, 20, b.sdu_int)
+    set_bits(var b.info, 2, 156, 12, b.max_sdu)
+    set_bits(var b.info, 2, 168, 16, b.crc)
+    set_bits(var b.info, 2, 184, 37, b.chmap)
+    set_bits(var b.info, 2, 221, 3, b.phy - 1)
+    if b.framed
+        set_bits(var b.info, 2, 263, 1, 1)
+    if b.enc
+        for k in 0..8
+            b.info[2 + 33 + k] = b.ek.iv[k]
+        for k in 0..16
+            b.info[2 + 41 + k] = b.gskd[k]
+
+// Put the BIG_Offset of `off_us` microseconds and the bisPayloadCount `count` (39 bits) in the BIGInfo.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn info_at(var b: Big, off_us: Int, count: Int)
+    let unit = offset_unit(off_us)
+    var v = off_us / unit
+    if v > 0x3FFF
+        v = 0x3FFF
+    set_bits(var b.info, 2, 0, 14, v)
+    if unit == OFFSET_UNIT_COARSE_US
+        set_bits(var b.info, 2, 14, 1, 1)
+    else
+        set_bits(var b.info, 2, 14, 1, 0)
+    set_bits(var b.info, 2, 224, 39, count)
+
+// The first BIG anchor point at or after `t`: the anchors are the one of the event under way (`b.anchor`) and whole ISO intervals
+// from it.
+@tier(embedded)
+fn anchor_after(var b: Big, t: Int) -> Int
+    let iso = iso_us(b)
+    if t <= b.anchor
+        return b.anchor
+    b.anchor + ((t - b.anchor + iso - 1) / iso) * iso
+
+// The event counter of the event whose anchor point is `anchor`.
+@tier(embedded)
+fn anchor_event(var b: Big, anchor: Int) -> Int
+    b.ev + (anchor - b.anchor) / iso_us(b)
+
+// Prepare the BIGInfo for the AUX_SYNC_IND that starts at `due`: the next anchor point at least `INFO_LEAD_US` after it, as an offset
+// from `due` less `phase_us` (the start error of the PDU, so that the anchor falls in the unit the offset names), and the
+// payload count at that anchor.  The answer is the BIG anchor point.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn info_for(var b: Big, due: Int, phase_us: Int) -> Int
+    let a = anchor_after(var b, due + INFO_LEAD_US)
+    let e = anchor_event(var b, a)
+    info_at(var b, a - due - phase_us, e * b.bn)
+    a
+
+// ── Taking a BIGInfo ────────────────────────────────────────────────
+
+// What a received BIGInfo says.  `ok` is false for a BIGInfo that is too short or holds a value out of range.
+@value
+struct InfoView
+    ok: Bool
+    enc: Bool
+    off_us: Int
+    unit: Int
+    iso: Int
+    num_bis: Int
+    nse: Int
+    bn: Int
+    sub_int: Int
+    pto: Int
+    bis_sp: Int
+    irc: Int
+    max_pdu: Int
+    saa: Int
+    sdu_int: Int
+    max_sdu: Int
+    crc: Int
+    chmap: Int
+    phy: Int
+    count: Int
+    framed: Bool
+
+@tier(embedded)
+fn info_view_none() -> InfoView
+    InfoView { ok: false, enc: false, off_us: 0, unit: 30, iso: 0, num_bis: 0, nse: 0, bn: 0, sub_int: 0, pto: 0, bis_sp: 0, irc: 0,
+               max_pdu: 0, saa: 0, sdu_int: 0, max_sdu: 0, crc: 0, chmap: 0, phy: 0, count: 0, framed: false }
+
+// Read the BIGInfo whose content starts at octet `at` of `p`, `n` octets of it (33 or 57).
+@satisfies("REQ-BLE-CTL-101")
+@tier(embedded)
+fn info_get(var p: Pdu, at: Int, n: Int) -> InfoView
+    if (n != INFO_PLAIN and n != INFO_ENC) or at + n > p.n
+        return info_view_none()
+    let units = get_bits(var p, at, 14, 1)
+    var unit = OFFSET_UNIT_FINE_US
+    if units == 1
+        unit = OFFSET_UNIT_COARSE_US
+    let off = get_bits(var p, at, 0, 14) * unit
+    let phy_code = get_bits(var p, at, 221, 3)
+    if phy_code > 2
+        return info_view_none()
+    InfoView { ok: true, enc: n == INFO_ENC, off_us: off, unit: unit, iso: get_bits(var p, at, 15, 12), num_bis: get_bits(var p, at, 27, 5),
+               nse: get_bits(var p, at, 32, 5), bn: get_bits(var p, at, 37, 3), sub_int: get_bits(var p, at, 40, 20), pto: get_bits(var p, at, 60, 4),
+               bis_sp: get_bits(var p, at, 64, 20), irc: get_bits(var p, at, 84, 4), max_pdu: get_bits(var p, at, 88, 8),
+               saa: get_bits(var p, at, 104, 32), sdu_int: get_bits(var p, at, 136, 20), max_sdu: get_bits(var p, at, 156, 12),
+               crc: get_bits(var p, at, 168, 16), chmap: get_bits(var p, at, 184, 37), phy: phy_code + 1, count: get_bits(var p, at, 224, 39),
+               framed: get_bits(var p, at, 263, 1) == 1 }
+
+// The BIGInfo in the ACAD of `p` (from octet `acad_at`, `acad_len` octets): the ACAD is a series of AD structures (length, type,
+// data).  The answer is `content_at * 64 + n`, n the octets of the BIGInfo and content_at the octet it starts at; -1 when the ACAD
+// holds none.
+@satisfies("REQ-BLE-CTL-101")
+@tier(embedded)
+fn acad_find(var p: Pdu, acad_at: Int, acad_len: Int) -> Int
+    var i = acad_at
+    let end = acad_at + acad_len
+    for _ in 0..8
+        if i + 2 > end
+            break
+        let l = p.b[i] as Int
+        if l == 0 or i + 1 + l > end
+            break
+        if (p.b[i + 1] as Int) == AD_BIGINFO
+            return (i + 2) * 64 + (l - 1)
+        i = i + 1 + l
+    -1
+
+// ── The streams of a group ──────────────────────────────────────────
+
+// Set the stream `x` (BIS_Number `n`, slot `slot` of the table) from the group `b`.  The broadcaster is the transmitting end of a
+// `Cis`, the Central's (`central` true, the `_c` fields), the receiver the receiving one (`central` false, the `_c` fields too, as the
+// Peripheral reads them); the fields the CIS timing uses (`ft_c`, `cis_sync`) carry what the time stamp of a received SDU needs
+// (Part G, Section 3.3): the events early the payloads are sent, and BIG_Sync_Delay.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn bis_config(var x: Cis, var b: Big, n: Int, slot: Int)
+    ll_iso.cis_reset_run(var x, ll_iso.S_UP)
+    x.handle = BIS_HANDLE_BASE + slot
+    x.cig_id = b.handle
+    x.cis_id = n
+    x.central = b.broadcaster
+    x.phy = b.phy
+    x.framed = b.framed
+    x.unseg = b.unseg
+    x.max_sdu_c = b.max_sdu
+    x.max_pdu_c = b.max_pdu
+    x.sdu_int_c = b.sdu_int
+    x.max_sdu_p = 0
+    x.max_pdu_p = 0
+    x.sdu_int_p = 0
+    x.nse = b.nse
+    x.sub_int = b.sub_int
+    x.bn_c = b.bn
+    x.bn_p = 0
+    x.ft_c = 1 + pre_events(var b)
+    x.ft_p = 1
+    x.iso_int = b.iso_int
+    x.aa = bis_aa(b.saa, n)
+    x.enc = b.enc
+    x.cis_sync = b.sync_delay
+    x.cig_sync = b.sync_delay
+    x.anchor = b.anchor
+    x.ev = b.ev
+    x.acl = -1
+    x.dp_in = false
+    x.dp_out = false
+    x.rx_num = 0
+    x.asm_idx = 0
+
+// The header octet of a BIS Data PDU or BIG Control PDU (Section 2.6.2): the LLID, the Control Subevent Sequence Number in bits 2
+// to 4 and the Control Subevent Transmission Flag in bit 5.
+@tier(embedded)
+fn bis_header(llid: Int, cssn: Int, cstf: Bool) -> Int
+    var h = (llid & 3) | ((cssn & 7) << 2)
+    if cstf
+        h = h | 0x20
+    h
+
+// Build the BIS Data PDU of payload `num` of the stream `x` into `p`, its payload not yet sealed: the LLID the ring holds for it
+// and the octets, or an empty PDU (LLID 1 for unframed data, 2 for framed) when the ring has no such payload.
+@satisfies("REQ-BLE-CTL-102")
+@tier(embedded)
+fn tx_build(var x: Cis, num: Int, var p: Pdu, cssn: Int, cstf: Bool)
+    if num < x.tx_num or num >= x.tx_wr
+        var llid = LLID_UNFRAMED_START
+        if x.framed
+            llid = LLID_FRAMED
+        p.b[0] = bis_header(llid, cssn, cstf) as u8
+        p.b[1] = 0
+        p.n = 2
+        return
+    let sl = ll_iso.slot_of(num)
+    let n = x.txl[sl]
+    p.b[0] = bis_header(x.txf[sl] & 3, cssn, cstf) as u8
+    p.b[1] = n as u8
+    let base = sl * ll_iso.SLOT_OCTETS
+    for i in 0..n
+        p.b[2 + i] = x.txd[base + i]
+    p.n = 2 + n
+
+// The BIG_TERMINATE_IND of the group, into `p`: Reason, Instant (the counter of the event the BIG ends in, 16 bits).
+@satisfies("REQ-BLE-CTL-103")
+@tier(embedded)
+fn ctrl_terminate(var b: Big, var p: Pdu)
+    p.b[0] = bis_header(LLID_CONTROL, b.cssn, false) as u8
+    p.b[1] = 4
+    p.b[2] = CTRL_TERMINATE as u8
+    p.b[3] = b.term_reason as u8
+    p.b[4] = (b.term_instant & 0xFF) as u8
+    p.b[5] = ((b.term_instant >>> 8) & 0xFF) as u8
+    p.n = 6
+
+// Whether the control subevent of event `ev` carries the PDU of a procedure that is under way: from the first event it is sent in to
+// the one before the instant.
+@tier(embedded)
+fn ctrl_active(var b: Big, ev: Int) -> Bool
+    (b.term_req and ev >= b.ctl_first and ev < b.term_instant) or (b.broadcaster and b.cm_req and ev >= b.cm_instant - CTRL_EVENTS and ev < b.cm_instant)
+
+// Begin the BIG Termination procedure with `reason`: the PDU is sent in the next six events (the one under way when its control
+// subevent has not passed), and the BIG ends at the event after them.  `first` is the first event the PDU goes in.
+@satisfies("REQ-BLE-CTL-103")
+@tier(embedded)
+fn terminate_begin(var b: Big, reason: Int, first: Int)
+    b.term_req = true
+    b.term_reason = reason
+    b.ctl_first = first
+    b.term_instant = first + CTRL_EVENTS
+    b.cssn = (b.cssn + 1) & 7
+    b.state = B_TERM
+
+// The BIG_CHANNEL_MAP_IND of the group, into `p`: the new channel map (5 octets) and the Instant (the 16 bits of the event counter the map takes
+// effect in).
+@satisfies("REQ-BLE-CTL-111")
+@tier(embedded)
+fn ctrl_chmap(var b: Big, var p: Pdu)
+    p.b[0] = bis_header(LLID_CONTROL, b.cssn, false) as u8
+    p.b[1] = 8
+    p.b[2] = CTRL_CHANNEL_MAP as u8
+    for k in 0..5
+        p.b[3 + k] = ((b.cm_map >>> (8 * k)) & 0xFF) as u8
+    p.b[8] = (b.cm_instant & 0xFF) as u8
+    p.b[9] = ((b.cm_instant >>> 8) & 0xFF) as u8
+    p.n = 10
+
+// Begin the BIG Channel Map Update procedure with the channel map `map` (`n_used` channels): the PDU is sent in the control subevent of the six
+// events from `first`, and the map takes effect at the event after them, the instant (Part B, Section 5.5.2: at least 6 BIG events after the first
+// one that carries the PDU).  A procedure that is under way ends first (Section 5.6.1), and so does the BIG Termination procedure.
+@satisfies("REQ-BLE-CTL-111")
+@tier(embedded)
+fn chmap_begin(var b: Big, map: Int, first: Int)
+    b.cm_req = true
+    b.cm_map = map
+    b.cm_instant = first + CTRL_EVENTS
+    b.cssn = (b.cssn + 1) & 7
+
+// Whether the broadcaster may begin a BIG Channel Map Update procedure with `map` now: the group is up, no control procedure is under way and
+// the map is not the one in use.
+@tier(embedded)
+fn chmap_due(var b: Big, map: Int) -> Bool
+    b.broadcaster and b.state == B_UP and not b.cm_req and not b.term_req and map != b.chmap
+
+// The new channel map takes effect: the group uses it from this event on and the BIGInfo names it.
+@satisfies("REQ-BLE-CTL-111")
+@tier(embedded)
+fn chmap_apply(var b: Big)
+    b.chmap = b.cm_map
+    b.n_used = ll_link.popcount(b.cm_map)
+    b.cm_req = false
+    if b.broadcaster
+        set_bits(var b.info, 2, 184, 37, b.cm_map)
+
+// Whether the data PDUs of event `ev` carry the Control Subevent Transmission Flag.
+@tier(embedded)
+fn cstf_of(var b: Big, ev: Int) -> Bool
+    ctrl_active(var b, ev)
+
+// ── The receiving side ──────────────────────────────────────────────
+
+// The bit of `x.txf` that says the payload in the slot arrived in this event (the ring of a receiving stream holds the payloads of
+// the event under way until its end).
+const RX_HAVE = 0x10000
+
+// Forget the payloads of event `ev` the stream `x` was holding.
+@tier(embedded)
+fn rx_begin(var x: Cis, ev: Int)
+    let bn = ll_iso.rx_bn(var x)
+    for j in 0..bn
+        x.txf[ll_iso.slot_of(ev * bn + j)] = 0
+
+// Keep the payload number `num` read into `p` (a BIS PDU with its header, still sealed when the BIG is encrypted) in the ring.
+// A payload that is already there is not replaced.  False when it was.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn rx_keep(var x: Cis, num: Int, var p: Pdu) -> Bool
+    let sl = ll_iso.slot_of(num)
+    if (x.txf[sl] & RX_HAVE) != 0
+        return false
+    let n = p.b[1] as Int
+    if n > ll_iso.SLOT_OCTETS - 1 or 2 + n > p.n
+        return false
+    let base = sl * ll_iso.SLOT_OCTETS
+    for i in 0..n
+        x.txd[base + i] = p.b[2 + i]
+    x.txl[sl] = n
+    x.txf[sl] = RX_HAVE | ((p.b[0] as Int) & 3)
+    true
+
+// Whether payload `num` of the stream `x` arrived.
+@tier(embedded)
+fn rx_have(var x: Cis, num: Int) -> Bool
+    (x.txf[ll_iso.slot_of(num)] & RX_HAVE) != 0
+
+// Forget that payload `num` was kept.
+@tier(embedded)
+fn rx_clear(var x: Cis, num: Int)
+    x.txf[ll_iso.slot_of(num)] = 0
+
+// The payload `num` the stream kept, into `p` as a PDU with its header.
+@tier(embedded)
+fn rx_load(var x: Cis, num: Int, var p: Pdu)
+    let sl = ll_iso.slot_of(num)
+    let n = x.txl[sl]
+    p.b[0] = (x.txf[sl] & 3) as u8
+    p.b[1] = n as u8
+    let base = sl * ll_iso.SLOT_OCTETS
+    for i in 0..n
+        p.b[2 + i] = x.txd[base + i]
+    p.n = 2 + n
+
+// The streams' payloads of event `ev` are over: the ones that arrived go to the recombination in order, and a number that did not
+// is reported lost (Part G, Section 2.1).  `open` is the verdict of the caller's decryption of each payload that arrived, as a mask
+// bit for each one: bit j clear is a payload whose MIC did not match.  The recombination of a payload is `ll_iso.rx_note`.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn rx_finish(var x: Cis, ev: Int, var p: Pdu, var scratch: Pdu)
+    let bn = ll_iso.rx_bn(var x)
+    for j in 0..bn
+        let num = ev * bn + j
+        if rx_have(var x, num)
+            rx_load(var x, num, var p)
+            ll_iso.rx_note(var x, num, true, var p)
+            x.n_rx = x.n_rx + 1
+            x.txf[ll_iso.slot_of(num)] = 0
+        else
+            ll_iso.rx_note(var x, num, false, var scratch)
+            x.n_flush_rx = x.n_flush_rx + 1
+
+// Retire the payloads of the stream `x` that no later subevent sends: those under `upto`.
+@tier(embedded)
+fn tx_done(var x: Cis, upto: Int)
+    for _ in 0..ll_iso.PAYLOAD_SLOTS
+        if x.tx_num >= x.tx_wr or x.tx_num >= upto
+            break
+        ll_iso.tx_retire(var x, false)
+
+// ── The Synchronized Receiver ───────────────────────────────────────
+
+// Whether a BIGInfo that was read describes a group this receiver can follow: every number in its range and the combinations the
+// specification allows (NSE a multiple of BN, IRC within the groups, the interval within 5 ms to 4 s).
+@satisfies("REQ-BLE-CTL-104")
+@tier(embedded)
+fn info_valid(v: InfoView) -> Bool
+    if not v.ok or v.nse < 1 or v.nse > NSE_MAX or v.bn < 1 or v.bn > BN_MAX or v.nse % v.bn != 0
+        return false
+    if v.irc < 1 or v.irc > v.nse / v.bn or v.iso < ISO_MIN or v.iso > ISO_MAX or v.num_bis < 1 or v.max_pdu < 1
+        return false
+    v.sub_int > 0 and v.sdu_int >= 0xFF and v.max_sdu >= 1
+
+// The subevents of a BIS the receiver listens to in an event: the groups that carry the payloads of the event itself (IRC x BN), fewer
+// when the Host asked for at most MSE (the pre-transmitted groups behind them are left out: a payload that is heard once is enough).
+@satisfies("REQ-BLE-CTL-104")
+@tier(embedded)
+fn listen_nse(var b: Big) -> Int
+    var n = b.irc * b.bn
+    if b.mse > 0 and b.mse < n
+        n = b.mse
+    n
+
+// Whether BIS_Number `n` (from 1) is one the receiver was asked for, and the BIS_Number of its j-th stream (j from 0, 0 for none).
+@tier(embedded)
+fn wants(var b: Big, n: Int) -> Bool
+    n >= 1 and n <= 31 and ((b.bis_mask >>> (n - 1)) & 1) == 1
+
+@tier(embedded)
+fn bis_number(var b: Big, j: Int) -> Int
+    var seen = 0
+    for n in 1..32
+        if wants(var b, n)
+            if seen == j
+                return n
+            seen = seen + 1
+    0
+
+// Whether the receiver listens to subevent `sub` of BIS `bis` in each event.
+@tier(embedded)
+fn rx_listens(var b: Big, bis: Int, sub: Int) -> Bool
+    wants(var b, bis) and sub <= listen_nse(var b)
+
+// The window widening of a PDU due at `at`, from the last PDU heard: both clocks' accuracy over the time between and the jitter,
+// at most half the ISO interval less T_MSS (Part B, Section 4.5.7).
+@satisfies("REQ-BLE-CTL-104")
+@tier(embedded)
+fn rx_widen(var b: Big, at: Int) -> Int
+    var elapsed = at - b.last_rx
+    if elapsed < 0
+        elapsed = 0
+    var w = ((b.ppm + ll_link.OWN_PPM) * elapsed) / 1000000 + ll_link.JITTER_US
+    let cap = iso_us(b) / 2 - T_MSS_US
+    if w > cap
+        w = cap
+    w
+
+// Whether the event counter `ev` (16 bits) has reached `instant`: the instants are within half the counter's range ahead.
+@tier(embedded)
+fn instant_reached(ev: Int, instant: Int) -> Bool
+    ((ev - instant) & 0xFFFF) < 0x8000
+
+// Take the group a BIGInfo describes into the receiver's group `b`: the numbers of Section 4.4.6.3, the Seed Access Address, the CRC seed,
+// the channel map, the key material of an encrypted group, the BIG_Sync_Delay and the transport latency (Part G, Section 3.2.2), and the
+// accuracy of the broadcaster's clock `ppm`.
+@satisfies("REQ-BLE-CTL-104")
+@tier(embedded)
+fn sync_fill(var b: Big, v: InfoView, ppm: Int)
+    b.num_bis = v.num_bis
+    b.nse = v.nse
+    b.bn = v.bn
+    b.irc = v.irc
+    b.pto = v.pto
+    b.iso_int = v.iso
+    b.sub_int = v.sub_int
+    b.bis_sp = v.bis_sp
+    b.phy = v.phy
+    b.max_pdu = v.max_pdu
+    b.max_sdu = v.max_sdu
+    b.sdu_int = v.sdu_int
+    b.framed = v.framed
+    b.unseg = false
+    b.enc = v.enc
+    b.saa = v.saa
+    b.crc = v.crc
+    b.chmap = v.chmap
+    b.n_used = ll_link.popcount(v.chmap)
+    b.packed = v.num_bis > 1 and v.bis_sp < v.sub_int
+    b.ppm = ppm
+    b.sync_delay = (v.num_bis - 1) * v.bis_sp + (v.nse - 1) * v.sub_int + mpt_us(v.phy, v.max_pdu, v.enc)
+    var pre = 0
+    if v.irc < v.nse / v.bn
+        pre = v.pto * (v.nse / v.bn - v.irc)
+    b.latency = b.sync_delay + pre * iso_us(b) + iso_us(b) - v.sdu_int
+    if v.framed
+        b.latency = b.sync_delay + pre * iso_us(b) + iso_us(b) + v.sdu_int
+
+// The GIV and the GSKD of an encrypted group from the 57 octets of its BIGInfo in `raw` (the content of the AD structure).
+@tier(embedded)
+fn key_from_info(var b: Big, var raw: Vec[u8; 64])
+    for k in 0..8
+        b.ek.iv[k] = raw[33 + k]
+    for k in 0..16
+        b.gskd[k] = raw[41 + k]
+
+// The first anchor point of a group whose BIGInfo came in a PDU that began at `t_first`: the offset on, then whole ISO intervals until the
+// receiver can be listening (`lead` microseconds after `now`).  The event counter is that of the bisPayloadCount at the offset's anchor.
+// The anchor point is somewhere in the unit after the offset, which the first window covers (`win`).
+@satisfies("REQ-BLE-CTL-104")
+@tier(embedded)
+fn sync_anchor(var b: Big, t_first: Int, off_us: Int, unit: Int, count: Int, now: Int, lead: Int)
+    b.anchor = t_first + off_us
+    b.ev = count / b.bn
+    b.win = unit
+    let iso = iso_us(b)
+    for _ in 0..4096
+        if b.anchor >= now + lead
+            break
+        b.anchor = b.anchor + iso
+        b.ev = b.ev + 1
+    b.last_rx = t_first
+    b.first_us = b.anchor
+
+// Set the receiving stream `x` up for the first event of its group: the recombination begins at the SDU of the first payload.
+@tier(embedded)
+fn rx_start(var x: Cis, var b: Big)
+    let up = upps_of(b.max_sdu, b.max_pdu)
+    x.asm_idx = (b.ev * b.bn) / up
+    if b.framed
+        x.asm_idx = 0
+    x.anchor = b.anchor
+    x.ev = b.ev
+    x.last_rx = b.last_rx
+    x.synced = false
+
+// The payload `p` (a BIG Control PDU read and, for an encrypted group, opened) of a receiver: BIG_TERMINATE_IND sets the end of the group
+// at its instant, BIG_CHANNEL_MAP_IND the map from the instant on.  The same PDU comes in six events; a PDU with the sequence number
+// of the one taken is the same.
+@satisfies("REQ-BLE-CTL-103")
+@tier(embedded)
+fn ctrl_rx(var b: Big, var p: Pdu)
+    let cssn = ((p.b[0] as Int) >>> 2) & 7
+    if cssn == b.last_cssn and b.last_cssn >= 0
+        return
+    let n = p.b[1] as Int
+    if n < 1
+        return
+    let op = p.b[2] as Int
+    if op == CTRL_TERMINATE and n >= 4
+        b.term_req = true
+        b.term_reason = p.b[3] as Int
+        b.term_instant = (p.b[4] as Int) | ((p.b[5] as Int) << 8)
+        b.last_cssn = cssn
+    else if op == CTRL_CHANNEL_MAP and n >= 8
+        var m = 0
+        for k in 0..5
+            m = m | ((p.b[3 + k] as Int) << (8 * k))
+        b.cm_req = true
+        b.cm_map = m & 0x1FFFFFFFFF
+        b.cm_instant = (p.b[8] as Int) | ((p.b[9] as Int) << 8)
+        b.last_cssn = cssn
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// A @value struct is changed through a `var` parameter, so the tests set fields through this function, by name.
+fn t_set(var b: Big, f: Str, v: Int)
+    if f == "state"
+        b.state = v
+    else if f == "broadcaster"
+        b.broadcaster = v != 0
+    else if f == "num_bis"
+        b.num_bis = v
+    else if f == "nse"
+        b.nse = v
+    else if f == "bn"
+        b.bn = v
+    else if f == "irc"
+        b.irc = v
+    else if f == "pto"
+        b.pto = v
+    else if f == "iso_int"
+        b.iso_int = v
+    else if f == "sub_int"
+        b.sub_int = v
+    else if f == "bis_sp"
+        b.bis_sp = v
+    else if f == "phy"
+        b.phy = v
+    else if f == "max_pdu"
+        b.max_pdu = v
+    else if f == "max_sdu"
+        b.max_sdu = v
+    else if f == "sdu_int"
+        b.sdu_int = v
+    else if f == "packed"
+        b.packed = v != 0
+    else if f == "enc"
+        b.enc = v != 0
+    else if f == "saa"
+        b.saa = v
+    else if f == "crc"
+        b.crc = v
+    else if f == "chmap"
+        b.chmap = v
+    else if f == "n_used"
+        b.n_used = v
+    else if f == "anchor"
+        b.anchor = v
+    else if f == "ev"
+        b.ev = v
+    else if f == "sync_delay"
+        b.sync_delay = v
+    else if f == "cssn"
+        b.cssn = v
+    else if f == "mse"
+        b.mse = v
+    else if f == "bis_mask"
+        b.bis_mask = v
+    else if f == "ppm"
+        b.ppm = v
+    else if f == "last_rx"
+        b.last_rx = v
+    else if f == "last_cssn"
+        b.last_cssn = v
+
+// The group of the examples: two BISes, 10 ms ISO interval, BN 1, IRC 2 (NSE 2), PDUs of 100 octets on LE 2M, sequential.
+fn t_big() -> Big
+    var b = big_new()
+    t_set(b, "broadcaster", 1)
+    t_set(b, "num_bis", 2)
+    t_set(b, "nse", 2)
+    t_set(b, "bn", 1)
+    t_set(b, "irc", 2)
+    t_set(b, "pto", 0)
+    t_set(b, "iso_int", 8)
+    t_set(b, "phy", 2)
+    t_set(b, "max_pdu", 100)
+    t_set(b, "max_sdu", 100)
+    t_set(b, "sdu_int", 10000)
+    t_set(b, "saa", 0x78E52493)
+    t_set(b, "crc", 0xABCD)
+    t_set(b, "chmap", 0x1FFFFFFFFF)
+    t_set(b, "n_used", 37)
+    t_set(b, "sub_int", 1000)
+    t_set(b, "bis_sp", 2000)
+    t_set(b, "anchor", 100000)
+    b
+
+fn t_pset(var p: BigPlan, f: Str, v: Int)
+    if f == "phy"
+        p.phy = v
+    else if f == "nse"
+        p.nse = v
+    else if f == "bn"
+        p.bn = v
+    else if f == "irc"
+        p.irc = v
+    else if f == "pto"
+        p.pto = v
+    else if f == "iso"
+        p.iso = v
+    else if f == "pdu"
+        p.pdu = v
+
+fn t_pdu_n(var p: Pdu, n: Int)
+    p.n = n
+
+fn t_pdu(var b: Big) -> Pdu
+    var p = ll_pdu.pdu_new()
+    for k in 0..b.info_n
+        p.b[k] = b.info[k]
+    t_pdu_n(var p, b.info_n)
+    p
+
+fn t_prof() -> ll_radio.RadioProfile
+    ll_radio.profile_new(true, 145, 45)
+
+@test
+fn test_the_access_addresses_of_the_streams_follow_the_sample_data_of_the_specification()
+    // [Vol 6] Part C, Section 5: the Seed Access Address 0x78E52493 gives 0x85E32493 for BIS 1, 0x79D52493 for 2, 0x86752493 for 3,
+    // 0x87472493 for 31, and 0x7A412493 for the BIG Control logical link.
+    test.assert_eq(bis_aa(0x78E52493, 1), 0x85E32493)
+    test.assert_eq(bis_aa(0x78E52493, 2), 0x79D52493)
+    test.assert_eq(bis_aa(0x78E52493, 3), 0x86752493)
+    test.assert_eq(bis_aa(0x78E52493, 10), 0x78E12493)
+    test.assert_eq(bis_aa(0x78E52493, 28), 0x7B532493)
+    test.assert_eq(bis_aa(0x78E52493, 31), 0x87472493)
+    test.assert_eq(bis_aa(0x78E52493, 0), 0x7A412493)
+    test.assert_eq(bis_dw(1), 0xFD060000)
+
+@test
+fn test_the_crc_seed_of_a_stream_has_the_number_in_its_least_significant_octet()
+    test.assert_eq(bis_crc(0xABCD, 3), 0xABCD03)
+    test.assert_eq(bis_crc(0xABCD, 0), 0xABCD00)
+
+@test
+fn test_a_seed_access_address_meets_the_requirements_of_the_specification()
+    test.assert(saa_valid(0x78E52493, 31, false))
+    // SAA25 set, SAA23 clear, SAA22 equal to SAA15.
+    test.assert(not saa_valid(0x78E52493 | (1 << 25), 4, false))
+    test.assert(not saa_valid(0x78E52493 & (0xFFFFFFFF ^ (1 << 23)), 4, false))
+    test.assert(not saa_valid(0x78E52493 ^ (1 << 22), 4, false))
+    // The generator finds one for every size of group, and one 2 bits apart from another BIG's.
+    for n in 1..32
+        let saa = make_saa(0x12345 + n, n, false, -1)
+        test.assert(saa != 0)
+        test.assert(saa_valid(saa, n, false))
+    let first = make_saa(77, 2, false, -1)
+    let second = make_saa(77, 2, false, first)
+    test.assert(saa_apart(first, second))
+    let coded = make_saa(5, 2, true, -1)
+    test.assert(saa_valid(coded, 2, true))
+
+@test
+fn test_payloads_are_allotted_to_subevents_as_the_figures_of_the_specification_show()
+    // Figure 4.36: BN 2, IRC 2, PTO 0, NSE 4: P0 P1 P0 P1; the next event P2 P3 P2 P3.
+    var b = big_new()
+    t_set(b, "bn", 2)
+    t_set(b, "irc", 2)
+    t_set(b, "pto", 0)
+    t_set(b, "nse", 4)
+    test.assert_eq(payload_of(var b, 0, 1), 0)
+    test.assert_eq(payload_of(var b, 0, 2), 1)
+    test.assert_eq(payload_of(var b, 0, 3), 0)
+    test.assert_eq(payload_of(var b, 0, 4), 1)
+    test.assert_eq(payload_of(var b, 1, 1), 2)
+    test.assert_eq(payload_of(var b, 1, 4), 3)
+    test.assert_eq(pre_events(var b), 0)
+    // Figure 4.37: BN 1, IRC 3, PTO 2, NSE 5: p0 p0 p0 p2 p4.
+    var c = big_new()
+    t_set(c, "bn", 1)
+    t_set(c, "irc", 3)
+    t_set(c, "pto", 2)
+    t_set(c, "nse", 5)
+    test.assert_eq(payload_of(var c, 0, 1), 0)
+    test.assert_eq(payload_of(var c, 0, 3), 0)
+    test.assert_eq(payload_of(var c, 0, 4), 2)
+    test.assert_eq(payload_of(var c, 0, 5), 4)
+    test.assert_eq(pre_events(var c), 4)
+    // Figure 4.38: BN 2, IRC 2, PTO 4, NSE 6: p0 p1 p0 p1 p8 p9.
+    var d = big_new()
+    t_set(d, "bn", 2)
+    t_set(d, "irc", 2)
+    t_set(d, "pto", 4)
+    t_set(d, "nse", 6)
+    test.assert_eq(payload_of(var d, 0, 2), 1)
+    test.assert_eq(payload_of(var d, 0, 3), 0)
+    test.assert_eq(payload_of(var d, 0, 5), 8)
+    test.assert_eq(payload_of(var d, 0, 6), 9)
+    test.assert_eq(pre_events(var d), 4)
+
+@test
+fn test_subevents_run_in_time_order_sequential_and_interleaved()
+    // Two BISes of two subevents: sequential 1.1 1.2 2.1 2.2, interleaved 1.1 2.1 1.2 2.2 (bis * 64 + subevent).
+    var b = t_big()
+    test.assert_eq(program_len(var b), 4)
+    test.assert_eq(program_at(var b, 0), 1 * 64 + 1)
+    test.assert_eq(program_at(var b, 1), 1 * 64 + 2)
+    test.assert_eq(program_at(var b, 2), 2 * 64 + 1)
+    test.assert_eq(program_at(var b, 3), 2 * 64 + 2)
+    t_set(b, "packed", 1)
+    t_set(b, "bis_sp", 500)
+    t_set(b, "sub_int", 1000)
+    test.assert_eq(program_at(var b, 0), 1 * 64 + 1)
+    test.assert_eq(program_at(var b, 1), 2 * 64 + 1)
+    test.assert_eq(program_at(var b, 2), 1 * 64 + 2)
+    test.assert_eq(program_at(var b, 3), 2 * 64 + 2)
+    // The offsets are (n - 1) x BIS_Spacing + (s - 1) x Sub_Interval, in order along the program.
+    test.assert_eq(sub_offset(var b, 1, 1), 0)
+    test.assert_eq(sub_offset(var b, 2, 1), 500)
+    test.assert_eq(sub_offset(var b, 1, 2), 1000)
+    test.assert_eq(sub_offset(var b, 2, 2), 1500)
+    test.assert_eq(control_offset(var b), 2000)
+
+@test
+fn test_the_arrangement_uses_the_least_spacing_the_specification_allows()
+    // 100 octets on LE 2M, unencrypted: 112 octets with the header are (112 + 9) x 4 = ... MPT is 2 + 100 octets of PDU.
+    var p = plan_new()
+    t_pset(var p, "phy", 2)
+    t_pset(var p, "nse", 2)
+    t_pset(var p, "bn", 1)
+    t_pset(var p, "irc", 2)
+    t_pset(var p, "iso", 8)
+    t_pset(var p, "pdu", 100)
+    let prof = t_prof()
+    test.assert_eq(arrange(var p, 2, false, false, 10000, false, prof), OK)
+    let mpt = mpt_us(2, 100, false)
+    test.assert_eq(mpt, (2 + 100 + 9) * 4)
+    // T_MSS 150 is the larger of the two spacings the fast radio needs (45 + 25 + 80 = 150).
+    test.assert_eq(p.sub_int, mpt + 150)
+    test.assert_eq(p.bis_sp, 2 * (mpt + 150))
+    test.assert_eq(p.sync, p.bis_sp + p.sub_int + mpt)
+    // Interleaved: BIS_Spacing is the least and Sub_Interval holds all the BISes.
+    test.assert_eq(arrange(var p, 2, true, false, 10000, false, prof), OK)
+    test.assert_eq(p.bis_sp, mpt + 150)
+    test.assert_eq(p.sub_int, 2 * (mpt + 150))
+    test.assert_eq(p.sync, p.bis_sp + p.sub_int + mpt)
+    // A radio that was not asked uses T_MSS alone; an encrypted BIG is four octets longer.
+    test.assert_eq(sub_gap_us(ll_radio.profile_assumed(), 2), 150)
+    test.assert_eq(mpt_us(2, 100, true), mpt + 16)
+
+@test
+fn test_the_transport_latency_is_the_sync_delay_the_pre_transmission_and_an_interval_less_an_sdu_interval()
+    var p = plan_new()
+    t_pset(var p, "phy", 2)
+    t_pset(var p, "nse", 2)
+    t_pset(var p, "bn", 1)
+    t_pset(var p, "irc", 2)
+    t_pset(var p, "iso", 8)
+    t_pset(var p, "pdu", 100)
+    test.assert_eq(arrange(var p, 1, false, false, 10000, false, t_prof()), OK)
+    test.assert_eq(p.latency, p.sync + 10000 - 10000)
+    // Framed adds the SDU interval where unframed takes it off; IRC under GC makes PTO x (GC - IRC) intervals early.
+    test.assert_eq(arrange(var p, 1, false, false, 10000, true, t_prof()), OK)
+    test.assert_eq(p.latency, p.sync + 10000 + 10000)
+    t_pset(var p, "nse", 4)
+    t_pset(var p, "irc", 2)
+    t_pset(var p, "pto", 1)
+    test.assert_eq(arrange(var p, 1, false, false, 10000, false, t_prof()), OK)
+    test.assert_eq(p.latency, p.sync + 2 * 10000 + 10000 - 10000)
+
+@test
+fn test_a_big_that_does_not_fit_its_interval_is_refused()
+    var p = plan_new()
+    t_pset(var p, "phy", 1)
+    t_pset(var p, "nse", 8)
+    t_pset(var p, "bn", 1)
+    t_pset(var p, "irc", 8)
+    t_pset(var p, "iso", 4)
+    t_pset(var p, "pdu", 251)
+    test.assert_eq(arrange(var p, 4, false, false, 5000, false, t_prof()), E_INVALID)
+
+@test
+fn test_create_big_derives_an_unframed_group_from_the_hosts_request()
+    // Two BISes, SDUs of 100 octets every 10 ms, 20 ms of latency, RTN 2, LE 2M preferred, sequential.
+    var p = plan_new()
+    let st = plan_big(var p, 2, 10000, 100, 20, 2, 3, 0, 0, false, true, t_prof())
+    test.assert_eq(st, OK)
+    test.assert_eq(p.phy, ll_phy.PHY_2M)
+    test.assert_eq(p.pdu, 100)
+    test.assert_eq(p.iso, 8)
+    test.assert_eq(p.bn, 1)
+    test.assert_eq(p.irc, 3)
+    test.assert_eq(p.nse, 3)
+    test.assert_eq(p.pto, 0)
+    test.assert(p.latency <= 20000)
+    // LE 1M alone is taken when LE 2M is not allowed; nothing allowed that the radio lacks is 0x11.
+    var q = plan_new()
+    test.assert_eq(plan_big(var q, 1, 10000, 100, 40, 0, 1, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(q.phy, ll_phy.PHY_1M)
+    test.assert_eq(plan_big(var q, 1, 10000, 100, 40, 0, 4, 0, 0, false, false, t_prof()), E_UNSUPPORTED)
+
+@test
+fn test_create_big_takes_a_long_sdu_in_several_payloads_and_sdu_intervals_of_other_lengths()
+    // 310-octet SDUs every 10 ms: two payloads of 251 and 59... PDUs of 251 octets, UPPS 2, BN 2.
+    var p = plan_new()
+    test.assert_eq(plan_big(var p, 1, 10000, 310, 40, 1, 2, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(p.pdu, 251)
+    test.assert_eq(p.bn, 2)
+    // 7.5 ms: the interval is 7.5 ms (6 units).
+    var q = plan_new()
+    test.assert_eq(plan_big(var q, 1, 7500, 100, 40, 1, 2, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(q.iso, 6)
+    // 2.5 ms SDUs: two in a 5 ms interval, BN 2.
+    var r = plan_new()
+    test.assert_eq(plan_big(var r, 1, 2500, 40, 40, 1, 2, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(r.iso, 4)
+    test.assert_eq(r.bn, 2)
+
+@test
+fn test_create_big_refuses_what_cannot_be_derived()
+    var p = plan_new()
+    let prof = t_prof()
+    test.assert_eq(plan_big(var p, 0, 10000, 100, 20, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 32, 10000, 100, 20, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 0, 20, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 100, 4, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 100, 20, 31, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 100, 20, 2, 0, 0, 0, false, true, prof), E_INVALID)
+    // More than seven payloads in an interval.
+    test.assert_eq(plan_big(var p, 1, 10000, 2000, 40, 0, 2, 0, 0, false, true, prof), E_INVALID)
+    // A latency under what one event takes.
+    test.assert_eq(plan_big(var p, 8, 10000, 251, 5, 0, 2, 0, 0, false, true, prof), E_INVALID)
+
+@test
+fn test_create_big_test_checks_the_hosts_numbers()
+    var p = plan_new()
+    let prof = t_prof()
+    // Two BISes, ISO interval 8 units, NSE 4, 100-octet SDUs and PDUs, LE 2M, BN 1, IRC 2, PTO 2: GC is 4 so IRC < GC.
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 0, 1, 2, 0, false, true, prof), OK)
+    test.assert_eq(p.nse, 4)
+    test.assert_eq(p.irc, 2)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 0, 1, 2, 2, false, true, prof), OK)
+    test.assert_eq(p.pto, 2)
+    // NSE no multiple of BN, NSE under IRC x BN, framed PDUs in Unsegmented mode, several PHYs, a pre-transmission the ring cannot hold: 0x11.
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 3, 100, 100, 2, 0, 0, 2, 1, 0, false, true, prof), E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 2, 100, 100, 2, 0, 0, 1, 3, 0, false, true, prof), E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 2, 1, 2, 0, false, true, prof), E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 3, 0, 0, 1, 2, 0, false, true, prof), E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 16, 100, 100, 2, 0, 0, 1, 1, 3, false, true, prof), E_UNSUPPORTED)
+    // An ISO interval that is no multiple of the SDU interval, a BN that is not the SDUs of an interval: 0x12.
+    test.assert_eq(check_big_test(var p, 2, 10000, 6, 4, 100, 100, 2, 0, 0, 1, 2, 0, false, true, prof), E_INVALID)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 0, 2, 2, 0, false, true, prof), E_INVALID)
+
+@test
+fn test_create_big_derives_a_framed_group_whose_pdus_carry_the_segments_of_the_sdus_of_an_interval()
+    // SDUs of 40 octets every 10 ms in Segmentable mode: the interval is 10 ms, the octets of an interval 1.25 x 1.0001 x (5 + 40) = 57 (rounded up), PDUs of 59, BN 1.
+    var p = plan_new()
+    test.assert_eq(plan_big(var p, 1, 10000, 40, 40, 2, 2, 0, 1, false, true, t_prof()), OK)
+    test.assert_eq(p.iso, 8)
+    test.assert_eq(p.pdu, 59)
+    test.assert_eq(p.bn, 1)
+    test.assert_eq(p.irc, 3)
+    // The latency adds the interval and the SDU interval to BIG_Sync_Delay (the framing delay of Segmentable mode): 20 ms and a little more, so 20 ms is not enough.
+    test.assert(p.latency > 20000 and p.latency <= 40000)
+    test.assert_eq(p.latency, p.sync + 8 * 1250 + 10000)
+    var q = plan_new()
+    test.assert_eq(plan_big(var q, 1, 10000, 40, 20, 2, 2, 0, 1, false, true, t_prof()), E_INVALID)
+    // An SDU interval of 8 ms gets an interval of 8.75 ms: no multiple of the SDU interval is needed.
+    var r = plan_new()
+    test.assert_eq(plan_big(var r, 1, 8000, 40, 40, 1, 2, 0, 1, false, true, t_prof()), OK)
+    test.assert_eq(r.iso, 7)
+    // 310-octet SDUs every 20 ms: PDUs of 251, BN 2.
+    var u = plan_new()
+    test.assert_eq(plan_big(var u, 1, 20000, 310, 60, 1, 2, 0, 1, false, true, t_prof()), OK)
+    test.assert_eq(u.pdu, 251)
+    test.assert_eq(u.bn, 2)
+
+@test
+fn test_create_big_test_takes_framed_pdus_that_carry_the_sdus_of_an_interval()
+    var p = plan_new()
+    let prof = t_prof()
+    // 40-octet SDUs every 10 ms, ISO interval 8 units, NSE 3, PDUs of 59, BN 1, IRC 3.
+    test.assert_eq(check_big_test(var p, 1, 10000, 8, 3, 40, 59, 2, 0, 1, 1, 3, 0, false, true, prof), OK)
+    test.assert_eq(p.pdu, 59)
+    // The interval is no multiple of the SDU interval (8 ms in 7 units, 62 octets of segments an interval); PDUs too small for the segments of an interval (BN x (Max_PDU - 2) under 57 or 62): 0x12.
+    test.assert_eq(check_big_test(var p, 1, 8000, 7, 3, 40, 65, 2, 0, 1, 1, 3, 0, false, true, prof), OK)
+    test.assert_eq(check_big_test(var p, 1, 8000, 7, 3, 40, 59, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+    test.assert_eq(check_big_test(var p, 1, 10000, 8, 3, 40, 50, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+    test.assert_eq(check_big_test(var p, 1, 10000, 8, 3, 40, 5, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+    // An interval under the SDU interval is not carried either.
+    test.assert_eq(check_big_test(var p, 1, 20000, 8, 3, 40, 59, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+
+@test
+fn test_the_biginfo_round_trips_through_its_ad_structure()
+    var b = t_big()
+    t_set(b, "chmap", 0x1FFFFFFFFE)
+    t_set(b, "sdu_int", 10000)
+    t_set(b, "sync_delay", 3000)
+    info_static(var b)
+    test.assert_eq(b.info_n, 35)
+    test.assert_eq(b.info[0] as Int, 34)
+    test.assert_eq(b.info[1] as Int, 0x2C)
+    info_at(var b, 12345, 4096)
+    var p = t_pdu(b)
+    let at = acad_find(var p, 0, b.info_n)
+    test.assert_eq(at, 2 * 64 + 33)
+    let v = info_get(var p, 2, 33)
+    test.assert(v.ok)
+    test.assert(not v.enc)
+    // 12,345 microseconds in units of 30: 411 units, 12,330.
+    test.assert_eq(v.off_us, 411 * 30)
+    test.assert_eq(v.unit, 30)
+    test.assert_eq(v.iso, 8)
+    test.assert_eq(v.num_bis, 2)
+    test.assert_eq(v.nse, 2)
+    test.assert_eq(v.bn, 1)
+    test.assert_eq(v.sub_int, 1000)
+    test.assert_eq(v.pto, 0)
+    test.assert_eq(v.bis_sp, 2000)
+    test.assert_eq(v.irc, 2)
+    test.assert_eq(v.max_pdu, 100)
+    test.assert_eq(v.saa, 0x78E52493)
+    test.assert_eq(v.sdu_int, 10000)
+    test.assert_eq(v.max_sdu, 100)
+    test.assert_eq(v.crc, 0xABCD)
+    test.assert_eq(v.chmap, 0x1FFFFFFFFE)
+    test.assert_eq(v.phy, 2)
+    test.assert_eq(v.count, 4096)
+    test.assert(not v.framed)
+
+@test
+fn test_the_biginfo_of_an_encrypted_group_carries_the_giv_and_the_gskd()
+    var b = t_big()
+    t_set(b, "enc", 1)
+    for k in 0..8
+        b.ek.iv[k] = (0x10 + k) as u8
+    for k in 0..16
+        b.gskd[k] = (0x40 + k) as u8
+    info_static(var b)
+    test.assert_eq(b.info_n, 59)
+    test.assert_eq(b.info[0] as Int, 58)
+    info_at(var b, 700, 0)
+    var p = t_pdu(b)
+    let at = acad_find(var p, 0, b.info_n)
+    test.assert_eq(at, 2 * 64 + 57)
+    let v = info_get(var p, 2, 57)
+    test.assert(v.ok)
+    test.assert(v.enc)
+    test.assert_eq(p.b[2 + 33] as Int, 0x10)
+    test.assert_eq(p.b[2 + 40] as Int, 0x17)
+    test.assert_eq(p.b[2 + 41] as Int, 0x40)
+    test.assert_eq(p.b[2 + 56] as Int, 0x4F)
+    // A BIGInfo of any other length is none.
+    var q = t_pdu(b)
+    test.assert(not info_get(var q, 2, 40).ok)
+
+@test
+fn test_the_offset_of_a_biginfo_is_in_units_of_300_microseconds_from_491460()
+    var b = t_big()
+    info_static(var b)
+    info_at(var b, 491459, 0)
+    var p = t_pdu(b)
+    var v = info_get(var p, 2, 33)
+    test.assert_eq(v.unit, 30)
+    test.assert_eq(v.off_us, (491459 / 30) * 30)
+    info_at(var b, 491460, 0)
+    var q = t_pdu(b)
+    v = info_get(var q, 2, 33)
+    test.assert_eq(v.unit, 300)
+    test.assert_eq(v.off_us, 491400)
+    // The anchor is never earlier than the offset and less than a unit later.
+    info_at(var b, 2000000, 0)
+    var r = t_pdu(b)
+    v = info_get(var r, 2, 33)
+    test.assert(v.off_us <= 2000000)
+    test.assert(2000000 - v.off_us < v.unit)
+
+@test
+fn test_the_biginfo_names_the_next_anchor_point_and_its_payload_count()
+    // Events are 10 ms apart from 100,000; an AUX_SYNC_IND at 104,000 names the anchor at 110,000 (event 1 -> payload count BN x 1)
+    // and, when the event under way is 5, the one at 150,000 after 145,000.
+    var b = t_big()
+    t_set(b, "bn", 2)
+    info_static(var b)
+    let a = info_for(var b, 104000, 12)
+    test.assert_eq(a, 110000)
+    var p = t_pdu(b)
+    var v = info_get(var p, 2, 33)
+    test.assert_eq(v.count, 2)
+    test.assert(v.off_us <= 110000 - 104000 - 12)
+    test.assert(110000 - 104000 - 12 - v.off_us < 30)
+    // The lead keeps the offset over 600 microseconds: an AUX_SYNC_IND 300 microseconds before an anchor names the next.
+    let a2 = info_for(var b, 109700, 12)
+    test.assert_eq(a2, 120000)
+    t_set(b, "anchor", 150000)
+    t_set(b, "ev", 5)
+    let a3 = info_for(var b, 145000, 12)
+    test.assert_eq(a3, 150000)
+    var q = t_pdu(b)
+    v = info_get(var q, 2, 33)
+    test.assert_eq(v.count, 10)
+
+@test
+fn test_the_acad_is_searched_for_the_biginfo()
+    var b = t_big()
+    info_static(var b)
+    var p = ll_pdu.pdu_new()
+    // Another AD structure first (length 3, type 0x2B, two octets), the BIGInfo behind it.
+    p.b[0] = 3
+    p.b[1] = 0x2B
+    p.b[2] = 1
+    p.b[3] = 2
+    for k in 0..b.info_n
+        p.b[4 + k] = b.info[k]
+    t_pdu_n(var p, 4 + b.info_n)
+    test.assert_eq(acad_find(var p, 0, p.n), (4 + 2) * 64 + 33)
+    // An ACAD of the other AD structure alone, and a truncated BIGInfo, hold none.
+    test.assert_eq(acad_find(var p, 0, 4), -1)
+    test.assert_eq(acad_find(var p, 0, 20), -1)
+
+@test
+fn test_the_control_pdu_of_a_termination_carries_the_reason_and_the_instant()
+    var b = t_big()
+    terminate_begin(var b, REASON_LOCAL_HOST, 7)
+    test.assert_eq(b.state, B_TERM)
+    test.assert_eq(b.term_instant, 13)
+    test.assert_eq(b.cssn, 1)
+    test.assert(ctrl_active(var b, 7))
+    test.assert(ctrl_active(var b, 12))
+    test.assert(not ctrl_active(var b, 6))
+    test.assert(not ctrl_active(var b, 13))
+    var p = ll_pdu.pdu_new()
+    ctrl_terminate(b, p)
+    test.assert_eq(p.n, 6)
+    test.assert_eq(p.b[0] as Int, 3 | (1 << 2))
+    test.assert_eq(p.b[1] as Int, 4)
+    test.assert_eq(p.b[2] as Int, CTRL_TERMINATE)
+    test.assert_eq(p.b[3] as Int, 0x16)
+    test.assert_eq(p.b[4] as Int, 13)
+    test.assert_eq(p.b[5] as Int, 0)
+    // The header of a data PDU of such an event has the transmission flag, and the sequence number in bits 2 to 4.
+    test.assert_eq(bis_header(1, 5, true), 1 | (5 << 2) | 0x20)
+    test.assert_eq(bis_header(0, 7, false), 0x1C)
+
+@test
+fn test_a_big_stream_is_configured_from_its_group_and_carries_sdus_in_unframed_payloads()
+    if not ctl_limits.iso_on()
+        return
+    var b = t_big()
+    t_set(b, "bn", 1)
+    var x = ll_iso.cis_new()
+    bis_config(var x, var b, 2, 1)
+    test.assert_eq(x.handle, BIS_HANDLE_BASE + 1)
+    test.assert(x.central)
+    test.assert_eq(x.aa, bis_aa(0x78E52493, 2))
+    test.assert_eq(ll_iso.tx_bn(var x), 1)
+    test.assert_eq(ll_iso.tx_pdu(var x), 100)
+    test.assert_eq(ll_iso.tx_upps(var x), 1)
+    // An SDU of 40 octets becomes one payload of LLID 0, and the PDU built for it has the BIS header.
+    var d = ll_iso.t_sdu(7)
+    test.assert(ll_iso.sdu_put(var x, var d, 0, 40))
+    var p = ll_pdu.pdu_new()
+    tx_build(x, 0, p, 3, true)
+    test.assert_eq(p.n, 42)
+    test.assert_eq(p.b[0] as Int, 0 | (3 << 2) | 0x20)
+    test.assert_eq(p.b[1] as Int, 40)
+    test.assert_eq(p.b[2] as Int, 7)
+    test.assert_eq(p.b[41] as Int, 46)
+    // A number with no payload is an empty PDU of LLID 1.
+    tx_build(x, 5, p, 0, false)
+    test.assert_eq(p.n, 2)
+    test.assert_eq(p.b[0] as Int, 1)
+    test.assert_eq(p.b[1] as Int, 0)
+    // The payload is retired when its event is over; the credit of its HCI packet goes back.
+    tx_done(var x, 1)
+    test.assert_eq(x.tx_num, 1)
+
+// ── The Synchronized Receiver ───────────────────────────────────────
+
+// The BIGInfo a group of the examples makes with the numbers given (SDUs of 40 octets), read back.
+fn t_view_of(nse: Int, bn: Int, irc: Int, iso_int: Int, sub_int: Int) -> InfoView
+    var b = t_big()
+    t_set(b, "max_sdu", 40)
+    t_set(b, "nse", nse)
+    t_set(b, "bn", bn)
+    t_set(b, "irc", irc)
+    t_set(b, "iso_int", iso_int)
+    t_set(b, "sub_int", sub_int)
+    info_static(var b)
+    info_at(var b, 100000, 0)
+    var p = t_pdu(b)
+    info_get(var p, 2, 33)
+
+fn t_view() -> InfoView
+    t_view_of(2, 1, 2, 8, 1000)
+
+@test
+fn test_a_biginfo_that_describes_a_group_the_receiver_cannot_follow_is_not_valid()
+    test.assert(info_valid(t_view()))
+    // NSE not a multiple of BN, IRC over NSE / BN, an interval under 5 ms, no sub-interval.
+    test.assert(not info_valid(t_view_of(3, 2, 1, 8, 1000)))
+    test.assert(not info_valid(t_view_of(2, 1, 3, 8, 1000)))
+    test.assert(not info_valid(t_view_of(2, 1, 2, 3, 1000)))
+    test.assert(not info_valid(t_view_of(2, 1, 2, 8, 0)))
+    // A BIGInfo of the wrong length is not read at all.
+    var b = t_big()
+    info_static(var b)
+    var p = t_pdu(b)
+    test.assert(not info_valid(info_get(var p, 2, 32)))
+
+@test
+fn test_the_receiver_listens_to_the_bises_it_was_asked_for_and_to_the_subevents_of_the_event_itself()
+    var b = big_new()
+    t_set(b, "nse", 6)
+    t_set(b, "bn", 1)
+    t_set(b, "irc", 2)
+    t_set(b, "pto", 2)
+    t_set(b, "bis_mask", 0x5)
+    test.assert(wants(var b, 1))
+    test.assert(not wants(var b, 2))
+    test.assert(wants(var b, 3))
+    test.assert(not wants(var b, 0))
+    test.assert(not wants(var b, 32))
+    test.assert_eq(bis_number(var b, 0), 1)
+    test.assert_eq(bis_number(var b, 1), 3)
+    test.assert_eq(bis_number(var b, 2), 0)
+    // IRC x BN subevents hold the payloads of the event; the pre-transmitted groups behind them are not listened to.
+    test.assert_eq(listen_nse(var b), 2)
+    test.assert(rx_listens(var b, 1, 2))
+    test.assert(not rx_listens(var b, 1, 3))
+    test.assert(not rx_listens(var b, 2, 1))
+    // MSE below that cuts it short, above it changes nothing.
+    t_set(b, "mse", 1)
+    test.assert_eq(listen_nse(var b), 1)
+    t_set(b, "mse", 5)
+    test.assert_eq(listen_nse(var b), 2)
+
+@test
+fn test_the_window_widening_grows_with_the_time_since_the_last_packet_and_stops_at_half_the_interval()
+    var b = big_new()
+    t_set(b, "iso_int", 8)
+    t_set(b, "ppm", 20)
+    t_set(b, "last_rx", 1000)
+    // (20 + 50) ppm over 100 ms is 7 us, plus the jitter.
+    test.assert_eq(rx_widen(var b, 101000), 7 + ll_link.JITTER_US)
+    test.assert_eq(rx_widen(var b, 1000), ll_link.JITTER_US)
+    test.assert_eq(rx_widen(var b, 0), ll_link.JITTER_US)
+    // Never more than half the ISO interval less T_MSS.
+    t_set(b, "ppm", 500)
+    test.assert_eq(rx_widen(var b, 1000 + 20000000), 5000 - T_MSS_US)
+
+@test
+fn test_an_instant_is_reached_by_the_counter_within_half_its_range_beyond_it()
+    test.assert(instant_reached(10, 10))
+    test.assert(instant_reached(11, 10))
+    test.assert(not instant_reached(9, 10))
+    test.assert(instant_reached(2, 0xFFFE))
+    test.assert(not instant_reached(0xFFFE, 2))
+
+@test
+fn test_a_group_taken_from_a_biginfo_has_the_numbers_the_broadcaster_planned()
+    let v = t_view()
+    test.assert(info_valid(v))
+    var r = big_new()
+    sync_fill(var r, v, 20)
+    let s = t_big()
+    test.assert_eq(r.nse, s.nse)
+    test.assert_eq(r.bn, s.bn)
+    test.assert_eq(r.irc, s.irc)
+    test.assert_eq(r.pto, s.pto)
+    test.assert_eq(r.iso_int, s.iso_int)
+    test.assert_eq(r.sub_int, s.sub_int)
+    test.assert_eq(r.bis_sp, s.bis_sp)
+    test.assert_eq(r.phy, s.phy)
+    test.assert_eq(r.max_pdu, s.max_pdu)
+    test.assert_eq(r.saa, s.saa)
+    test.assert_eq(r.crc, s.crc)
+    test.assert_eq(r.chmap, s.chmap)
+    test.assert_eq(r.n_used, 37)
+    test.assert_eq(r.ppm, 20)
+    test.assert(r.sync_delay > 0)
+    // The transport latency: the sync delay, one interval (no pre-transmission), less the SDU interval.
+    test.assert_eq(r.latency, r.sync_delay + iso_us(r) - v.sdu_int)
+
+@test
+fn test_the_first_anchor_point_is_the_offset_on_and_then_whole_intervals_until_the_receiver_can_listen()
+    var r = big_new()
+    t_set(r, "iso_int", 8)
+    t_set(r, "bn", 1)
+    sync_anchor(r, 200000, 4000, 30, 77, 100000, 3000)
+    test.assert_eq(r.anchor, 204000)
+    test.assert_eq(r.ev, 77)
+    test.assert_eq(r.win, 30)
+    test.assert_eq(r.last_rx, 200000)
+    // A PDU long past: whole ISO intervals (10 ms) on until the lead before `now` is met.
+    sync_anchor(r, 200000, 4000, 30, 77, 230500, 3000)
+    test.assert_eq(r.anchor, 234000)
+    test.assert_eq(r.ev, 77 + 3)
+    test.assert_eq(r.first_us, r.anchor)
+
+@test
+fn test_the_key_material_of_an_encrypted_group_is_the_giv_and_the_gskd_of_its_biginfo()
+    var raw: Vec[u8; 64] = Vec.new()
+    for k in 0..57
+        let _x = raw.push((k + 1) as u8)
+    var r = big_new()
+    key_from_info(var r, var raw)
+    test.assert_eq(r.ek.iv[0] as Int, 34)
+    test.assert_eq(r.ek.iv[7] as Int, 41)
+    test.assert_eq(r.gskd[0] as Int, 42)
+    test.assert_eq(r.gskd[15] as Int, 57)
+
+@test
+fn test_a_receiver_takes_the_termination_and_the_channel_map_of_a_control_pdu_once()
+    var r = big_new()
+    t_set(r, "last_cssn", -1)
+    var b = t_big()
+    terminate_begin(var b, REASON_LOCAL_HOST, 7)
+    var p = ll_pdu.pdu_new()
+    ctrl_terminate(b, p)
+    ctrl_rx(r, p)
+    test.assert(r.term_req)
+    test.assert_eq(r.term_reason, 0x16)
+    test.assert_eq(r.term_instant, 13)
+    test.assert_eq(r.last_cssn, 1)
+    // The same PDU in the next event changes nothing: the instant stays as it was.
+    ctrl_rx(r, p)
+    test.assert_eq(r.term_instant, 13)
+    // A channel map PDU: opcode 0, five octets of map, the instant.
+    var q = ll_pdu.pdu_new()
+    q.b[0] = (3 | (2 << 2)) as u8
+    q.b[1] = 8
+    q.b[2] = CTRL_CHANNEL_MAP as u8
+    for k in 0..5
+        q.b[3 + k] = 0xFF
+    q.b[7] = 0x1F
+    q.b[8] = 20
+    q.b[9] = 0
+    t_pdu_n(var q, 10)
+    ctrl_rx(r, q)
+    test.assert(r.cm_req)
+    test.assert_eq(r.cm_map, 0x1FFFFFFFFF)
+    test.assert_eq(r.cm_instant, 20)
+
+@test
+fn test_the_broadcaster_sends_a_new_channel_map_in_six_events_and_uses_it_from_the_instant()
+    var b = t_big()
+    t_set(b, "state", B_UP)
+    info_static(var b)
+    let map = 0x1FFFFFFFFF ^ 0x1000FF
+    test.assert(chmap_due(var b, map))
+    test.assert(not chmap_due(var b, b.chmap))
+    chmap_begin(var b, map, 20)
+    test.assert_eq(b.cm_instant, 26)
+    test.assert_eq(b.cssn, 1)
+    // The PDU goes in the control subevent of the events 20 to 25, and the data PDUs of those events say so.
+    test.assert(not ctrl_active(var b, 19))
+    test.assert(ctrl_active(var b, 20))
+    test.assert(ctrl_active(var b, 25))
+    test.assert(not ctrl_active(var b, 26))
+    test.assert(not cstf_of(var b, 26))
+    // A second map waits for the instant.
+    test.assert(not chmap_due(var b, 0x1FFFFFFFFE))
+    // A receiver reads the map and the instant from the PDU.
+    var p = ll_pdu.pdu_new()
+    ctrl_chmap(var b, var p)
+    test.assert_eq(p.n, 10)
+    test.assert_eq(p.b[0] as Int, 3 | (1 << 2))
+    test.assert_eq(p.b[1] as Int, 8)
+    test.assert_eq(p.b[2] as Int, CTRL_CHANNEL_MAP)
+    var r = big_new()
+    ctrl_rx(r, p)
+    test.assert(r.cm_req)
+    test.assert_eq(r.cm_map, map)
+    test.assert_eq(r.cm_instant, 26)
+    // The instant: the group uses the map, names it in the BIGInfo and may begin another procedure.
+    chmap_apply(var b)
+    test.assert_eq(b.chmap, map)
+    test.assert_eq(b.n_used, ll_link.popcount(map))
+    test.assert(not b.cm_req)
+    var q = t_pdu(b)
+    test.assert_eq(info_get(var q, 2, INFO_PLAIN).chmap, map)
+    test.assert(chmap_due(var b, 0x1FFFFFFFFE))

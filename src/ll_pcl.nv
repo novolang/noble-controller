@@ -1,0 +1,314 @@
+// src/ll_pcl.nv — LE Power Control of the Link Layer: the PDUs LL_POWER_CONTROL_REQ, LL_POWER_CONTROL_RSP and
+// LL_POWER_CHANGE_IND, the per-link record of the transmit power levels, and the arithmetic of a requested change.
+//
+// [Vol 6] Part B, Sections 2.4.2.31 to 2.4.2.33, 5.1.17 and 5.1.18; [Vol 4] Part E, Sections 7.7.65.33 and 7.8.117 to 7.8.121.  A
+// device asks its peer to change the transmit power it uses on one PHY by a Delta in dB (0 asks only for the current level), and the
+// peer answers with the level it now uses, flags that say whether that level is its minimum or its maximum, and the acceptable power
+// reduction (APR) it can take on its own receiver.  The level is kept per PHY; the four PHYs are LE 1M, LE 2M, LE Coded S=8 and
+// LE Coded S=2.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.pcl_on()`) says whether the build has the feature.
+
+use std.test
+use ll_pdu
+use ll_data
+use ll_ploss
+
+// 1 in a build with LE Power Control (feature bits 33 and 34), 0 in one without it.
+
+// ── Values of the PDUs and of the HCI events ────────────────────────
+
+// The PHY field of the PDUs is a mask with one bit per PHY; the PHY parameter of the HCI commands counts them from 1.
+const MASK_1M = 0x01
+const MASK_2M = 0x02
+const MASK_S8 = 0x04
+const MASK_S2 = 0x08
+const PHYS = 4
+
+// TxPower: 127 says the level is unavailable, 126 that the sender does not manage the power of the PHY.
+const TX_UNAVAILABLE = 127
+const TX_UNMANAGED = 126
+const APR_UNKNOWN = 0xFF
+const DELTA_MAX = 0x7F
+
+// The Flags octet: the level is the minimum, the level is the maximum.
+const FLAG_MIN = 0x01
+const FLAG_MAX = 0x02
+
+// The Reason of the LE Transmit Power Reporting event.
+const REASON_LOCAL = 0
+const REASON_REMOTE = 1
+const REASON_READ = 2
+// The request path loss monitoring sends for the level of the peer: no event of the Host reports its answer.
+const REASON_PATHLOSS = 3
+
+const E_UNSUPPORTED_PARAM = 0x20
+const E_INVALID_LL = 0x1E
+const E_BUSY = 0x3A
+
+// The procedure waits no longer than the Link Layer's other procedures do.
+const WAIT_US = 40000000
+
+// ── Arithmetic ──────────────────────────────────────────────────────
+
+// An octet read as a signed 8-bit value.
+@tier(embedded)
+fn i8(v: Int) -> Int
+    let b = v & 0xFF
+    if b >= 0x80
+        b - 0x100
+    else
+        b
+
+// The index (0 to 3) of the one PHY a PDU's mask names, -1 for a mask with no bit, with more than one bit, or with a reserved bit.
+@tier(embedded)
+fn mask_index(mask: Int) -> Int
+    match mask
+        0x01 => 0
+        0x02 => 1
+        0x04 => 2
+        0x08 => 3
+        _ => -1
+
+// The index of the PHY an HCI command names (1 to 4), -1 for any other value.
+@tier(embedded)
+fn hci_index(phy: Int) -> Int
+    if phy >= 1 and phy <= PHYS
+        phy - 1
+    else
+        -1
+
+// The mask bit of the PHY with index `i`.
+@tier(embedded)
+fn index_mask(i: Int) -> Int
+    1 << i
+
+// The index of the PHY a link uses: `phy` is 1, 2 or 3 and `s2` says that the Coded PHY carries S=2.
+@tier(embedded)
+fn link_index(phy: Int, s2: Bool) -> Int
+    if phy == 3 and s2
+        3
+    else
+        phy - 1
+
+// The level after a request of `delta` dB from `cur` within the range `lo` to `hi` dBm: 0x7F asks for the maximum, any other value
+// moves the level and stops at the end of the range (Section 5.1.17).
+@tier(embedded)
+fn apply_delta(cur: Int, delta: Int, lo: Int, hi: Int) -> Int
+    if (delta & 0xFF) == DELTA_MAX
+        return hi
+    let v = cur + i8(delta)
+    if v < lo
+        lo
+    else if v > hi
+        hi
+    else
+        v
+
+// The Flags octet of a level within the range `lo` to `hi`.
+@tier(embedded)
+fn level_flags(level: Int, lo: Int, hi: Int) -> Int
+    var f = 0
+    if level <= lo
+        f = f | FLAG_MIN
+    if level >= hi
+        f = f | FLAG_MAX
+    f
+
+// The acceptable power reduction from the received level and the lowest level the receiver accepts, both in dBm
+// (Section 5.1.17.1).
+@tier(embedded)
+fn apr_of(rssi: Int, rssi_min: Int) -> Int
+    if rssi <= rssi_min
+        0
+    else if rssi - rssi_min > 0xFE
+        0xFE
+    else
+        rssi - rssi_min
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// LL_POWER_CONTROL_REQ: the PHY mask, the Delta and the sender's own level on the PHY.
+@tier(embedded)
+fn put_req(var p: Pdu, mask: Int, delta: Int, level: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_POWER_CONTROL_REQ)
+    let _a = ll_pdu.pdu_put(var p, mask)
+    let _b = ll_pdu.pdu_put(var p, delta & 0xFF)
+    let _c = ll_pdu.pdu_put(var p, level & 0xFF)
+    ll_data.dpdu_finish(var p)
+
+// LL_POWER_CONTROL_RSP: the Flags, the change made, the level now in use and the acceptable power reduction.
+@tier(embedded)
+fn put_rsp(var p: Pdu, flags: Int, delta: Int, level: Int, apr: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_POWER_CONTROL_RSP)
+    let _a = ll_pdu.pdu_put(var p, flags)
+    let _b = ll_pdu.pdu_put(var p, delta & 0xFF)
+    let _c = ll_pdu.pdu_put(var p, level & 0xFF)
+    let _d = ll_pdu.pdu_put(var p, apr)
+    ll_data.dpdu_finish(var p)
+
+// LL_POWER_CHANGE_IND: the PHY mask, the Flags, the change and the level now in use.
+@tier(embedded)
+fn put_ind(var p: Pdu, mask: Int, flags: Int, delta: Int, level: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_POWER_CHANGE_IND)
+    let _a = ll_pdu.pdu_put(var p, mask)
+    let _b = ll_pdu.pdu_put(var p, flags)
+    let _c = ll_pdu.pdu_put(var p, delta & 0xFF)
+    let _d = ll_pdu.pdu_put(var p, level & 0xFF)
+    ll_data.dpdu_finish(var p)
+
+// ── The record of a link ────────────────────────────────────────────
+
+// What the Controller keeps of the power levels of one link: its own level per PHY, the last level and Flags the peer reported per
+// PHY (`TX_UNAVAILABLE` until it has), the reports the Host enabled, and the request this end has outstanding.  The three per-PHY
+// columns hold a signed octet per PHY, indexed by the index of the PHY (`own_level`, `peer_level`).
+@value
+struct Pcl
+    lvl: [i8; 4]
+    rlvl: [i8; 4]
+    rflg: [i8; 4]
+    local_rep: Bool
+    remote_rep: Bool
+    asked: Bool
+    wait: Bool
+    wait_phy: Int
+    wait_reason: Int
+    sent: Bool
+    t0: Int
+    ploss: ll_ploss.Ploss
+
+@tier(embedded)
+fn pcl_new() -> Pcl
+    Pcl { lvl: [0, 0, 0, 0], rlvl: [TX_UNAVAILABLE, TX_UNAVAILABLE, TX_UNAVAILABLE, TX_UNAVAILABLE], rflg: [0, 0, 0, 0], local_rep: false, remote_rep: false, asked: false, wait: false,
+          wait_phy: 0, wait_reason: REASON_READ, sent: false, t0: 0, ploss: ll_ploss.ploss_new() }
+
+// A new connection: every PHY at `dbm`, nothing known of the peer, nothing enabled.
+@tier(embedded)
+fn pcl_reset(var p: Pcl, dbm: Int)
+    for k in 0..PHYS
+        p.lvl[k] = dbm as i8
+        p.rlvl[k] = TX_UNAVAILABLE as i8
+        p.rflg[k] = 0
+    p.local_rep = false
+    p.remote_rep = false
+    p.asked = false
+    p.wait = false
+    p.wait_phy = 0
+    p.wait_reason = REASON_READ
+    p.sent = false
+    p.t0 = 0
+    p.ploss = ll_ploss.ploss_new()
+
+// The level of this end on the PHY with index `i`, and the level set; a level beyond -128 to 127 keeps its low octet.
+@tier(embedded)
+@no_alloc
+fn own_level(var p: Pcl, i: Int) -> Int
+    p.lvl[i] as Int
+
+@tier(embedded)
+@no_alloc
+fn set_own_level(var p: Pcl, i: Int, v: Int)
+    p.lvl[i] = v as i8
+
+// The level the peer last reported on the PHY with index `i`.
+@tier(embedded)
+@no_alloc
+fn peer_level(var p: Pcl, i: Int) -> Int
+    p.rlvl[i] as Int
+
+// The level and the Flags the peer reported on the PHY with index `i`.
+@tier(embedded)
+@no_alloc
+fn set_peer(var p: Pcl, i: Int, level: Int, flags: Int)
+    p.rlvl[i] = level as i8
+    p.rflg[i] = flags as i8
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_masks_name_one_phy()
+    test.assert_eq(mask_index(0x01), 0)
+    test.assert_eq(mask_index(0x08), 3)
+    test.assert_eq(mask_index(0x00), -1)
+    test.assert_eq(mask_index(0x03), -1)
+    test.assert_eq(mask_index(0x10), -1)
+    test.assert_eq(hci_index(1), 0)
+    test.assert_eq(hci_index(4), 3)
+    test.assert_eq(hci_index(0), -1)
+    test.assert_eq(hci_index(5), -1)
+    test.assert_eq(link_index(3, true), 3)
+    test.assert_eq(link_index(3, false), 2)
+    test.assert_eq(link_index(2, false), 1)
+
+@test
+fn test_delta_stops_at_the_range()
+    test.assert_eq(apply_delta(0, 0, -20, 8), 0)
+    test.assert_eq(apply_delta(0, 0xFC, -20, 8), -4)
+    test.assert_eq(apply_delta(0, 5, -20, 8), 5)
+    test.assert_eq(apply_delta(0, 20, -20, 8), 8)
+    test.assert_eq(apply_delta(0, 0xE0, -20, 8), -20)
+    test.assert_eq(apply_delta(-7, 0x7F, -20, 8), 8)
+    test.assert_eq(level_flags(-20, -20, 8), FLAG_MIN)
+    test.assert_eq(level_flags(8, -20, 8), FLAG_MAX)
+    test.assert_eq(level_flags(0, -20, 8), 0)
+
+@test
+fn test_apr_is_the_margin_above_the_floor()
+    test.assert_eq(apr_of(-60, -70), 10)
+    test.assert_eq(apr_of(-70, -70), 0)
+    test.assert_eq(apr_of(-80, -70), 0)
+    test.assert_eq(apr_of(40, -70), 110)
+    test.assert_eq(apr_of(200, -70), 0xFE)
+
+@test
+fn test_pdu_layouts()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, MASK_2M, 0xFE, 4)
+    test.assert_eq(ll_data.dpdu_len(var p), 4)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x23)
+    test.assert_eq(ll_data.dpdu_byte(var p, 1), 2)
+    test.assert_eq(ll_data.dpdu_byte(var p, 2), 0xFE)
+    test.assert_eq(ll_data.dpdu_byte(var p, 3), 4)
+    put_rsp(var p, FLAG_MAX, 0x03, 0xFC, 0xFF)
+    test.assert_eq(ll_data.dpdu_len(var p), 5)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x24)
+    test.assert_eq(ll_data.dpdu_byte(var p, 1), FLAG_MAX)
+    test.assert_eq(ll_data.dpdu_byte(var p, 4), 0xFF)
+    put_ind(var p, MASK_S8, 0, 0xFF, 0)
+    test.assert_eq(ll_data.dpdu_len(var p), 5)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x25)
+    test.assert_eq(ll_data.dpdu_byte(var p, 1), MASK_S8)
+
+fn dirty(var p: Pcl)
+    set_peer(var p, 1, 3, 0)
+    p.remote_rep = true
+    p.asked = true
+
+@test
+fn test_reset_forgets_the_peer()
+    var p = pcl_new()
+    dirty(var p)
+    pcl_reset(var p, -4)
+    test.assert_eq(own_level(var p, 2), -4)
+    test.assert_eq(peer_level(var p, 1), TX_UNAVAILABLE)
+    test.assert(not p.remote_rep)
+    test.assert(not p.asked)
+
+@test
+fn test_a_column_keeps_one_signed_octet_per_phy()
+    var p = pcl_new()
+    set_own_level(var p, 0, -46)
+    set_own_level(var p, 1, 8)
+    set_own_level(var p, 3, -1)
+    test.assert_eq(own_level(var p, 0), -46)
+    test.assert_eq(own_level(var p, 1), 8)
+    test.assert_eq(own_level(var p, 2), 0)
+    test.assert_eq(own_level(var p, 3), -1)
+    set_own_level(var p, 3, 127)
+    test.assert_eq(own_level(var p, 3), 127)
+    test.assert_eq(own_level(var p, 0), -46)
+    set_own_level(var p, 2, 200)
+    test.assert_eq(own_level(var p, 2), -56)
+    set_peer(var p, 2, -20, 3)
+    test.assert_eq(peer_level(var p, 2), -20)
+    test.assert_eq(peer_level(var p, 1), TX_UNAVAILABLE)

@@ -1,0 +1,963 @@
+// src/ll_pawr.nv — periodic advertising with responses (PAwR) of the Link Layer: the train of subevents with response slots,
+// the data the Host gives for each subevent, the responses a synchronized device sends, and the plan of both ends.
+//
+// [Vol 6] Part B, Sections 2.3.1.9, 2.3.1.10, 4.4.2.2.4 and 4.4.2.12.2; [Vol 4] Part E, Sections 7.8.61, 7.8.125 to 7.8.127 and 7.7.65.36 /
+// 7.7.65.37.  A periodic advertising train with responses has, in each event, `n_sub` subevents `si` apart.  A subevent is an
+// AUX_SYNC_SUBEVENT_IND on the data channel that channel selection algorithm #2 gives the counter paEventCounter XOR paSubEventCounter, and,
+// behind it, the response slots: slot r starts `delay` + r x `spacing` after the start of the AUX_SYNC_SUBEVENT_IND, on the same channel, with
+// the access address RspAA that the AUX_ADV_IND announces in its ACAD (the Periodic Advertising Response Timing Information, AD type 0x32:
+// RspAA, Num_Subevents, Subevent_Interval, Response_Slot_Delay, Response_Slot_Spacing).  A synchronized device sends an
+// AUX_SYNC_SUBEVENT_RSP in at most one slot of a subevent, as its Host says.
+//
+// The advertiser's Host gives the data of a subevent when the Controller asks (LE Periodic Advertising Subevent Data Request), in the order of
+// the subevents; the Controller keeps `PW_BUFS` buffers, each of `PW_DATA` octets, and asks for as many subevents as it has free buffers.  The
+// data of a subevent is sent once.  A subevent whose data did not come is sent with none.
+//
+// This module holds no radio and no clock.  The records have inline storage; no function here allocates.  The buffers, the octets of one and the
+// octets of staged responses follow the keys `ctl_pawr_bufs` and `ctl_pawr_data` (`ctl_limits.pw_bufs()`, `pw_data()`, `pw_rsp()`); the build has the advertiser with `ctl_limits.pawr_adv_on()` and the synchronizer with
+// `ctl_limits.pawr_sync_on()`.
+
+use noble_controller_config
+use ctl_limits
+use std.test
+use ll_pdu
+use ll_phy
+use ll_init
+use ll_ext
+use ll_link
+use ll_xadv
+use ll_per
+
+// ── The profile ─────────────────────────────────────────────────────
+
+// The buffers of subevent data (and of response data on the synchronizing side), the octets one holds, and the octets of the responses the
+// advertiser stages for the report of one subevent.
+
+// ── Statuses and limits ─────────────────────────────────────────────
+
+const OK = 0
+const E_MEMORY = 0x07
+const E_DISALLOWED = 0x0C
+const E_UNSUPPORTED = 0x11
+const E_INVALID = 0x12
+const E_UNKNOWN_ADVERTISING = 0x42
+const E_TOO_LONG = 0x45
+const E_TOO_LATE = 0x46
+
+// The Periodic Advertising Response Timing Information: AD type 0x32, a length octet of 9, the access address of the responses and four
+// octets of timing.
+const AD_TIMING = 0x32
+const TIMING_OCTETS = 10
+
+// The subevents of a train (Num_Subevents 1 to 128), the Subevent_Interval (6 to 255 units of 1.25 ms), the Response_Slot_Delay (1 to 254 units of
+// 1.25 ms) and the Response_Slot_Spacing (2 to 255 units of 0.125 ms).
+const SUBEVENTS_MAX = 128
+const SI_MIN = 6
+const SI_MAX = 255
+const DELAY_MAX = 254
+const SPACING_MIN = 2
+const SI_UNIT_US = 1250
+const SPACING_UNIT_US = 125
+
+// The responses one LE Periodic Advertising Response Report holds (the specification's limit), and the subevents a synchronization listens to.
+const RESPONSES_MAX = 25
+const SUBS_MAX = 8
+
+// The gap a PDU must leave before the next of the subevent ([Vol 6] Part B, Section 4.4.2.2.4).
+const T_IFS_150 = 150
+
+// The state of a buffer: free, asked for (the Host has to give the data) or holding data.
+const B_FREE = 0
+const B_ASKED = 1
+const B_FILLED = 2
+
+// ── The Periodic Advertising Response Timing Information ───────────
+
+// Write the ACAD of the AUX_ADV_IND of a train with responses into `t`.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn timing_put(var t: PerAdv, rsp_aa: Int, n_sub: Int, si: Int, delay: Int, spacing: Int)
+    t.acad[0] = 9
+    t.acad[1] = AD_TIMING as u8
+    for k in 0..4
+        t.acad[2 + k] = ((rsp_aa >>> (8 * k)) & 0xFF) as u8
+    t.acad[6] = n_sub as u8
+    t.acad[7] = si as u8
+    t.acad[8] = delay as u8
+    t.acad[9] = spacing as u8
+    t.acad_n = TIMING_OCTETS
+
+// The octet of the length of the AD structure of type 0x32 in the ACAD at `acad_at` of `rx` (`acad_len` octets), -1 when there is none or it
+// is not the 9 octets the information has.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn timing_find(var rx: Pdu, acad_at: Int, acad_len: Int) -> Int
+    var i = acad_at
+    let end = acad_at + acad_len
+    for _ in 0..8
+        if i + 2 > end
+            break
+        let l = rx.b[i] as Int
+        if l == 0 or i + 1 + l > end
+            break
+        if (rx.b[i + 1] as Int) == AD_TIMING
+            if l == 9
+                return i
+            return -1
+        i = i + 1 + l
+    -1
+
+// The fields of the information whose length octet is at `at`.
+@tier(embedded)
+fn timing_aa(var rx: Pdu, at: Int) -> Int
+    (rx.b[at + 2] as Int) | ((rx.b[at + 3] as Int) << 8) | ((rx.b[at + 4] as Int) << 16) | ((rx.b[at + 5] as Int) << 24)
+
+@tier(embedded)
+fn timing_n_sub(var rx: Pdu, at: Int) -> Int
+    rx.b[at + 6] as Int
+
+@tier(embedded)
+fn timing_si(var rx: Pdu, at: Int) -> Int
+    rx.b[at + 7] as Int
+
+@tier(embedded)
+fn timing_delay(var rx: Pdu, at: Int) -> Int
+    rx.b[at + 8] as Int
+
+@tier(embedded)
+fn timing_spacing(var rx: Pdu, at: Int) -> Int
+    rx.b[at + 9] as Int
+
+// Whether the information describes a train that can be listened to: 1 to 128 subevents, intervals and delays in their ranges, and a valid
+// access address for the responses.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn timing_usable(var rx: Pdu, at: Int) -> Bool
+    let n = timing_n_sub(var rx, at)
+    n >= 1 and n <= SUBEVENTS_MAX and timing_si(var rx, at) >= SI_MIN and timing_delay(var rx, at) >= 1 and timing_delay(var rx, at) <= DELAY_MAX
+        and timing_spacing(var rx, at) >= SPACING_MIN and ll_init.aa_valid(timing_aa(var rx, at))
+
+// ── The parameters ──────────────────────────────────────────────────
+
+// The Status of the PAwR part of LE Set Periodic Advertising Parameters [v2] ([Vol 4] Part E, Section 7.8.61) for `n_sub` subevents (1 or more)
+// `si` apart, `slots` response slots `delay` after the start of the subevent and `spacing` apart, on a train whose interval range starts at
+// `int_min` (units of 1.25 ms): Unsupported Feature or Parameter Value above 128 subevents; Invalid HCI Command Parameters for a
+// Subevent_Interval out of range or above int_min / n_sub, a Response_Slot_Delay out of range or not under the Subevent_Interval, a
+// Response_Slot_Spacing out of range or above 10 x (Subevent_Interval - Response_Slot_Delay) / slots, and for no slots.  With one subevent
+// the Subevent_Interval is ignored and `int_max` stands in for it; with one slot the spacing is ignored.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn params_status(int_min: Int, int_max: Int, n_sub: Int, si: Int, delay: Int, spacing: Int, slots: Int) -> Int
+    if n_sub > SUBEVENTS_MAX
+        return E_UNSUPPORTED
+    var interval = si
+    if n_sub == 1
+        interval = int_max
+    else
+        if si < SI_MIN or si > SI_MAX or si * n_sub > int_min
+            return E_INVALID
+    if delay < 1 or delay > DELAY_MAX or delay >= interval
+        return E_INVALID
+    if slots < 1
+        return E_INVALID
+    if slots > 1
+        if spacing < SPACING_MIN or spacing * slots > 10 * (interval - delay)
+            return E_INVALID
+    OK
+
+// ── The advertiser ──────────────────────────────────────────────────
+
+// A buffer.  On the advertiser it is the subevent number `abs` (counted without wrap from the first subevent sent), which is subevent `sub` of its
+// event; `rs` and `rc` are the first response slot and the number of slots the Host expects to be used, `len` the octets of data.  On
+// the synchronizer it holds a response: `abs` is the paEventCounter of the event it is for, `sub` the subevent, `rs` the slot.
+@value
+struct PwBuf
+    state: Int
+    abs: Int
+    sub: Int
+    rs: Int
+    rc: Int
+    len: Int
+    data: Vec[u8; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then noble_controller_config.CTL_PAWR_DATA else 8]
+
+@tier(embedded)
+fn pb_new() -> PwBuf
+    var b = PwBuf { state: B_FREE, abs: 0, sub: 0, rs: 0, rc: 0, len: 0, data: Vec.new() }
+    for _ in 0..ctl_limits.pw_data()
+        let _a = b.data.push(0)
+    b
+
+// Set the fields of a buffer, and an octet of its data.
+@tier(embedded)
+fn pb_set(var b: PwBuf, state: Int, abs: Int, sub: Int, rs: Int, rc: Int, len: Int)
+    b.state = state
+    b.abs = abs
+    b.sub = sub
+    b.rs = rs
+    b.rc = rc
+    b.len = len
+
+@tier(embedded)
+fn pb_put(var b: PwBuf, j: Int, v: Int)
+    b.data[j] = v as u8
+
+// The advertiser of a train with responses.  `on` says the train is one; `rsp_aa` is the access address of the responses; `n_sub`, `si_us`,
+// `delay_us` and `spacing_us` the timing in microseconds, `slots` the number of response slots of a subevent.  `air` is the number of the next
+// subevent the radio sends and `next_ask` the number of the next subevent the Host has not been asked about.  `ask_owed` says LE Periodic
+// Advertising Subevent Data Request is owed for `ask_n` subevents from `ask_sub`; `rep_owed` that LE Periodic Advertising Response Report is
+// owed for subevent `rep_sub` (`rep_tx` the TX_Status), with the `rn` responses staged in `rdata`, each as slot, RSSI, Tx Power, length and
+// data (`rlen` octets in all).
+@value
+struct PwAdv
+    on: Bool
+    rsp_aa: Int
+    n_sub: Int
+    si_us: Int
+    delay_us: Int
+    spacing_us: Int
+    slots: Int
+    bufs: Vec[PwBuf; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then noble_controller_config.CTL_PAWR_BUFS else 1]
+    next_ask: Int
+    air: Int
+    ask_owed: Bool
+    ask_sub: Int
+    ask_n: Int
+    rep_owed: Bool
+    rep_sub: Int
+    rep_tx: Int
+    rn: Int
+    rlen: Int
+    rdata: Vec[u8; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then 2 * noble_controller_config.CTL_PAWR_DATA + 8 else 8]
+    cur_rs: Int
+    cur_rc: Int
+
+@tier(embedded)
+fn pa_new() -> PwAdv
+    var w = PwAdv { on: false, rsp_aa: 0, n_sub: 0, si_us: 0, delay_us: 0, spacing_us: 0, slots: 0, bufs: Vec.new(), next_ask: 0, air: 0,
+                    ask_owed: false, ask_sub: 0, ask_n: 0, rep_owed: false, rep_sub: 0, rep_tx: 0, rn: 0, rlen: 0, rdata: Vec.new(), cur_rs: 0, cur_rc: 0 }
+    for _ in 0..ctl_limits.pw_bufs()
+        let _b = w.bufs.push(pb_new())
+    for _ in 0..ctl_limits.pw_rsp()
+        let _r = w.rdata.push(0)
+    w
+
+// The train forgotten: no buffers, nothing owed.
+@tier(embedded)
+fn pa_clear(var w: PwAdv)
+    w.on = false
+    w.next_ask = 0
+    w.air = 0
+    w.ask_owed = false
+    w.rep_owed = false
+    w.rn = 0
+    w.rlen = 0
+    for k in 0..ctl_limits.pw_bufs()
+        w.bufs[k].state = B_FREE
+
+// The train takes the timing of LE Set Periodic Advertising Parameters [v2] (units of the command; with one subevent `si` is the interval the
+// subevent is as long as, at most 255 units).
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn pa_define(var w: PwAdv, n_sub: Int, si: Int, delay: Int, spacing: Int, slots: Int)
+    pa_clear(var w)
+    w.on = true
+    w.n_sub = n_sub
+    w.si_us = si * SI_UNIT_US
+    w.delay_us = delay * SI_UNIT_US
+    w.spacing_us = spacing * SPACING_UNIT_US
+    w.slots = slots
+
+// The train starts: subevent numbering from 0.
+@tier(embedded)
+fn pa_start(var w: PwAdv, rsp_aa: Int)
+    w.rsp_aa = rsp_aa
+    w.next_ask = 0
+    w.air = 0
+    w.ask_owed = false
+    w.rep_owed = false
+    w.rn = 0
+    w.rlen = 0
+    for k in 0..ctl_limits.pw_bufs()
+        w.bufs[k].state = B_FREE
+
+@tier(embedded)
+fn pa_free(var w: PwAdv) -> Int
+    var n = 0
+    for k in 0..ctl_limits.pw_bufs()
+        if w.bufs[k].state == B_FREE
+            n = n + 1
+    n
+
+// The Controller asks the Host for data when at least half of its buffers are free (all of them when it has one): a request for the next
+// subevents to ask about, as many as there are free buffers and at most the subevents of an event.  False when it is not time to ask or a request
+// is still to be sent.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn pa_ask(var w: PwAdv) -> Bool
+    if w.ask_owed
+        return false
+    let free = pa_free(var w)
+    if free * 2 < ctl_limits.pw_bufs() or free == 0
+        return false
+    var n = free
+    if n > w.n_sub
+        n = w.n_sub
+    if w.next_ask < w.air
+        w.next_ask = w.air
+    w.ask_sub = w.next_ask % w.n_sub
+    w.ask_n = n
+    var left = n
+    for k in 0..ctl_limits.pw_bufs()
+        if left > 0 and w.bufs[k].state == B_FREE
+            w.bufs[k].state = B_ASKED
+            w.bufs[k].abs = w.next_ask
+            w.bufs[k].sub = w.next_ask % w.n_sub
+            w.bufs[k].len = 0
+            w.bufs[k].rc = 0
+            w.bufs[k].rs = 0
+            w.next_ask = w.next_ask + 1
+            left = left - 1
+    w.ask_owed = true
+    true
+
+// The buffer asked for subevent `sub` that the radio has not yet come to (the oldest), -1 for none.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn pa_asked(var w: PwAdv, sub: Int) -> Int
+    var best = -1
+    for k in 0..ctl_limits.pw_bufs()
+        if w.bufs[k].state == B_ASKED and w.bufs[k].sub == sub and w.bufs[k].abs >= w.air
+            if best < 0 or w.bufs[k].abs < w.bufs[best].abs
+                best = k
+    best
+
+// The buffer holding the data of the subevent `w.air`, -1 for none.
+@tier(embedded)
+fn pa_due(var w: PwAdv) -> Int
+    for k in 0..ctl_limits.pw_bufs()
+        if w.bufs[k].state == B_FILLED and w.bufs[k].abs == w.air
+            return k
+    -1
+
+// The subevent number the radio sends next.
+@tier(embedded)
+fn pa_sub(var w: PwAdv) -> Int
+    w.air % w.n_sub
+
+// The subevent `w.air` is over, sent or given up: its buffer is free, and so is any asked-for buffer whose time has passed.
+@tier(embedded)
+fn pa_pass(var w: PwAdv)
+    for k in 0..ctl_limits.pw_bufs()
+        if w.bufs[k].state != B_FREE and w.bufs[k].abs <= w.air
+            w.bufs[k].state = B_FREE
+    w.air = w.air + 1
+
+// The octets of an AUX_SYNC_SUBEVENT_IND carrying `len` octets of data: the header of two octets, the extended header length octet, the flags and
+// the Tx Power when `txp`, and the data.
+@tier(embedded)
+fn ind_octets(len: Int, txp: Bool) -> Int
+    var n = 2 + 1 + len
+    if txp
+        n = n + 2
+    n
+
+// Whether an AUX_SYNC_SUBEVENT_IND of `len` octets on `phy` ends `T_IFS_150` before the first response slot (before the next subevent when
+// the train has no slot).
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ind_fits(var w: PwAdv, len: Int, txp: Bool, phy: Int) -> Bool
+    var room = w.si_us
+    if w.slots > 0
+        room = w.delay_us
+    ll_phy.air_us(phy, true, ind_octets(len, txp)) + T_IFS_150 <= room
+
+// An extended advertising PDU of AdvMode 0 that holds only the Tx Power (when `txp_on`) and `len` octets of the buffer `b` as data: the
+// AUX_SYNC_SUBEVENT_IND and the AUX_SYNC_SUBEVENT_RSP, which carry no address, ADI, pointer or SyncInfo here.  With no field the Extended Header Length is
+// 0 and the header has no flags octet ([Vol 6] Part B, Section 2.3.4), as the SoftDevice Controller sends it.
+@tier(embedded)
+fn pdu_plain(var p: Pdu, txp_on: Bool, txp: Int, var b: PwBuf, len: Int)
+    ll_pdu.pdu_begin(var p, ll_init.EXT_ADV, 0, 0)
+    let _hl = ll_pdu.pdu_put_data(var p, 0)
+    if txp_on
+        let _fl = ll_pdu.pdu_put_data(var p, 0x40)
+        let _x = ll_pdu.pdu_put_data(var p, txp & 0xFF)
+        p.b[2] = 2
+    for j in 0..len
+        let _d = ll_pdu.pdu_put_data(var p, b.data[j] as Int)
+    ll_pdu.pdu_finish(var p)
+
+// The AUX_SYNC_SUBEVENT_IND of the subevent `w.air` in `p`: the data of buffer `b` (none when `b` is -1).  The Tx Power is in when `txp_on`.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ind_build(var w: PwAdv, b: Int, var p: Pdu, txp_on: Bool, txp: Int)
+    var at = 0
+    var len = 0
+    if b >= 0
+        at = b
+        len = w.bufs[b].len
+    pdu_plain(var p, txp_on, txp, var w.bufs[at], len)
+
+// The slots the subevent `w.air` uses: those of buffer `b`, none for -1.
+@tier(embedded)
+fn pa_cur(var w: PwAdv, b: Int)
+    w.cur_rs = 0
+    w.cur_rc = 0
+    if b >= 0
+        w.cur_rs = w.bufs[b].rs
+        w.cur_rc = w.bufs[b].rc
+
+// An access address for the responses of a train, valid and not the train's own.
+@tier(embedded)
+fn rsp_aa_make(var t: PerAdv) -> Int
+    var aa = ll_per.make_aa(var t)
+    for _ in 0..8
+        if aa != t.aa
+            break
+        aa = ll_per.make_aa(var t)
+    aa
+
+// The data channel of the subevent `sub` of the event with the counter `counter`.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn sub_channel(aa: Int, counter: Int, sub: Int, chmap: Int, n_used: Int) -> Int
+    ll_link.csa2_channel(ll_per.channel_id(aa), (counter ^ sub) & 0xFFFF, chmap, n_used)
+
+// The start of the response slot `slot` of the subevent whose AUX_SYNC_SUBEVENT_IND started at `ind_start`.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn slot_at(ind_start: Int, delay_us: Int, spacing_us: Int, slot: Int) -> Int
+    ind_start + delay_us + slot * spacing_us
+
+// A response heard in slot `slot` with `rssi`, Tx Power `txp` and `len` octets of `src` from `at`: staged for the report.  False when the
+// report is full (25 responses, or no room for the data), which drops it.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn pa_response(var w: PwAdv, slot: Int, rssi: Int, txp: Int, var src: Pdu, at: Int, len: Int) -> Bool
+    // The report must fit an HCI event: 5 octets, and for each response 6 and its data.
+    if w.rn >= RESPONSES_MAX or w.rlen + 4 + len > ctl_limits.pw_rsp() or 5 + w.rlen + 4 + len + 2 * (w.rn + 1) > 255
+        return false
+    let o = w.rlen
+    w.rdata[o] = slot as u8
+    w.rdata[o + 1] = rssi as u8
+    w.rdata[o + 2] = txp as u8
+    w.rdata[o + 3] = len as u8
+    for j in 0..len
+        w.rdata[o + 4 + j] = src.b[at + j]
+    w.rlen = o + 4 + len
+    w.rn = w.rn + 1
+    true
+
+// The subevent `sub` is over: a report is owed when responses came, or when the AUX_SYNC_SUBEVENT_IND could not be sent (`tx_ok` false).
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn pa_over(var w: PwAdv, sub: Int, tx_ok: Bool)
+    if w.rn > 0 or not tx_ok
+        w.rep_owed = true
+        w.rep_sub = sub
+        w.rep_tx = 0
+        if not tx_ok
+            w.rep_tx = 1
+
+// The report is sent.
+@tier(embedded)
+fn pa_reported(var w: PwAdv)
+    w.rep_owed = false
+    w.rn = 0
+    w.rlen = 0
+
+// ── The synchronizer ────────────────────────────────────────────────
+
+// The synchronization of a train with responses.  `on` says the train is one; `rsp_aa`, `n_sub`, `si_us`, `delay_us` and `spacing_us` are the
+// train's timing.  The window at `PerSync.due` is for the subevent `subs[k]` of the event that starts at `ev_start`; `subs` holds the `n_subs`
+// subevents the Host chose (subevent 0 until it chooses), and `txp` says a response carries the Tx Power and `hsub` is the subevent of the last packet heard.  The responses the Host gave wait in `bufs`.
+@value
+struct PwSync
+    on: Bool
+    rsp_aa: Int
+    n_sub: Int
+    si_us: Int
+    delay_us: Int
+    spacing_us: Int
+    ev_start: Int
+    k: Int
+    n_subs: Int
+    subs: Vec[u8; 8]
+    txp: Bool
+    hsub: Int
+    bufs: Vec[PwBuf; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then noble_controller_config.CTL_PAWR_BUFS else 1]
+
+@tier(embedded)
+fn ps_new() -> PwSync
+    var s = PwSync { on: false, rsp_aa: 0, n_sub: 0, si_us: 0, delay_us: 0, spacing_us: 0, ev_start: 0, k: 0, n_subs: 1, subs: Vec.new(),
+                     txp: false, hsub: 0, bufs: Vec.new() }
+    for _ in 0..SUBS_MAX
+        let _a = s.subs.push(0)
+    for _ in 0..ctl_limits.pw_bufs()
+        let _b = s.bufs.push(pb_new())
+    s
+
+@tier(embedded)
+fn ps_clear(var s: PwSync)
+    s.on = false
+    s.n_subs = 1
+    s.subs[0] = 0
+    s.k = 0
+    s.txp = false
+    for j in 0..ctl_limits.pw_bufs()
+        s.bufs[j].state = B_FREE
+
+// The slot `ps` takes the timing the information at `at` of `rx` holds; the first window (`PerSync.due`, counted to subevent 0 by the
+// SyncInfo) moves to the first subevent chosen.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ps_begin(var s: PwSync, var p: PerSync, var rx: Pdu, at: Int)
+    ps_clear(var s)
+    s.on = true
+    s.rsp_aa = timing_aa(var rx, at)
+    s.n_sub = timing_n_sub(var rx, at)
+    s.si_us = timing_si(var rx, at) * SI_UNIT_US
+    if s.n_sub == 1
+        s.si_us = p.interval * SI_UNIT_US
+    s.delay_us = timing_delay(var rx, at) * SI_UNIT_US
+    s.spacing_us = timing_spacing(var rx, at) * SPACING_UNIT_US
+    s.ev_start = p.due
+    p.due = s.ev_start + (s.subs[0] as Int) * s.si_us
+
+// The subevents the Host chose (LE Set Periodic Sync Subevent): `n` of them, in the order given; the next window is for the first.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ps_choose(var s: PwSync, var p: PerSync, n: Int, first: Int, txp: Bool)
+    s.n_subs = n
+    s.subs[0] = first as u8
+    s.k = 0
+    s.txp = txp
+    p.due = s.ev_start + first * s.si_us
+
+@tier(embedded)
+fn ps_put(var s: PwSync, k: Int, sub: Int)
+    s.subs[k] = sub as u8
+
+// Whether the synchronization listens to the subevent `sub`.
+@tier(embedded)
+fn ps_listens(var s: PwSync, sub: Int) -> Bool
+    for j in 0..SUBS_MAX
+        if j < s.n_subs and (s.subs[j] as Int) == sub
+            return true
+    false
+
+// The subevent of the window at `PerSync.due`.
+@tier(embedded)
+fn ps_sub(var s: PwSync) -> Int
+    s.subs[s.k] as Int
+
+// The data channel of the window at `PerSync.due`.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ps_channel(var s: PwSync, var p: PerSync) -> Int
+    sub_channel(p.aa, p.counter, ps_sub(var s), p.chmap, p.n_used)
+
+// The window at `due` was over (a packet of the subevent heard at `start`, or none): the next is the following chosen subevent of the event,
+// or the first of the next event.  `ll_per.psync_heard` or `psync_missed` ran before and moved the window an interval on; this puts it where
+// the subevents are.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ps_pass(var s: PwSync, var p: PerSync, heard: Bool, start: Int)
+    let cur = ps_sub(var s)
+    var base = s.ev_start
+    if heard
+        // The packet is the clock: the event began `cur` subevents before it.
+        base = start - cur * s.si_us
+    let wrapped = s.k + 1 >= s.n_subs
+    if wrapped
+        s.k = 0
+        s.ev_start = base + ll_per.psync_interval_us(var p)
+    else
+        s.k = s.k + 1
+        s.ev_start = base
+        // The window stays in the same event: the counter went on by one, and the interval was added.
+        p.counter = (p.counter - 1) & 0xFFFF
+    p.due = s.ev_start + ps_sub(var s) * s.si_us
+
+// The response the Host gave for the event with the counter `counter`, subevent `sub`: the buffer, -1 for none.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn ps_response(var s: PwSync, counter: Int, sub: Int) -> Int
+    for j in 0..ctl_limits.pw_bufs()
+        if s.bufs[j].state == B_FILLED and s.bufs[j].abs == counter and s.bufs[j].sub == sub
+            return j
+    -1
+
+// The buffers of events before `counter` are free: their slots have passed.
+@tier(embedded)
+fn ps_expire(var s: PwSync, counter: Int)
+    for j in 0..ctl_limits.pw_bufs()
+        if s.bufs[j].state != B_FREE
+            let d = (counter - s.bufs[j].abs) & 0xFFFF
+            if d != 0 and d < 0x8000
+                s.bufs[j].state = B_FREE
+
+// The event a response is for: the one of the request when the response subevent is the request's or comes after it, else the next.  A response in
+// the request's own subevent has its slot in the same event ([Vol 4] Part E, Section 7.8.126; with one subevent in an event it can be in no other); it
+// can be given in time only by a Host that answers before the slot.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn response_event(req_event: Int, req_sub: Int, rsp_sub: Int) -> Int
+    if rsp_sub < req_sub
+        return (req_event + 1) & 0xFFFF
+    req_event & 0xFFFF
+
+// Whether the slot of a response for the event `target` in subevent `sub` has passed when the window at `PerSync.counter` and the subevent
+// `cur` is the next to be heard.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn response_late(target: Int, sub: Int, counter: Int, cur: Int) -> Bool
+    let d = (target - counter) & 0xFFFF
+    if d >= 0x8000
+        return true
+    d == 0 and sub < cur
+
+// The AUX_SYNC_SUBEVENT_RSP of buffer `b` in `p`, with the Tx Power `txp` when the properties say so.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn rsp_build(var s: PwSync, b: Int, var p: Pdu, txp: Int)
+    pdu_plain(var p, s.txp, txp, var s.bufs[b], s.bufs[b].len)
+
+// The octets of an AUX_SYNC_SUBEVENT_RSP of `len` octets.
+@tier(embedded)
+fn rsp_octets(len: Int, txp: Bool) -> Int
+    ind_octets(len, txp)
+
+// Whether a response of `len` octets on `phy` ends `T_IFS_150` before the next slot starts.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn rsp_fits(var s: PwSync, len: Int, phy: Int) -> Bool
+    ll_phy.air_us(phy, true, rsp_octets(len, s.txp)) + T_IFS_150 <= s.spacing_us
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@tier(app)
+fn t_adv(n_sub: Int) -> PwAdv
+    var w = pa_new()
+    pa_define(var w, n_sub, 12, 1, 16, 4)
+    pa_start(var w, 0x71764129)
+    w
+
+@tier(app)
+fn t_fill(var w: PwAdv, b: Int, len: Int, rs: Int, rc: Int)
+    pb_set(var w.bufs[b], B_FILLED, w.bufs[b].abs, w.bufs[b].sub, rs, rc, len)
+    for j in 0..len
+        pb_put(var w.bufs[b], j, j + 1)
+
+@tier(app)
+fn t_bfill(var s: PwSync, abs: Int, sub: Int, len: Int)
+    pb_set(var s.bufs[0], B_FILLED, abs, sub, 0, 0, len)
+
+@tier(app)
+fn t_min(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+@tier(app)
+fn t_ask_owed(var w: PwAdv, v: Bool)
+    w.ask_owed = v
+
+@tier(app)
+fn t_slots(var w: PwAdv, v: Int)
+    w.slots = v
+
+@tier(app)
+fn t_pdu_n(var p: Pdu, n: Int)
+    p.n = n
+
+@tier(app)
+fn t_sync_at(var s: PwSync, spacing: Int, n_sub: Int)
+    s.spacing_us = spacing
+    s.n_sub = n_sub
+
+@tier(app)
+fn t_psync_at(var p: PerSync, interval: Int, due: Int, counter: Int)
+    p.interval = interval
+    p.due = due
+    p.counter = counter
+    p.state = ll_per.PS_SYNCING
+
+@test
+fn test_capacities_match_the_constants()
+    let w = pa_new()
+    test.assert_eq(w.bufs.capacity(), ctl_limits.pw_bufs())
+    test.assert_eq(w.bufs[0].data.capacity(), ctl_limits.pw_data())
+    test.assert_eq(w.rdata.capacity(), ctl_limits.pw_rsp())
+    let s = ps_new()
+    test.assert_eq(s.bufs.capacity(), ctl_limits.pw_bufs())
+    test.assert_eq(s.subs.capacity(), SUBS_MAX)
+
+@test
+fn test_the_parameters_follow_the_command()
+    // A train of 10 subevents 15 units (18.75 ms) apart in an interval of 150 units, 5 slots 1.25 ms after the PDU and 0.5 ms apart.
+    test.assert_eq(params_status(150, 200, 10, 15, 1, 4, 5), OK)
+    test.assert_eq(params_status(150, 200, 129, 1, 1, 4, 5), E_UNSUPPORTED)
+    // The subevents fill the interval: 10 x 16 is above 150.
+    test.assert_eq(params_status(150, 200, 10, 16, 1, 4, 5), E_INVALID)
+    test.assert_eq(params_status(150, 200, 10, 5, 1, 4, 5), E_INVALID)
+    test.assert_eq(params_status(150, 200, 10, 15, 0, 4, 5), E_INVALID)
+    test.assert_eq(params_status(150, 200, 10, 15, 15, 4, 5), E_INVALID)
+    test.assert_eq(params_status(150, 200, 10, 15, 1, 4, 0), E_INVALID)
+    // The spacing: 10 x (15 - 1) / 5 = 28 at most, 2 at least.
+    test.assert_eq(params_status(150, 200, 10, 15, 1, 28, 5), OK)
+    test.assert_eq(params_status(150, 200, 10, 15, 1, 29, 5), E_INVALID)
+    test.assert_eq(params_status(150, 200, 10, 15, 1, 1, 5), E_INVALID)
+    // One slot: the spacing is ignored.  One subevent: the Subevent_Interval is ignored and the interval range is the bound.
+    test.assert_eq(params_status(150, 200, 10, 15, 1, 0, 1), OK)
+    test.assert_eq(params_status(150, 200, 1, 0, 100, 4, 5), OK)
+    test.assert_eq(params_status(150, 200, 1, 0, 200, 4, 5), E_INVALID)
+
+@test
+fn test_the_timing_information_round_trips_through_the_acad()
+    var t = ll_per.t_train(0, 0)
+    timing_put(var t, 0x71764129, 10, 15, 1, 4)
+    test.assert_eq(t.acad_n, TIMING_OCTETS)
+    var p = pdu_of(var t.acad, TIMING_OCTETS)
+    test.assert_eq(timing_find(var p, 0, TIMING_OCTETS), 0)
+    test.assert_eq(timing_aa(var p, 0), 0x71764129)
+    test.assert_eq(timing_n_sub(var p, 0), 10)
+    test.assert_eq(timing_si(var p, 0), 15)
+    test.assert_eq(timing_delay(var p, 0), 1)
+    test.assert_eq(timing_spacing(var p, 0), 4)
+    test.assert(timing_usable(var p, 0))
+    // Another structure first, then the information: found behind it.
+    var q = pdu_of(var t.acad, TIMING_OCTETS)
+    for k in 0..TIMING_OCTETS
+        q.b[3 + k] = t.acad[k]
+    q.b[0] = 2
+    q.b[1] = 1
+    q.b[2] = 6
+    test.assert_eq(timing_find(var q, 0, 3 + TIMING_OCTETS), 3)
+    // A structure of another length or type is not it.
+    q.b[3] = 8
+    test.assert_eq(timing_find(var q, 0, 3 + TIMING_OCTETS), -1)
+
+@tier(app)
+fn pdu_of(var src: Vec[u8; 64], n: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    for k in 0..n
+        p.b[k] = src[k]
+    t_pdu_n(var p, n)
+    p
+
+@test
+fn test_the_controller_asks_for_the_subevents_it_has_buffers_for()
+    // With one buffer the Controller asks whenever it is free; the request names the next subevent in order and as many as there are free buffers.
+    var w = t_adv(3)
+    test.assert(pa_ask(var w))
+    let n = t_min(ctl_limits.pw_bufs(), 3)
+    test.assert_eq(w.ask_sub, 0)
+    test.assert_eq(w.ask_n, n)
+    test.assert(w.ask_owed)
+    // A request is still to be sent: no second.
+    test.assert(not pa_ask(var w))
+    t_ask_owed(var w, false)
+    test.assert_eq(pa_free(var w), ctl_limits.pw_bufs() - n)
+    test.assert_eq(pa_ask(var w), (ctl_limits.pw_bufs() - n) * 2 >= ctl_limits.pw_bufs() and ctl_limits.pw_bufs() > n)
+    t_ask_owed(var w, false)
+    // The Host gave the data of subevent 0; the radio sent it; the buffer is free again and the next request starts at subevent 1 or later.
+    let b = pa_asked(var w, 0)
+    test.assert(b >= 0)
+    test.assert_eq(w.bufs[b].state, B_ASKED)
+    t_fill(w, b, 5, 0, 2)
+    test.assert_eq(pa_due(var w), b)
+    test.assert_eq(pa_sub(var w), 0)
+    pa_pass(var w)
+    test.assert_eq(w.air, 1)
+    test.assert_eq(pa_sub(var w), 1)
+    test.assert_eq(pa_due(var w), -1)
+    t_ask_owed(var w, false)
+    test.assert(pa_ask(var w))
+    test.assert_eq(w.ask_sub, (w.next_ask - w.ask_n) % 3)
+
+@test
+fn test_a_subevent_whose_time_passed_frees_its_buffer_and_goes_without_data()
+    var w = t_adv(2)
+    test.assert(pa_ask(var w))
+    t_ask_owed(var w, false)
+    // The Host answers too late: the radio went by, the asked-for buffer is free and no longer wanted.
+    pa_pass(var w)
+    test.assert_eq(pa_asked(var w, 0), -1)
+    test.assert_eq(pa_due(var w), -1)
+    test.assert(pa_free(var w) >= 1)
+    // The next request starts after the subevents already asked about and never before the one the radio comes to.
+    t_ask_owed(var w, false)
+    test.assert(pa_ask(var w))
+    test.assert_eq(w.ask_sub, t_min(ctl_limits.pw_bufs(), 2) % 2)
+
+@test
+fn test_the_subevent_pdu_holds_the_data_and_the_tx_power_of_the_train()
+    var w = t_adv(2)
+    var p = ll_pdu.pdu_new()
+    ind_build(var w, -1, var p, true, 4)
+    // No data: the header, the extended header length and its flags, the Tx Power.
+    test.assert_eq(p.n, ind_octets(0, true))
+    test.assert_eq((p.b[0] as Int) & 0x0F, ll_init.EXT_ADV)
+    test.assert_eq((p.b[2] as Int) >>> 6, 0)
+    let x = ll_ext.ext_parse(var p)
+    test.assert(x.ok)
+    test.assert(x.txp >= 0)
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(x.adi, -1)
+    test.assert_eq(x.aux, -1)
+    test.assert_eq(x.sync, -1)
+    test.assert_eq(x.data_len, 0)
+    test.assert_eq(ll_ext.tx_power(var p, x), 4)
+    // Data of buffer 0.
+    t_fill(w, 0, 6, 0, 1)
+    var q = ll_pdu.pdu_new()
+    ind_build(var w, 0, var q, true, 4)
+    test.assert_eq(q.n, ind_octets(6, true))
+    let y = ll_ext.ext_parse(var q)
+    test.assert_eq(y.data_len, 6)
+    test.assert_eq(q.b[y.data_at], 1)
+    test.assert_eq(q.b[y.data_at + 5], 6)
+    // Without the property no Tx Power.
+    var r = ll_pdu.pdu_new()
+    ind_build(var w, 0, var r, false, 4)
+    test.assert_eq(r.n, ind_octets(6, false))
+    test.assert_eq(ll_ext.ext_parse(var r).txp, -1)
+
+@test
+fn test_a_subevent_pdu_must_end_before_the_first_response_slot()
+    var w = t_adv(2)
+    // The delay is 1 unit, 1.25 ms: on the 1M PHY 8 us an octet and 8 octets of overhead, and 150 us before the slot.
+    test.assert(ind_fits(var w, 100, false, ll_phy.PHY_1M))
+    test.assert(not ind_fits(var w, 150, false, ll_phy.PHY_1M))
+    test.assert(ind_fits(var w, 150, false, ll_phy.PHY_2M))
+    t_slots(var w, 0)
+    test.assert(ind_fits(var w, 240, false, ll_phy.PHY_1M))
+
+@test
+fn test_the_channel_follows_the_event_and_the_subevent_and_the_slot_follows_the_delay_and_the_spacing()
+    // A subevent differs from the next of its event in the counter used, which is the XOR of the event counter and the subevent number.
+    var differ = 0
+    for sub in 1..8
+        if sub_channel(0x8E89BED7, 100, sub, 0x1FFFFFFFFF, 37) != sub_channel(0x8E89BED7, 100, 0, 0x1FFFFFFFFF, 37)
+            differ = differ + 1
+    test.assert(differ >= 5)
+    test.assert_eq(sub_channel(0x8E89BED7, 100, 5, 0x1FFFFFFFFF, 37), sub_channel(0x8E89BED7, 97, 0, 0x1FFFFFFFFF, 37))
+    test.assert_eq(sub_channel(0x8E89BED7, 0x10005, 5, 0x1FFFFFFFFF, 37), sub_channel(0x8E89BED7, 0, 0, 0x1FFFFFFFFF, 37) * 0 + sub_channel(0x8E89BED7, 5, 5, 0x1FFFFFFFFF, 37))
+    test.assert_eq(slot_at(10000, 2500, 500, 0), 12500)
+    test.assert_eq(slot_at(10000, 2500, 500, 3), 14000)
+
+@test
+fn test_responses_are_staged_with_their_slot_and_signal_for_one_report()
+    var w = t_adv(2)
+    var src = ll_pdu.pdu_new()
+    for k in 0..40
+        src.b[k] = (k + 1) as u8
+    test.assert(pa_response(var w, 3, 0xC8, 0x7F, var src, 10, 4))
+    test.assert_eq(w.rn, 1)
+    test.assert_eq(w.rlen, 8)
+    test.assert_eq(w.rdata[0], 3)
+    test.assert_eq(w.rdata[1], 0xC8)
+    test.assert_eq(w.rdata[3], 4)
+    test.assert_eq(w.rdata[4], 11)
+    // A subevent with a response owes a report; one with none and its PDU sent does not; one whose PDU was not sent does, with TX_Status 1.
+    pa_over(var w, 1, true)
+    test.assert(w.rep_owed)
+    test.assert_eq(w.rep_sub, 1)
+    test.assert_eq(w.rep_tx, 0)
+    pa_reported(var w)
+    test.assert(not w.rep_owed)
+    test.assert_eq(w.rn, 0)
+    pa_over(var w, 1, true)
+    test.assert(not w.rep_owed)
+    pa_over(var w, 1, false)
+    test.assert(w.rep_owed)
+    test.assert_eq(w.rep_tx, 1)
+
+@test
+fn test_a_synchronization_moves_to_the_subevents_it_listens_to_and_follows_the_clock()
+    var rx = ll_pdu.pdu_new()
+    var t = ll_per.t_train(0, 0)
+    timing_put(var t, 0x71764129, 3, 12, 2, 16)
+    for k in 0..TIMING_OCTETS
+        rx.b[k] = t.acad[k]
+    t_pdu_n(var rx, TIMING_OCTETS)
+    var p = ll_per.psync_new()
+    t_psync_at(var p, 160, 1000000, 50)
+    var s = ps_new()
+    ps_begin(var s, var p, var rx, 0)
+    test.assert(s.on)
+    test.assert_eq(s.rsp_aa, 0x71764129)
+    test.assert_eq(s.n_sub, 3)
+    test.assert_eq(s.si_us, 15000)
+    test.assert_eq(s.delay_us, 2500)
+    test.assert_eq(s.spacing_us, 2000)
+    test.assert_eq(p.due, 1000000)
+    // Subevents 0 and 2: the first window is for 0, the second for 2 of the same event, the third for 0 of the next.
+    ps_put(var s, 1, 2)
+    ps_choose(var s, var p, 2, 0, false)
+    test.assert(ps_listens(var s, 0))
+    test.assert(ps_listens(var s, 2))
+    test.assert(not ps_listens(var s, 1))
+    test.assert_eq(ps_channel(var s, var p), sub_channel(0, 0, 0, 0, 0) * 0 + ps_channel(var s, var p))
+    ll_per.psync_heard(var p, 1000010)
+    ps_pass(var s, var p, true, 1000010)
+    test.assert_eq(ps_sub(var s), 2)
+    test.assert_eq(p.counter, 50)
+    test.assert_eq(p.due, 1000010 + 30000)
+    ll_per.psync_heard(var p, 1030020)
+    ps_pass(var s, var p, true, 1030020)
+    test.assert_eq(ps_sub(var s), 0)
+    test.assert_eq(p.counter, 51)
+    test.assert_eq(p.due, 1000020 + 200000)
+    // A window with no packet: the next is where the subevents are, from the event's start.
+    ll_per.psync_missed(var p)
+    ps_pass(var s, var p, false, 0)
+    test.assert_eq(ps_sub(var s), 2)
+    test.assert_eq(p.counter, 51)
+    test.assert_eq(p.due, 1000020 + 200000 + 30000)
+
+@test
+fn test_a_response_is_for_the_event_of_the_request_or_the_next_and_expires_with_it()
+    test.assert_eq(response_event(100, 2, 3), 100)
+    test.assert_eq(response_event(100, 2, 2), 100)
+    test.assert_eq(response_event(100, 2, 1), 101)
+    test.assert_eq(response_event(0xFFFF, 2, 0), 0)
+    // The slot has passed for an earlier event, and for an earlier subevent of the window's event; not for the window's own subevent or later.
+    test.assert(response_late(99, 2, 100, 0))
+    test.assert(response_late(100, 0, 100, 1))
+    test.assert(not response_late(100, 1, 100, 1))
+    test.assert(not response_late(100, 2, 100, 1))
+    test.assert(not response_late(101, 0, 100, 1))
+    test.assert(response_late(0xFFFF, 0, 0, 0))
+    test.assert(not response_late(0, 0, 0xFFFF, 2))
+    var s = ps_new()
+    t_bfill(var s, 101, 1, 3)
+    test.assert_eq(ps_response(var s, 101, 1), 0)
+    test.assert_eq(ps_response(var s, 101, 0), -1)
+    test.assert_eq(ps_response(var s, 100, 1), -1)
+    ps_expire(var s, 101)
+    test.assert_eq(s.bufs[0].state, B_FILLED)
+    ps_expire(var s, 102)
+    test.assert_eq(s.bufs[0].state, B_FREE)
+    // Across the wrap of the counter.
+    t_bfill(var s, 0xFFFF, 0, 1)
+    ps_expire(var s, 0)
+    test.assert_eq(s.bufs[0].state, B_FREE)
+
+@test
+fn test_a_response_pdu_holds_the_data_and_fits_a_slot()
+    var s = ps_new()
+    t_sync_at(var s, 2000, 2)
+    pb_set(var s.bufs[0], B_FILLED, 0, 0, 0, 0, 4)
+    for j in 0..4
+        pb_put(var s.bufs[0], j, 0x10 + j)
+    var p = ll_pdu.pdu_new()
+    rsp_build(var s, 0, var p, 3)
+    test.assert_eq(p.n, rsp_octets(4, false))
+    let x = ll_ext.ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(x.data_len, 4)
+    test.assert_eq(p.b[x.data_at], 0x10)
+    test.assert(rsp_fits(var s, 100, ll_phy.PHY_1M))
+    test.assert(not rsp_fits(var s, 250, ll_phy.PHY_1M))

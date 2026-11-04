@@ -1,0 +1,586 @@
+// src/ll_past.nv — Periodic Advertising Sync Transfer of the Link Layer: the PDU LL_PERIODIC_SYNC_IND that
+// carries a periodic advertising train from one connected device to the other, the plan of the device that sends it
+// and the plan of the one that receives it.
+//
+// [Vol 6] Part B, Sections 2.3.4.6, 2.4.2.27 and 5.1.13; [Vol 4] Part E, Sections 7.7.65.24 and 7.8.89 to 7.8.92.  A device
+// that advertises a periodic train, or that is synchronized to one, tells a peer it is connected to how to find the train
+// without scanning for it: the SyncInfo of the train (the same 18 octets an AUX_ADV_IND carries), written so that its
+// offset is counted from the anchor point of a connection event of the link, and the identity of the advertiser.  The
+// receiving Host chose, with LE Set Periodic Advertising Sync Transfer Parameters or the default of LE Set Default Periodic
+// Advertising Sync Transfer Parameters, whether and how the Controller synchronizes.
+//
+// Three clocks are involved: the advertiser A, the device B that sends the PDU, and the device C that receives it.  C
+// converts the offset to a time on its own clock through its own anchor point of the link, then widens the window it listens
+// in by the drift each of the two spans can have gathered (Section 5.1.13.1, Figure 5.4):
+//
+//   Tnominal = anchor(CEref) + Offset, the AUX_SYNC_IND with the counter PEa;  PEc is the event C listens to first.
+//   D        = (Da + Db) x (1 + CAa + CAb + CAc),  Da = |PEc - PEb| x PAI x (CAa + CAc),  Db = |CEt - CEs| x CI x (CAb + CAc).
+//
+// This module holds no radio and no clock.  The configuration (`ctl_limits.past_on()`) says whether the build has the feature.
+
+use ctl_limits
+use std.test
+use ll_pdu
+use ll_data
+use ll_per
+use ll_link
+use ll_phy
+use ll_init
+
+// ── Statuses and limits ─────────────────────────────────────────────
+
+const OK = 0
+const E_UNKNOWN_CONNECTION = 0x02
+const E_MEMORY = 0x07
+const E_DISALLOWED = 0x0C
+const E_UNSUPPORTED = 0x11
+const E_INVALID = 0x12
+const E_UNSUPPORTED_REMOTE = 0x1A
+const E_UNKNOWN_ADVERTISING = 0x42
+
+// The Mode of the transfer parameters: nothing is attempted, the Host is told, and the Host is told with the reports on (0x02) or on and
+// filtered for duplicates (0x03, which needs Periodic Advertising ADI support).
+const MODE_OFF = 0
+const MODE_EVENT = 1
+const MODE_REPORTS = 2
+const MODE_FILTERED = 3
+
+const SKIP_MAX = 0x1F3
+const TIMEOUT_MIN = 0x0A
+const TIMEOUT_MAX = 0x4000
+
+// The octets of the CtrData of LL_PERIODIC_SYNC_IND, and where its fields begin in the payload (the opcode is octet 0): the ID, the
+// SyncInfo of 18 octets, connEventCount, lastPaEventCounter, the byte of SID, AType and SCA, the PHY, AdvA and syncConnEventCount.
+const CTR_OCTETS = 34
+const AT_ID = 1
+const AT_SYNC_INFO = 3
+const AT_CE_REF = 21
+const AT_LAST_PE = 23
+const AT_SID = 25
+const AT_PHY = 26
+const AT_ADVA = 27
+const AT_CE_SYNC = 33
+
+// The longest a transfer waits for its connection, in microseconds.
+const WAIT_US = 30000000
+
+// The offset above which the Offset Adjust bit of a SyncInfo in this PDU is set, and the time it adds: 2.4576 s.
+const ADJUST_US = 2457600
+
+// The widening the specification adds to the drift: +-16 microseconds of the receivers' start (the 32 microseconds of `ll_link.JITTER_US`
+// that every window carries cover it) and the connection events a plan may look ahead.
+const LOOK_AHEAD_MAX = 0x3FFF
+
+// ── The transfer parameters ─────────────────────────────────────────
+
+// What the Host asked for the PDUs a connection receives (LE Set Periodic Advertising Sync Transfer Parameters, or the default of LE Set Default
+// Periodic Advertising Sync Transfer Parameters): the `mode`, the `skip` (events that may be skipped; this Controller listens to all of
+// them), the `timeout` in units of 10 ms and the Constant Tone Extension type (`cte`, which this Controller does not have: only 0 is taken).
+@value
+struct PastCfg
+    mode: Int
+    skip: Int
+    timeout: Int
+    cte: Int
+
+@tier(embedded)
+fn cfg_new() -> PastCfg
+    PastCfg { mode: MODE_OFF, skip: 0, timeout: TIMEOUT_MIN, cte: 0 }
+
+// The Status of the two parameter commands for these values: Command Disallowed for a CTE_Type with every bit set, Invalid HCI Command
+// Parameters for a Mode, Skip or Sync_Timeout out of range, Unsupported Feature or Parameter Value for the duplicate filtering mode (this
+// Controller has no Periodic Advertising ADI support) and for a Constant Tone Extension type (no Connectionless CTE Receiver).
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn cfg_status(mode: Int, skip: Int, timeout: Int, cte: Int) -> Int
+    if (cte & 0x1F) == 0x1F
+        return E_DISALLOWED
+    if mode > MODE_FILTERED or skip > SKIP_MAX or timeout < TIMEOUT_MIN or timeout > TIMEOUT_MAX
+        return E_INVALID
+    if mode == MODE_FILTERED or cte != 0
+        return E_UNSUPPORTED
+    OK
+
+@tier(embedded)
+fn cfg_set(var g: PastCfg, mode: Int, skip: Int, timeout: Int, cte: Int)
+    g.mode = mode
+    g.skip = skip
+    g.timeout = timeout
+    g.cte = cte
+
+@tier(embedded)
+fn cfg_copy(var to: PastCfg, var from: PastCfg)
+    to.mode = from.mode
+    to.skip = from.skip
+    to.timeout = from.timeout
+    to.cte = from.cte
+
+// Whether the reports of a transferred train are on from the start: Mode 0x02 and 0x03.
+@tier(embedded)
+fn cfg_reports(var g: PastCfg) -> Bool
+    g.mode >= MODE_REPORTS
+
+// ── What a Host asked to send ───────────────────────────────────────
+
+// A transfer waiting for the connection `ls` to have an anchor point to count the offset from.  `own` says the train
+// is the one this device advertises (`train` is its slot) and not one it is synchronized to (`train` is the synchronization's slot); `sdata` is the
+// Service_Data the Host gave and `t0` the time the Host asked; a transfer that cannot go in `WAIT_US` is given up.
+@value
+struct PastTx
+    used: Bool
+    own: Bool
+    train: Int
+    sdata: Int
+    t0: Int
+
+@tier(embedded)
+fn tx_new() -> PastTx
+    PastTx { used: false, own: false, train: 0, sdata: 0, t0: 0 }
+
+@tier(embedded)
+fn tx_set(var t: PastTx, own: Bool, train: Int, sdata: Int, now: Int)
+    t.used = true
+    t.own = own
+    t.train = train
+    t.sdata = sdata
+    t.t0 = now
+
+// ── The SyncInfo of the PDU ─────────────────────────────────────────
+
+// The 16 bits of the first two octets of a SyncInfo for the offset `off_us` counted from a connection event: the Offset Base, the Offset
+// Units in bit 13 (30 microseconds below 245.7 ms, 300 above) and the Offset Adjust in bit 14 (2.4576 s more, only with the larger unit).
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn offset_field(off_us: Int) -> Int
+    if off_us < ll_per.FINE_LIMIT_US
+        return off_us / ll_per.UNIT_FINE_US
+    var adjust = 0
+    var rest = off_us
+    if off_us >= ADJUST_US
+        adjust = 1
+        rest = off_us - ADJUST_US
+    var base = rest / ll_per.UNIT_COARSE_US
+    if base > 0x1FFF
+        base = 0x1FFF
+    base | (1 << 13) | (adjust << 14)
+
+// The offset, in microseconds, that the first two octets of a SyncInfo at the octet `at` of `rx` name; unlike an AUX_ADV_IND's, a zero offset
+// is an offset.
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn rx_offset_us(var rx: Pdu, at: Int) -> Int
+    let base = (rx.b[at] as Int) | (((rx.b[at + 1] as Int) & 0x1F) << 8)
+    var off = base * ll_per.UNIT_FINE_US
+    if (((rx.b[at + 1] as Int) >>> 5) & 1) == 1
+        off = base * ll_per.UNIT_COARSE_US
+        if (((rx.b[at + 1] as Int) >>> 6) & 1) == 1
+            off = off + ADJUST_US
+    off
+
+// The offset unit of the SyncInfo at the octet `at` of `rx`, in microseconds.
+@tier(embedded)
+fn rx_unit_us(var rx: Pdu, at: Int) -> Int
+    ll_per.si_unit_us(var rx, at)
+
+// The bit of the PHY field for a PHY (LE 1M, LE 2M and LE Coded are bits 0, 1 and 2), and the PHY a field names: 0 for a field with no bit or
+// more than one set, and for a bit beyond LE Coded.
+@tier(embedded)
+fn phy_bit(phy: Int) -> Int
+    1 << (phy - 1)
+
+@tier(embedded)
+fn phy_of(field: Int) -> Int
+    if field == 1
+        return ll_phy.PHY_1M
+    if field == 2
+        return ll_phy.PHY_2M
+    if field == 4
+        return ll_phy.PHY_CODED
+    0
+
+// ── The sender ──────────────────────────────────────────────────────
+
+// Where a train sits in time for the sender: the start `t0` of an event of it that this device sent or received, with the counter `n0`
+// (a recent one; the offer counts forward from it), and the interval `pai_us`.  The offer: the first event at or after `from` is the one
+// the SyncInfo names (`pea`, at `at`), counted from the connection event `ceref` of the link whose anchor point is `ref_us`, `off_us`
+// before it; `ok` is false for a train further from the link's events than a counter can name.
+@value
+struct Offer
+    ok: Bool
+    pea: Int
+    at: Int
+    ceref: Int
+    ref_us: Int
+    off_us: Int
+
+// Plan the SyncInfo.  The link's last anchor point is `a0`, of the connection event `ces` (an event in which this device received a packet
+// from the peer), the interval `ci_us`; `now` is the time of the plan.  The AUX_SYNC_IND named is the first of the train at or after both `now`
+// and `a0`, and the reference is the last connection event before it (a zero offset is allowed), so the offset is under one connection
+// interval whatever the interval of the train.
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn plan_offer(t0: Int, n0: Int, pai_us: Int, a0: Int, ces: Int, ci_us: Int, now: Int) -> Offer
+    var from = a0
+    if now > from
+        from = now
+    var n = 0
+    if t0 < from
+        n = (from - t0 + pai_us - 1) / pai_us
+    let at = t0 + n * pai_us
+    let m = (at - a0) / ci_us
+    var ok = m <= LOOK_AHEAD_MAX
+    if not ok
+        return Offer { ok: false, pea: 0, at: 0, ceref: 0, ref_us: 0, off_us: 0 }
+    let ref_us = a0 + m * ci_us
+    Offer { ok: true, pea: (n0 + n) & 0xFFFF, at: at, ceref: (ces + m) & 0xFFFF, ref_us: ref_us, off_us: at - ref_us }
+
+// Write the LL_PERIODIC_SYNC_IND for the train described by the offer `o` and the fields of the train into `p`: the ID the Host gave,
+// the SyncInfo, the connection event the offset is counted from, the last event this device sent or heard (`peb`), the SID, the address
+// type (0 public, 1 random) of the advertiser and this device's own sleep clock accuracy class, the PHY of the train as a PHY of `ll_phy`,
+// the advertiser's address and the connection event the plan was made in (`ces`).
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn put_sync_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int,
+                sca_own: Int, phy: Int, var adva: Vec[u8; 6], ces: Int)
+    put_sync_fields(var p, ll_data.OP_PERIODIC_SYNC_IND, id, var o, interval, chmap, sca_adv, aa, crc, peb, sid, atype, sca_own, phy, var adva, ces)
+    ll_data.dpdu_finish(var p)
+
+// Write the LL_PERIODIC_SYNC_WR_IND ([Vol 6] Part B, Section 2.4.2.40) of a train with responses: the fields of LL_PERIODIC_SYNC_IND with
+// `lastPaEventCounter` of an event whose subevent 0 this device sent, then RspAA, Num_Subevents, Subevent_Interval, Response_Slot_Delay and
+// Response_Slot_Spacing, which are the octets 2 to 9 of the train's Periodic Advertising Response Timing Information (`acad`, the AD
+// structure the AUX_ADV_IND carries, built by `ll_pawr.timing_put`).  Section 5.1.13 requires this PDU, and not LL_PERIODIC_SYNC_IND, for such a train.
+@satisfies("REQ-BLE-CTL-109")
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn put_sync_wr_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int,
+                   sca_own: Int, phy: Int, var adva: Vec[u8; 6], ces: Int, var acad: Vec[u8; 64])
+    put_sync_fields(var p, ll_data.OP_PERIODIC_SYNC_WR_IND, id, var o, interval, chmap, sca_adv, aa, crc, peb, sid, atype, sca_own, phy, var adva, ces)
+    for k in 0..8
+        let _t = ll_pdu.pdu_put_data(var p, acad[2 + k] as Int)
+    ll_data.dpdu_finish(var p)
+
+// The fields the two PDUs share, after the opcode `op`.
+@tier(embedded)
+fn put_sync_fields(var p: Pdu, op: Int, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int,
+                   sca_own: Int, phy: Int, var adva: Vec[u8; 6], ces: Int)
+    ll_data.ctrl_begin(var p, op)
+    ll_data.put_u16(var p, id)
+    ll_data.put_u16(var p, offset_field(o.off_us))
+    ll_data.put_u16(var p, interval)
+    for k in 0..4
+        let _c = ll_pdu.pdu_put(var p, (chmap >>> (8 * k)) & 0xFF)
+    let _d = ll_pdu.pdu_put(var p, ((chmap >>> 32) & 0x1F) | (sca_adv << 5))
+    for k in 0..4
+        let _e = ll_pdu.pdu_put(var p, (aa >>> (8 * k)) & 0xFF)
+    for k in 0..3
+        let _f = ll_pdu.pdu_put(var p, (crc >>> (8 * k)) & 0xFF)
+    ll_data.put_u16(var p, o.pea)
+    ll_data.put_u16(var p, o.ceref)
+    ll_data.put_u16(var p, peb)
+    let _g = ll_pdu.pdu_put(var p, (sid & 0x0F) | ((atype & 1) << 4) | (sca_own << 5))
+    let _h = ll_pdu.pdu_put(var p, phy_bit(phy))
+    for k in 0..6
+        let _i = ll_pdu.pdu_put(var p, adva[k] as Int)
+    ll_data.put_u16(var p, ces)
+
+// ── The receiver ────────────────────────────────────────────────────
+
+// The plan of the first window: `due` is the nominal time of the AUX_SYNC_IND with the counter `counter` (an event of the train that C can still
+// listen to), `win` the offset unit its time can be late by, `t_ref` the time of a packet the drift counts from (the widening is the
+// advertiser's accuracy and C's over `due - t_ref`), `pre` the drift of B's clock between the two connection events that B's offset spans, in
+// microseconds.
+@value
+struct Plan
+    ok: Bool
+    due: Int
+    counter: Int
+    win: Int
+    t_ref: Int
+    pre: Int
+
+// The signed difference of two 16-bit counters, the nearest way round.
+@tier(embedded)
+fn diff16(a: Int, b: Int) -> Int
+    let d = (a - b) & 0xFFFF
+    if d >= 0x8000
+        return d - 0x10000
+    d
+
+@tier(embedded)
+fn abs_int(v: Int) -> Int
+    if v < 0
+        return -v
+    v
+
+// The drift to allow for the AUX_SYNC_IND with the counter `pec` (microseconds, rounded up), by the formula of Section 5.1.13.1: the
+// advertiser's and C's clocks over the span from the packet B heard (`peb`), and B's and C's over the span between the connection events B
+// measured in (`ces`) and C received the PDU in (`cet`).  `ppm_a` and `ppm_b` are the accuracies of A and B, `ppm_c` this device's.
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn drift_us(pec: Int, peb: Int, pai_us: Int, cet: Int, ces: Int, ci_us: Int, ppm_a: Int, ppm_b: Int, ppm_c: Int) -> Int
+    let da = (abs_int(diff16(pec, peb)) * pai_us * (ppm_a + ppm_c) + 999999) / 1000000
+    let db = (abs_int(diff16(cet, ces)) * ci_us * (ppm_b + ppm_c) + 999999) / 1000000
+    let both = da + db
+    both + (both * (ppm_a + ppm_b + ppm_c) + 999999) / 1000000
+
+// The drift between the two connection events, the part of `drift_us` that does not grow with the events of the train.
+@tier(embedded)
+fn link_drift_us(cet: Int, ces: Int, ci_us: Int, ppm_b: Int, ppm_c: Int) -> Int
+    (abs_int(diff16(cet, ces)) * ci_us * (ppm_b + ppm_c) + 999999) / 1000000
+
+// Plan the window of the first AUX_SYNC_IND C listens to.  The PDU gave the offset `off_us` (unit `unit_us`) from the connection event
+// `ceref`, the paEventCounter `pea` of the train's event it describes, the counter `peb` of the last event B had, the interval `pai_us`,
+// B's `ces`, and the accuracies `ppm_a` of the advertiser and `ppm_b` of B.  C received it in the connection event `cet`, whose anchor point
+// was `a_t`; `ci_us` is the connection interval.  The window may not open before `now` plus `lead_us`.  The event is the first of the
+// train, counting forward or back from the one named, whose window (widened by the drift) opens that late or later.
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn plan_receive(off_us: Int, unit_us: Int, pea: Int, peb: Int, ceref: Int, ces: Int, pai_us: Int, ppm_a: Int, ppm_b: Int,
+                cet: Int, a_t: Int, ci_us: Int, now: Int, lead_us: Int) -> Plan
+    let ppm_c = ll_link.OWN_PPM
+    let ref_us = a_t + diff16(ceref, cet) * ci_us
+    let tn = ref_us + off_us
+    let need = now + lead_us
+    // The first k whose event starts at `need` or later, counting from the event named.
+    var k = 0
+    if need > tn
+        k = (need - tn + pai_us - 1) / pai_us
+    else
+        k = -((tn - need) / pai_us)
+    var pec = (pea + k) & 0xFFFF
+    var at = tn + k * pai_us
+    var d = drift_us(pec, peb, pai_us, cet, ces, ci_us, ppm_a, ppm_b, ppm_c)
+    for _ in 0..3
+        if at - d - ll_link.JITTER_US < need
+            k = k + 1
+            pec = (pea + k) & 0xFFFF
+            at = tn + k * pai_us
+            d = drift_us(pec, peb, pai_us, cet, ces, ci_us, ppm_a, ppm_b, ppm_c)
+    let span = abs_int(diff16(pec, peb)) * pai_us
+    Plan { ok: true, due: at, counter: pec, win: unit_us, t_ref: at - span, pre: link_drift_us(cet, ces, ci_us, ppm_b, ppm_c) + 1 }
+
+// The synchronization slot `s` takes the train of the PDU in `rx` (its SyncInfo at the octet `at`), described by the plan `pl`: it is the
+// slot of an ordinary synchronization (`ll_per.psync_begin`) with the first window, the counter and the drift of the plan, and the connection
+// `conn` and Service_Data `sdata` of the sender, so that the Host is told with the transfer event.  `timeout` is the Sync_Timeout in units of
+// 10 ms and `now` the time of the plan.
+@satisfies("REQ-BLE-CTL-109")
+@tier(embedded)
+fn psync_begin(var s: PerSync, handle: Int, var rx: Pdu, at: Int, kind: Int, var a: Vec[u8; 6], sid: Int, phy: Int, var pl: Plan,
+               timeout: Int, reports: Bool, conn: Int, sdata: Int, now: Int)
+    ll_per.psync_begin(var s, handle, var rx, at, kind, var a, sid, phy, now, timeout, reports)
+    s.due = pl.due
+    s.win = pl.win
+    s.counter = pl.counter
+    s.t_ref = pl.t_ref
+    s.pre = pl.pre
+    s.past = true
+    s.conn = conn
+    s.sdata = sdata
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@tier(app)
+fn t_addr(seed: Int) -> Vec[u8; 6]
+    var a: Vec[u8; 6] = Vec.new()
+    for k in 0..6
+        let _x = a.push(seed + k)
+    a
+
+@tier(app)
+fn t_offer(off_us: Int) -> Offer
+    Offer { ok: true, pea: 0x1234, at: 0, ceref: 0x0102, ref_us: 0, off_us: off_us }
+
+@tier(app)
+fn t_pdu(off_us: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var a = t_addr(0x10)
+    var o = t_offer(off_us)
+    put_sync_ind(var p, 0xBEEF, var o, 80, 0x1FFFFFFFFF, 3, 0x8E89BED7, 0xA1B2C3, 0x1230, 7, 1, 5, ll_phy.PHY_2M, var a, 0x0100)
+    p
+
+@test
+fn test_the_offset_field_picks_the_unit_and_the_adjust()
+    // Under 245.7 ms the unit is 30 microseconds; at and above it, 300, and at 2.4576 s the adjust adds 2.4576 s.
+    test.assert_eq(offset_field(0), 0)
+    test.assert_eq(offset_field(29970), 999)
+    test.assert_eq(offset_field(245699), 8189)
+    test.assert_eq(offset_field(245700), 819 | (1 << 13))
+    test.assert_eq(offset_field(2457300), 8191 | (1 << 13))
+    test.assert_eq(offset_field(2457600), 0 | (1 << 13) | (1 << 14))
+    test.assert_eq(offset_field(2457600 + 300 * 100), 100 | (1 << 13) | (1 << 14))
+    test.assert_eq(offset_field(4000000), 5141 | (1 << 13) | (1 << 14))
+
+@test
+fn test_the_sync_wr_ind_has_the_fields_of_the_sync_ind_and_the_timing_of_the_train()
+    // [Vol 6] Part B, Section 2.4.2.40: the CtrData of LL_PERIODIC_SYNC_IND, then RspAA (4 octets), Num_Subevents, Subevent_Interval,
+    // Response_Slot_Delay and Response_Slot_Spacing; the opcode is 0x2A and the payload 43 octets with it.
+    var p = ll_pdu.pdu_new()
+    var a = t_addr(0x10)
+    var o = t_offer(29970)
+    var t = ll_per.padv_new()
+    // The AD structure of Section 'Periodic Advertising Response Timing Information': length 9, type 0x32, RspAA, 10 subevents, 15, 1 and 4 units.
+    let timing = [9, 0x32, 0x29, 0x41, 0x76, 0x71, 10, 15, 1, 4]
+    for k in 0..10
+        t.acad[k] = timing[k] as u8
+    put_sync_wr_ind(var p, 0xBEEF, var o, 80, 0x1FFFFFFFFF, 3, 0x8E89BED7, 0xA1B2C3, 0x1230, 7, 1, 5, ll_phy.PHY_2M, var a, 0x0100, var t.acad)
+    var q = t_pdu(29970)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x2A)
+    test.assert_eq(ll_data.dpdu_len(var p), ll_data.ctrl_payload_len(ll_data.OP_PERIODIC_SYNC_WR_IND))
+    test.assert_eq(ll_data.dpdu_len(var p), ll_data.dpdu_len(var q) + 8)
+    test.assert_eq(ll_data.dpdu_u16(var p, AT_ID), 0xBEEF)
+    for k in 1..1 + CTR_OCTETS
+        test.assert_eq(ll_data.dpdu_byte(var p, k), ll_data.dpdu_byte(var q, k))
+    let at = 1 + CTR_OCTETS
+    test.assert_eq(ll_data.dpdu_byte(var p, at), 0x29)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 1), 0x41)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 2), 0x76)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 3), 0x71)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 4), 10)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 5), 15)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 6), 1)
+    test.assert_eq(ll_data.dpdu_byte(var p, at + 7), 4)
+
+@test
+fn test_the_sync_ind_holds_the_fields_in_their_places()
+    var p = t_pdu(29970)
+    test.assert_eq(p.n, 2 + 1 + CTR_OCTETS)
+    test.assert_eq(ll_data.dpdu_len(var p), 1 + CTR_OCTETS)
+    test.assert_eq(ll_data.dpdu_len(var p), ll_data.ctrl_payload_len(ll_data.OP_PERIODIC_SYNC_IND))
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x1C)
+    test.assert_eq(ll_data.dpdu_u16(var p, AT_ID), 0xBEEF)
+    var q = t_pdu(29970)
+    test.assert_eq(rx_offset_us(var q, 2 + AT_SYNC_INFO), 29970)
+    test.assert_eq(ll_per.si_interval(var q, 2 + AT_SYNC_INFO), 80)
+    test.assert_eq(ll_per.si_chmap(var q, 2 + AT_SYNC_INFO), 0x1FFFFFFFFF)
+    test.assert_eq(ll_per.si_sca(var q, 2 + AT_SYNC_INFO), 3)
+    test.assert_eq(ll_per.si_aa(var q, 2 + AT_SYNC_INFO), 0x8E89BED7)
+    test.assert_eq(ll_per.si_crc(var q, 2 + AT_SYNC_INFO), 0xA1B2C3)
+    test.assert_eq(ll_per.si_counter(var q, 2 + AT_SYNC_INFO), 0x1234)
+    test.assert_eq(ll_data.dpdu_u16(var p, AT_CE_REF), 0x0102)
+    test.assert_eq(ll_data.dpdu_u16(var p, AT_LAST_PE), 0x1230)
+    test.assert_eq(ll_data.dpdu_byte(var p, AT_SID), 7 | (1 << 4) | (5 << 5))
+    test.assert_eq(ll_data.dpdu_byte(var p, AT_PHY), 2)
+    for k in 0..6
+        test.assert_eq(ll_data.dpdu_byte(var p, AT_ADVA + k), 0x10 + k)
+    test.assert_eq(ll_data.dpdu_u16(var p, AT_CE_SYNC), 0x0100)
+
+@test
+fn test_an_offset_of_the_pdu_reads_back_with_the_unit_and_the_adjust()
+    for off in [0, 30, 29970, 245670, 245700, 1000000, 2457300, 2457600, 3000000, 4800000]
+        var p = t_pdu(off)
+        let back = rx_offset_us(var p, 2 + AT_SYNC_INFO)
+        let unit = rx_unit_us(var p, 2 + AT_SYNC_INFO)
+        // The offset is rounded down to the unit: the train's packet is no earlier than it and less than a unit later.
+        test.assert(back <= off and off < back + unit)
+
+@test
+fn test_the_phy_field_names_one_phy_or_none()
+    test.assert_eq(phy_bit(ll_phy.PHY_1M), 1)
+    test.assert_eq(phy_bit(ll_phy.PHY_2M), 2)
+    test.assert_eq(phy_bit(ll_phy.PHY_CODED), 4)
+    test.assert_eq(phy_of(1), ll_phy.PHY_1M)
+    test.assert_eq(phy_of(2), ll_phy.PHY_2M)
+    test.assert_eq(phy_of(4), ll_phy.PHY_CODED)
+    test.assert_eq(phy_of(0), 0)
+    test.assert_eq(phy_of(3), 0)
+    test.assert_eq(phy_of(8), 0)
+    test.assert_eq(phy_of(7), 0)
+
+@test
+fn test_the_parameters_are_checked_in_the_order_of_the_command()
+    test.assert_eq(cfg_status(0, 0, 0x0A, 0), OK)
+    test.assert_eq(cfg_status(2, 0x1F3, 0x4000, 0), OK)
+    test.assert_eq(cfg_status(4, 0, 0x0A, 0), E_INVALID)
+    test.assert_eq(cfg_status(1, 0x1F4, 0x0A, 0), E_INVALID)
+    test.assert_eq(cfg_status(1, 0, 9, 0), E_INVALID)
+    test.assert_eq(cfg_status(1, 0, 0x4001, 0), E_INVALID)
+    test.assert_eq(cfg_status(3, 0, 0x0A, 0), E_UNSUPPORTED)
+    test.assert_eq(cfg_status(1, 0, 0x0A, 1), E_UNSUPPORTED)
+    test.assert_eq(cfg_status(1, 0, 0x0A, 0x1F), E_DISALLOWED)
+    test.assert_eq(cfg_status(9, 0, 0x0A, 0x1F), E_DISALLOWED)
+    var g = cfg_new()
+    test.assert_eq(g.mode, MODE_OFF)
+    test.assert(not cfg_reports(var g))
+    cfg_set(var g, 2, 3, 100, 0)
+    test.assert(cfg_reports(var g))
+    var h = cfg_new()
+    cfg_copy(var h, var g)
+    test.assert_eq(h.skip, 3)
+    test.assert_eq(h.timeout, 100)
+    cfg_set(var g, 1, 0, 10, 0)
+    test.assert(not cfg_reports(var g))
+
+@test
+fn test_the_offer_names_the_first_event_after_the_link_anchor_and_a_reference_before_it()
+    // A train of 100 ms (80 units) heard at 1000000 with the counter 500; the link's anchor is at 1230000 (event 40), 30 ms apart, now 1240000.
+    let o = plan_offer(1000000, 500, 100000, 1230000, 40, 30000, 1240000)
+    test.assert(o.ok)
+    // Events at 1000000 + n x 100000: the first at or after 1240000 is the third, 1300000, the counter 503.
+    test.assert_eq(o.at, 1300000)
+    test.assert_eq(o.pea, 503)
+    // The reference is the last connection event at or before it: (1300000 - 1230000) / 30000 = 2 events on, an offset of 10000.
+    test.assert_eq(o.ceref, 42)
+    test.assert_eq(o.ref_us, 1290000)
+    test.assert_eq(o.off_us, 10000)
+
+@test
+fn test_the_offer_keeps_the_offset_under_one_interval_for_a_long_train()
+    // A train of 40 s heard at 0; the link has an interval of 7.5 ms and its anchor at 1000000 (event 65530): the next event is at 40 s.
+    let o = plan_offer(0, 0xFFFF, 40000000, 1000000, 65530, 7500, 1000000)
+    test.assert(o.ok)
+    test.assert_eq(o.pea, 0)
+    test.assert_eq(o.at, 40000000)
+    test.assert(o.off_us >= 0 and o.off_us < 7500)
+    // The reference counter wraps, and is no further than the 14 bits of the specification.
+    test.assert_eq(o.ceref, (65530 + (40000000 - 1000000) / 7500) & 0xFFFF)
+    test.assert(((o.ceref - 65530) & 0xFFFF) < 0x4000)
+
+@test
+fn test_a_train_further_than_the_counter_reaches_is_not_offered()
+    // A guard: no interval of the specification (81.9 s at most) puts an event more than 14 bits of 7.5 ms intervals away.
+    let o = plan_offer(0, 0, 200000000, 1000000, 1, 7500, 1000000)
+    test.assert(not o.ok)
+
+@test
+fn test_the_drift_follows_the_formula_of_the_specification()
+    // A at 50 ppm, B at 100 ppm, C at 50: Da over 10 events of 100 ms is 1 s x 100 ppm = 100 us, Db over 4 events of 30 ms is 120 ms x 150 ppm = 18 us.
+    let d = drift_us(510, 500, 100000, 44, 40, 30000, 50, 100, 50)
+    test.assert(d >= 118 and d <= 120)
+    test.assert_eq(link_drift_us(44, 40, 30000, 100, 50), 18)
+    // The counters are compared the nearest way round.
+    test.assert_eq(drift_us(2, 0xFFFE, 100000, 0, 0, 30000, 50, 100, 50), drift_us(0xFFFE, 2, 100000, 0, 0, 30000, 50, 100, 50))
+    test.assert_eq(diff16(2, 0xFFFE), 4)
+    test.assert_eq(diff16(0xFFFE, 2), -4)
+
+@test
+fn test_the_receiver_listens_to_the_first_event_whose_window_opens_late_enough()
+    // The PDU arrived in event 100 (anchor 5000000), connection interval 30 ms, offset 20 ms counted from event 103 (anchor 5090000): the AUX_SYNC_IND
+    // named is at 5110000, the counter 700 of a train of 100 ms.  Now is 5001000, the window may not open before 5003000.
+    let pl = plan_receive(20010, 30, 700, 699, 103, 98, 100000, 50, 50, 100, 5000000, 30000, 5001000, 2000)
+    test.assert(pl.ok)
+    test.assert_eq(pl.win, 30)
+    // 5110000 is the nominal time of the event named; the first event whose window opens at 5003000 or later: 5110000 - 100000 = 5010000 is
+    // the one before (counter 699), whose window opens a drift before that.
+    test.assert_eq(pl.counter, 699)
+    test.assert_eq(pl.due, 5110010 - 100000)
+    test.assert(pl.due - 100 >= 5003000)
+    // The widening counts from the packet B heard (counter 699): none for the event of that counter.
+    test.assert_eq(pl.t_ref, pl.due)
+    test.assert(pl.pre > 0)
+
+@test
+fn test_the_receiver_moves_on_when_the_event_is_too_close()
+    // The same PDU but now is 5009000: the event at 5010010 (counter 699) opens its window before the lead, so the plan takes the next.
+    let pl = plan_receive(20010, 30, 700, 699, 103, 98, 100000, 50, 50, 100, 5000000, 30000, 5009000, 2000)
+    test.assert_eq(pl.counter, 700)
+    test.assert_eq(pl.due, 5110010)
+    test.assert_eq(pl.t_ref, 5110010 - 100000)
+
+@test
+fn test_the_receiver_counts_back_when_the_train_is_far_ahead()
+    // An offset of 4 s from a connection event: the train of 100 ms has events in between, and the plan listens to the first of them.
+    let pl = plan_receive(2457600 + 300 * 4000, 300, 900, 899, 100, 100, 100000, 50, 50, 100, 5000000, 30000, 5001000, 2000)
+    // The nominal time is 5000000 + 2457600 + 1200000 = 8657600; 36 events of 100 ms back is 5057600, the first at or after 5003000.
+    test.assert_eq(pl.counter, 864)
+    test.assert_eq(pl.due, 5057600)
+    test.assert_eq(pl.t_ref, 5057600 - 35 * 100000)

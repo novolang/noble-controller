@@ -1,0 +1,222 @@
+// src/ll_sub.nv — Connection Subrating of the Link Layer: the PDUs LL_SUBRATE_REQ and LL_SUBRATE_IND, the grid of
+// subrated and continuation connection events, and the arithmetic of the Central's answer to a request.
+//
+// [Vol 6] Part B, Sections 2.4.2.36, 2.4.2.37, 4.5.1, 5.1.19 and 5.1.20; [Vol 4] Part E, Sections 7.7.65.35, 7.8.123 and 7.8.124.  A
+// connection with a subrate factor F carries data on one connection event in F (a subrated event) and on the continuation events that
+// follow an event with data; the events between are counted but not used.  The Central starts the update with LL_SUBRATE_IND, on its own
+// or because the Peripheral asked with LL_SUBRATE_REQ, and the Peripheral applies it when it receives it.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.sub_on()`) says whether the build has the feature.
+
+use std.test
+use ll_pdu
+use ll_data
+
+// 1 in a build with Connection Subrating (feature bits 37 and 38), 0 in one without it.
+
+const FACTOR_MAX = 500
+
+// The interval range a Peripheral may ask for before the Host says otherwise (LE Set Default Rate Parameters): 7.5 ms to 4 s, in units of 125 us,
+// the least in the low 16 bits and the greatest above (`ll_rate.pack`).
+const ALLOW_IV = 0x7D00003C
+const E_UNSUPPORTED_PARAM = 0x20
+const E_DIFFERENT_TRANSACTION = 0x23
+const E_UNSUPPORTED_FEATURE = 0x1A
+const E_UNACCEPTABLE = 0x3B
+
+// The procedure waits no longer than the Link Layer's other procedures do.
+const WAIT_US = 40000000
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// LL_SUBRATE_REQ: the least and greatest factor, the greatest latency, the continuation number and the supervision timeout.
+@tier(embedded)
+fn put_req(var p: Pdu, fmin: Int, fmax: Int, lat: Int, cont: Int, timeout: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_SUBRATE_REQ)
+    put16(var p, fmin)
+    put16(var p, fmax)
+    put16(var p, lat)
+    put16(var p, cont)
+    put16(var p, timeout)
+    ll_data.dpdu_finish(var p)
+
+// LL_SUBRATE_IND: the factor, the base event, the latency, the continuation number and the supervision timeout now in force.
+@tier(embedded)
+fn put_ind(var p: Pdu, factor: Int, base: Int, lat: Int, cont: Int, timeout: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_SUBRATE_IND)
+    put16(var p, factor)
+    put16(var p, base)
+    put16(var p, lat)
+    put16(var p, cont)
+    put16(var p, timeout)
+    ll_data.dpdu_finish(var p)
+
+@tier(embedded)
+fn put16(var p: Pdu, v: Int)
+    let _a = ll_pdu.pdu_put(var p, v & 0xFF)
+    let _b = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+
+// The 16-bit field at payload octet `i` (counted from the opcode as octet 0).
+@tier(embedded)
+fn get16(var p: Pdu, i: Int) -> Int
+    ll_data.dpdu_byte(var p, i) | (ll_data.dpdu_byte(var p, i + 1) << 8)
+
+// ── The grid ────────────────────────────────────────────────────────
+
+// The residue of a base event: events whose counter minus the residue is a multiple of the factor are subrated events.  The counter
+// is 16 bits; a base event whose bits 15-14 are 0b11 while the counter is in its first quarter belongs to the epoch before the wrap, so
+// the residue is that of the base less 65536 (Section 5.1.19).
+@tier(embedded)
+fn residue(base: Int, factor: Int, ev_count: Int) -> Int
+    let r = base % factor
+    if ((base >>> 14) & 3) == 3 and ((ev_count >>> 14) & 3) == 0
+        return wrap(r, factor)
+    r
+
+// The residue after the event counter wrapped from 65535 to 0 (Section 4.5.1).
+@tier(embedded)
+fn wrap(r: Int, factor: Int) -> Int
+    let m = 65536 % factor
+    (r + factor - m) % factor
+
+// Whether the event `evc` is a subrated event of the grid with `factor` and residue `r`.
+@tier(embedded)
+fn on_grid(evc: Int, r: Int, factor: Int) -> Bool
+    factor <= 1 or ((evc + factor - r) % factor) == 0
+
+// ── The Central's answer to a request ───────────────────────────────
+
+// What the Host allows the peer to ask for (HCI_LE_Set_Default_Subrate and HCI_LE_Subrate_Request; for Connection Rate also the interval range
+// `aiv`, from HCI_LE_Set_Default_Rate_Parameters and HCI_LE_Connection_Rate_Request) and the request this end has out.  A Connection Rate
+// request this end has out is the same record with its interval range in `iv` (0 for a Connection Subrating request).
+@value
+struct Sub
+    amin: Int
+    amax: Int
+    alat: Int
+    acont: Int
+    ato: Int
+    wait: Bool
+    sent: Bool
+    host: Bool
+    t0: Int
+    fmin: Int
+    fmax: Int
+    lat: Int
+    cont: Int
+    to: Int
+    iv: Int
+    aiv: Int
+
+@tier(embedded)
+fn sub_new() -> Sub
+    Sub { amin: 1, amax: 1, alat: 0, acont: 0, ato: 0x0C80, wait: false, sent: false, host: false, t0: 0,
+          fmin: 1, fmax: 1, lat: 0, cont: 0, to: 0x0C80, iv: 0, aiv: ALLOW_IV }
+
+// Whether a Central accepts the request (fmin, fmax, lat, to) at the interval `interval` (1.25 ms) given what the Host allows: the
+// five conditions of Section 5.1.20.
+@tier(embedded)
+fn req_ok(var s: Sub, interval: Int, fmin: Int, fmax: Int, lat: Int, to: Int) -> Bool
+    fmin >= 1 and fmax <= FACTOR_MAX and fmin <= fmax and lat <= s.alat and to <= s.ato and fmax >= s.amin and fmin <= s.amax
+        and interval * fmin * (lat + 1) < to * 4
+
+// The factor an accepted request gets: the least in both ranges.
+@tier(embedded)
+fn pick_factor(var s: Sub, fmin: Int) -> Int
+    if fmin > s.amin
+        fmin
+    else
+        s.amin
+
+// The latency an accepted request gets at `factor`: the least of the two limits, lowered until the factor times (latency + 1) is within
+// 500 and twice the interval times it is within the timeout; -1 when no latency fits.  A latency is at most 499, so FACTOR_MAX
+// decrements reach -1.
+@tier(embedded)
+fn pick_latency(var s: Sub, interval: Int, factor: Int, lat: Int, to: Int) -> Int
+    var l = lat
+    if s.alat < l
+        l = s.alat
+    for _ in 0..FACTOR_MAX
+        if l < 0 or (factor * (l + 1) <= FACTOR_MAX and interval * factor * (l + 1) < to * 4)
+            break
+        l = l - 1
+    l
+
+// The timeout an accepted request gets.
+@tier(embedded)
+fn pick_timeout(var s: Sub, to: Int) -> Int
+    if to < s.ato
+        to
+    else
+        s.ato
+
+// The continuation number: the greater of what the Host allows and the peer asked, below the factor.
+@tier(embedded)
+fn pick_cont(var s: Sub, factor: Int, cont: Int) -> Int
+    var c = cont
+    if s.acont > c
+        c = s.acont
+    if c > factor - 1
+        c = factor - 1
+    c
+
+// The limits the Host allows, with no request out.
+@tier(embedded)
+fn allow(amin: Int, amax: Int, alat: Int, acont: Int, ato: Int) -> Sub
+    Sub { amin: amin, amax: amax, alat: alat, acont: acont, ato: ato, wait: false, sent: false, host: false, t0: 0,
+          fmin: 1, fmax: 1, lat: 0, cont: 0, to: 0x0C80, iv: 0, aiv: ALLOW_IV }
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_pdu_layouts()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, 2, 8, 1, 3, 0x0100)
+    test.assert_eq(ll_data.dpdu_len(var p), 11)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x26)
+    test.assert_eq(get16(var p, 1), 2)
+    test.assert_eq(get16(var p, 3), 8)
+    test.assert_eq(get16(var p, 5), 1)
+    test.assert_eq(get16(var p, 7), 3)
+    test.assert_eq(get16(var p, 9), 0x0100)
+    put_ind(var p, 4, 0x4001, 0, 3, 0x0C80)
+    test.assert_eq(ll_data.dpdu_len(var p), 11)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x27)
+    test.assert_eq(get16(var p, 1), 4)
+    test.assert_eq(get16(var p, 3), 0x4001)
+    test.assert_eq(get16(var p, 9), 0x0C80)
+
+@test
+fn test_grid_and_wrap()
+    test.assert(on_grid(10, 0, 5))
+    test.assert(not on_grid(11, 0, 5))
+    test.assert(on_grid(11, 1, 5))
+    test.assert(on_grid(7, 3, 1))
+    test.assert_eq(residue(12, 5, 100), 2)
+    // 65536 mod 5 = 1: after the wrap the residue moves down by one.
+    test.assert_eq(wrap(2, 5), 1)
+    test.assert_eq(wrap(0, 5), 4)
+    test.assert_eq(wrap(3, 4), 3)
+    // A base from before the wrap seen after it.
+    test.assert_eq(residue(0xFFF0, 5, 3), wrap(0xFFF0 % 5, 5))
+    test.assert_eq(residue(0xFFF0, 5, 0xFFF1), 0xFFF0 % 5)
+
+@test
+fn test_acceptance_rules()
+    var s = allow(2, 8, 2, 1, 400)
+    test.assert(req_ok(var s, 24, 3, 6, 1, 300))
+    test.assert(not req_ok(var s, 24, 3, 6, 3, 300))
+    test.assert(not req_ok(var s, 24, 3, 6, 1, 500))
+    test.assert(not req_ok(var s, 24, 9, 12, 1, 300))
+    test.assert(not req_ok(var s, 24, 1, 1, 1, 300))
+    test.assert(not req_ok(var s, 24, 8, 8, 2, 100))
+    test.assert_eq(pick_factor(var s, 1), 2)
+    test.assert_eq(pick_factor(var s, 5), 5)
+    test.assert_eq(pick_latency(var s, 24, 5, 9, 300), 2)
+    test.assert_eq(pick_latency(var s, 24, 60, 2, 400), 0)
+    test.assert_eq(pick_latency(var s, 100, 60, 2, 400), -1)
+    test.assert_eq(pick_timeout(var s, 300), 300)
+    test.assert_eq(pick_timeout(var s, 900), 400)
+    test.assert_eq(pick_cont(var s, 5, 0), 1)
+    test.assert_eq(pick_cont(var s, 5, 9), 4)
+    test.assert_eq(pick_cont(var s, 1, 9), 0)

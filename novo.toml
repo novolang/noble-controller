@@ -1,0 +1,235 @@
+[package]
+name        = "noble-controller"
+version     = "0.1.0"
+description = "The portable Bluetooth Low Energy Link Layer and HCI command handler of the noble stack: advertising, scanning, connections, encryption, extended and periodic advertising, isochronous channels, power control, subrating and the other LE features of Core 6.3.  Reads the radio, the clock and the cipher only through the noble-radio traits and the HCI seam through noble-hci."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["bluetooth", "ble", "controller", "link-layer", "hci", "isochronous", "embedded"]
+repository  = "https://github.com/novolang/noble-controller"
+maintainers = ["novo-lang"]
+novo        = ">= 0.22.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and effect-checks every module under `src/` and writes no binary.
+
+# The embedded tier of orbit/ble, whose images (the Novo Controller on the nRF54LM20, the co-resident Host and Controller)
+# link this package.
+[tier]
+tier   = "embedded"
+target = "nrf52832-dk"
+
+# The modules were written as the embedded tier of orbit/ble and keep their `@tier(embedded)` marks.  Some of their functions
+# build a list or call `list.append`, which the embedded tier refuses (E4000); orbit/ble carries the same findings under the
+# same knob, and the package reports them as warnings until the codecs are written over fixed-capacity buffers.
+sibling_check = "warn"
+
+[docs.pages]
+"README.md"           = "The Link Layer and HCI command handler of the noble stack"
+"docs/controller.md"  = "Modules, configuration and the radio seam"
+
+[publish]
+coverage_floor = 0
+
+[dependencies]
+noble-hci   = { path = "../noble-hci" }
+noble-radio = { path = "../noble-radio" }
+
+# Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Controller.  A consumer writes a
+# [noble-controller] section in its config file; the generated module is `noble_controller_config`, read in the sources as
+# `noble_controller_config.CTL_LINKS`.  The keys keep the names they had in the schema of orbit/ble, where they were `ctl_*`.
+# The storage the keys add up to is stated by `bytes`, `bytes_expr`, `floor` and `floor_when`, one term for each record the
+# Controller declares, so that `novo config explain` prints the figure `src/ctl_budget.nv` recomputes.
+[config.ctl_links]
+type    = "int"
+default = 2
+min     = 1
+max     = 8
+bytes_expr = "2 * (((ctl_links) * 32 + 15) / 8 * 8) + 32 + ((ctl_links) * 48 + 15) / 8 * 8"
+doc     = "connection slots of the Controller (ctl_hci.nv), both roles; the Controller's storage"
+
+[config.ctl_peripheral]
+type    = "int"
+default = 1
+min     = 0
+max     = 8
+at_most = "ctl_links"
+doc     = "connections the Controller holds as Peripheral at once, at most CTL_LINKS"
+
+[config.ctl_central]
+type    = "int"
+default = 1
+min     = 0
+max     = 8
+at_most = "ctl_links"
+doc     = "connections the Controller holds as Central at once, at most CTL_LINKS"
+
+[config.ctl_cis]
+type    = "int"
+default = 0
+min     = 0
+max     = 8
+bytes = 4568
+floor = 2176
+doc     = "connected isochronous streams the Controller holds (ll_iso.nv), 0 for a build without isochronous channels; the Controller's storage"
+
+[config.ctl_cigs]
+type     = "int"
+default  = 0
+min      = 0
+max      = 8
+at_most  = "ctl_cis"
+zero_iff = "ctl_cis"
+bytes = 128
+floor = 128
+doc      = "connected isochronous groups the Controller holds as Central, 0 exactly when CTL_CIS is 0"
+
+[config.ctl_bigs]
+type     = "int"
+default  = 0
+min      = 0
+max      = 4
+requires = ["ctl_cis", "ctl_per_adv"]
+bytes = 576
+floor = 576
+doc      = "broadcast isochronous groups the Controller holds, as Isochronous Broadcaster or Synchronized Receiver (ll_big.nv); 0 for a build without them, which then answers none of their commands; needs CTL_CIS and CTL_PER_ADV; the Controller's storage"
+
+[config.ctl_bis]
+type     = "int"
+default  = 0
+min      = 0
+max      = 31
+zero_iff = "ctl_bigs"
+at_least = "ctl_bigs"
+bytes = 4568
+floor = 4568
+floor_when = "ctl_cis"
+doc      = "broadcast isochronous streams the Controller holds, of all its groups, 0 exactly when CTL_BIGS is 0"
+
+[config.ctl_adv_sets]
+type    = "int"
+default = 2
+min     = 0
+max     = 4
+bytes_expr = "ctl_adv_sets * (288 + 2 * ((ctl_adv_data + 15) / 8 * 8))"
+floor = 320
+doc     = "advertising sets the Controller holds for the extended advertising commands (ll_xadv.nv), 0 for a build without them; the Controller's storage"
+
+[config.ctl_adv_data]
+type    = "int"
+default = 251
+min     = 31
+max     = 1650
+unit    = "bytes"
+doc     = "octets of advertising data, and of scan response data, one advertising set holds, which LE Read Maximum Advertising Data Length answers (31 to 1650)"
+
+[config.ctl_per_adv]
+type    = "int"
+default = 1
+min     = 0
+max     = 4
+at_most = "ctl_adv_sets"
+bytes_expr = "ctl_per_adv * (304 + (ctl_adv_data + 15) / 8 * 8)"
+floor = 320
+doc     = "periodic advertising trains the Controller advertises (ll_per.nv), at most CTL_ADV_SETS; 0 for a build without periodic advertising and synchronization, which then answers none of their commands; the Controller's storage"
+
+[config.ctl_per_sync]
+type     = "int"
+default  = 2
+min      = 0
+max      = 4
+zero_iff = "ctl_per_adv"
+bytes_expr = "ctl_per_sync * 264 + 152"
+floor = 416
+doc      = "periodic advertising trains the Controller synchronizes to at once, 0 exactly when CTL_PER_ADV is 0"
+
+[config.ctl_per_list]
+type    = "int"
+default = 4
+min     = 1
+max     = 255
+doc     = "entries of the Periodic Advertiser List the Controller holds"
+
+[config.ctl_past]
+type     = "bool"
+default  = false
+requires = ["ctl_per_adv"]
+doc      = "on when the Controller sends and receives Periodic Advertising Sync Transfer (ll_past.nv), off for a build without it, which then answers none of its commands and leaves LE features 24 and 25 clear; needs CTL_PER_ADV"
+
+[config.ctl_pcl]
+type    = "bool"
+default = false
+bytes_expr = "((ctl_links) * 192 + 15) / 8 * 8"
+floor = 200
+doc     = "on when the Controller answers and sends LE Power Control (ll_pcl.nv: the Power Control Request and Power Change Indication procedures and the commands and event that report the levels), off for a build without it, which then answers none of its commands and leaves LE features 33 and 34 clear"
+
+[config.ctl_subrate]
+type    = "bool"
+default = false
+bytes_expr = "((ctl_links) * 136 + 15) / 8 * 8"
+floor = 144
+doc     = "on when the Controller answers and sends Connection Subrating (ll_sub.nv: the Connection Subrate Update and Request procedures, the skipped events and the commands and event that report them), off for a build without it, which then answers none of its commands and leaves LE features 37 and 38 clear"
+
+[config.ctl_featpages]
+type    = "bool"
+default = false
+doc     = "on when the Controller exchanges feature pages above page 0 (ll_feat.nv: LL_FEATURE_EXT_REQ and LL_FEATURE_EXT_RSP, LE Read All Local Supported Features, LE Read All Remote Features and its Complete event), off for a build without it, which then answers none of the commands and the two PDUs with LL_UNKNOWN_RSP and leaves LE feature 63 clear"
+
+[config.ctl_ploss]
+type     = "bool"
+default  = false
+requires = ["ctl_pcl"]
+doc      = "on when the Controller monitors the path loss of a connection (ll_ploss.nv: LE Set Path Loss Reporting Parameters, LE Set Path Loss Reporting Enable and the LE Path Loss Threshold event, from the transmit level LE Power Control learns and the received signal strength), off for a build without it, which then answers none of its commands and leaves LE feature 35 clear; needs CTL_PCL"
+
+[config.ctl_peersca]
+type     = "bool"
+default  = false
+requires = ["ctl_cis"]
+doc      = "on when the Host can ask the peer for its Sleep Clock Accuracy (ll_sca.nv: LE Request Peer SCA and the LE Request Peer SCA Complete event, over LL_CLOCK_ACCURACY_REQ and RSP), off for a build without it, which then answers the command with Unknown HCI Command; needs CTL_CIS, whose build carries the two PDUs"
+
+[config.ctl_connrate]
+type     = "bool"
+default  = false
+requires = ["ctl_subrate", "ctl_featpages"]
+doc      = "on when the Controller answers and sends Connection Rate (ll_rate.nv: LL_CONNECTION_RATE_REQ and LL_CONNECTION_RATE_IND, LE Connection Rate Request, LE Set Default Rate Parameters, LE Read Minimum Supported Connection Interval, LE Set Host Feature [v2] and the LE Connection Rate Change event, intervals of 1.25 ms and its multiples), off for a build without it, which then answers none of its commands and the two PDUs with LL_UNKNOWN_RSP and leaves LE feature 72 clear; needs CTL_SUBRATE and CTL_FEATPAGES"
+
+[config.ctl_framespace]
+type     = "bool"
+default  = false
+requires = ["ctl_featpages"]
+doc      = "on when the Controller answers and sends Frame Space Update (ll_fs.nv: LL_FRAME_SPACE_REQ and LL_FRAME_SPACE_RSP, LE Frame Space Update and the LE Frame Space Update Complete event; the frame space kept is 150 microseconds), off for a build without it, which then answers its command with Unknown HCI Command and the two PDUs with LL_UNKNOWN_RSP and leaves bit 65 of page 1 clear; needs CTL_FEATPAGES"
+
+[config.ctl_pawr_adv]
+type     = "bool"
+default  = false
+requires = ["ctl_per_adv", "ctl_adv_sets"]
+doc      = "on when the Controller advertises periodic trains with responses (ll_pawr.nv), off for a build without it, which then answers Unsupported Feature or Parameter Value to a train with subevents and leaves LE feature 43 clear; needs CTL_PER_ADV"
+
+[config.ctl_pawr_sync]
+type     = "bool"
+default  = false
+requires = ["ctl_per_adv", "ctl_adv_sets"]
+doc      = "on when the Controller synchronizes to periodic trains with responses and sends the responses, off for a build without it, which then leaves LE feature 44 clear and does not synchronize to such a train; needs CTL_PER_ADV"
+
+[config.ctl_pawr_data]
+type    = "int"
+default = 0
+min     = 0
+max     = 252
+unit    = "bytes"
+max_key = "ctl_adv_data"
+when    = ["ctl_pawr_adv", "ctl_pawr_sync"]
+bytes_expr = "(ctl_pawr_adv * max(1, ctl_per_adv) + (1 - ctl_pawr_adv)) * (144 + ctl_pawr_bufs * (56 + (ctl_pawr_data + 7) / 8 * 8) + (2 * ctl_pawr_data + 8 + 7) / 8 * 8) + (ctl_pawr_sync * max(1, ctl_per_sync) + (1 - ctl_pawr_sync)) * (64 + ctl_pawr_bufs * (56 + (ctl_pawr_data + 7) / 8 * 8))"
+floor = 344
+min_when = [{ when = "ctl_pawr_adv", min = 1 }, { when = "ctl_pawr_sync", min = 1 }]
+doc     = "octets of data one subevent (advertiser) or one response (synchronizer) holds, 1 to 252, within CTL_ADV_DATA; 0 when neither side of PAwR is on"
+
+[config.ctl_pawr_bufs]
+type    = "int"
+default = 0
+min     = 0
+max     = 8
+unit    = "buffers"
+when    = ["ctl_pawr_adv", "ctl_pawr_sync"]
+min_when = [{ when = "ctl_pawr_adv", min = 1 }, { when = "ctl_pawr_sync", min = 1 }]
+doc     = "buffers of subevent data the advertiser keeps, and of responses each synchronization keeps, 1 to 8; 0 when neither side of PAwR is on"

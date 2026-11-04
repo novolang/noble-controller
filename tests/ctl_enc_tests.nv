@@ -1,0 +1,1246 @@
+// tests/ctl_enc_tests.nv — the Encryption Start and Encryption Pause procedures
+// of the Link Layer, run between two Controllers: one the Central of a connection,
+// one the Peripheral, each driven by its own Host's HCI commands, with the
+// software AES-CCM backend (`ll_ccm.nv`) under both and the sample data of
+// [Vol 6] Part C, Section 1 as the check of the octets on air.
+//
+// The two ends run the contract the radio program follows (ll_air.nv):
+// the PDUs in flight are sealed into a mirror when the event begins and again
+// whenever the Link Layer says they changed (`dirty`), the answer to a packet is
+// taken from the mirror before the packet is read, and a received packet is opened
+// before `ctl_conn_rx_slow` reads it.  Random octets for the diversifiers come from
+// a list the test gives each end.  An event can go unheard by the Peripheral
+// (`mute`) or its answer can be lost (`lose`), and one packet of the run can have an
+// octet changed on air (`bad_to_b`, `bad_to_a`).
+
+use std.test
+use ctl_hci
+use ctl_pool
+use ll_pdu
+use ll_data
+use ll_link
+use ll_cipher
+use ll_ccm
+
+// ── The Hosts' side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn host_read(var c: ctl_hci.Controller, var log: [Int])
+    let _ran = ctl_hci.ctl_step(var c)
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(log, ctl_hci.ctl_tx_next(var c))
+
+fn cmd(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> [Int]
+    var out: [Int] = []
+    send(c, opcode, params)
+    host_read(var c, var out)
+    for b in out
+        list.push(log, b)
+    out
+
+// Split the octets into packets: an event (0x04) or an ACL packet (0x02).
+fn packets_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i < list.len(bytes)
+        var n = 3 + bytes[i + 2]
+        if bytes[i] == 0x02
+            n = 5 + bytes[i + 3]
+        var e: [Int] = []
+        for k in 0..n
+            list.push(e, bytes[i + k])
+        list.push(out, e)
+        i = i + n
+    out
+
+fn events_coded(bytes: [Int], code: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x04 and e[1] == code
+            list.push(out, e[:])
+    out
+
+fn meta_events(bytes: [Int], sub: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in events_coded(bytes, 0x3E)
+        if e[3] == sub
+            list.push(out, e[:])
+    out
+
+fn acl_data(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x02
+            var d: [Int] = []
+            for k in 5..list.len(e)
+                list.push(d, e[k])
+            list.push(out, d)
+    out
+
+fn status_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> Int
+    let r = cmd(c, log, opcode, params)
+    let st = events_coded(r, 0x0F)
+    test.assert_eq(list.len(st), 1)
+    test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
+    st[0][3]
+
+fn complete_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> Int
+    let r = cmd(c, log, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
+    done[0][6]
+
+fn host_acl(handle: Int, pb: Int, data: [Int]) -> [Int]
+    var p: [Int] = [0x02, handle & 0xFF, ((handle >>> 8) & 0x0F) | (pb << 4), list.len(data), 0]
+    for d in data
+        list.push(p, d)
+    p
+
+fn feed(var c: ctl_hci.Controller, bytes: [Int])
+    for b in bytes
+        ctl_hci.ctl_rx(var c, b)
+
+fn cat(a: [Int], b: [Int]) -> [Int]
+    var out: [Int] = []
+    for x in a
+        list.push(out, x)
+    for x in b
+        list.push(out, x)
+    out
+
+// ── The sample data of [Vol 6] Part C, Section 1 ────────────────────
+
+fn s_ltk() -> [Int]
+    [0xBF, 0x01, 0xFB, 0x9D, 0x4E, 0xF3, 0xBC, 0x36, 0xD8, 0x74, 0xF5, 0x39, 0x41, 0x38, 0x68, 0x4C]
+
+fn s_rand() -> [Int]
+    [0x90, 0x78, 0x56, 0x34, 0x12, 0xEF, 0xCD, 0xAB]
+
+// SKD_C and IV_C, then SKD_P and IV_P, as each end draws them.
+fn s_rnd_central() -> [Int]
+    [0x13, 0x02, 0xF1, 0xE0, 0xDF, 0xCE, 0xBD, 0xAC, 0x24, 0xAB, 0xDC, 0xBA]
+
+fn s_rnd_peripheral() -> [Int]
+    [0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xBE, 0xBA, 0xAF, 0xDE]
+
+fn s_sk() -> [Int]
+    [0x66, 0xC6, 0xC2, 0x27, 0x8E, 0x3B, 0x8E, 0x05, 0x3E, 0x7E, 0xA3, 0x26, 0x52, 0x1B, 0xAD, 0x99]
+
+fn s_data1() -> [Int]
+    [0x17, 0x00, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71,
+     0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30]
+
+fn s_data2() -> [Int]
+    [0x17, 0x00, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+     0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51]
+
+// The encrypted payload and MIC of data packet 1 of the sample, in each direction.
+fn s_air1() -> [Int]
+    [0x7A, 0x70, 0xD6, 0x64, 0x15, 0x22, 0x6D, 0xF2, 0x6B, 0x17, 0x83, 0x9A, 0x06, 0x04, 0x05, 0x59, 0x6B, 0xD6,
+     0x56, 0x4F, 0x79, 0x6B, 0x5B, 0x9C, 0xE6, 0xFF, 0x32, 0xF7, 0x5A, 0x6D, 0x33]
+
+fn s_air2() -> [Int]
+    [0xF3, 0x88, 0x81, 0xE7, 0xBD, 0x94, 0xC9, 0xC3, 0x69, 0xB9, 0xA6, 0x68, 0x46, 0xDD, 0x47, 0x86, 0xAA, 0x8C,
+     0x39, 0xCE, 0x54, 0x0D, 0x0D, 0xAE, 0x3A, 0xDC, 0xDF, 0x89, 0xB9, 0x60, 0x88]
+
+// ── The two ends ────────────────────────────────────────────────────
+
+fn host_ctl(first: Int, le_mask: Int) -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, first + i)
+    var trace: [Int] = []
+    test.assert_eq(complete_of(var c, var trace, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(complete_of(var c, var trace, 0x2001, [le_mask, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c
+
+struct World
+    var a: ctl_hci.Controller
+    var b: ctl_hci.Controller
+    var ca: ll_ccm.SoftCipher
+    var cb: ll_ccm.SoftCipher
+    var ma: Pdu
+    var na: Pdu
+    var mb: Pdu
+    var nb: Pdu
+    var ha: [Int]
+    var hb: [Int]
+    var air_a: [[Int]]
+    var air_b: [[Int]]
+    var rnd_a: [Int]
+    var rnd_b: [Int]
+    var bad_to_b: Bool
+    var bad_to_a: Bool
+    var count: Int
+    var s: Int
+
+fn conn_req(aa: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 0, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0xA0 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0xB0 + i)
+    for k in 0..4
+        let _c = ll_pdu.pdu_put(var p, (aa >>> (8 * k)) & 0xFF)
+    for b in [0x11, 0x22, 0x33, 2]
+        let _d = ll_pdu.pdu_put(var p, b)
+    for v in [0, 24, 0, 400]
+        let _e = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _f = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _g = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn world() -> World
+    world_in(0)
+
+// A connection held in the slot `s` of both Controllers: the handle is `s + 1`.
+fn world_in(s: Int) -> World
+    var a = host_ctl(0xA0, 0x3F)
+    var b = host_ctl(0xB0, 0x3F)
+    var req = conn_req(0x50655A12)
+    if s == 0
+        ll_link.link_open_central(var a.links[0], 1, var req, 1000)
+        ll_link.link_open(var b.links[0], 1, var req, 1000)
+    else
+        ll_link.link_open_central(var a.links[1], 2, var req, 1000)
+        ll_link.link_open(var b.links[1], 2, var req, 1000)
+    var w = World { a: a, b: b, ca: ll_ccm.soft_cipher_new(), cb: ll_ccm.soft_cipher_new(),
+                    ma: ll_pdu.pdu_new(), na: ll_pdu.pdu_new(), mb: ll_pdu.pdu_new(), nb: ll_pdu.pdu_new(),
+                    ha: [], hb: [], air_a: [], air_b: [], rnd_a: s_rnd_central(), rnd_b: s_rnd_peripheral(),
+                    bad_to_b: false, bad_to_a: false, count: 0, s: s }
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+    w
+
+// What the radio program does when it mirrors a link's PDUs into radio memory.
+fn mirror(var c: ctl_hci.Controller, s: Int, var cc: ll_ccm.SoftCipher, var cur: Pdu, var nxt: Pdu)
+    ctl_hci.ctl_conn_air(var c, s, var cc, false, var cur)
+    ctl_hci.ctl_conn_air(var c, s, var cc, true, var nxt)
+    ctl_hci.ctl_conn_mirrored(var c, s)
+
+fn rnd_vec(v: [Int]) -> Vec[u8; 12]
+    var out: Vec[u8; 12] = Vec.new()
+    for i in 0..12
+        let _a = out.push(v[i] as u8)
+    out
+
+// The next twelve octets after `v`.
+fn rnd_next(var v: [Int])
+    for i in 0..12
+        v[i] = (v[i] + 17) & 0xFF
+
+// The program's turn between events: give a link that waits for random octets or
+// for the cipher what it needs.
+fn secure(var w: World)
+    if ctl_hci.ctl_secure_wanted(var w.a)
+        var ra = rnd_vec(w.rnd_a)
+        if ctl_hci.ctl_secure_poll(var w.a, var w.ca, var ra, ctl_hci.ctl_wants_random(var w.a))
+            rnd_next(var w.rnd_a)
+    if ctl_hci.ctl_secure_wanted(var w.b)
+        var rb = rnd_vec(w.rnd_b)
+        if ctl_hci.ctl_secure_poll(var w.b, var w.cb, var rb, ctl_hci.ctl_wants_random(var w.b))
+            rnd_next(var w.rnd_b)
+
+fn bytes_of(var p: Pdu) -> [Int]
+    var out: [Int] = []
+    for i in 0..p.n
+        list.push(out, p.b[i] as Int)
+    out
+
+fn flight(var l: ll_link.Link, var m: Pdu, var n: Pdu, var out: Pdu)
+    if l.use_nxt
+        ll_link.pdu_copy(var out, var n)
+    else
+        ll_link.pdu_copy(var out, var m)
+
+// The link of the slot `s` of the Controller, read through one function a field.
+fn l_due(var c: ctl_hci.Controller, s: Int) -> Int
+    if s == 0
+        c.links[0].due
+    else
+        c.links[1].due
+
+fn l_first(var c: ctl_hci.Controller, s: Int) -> Int
+    if s == 0
+        ll_link.link_first_header(var c.links[0])
+    else
+        ll_link.link_first_header(var c.links[1])
+
+fn l_note(var c: ctl_hci.Controller, s: Int, t: Int)
+    if s == 0
+        ll_link.link_note_rx(var c.links[0], t, true)
+    else
+        ll_link.link_note_rx(var c.links[1], t, true)
+
+fn l_fast(var c: ctl_hci.Controller, s: Int, hdr: Int) -> Int
+    if s == 0
+        ll_link.link_rx_fast(var c.links[0], hdr)
+    else
+        ll_link.link_rx_fast(var c.links[1], hdr)
+
+fn l_flight(var c: ctl_hci.Controller, s: Int, var m: Pdu, var n: Pdu, var out: Pdu)
+    if s == 0
+        flight(var c.links[0], var m, var n, var out)
+    else
+        flight(var c.links[1], var m, var n, var out)
+
+fn l_dirty(var c: ctl_hci.Controller, s: Int) -> Bool
+    if s == 0
+        c.links[0].dirty
+    else
+        c.links[1].dirty
+
+fn l_cont(var c: ctl_hci.Controller, s: Int) -> Bool
+    if s == 0
+        c.links[0].cont
+    else
+        c.links[1].cont
+
+fn l_closing(var c: ctl_hci.Controller, s: Int) -> Bool
+    if s == 0
+        c.links[0].closing
+    else
+        c.links[1].closing
+
+fn l_enc_rx(var c: ctl_hci.Controller, s: Int) -> Bool
+    if s == 0
+        c.links[0].enc_rx
+    else
+        c.links[1].enc_rx
+
+// One connection event, run as the radio program runs it.  `mute`: the Peripheral
+// hears nothing.  `lose`: the Central does not hear the Peripheral's answers.
+fn event(var w: World, mute: Bool, lose: Bool)
+    let s = w.s
+    if not ctl_hci.ctl_conn_active(var w.a, s)
+        return
+    secure(w)
+    let t0 = l_due(var w.a, s)
+    ctl_hci.ctl_set_time(var w.a, t0)
+    ctl_hci.ctl_set_time(var w.b, t0)
+    let b_on = ctl_hci.ctl_conn_active(var w.b, s)
+    let _cha = ctl_hci.ctl_conn_begin(var w.a, s)
+    if b_on
+        let _chb = ctl_hci.ctl_conn_begin(var w.b, s)
+    mirror(var w.a, s, var w.ca, var w.ma, var w.na)
+    if b_on
+        mirror(var w.b, s, var w.cb, var w.mb, var w.nb)
+    var t = t0
+    var tx = ll_pdu.pdu_new()
+    ll_link.pdu_copy(var tx, var w.ma)
+    var hdr = l_first(var w.a, s)
+    tx.b[0] = hdr as u8
+    var n = 0
+    var open = true
+    while open and n < 8
+        list.push(w.air_a, bytes_of(tx))
+        w.count = w.count + 1
+        var rxp = ll_pdu.pdu_new()
+        ll_link.pdu_copy(var rxp, var tx)
+        if w.bad_to_b and rxp.n > 2
+            rxp.b[2] = rxp.b[2] ^ 0x40
+            w.bad_to_b = false
+        let start = t
+        t = t + ll_pdu.airtime_us(tx.n)
+        if mute or not b_on
+            open = false
+        else
+            l_note(var w.b, s, start)
+            let hb = l_fast(var w.b, s, hdr)
+            var reply = ll_pdu.pdu_new()
+            l_flight(var w.b, s, var w.mb, var w.nb, var reply)
+            reply.b[0] = hb as u8
+            ctl_hci.ctl_conn_rx_open(var w.b, s, var w.cb, var rxp)
+            ctl_hci.ctl_conn_rx_slow(var w.b, s, var rxp)
+            if l_dirty(var w.b, s)
+                mirror(var w.b, s, var w.cb, var w.mb, var w.nb)
+            list.push(w.air_b, bytes_of(reply))
+            w.count = w.count + 1
+            t = t + 150
+            let rstart = t
+            t = t + ll_pdu.airtime_us(reply.n)
+            if lose
+                open = false
+            else
+                var rxr = ll_pdu.pdu_new()
+                ll_link.pdu_copy(var rxr, var reply)
+                if w.bad_to_a and rxr.n > 2
+                    rxr.b[2] = rxr.b[2] ^ 0x40
+                    w.bad_to_a = false
+                l_note(var w.a, s, rstart)
+                let nh = l_fast(var w.a, s, hb)
+                var next = ll_pdu.pdu_new()
+                l_flight(var w.a, s, var w.ma, var w.na, var next)
+                next.b[0] = nh as u8
+                ctl_hci.ctl_conn_rx_open(var w.a, s, var w.ca, var rxr)
+                ctl_hci.ctl_conn_rx_slow(var w.a, s, var rxr)
+                if l_dirty(var w.a, s)
+                    mirror(var w.a, s, var w.ca, var w.ma, var w.na)
+                n = n + 1
+                t = t + 150
+                let ends = ll_data.dpdu_llid(var reply) == ll_data.LLID_CONTROL and (ll_data.dpdu_opcode(var reply) == ll_data.OP_TERMINATE_IND or l_enc_rx(var w.a, s))
+                open = (l_cont(var w.a, s) and not l_closing(var w.a, s) and not l_closing(var w.b, s)) or (ends and not l_closing(var w.b, s))
+                tx = next
+                hdr = nh
+    ctl_hci.ctl_conn_done(var w.a, s, t)
+    if b_on
+        ctl_hci.ctl_conn_done(var w.b, s, t)
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+
+fn events(var w: World, n: Int)
+    for _ in 0..n
+        event(w, false, false)
+
+fn start_params(rand: [Int], ediv: Int, ltk: [Int]) -> [Int]
+    var p: [Int] = [1, 0]
+    for r in rand
+        list.push(p, r)
+    list.push(p, ediv & 0xFF)
+    list.push(p, (ediv >>> 8) & 0xFF)
+    for k in ltk
+        list.push(p, k)
+    p
+
+fn reply_params(ltk: [Int]) -> [Int]
+    cat([1, 0], ltk)
+
+// The Central's Host starts encryption with the key of the sample, the Peripheral's
+// Host gives the key when it is asked, and the events run until both Hosts have
+// heard Encryption Change.
+fn encrypted_world() -> World
+    var w = world()
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 4)
+    test.assert_eq(list.len(meta_events(w.hb, 0x05)), 1)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(s_ltk())), 0)
+    events(var w, 6)
+    w
+
+// Everything the Central sent that was an LL Control PDU of `op`, from the air log.
+fn ctrl_count(air: [[Int]], op: Int) -> Int
+    var n = 0
+    for p in air
+        if (p[0] & 3) == 3 and p[1] > 0 and p[2] == op
+            n = n + 1
+    n
+
+fn find_air(air: [[Int]], op: Int) -> [Int]
+    for p in air
+        if (p[0] & 3) == 3 and p[1] > 0 and p[2] == op
+            return p[:]
+    []
+
+// ── The procedure with the sample data ──────────────────────────────
+
+@test
+fn test_the_start_procedure_matches_the_sample_data_of_the_specification()
+    var w = encrypted_world()
+    // LL_ENC_REQ and LL_ENC_RSP, octet for octet.
+    let req = find_air(w.air_a, 0x03)
+    test.assert_eq(list.len(req), 25)
+    test.assert_eq(req[1], 0x17)
+    for i in 2..25
+        test.assert_eq(req[i], [0x03, 0x90, 0x78, 0x56, 0x34, 0x12, 0xEF, 0xCD, 0xAB, 0x74, 0x24, 0x13, 0x02, 0xF1, 0xE0, 0xDF, 0xCE, 0xBD, 0xAC, 0x24, 0xAB, 0xDC, 0xBA][i - 2])
+    let rsp = find_air(w.air_b, 0x04)
+    test.assert_eq(list.len(rsp), 15)
+    for i in 2..15
+        test.assert_eq(rsp[i], [0x04, 0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xBE, 0xBA, 0xAF, 0xDE][i - 2])
+    // The Peripheral's Host was asked with the Rand and the EDIV.
+    let ask = meta_events(w.hb, 0x05)[0]
+    test.assert_eq(ask[4] | (ask[5] << 8), 1)
+    for i in 0..8
+        test.assert_eq(ask[6 + i], s_rand()[i])
+    test.assert_eq(ask[14] | (ask[15] << 8), 0x2474)
+    // Both ends derived the session key of the sample and hold the IV.
+    for i in 0..16
+        test.assert_eq(w.a.links[0].ek.sk[i] as Int, s_sk()[i])
+        test.assert_eq(w.b.links[0].ek.sk[i] as Int, s_sk()[i])
+    for i in 0..8
+        test.assert_eq(w.a.links[0].ek.iv[i], w.b.links[0].ek.iv[i])
+    test.assert_eq(w.a.links[0].ek.iv[0] as Int, 0x24)
+    test.assert_eq(w.a.links[0].ek.iv[7] as Int, 0xDE)
+    // The key and the diversifier are gone from the ends.
+    for i in 0..16
+        test.assert_eq(w.a.links[0].ltk[i] as Int, 0)
+        test.assert_eq(w.b.links[0].skd[i] as Int, 0)
+    // LL_START_ENC_REQ was in the clear; both LL_START_ENC_RSP are encrypted.
+    let sreq = find_air(w.air_b, 0x05)
+    test.assert_eq(list.len(sreq), 3)
+    let rsp1 = w.air_a[ctrl_index(w.air_a)]
+    test.assert_eq(rsp1[1], 5)
+    test.assert_eq(rsp1[2], 0x9F)
+    test.assert_eq(rsp1[3], 0xCD)
+    test.assert_eq(rsp1[6], 0x48)
+    let rsp2 = w.air_b[ctrl_index(w.air_b)]
+    test.assert_eq(rsp2[1], 5)
+    test.assert_eq(rsp2[2], 0xA3)
+    test.assert_eq(rsp2[3], 0x4C)
+    test.assert_eq(rsp2[6], 0x15)
+    // Each Host heard Encryption Change, successful and enabled, once.
+    for log in [w.ha, w.hb]
+        let ch = events_coded(log, 0x08)
+        test.assert_eq(list.len(ch), 1)
+        test.assert_eq(ch[0][3], 0)
+        test.assert_eq(ch[0][4] | (ch[0][5] << 8), 1)
+        test.assert_eq(ch[0][6], 1)
+    test.assert(ll_link.link_encrypted(var w.a.links[0]))
+    test.assert(ll_link.link_encrypted(var w.b.links[0]))
+    test.assert_eq(w.a.links[0].proc, ll_link.PROC_NONE)
+    test.assert_eq(w.b.links[0].proc, ll_link.PROC_NONE)
+    test.assert_eq(w.a.links[0].enc_ph, ll_link.ENC_IDLE)
+
+// The index in the log of the first LL Control PDU that was sent encrypted: an LL
+// Control PDU with a payload of 5.
+fn ctrl_index(air: [[Int]]) -> Int
+    var i = 0
+    for p in air
+        if (p[0] & 3) == 3 and p[1] == 5
+            return i
+        i = i + 1
+    -1
+
+@test
+fn test_data_pdus_of_the_sample_go_both_ways_with_the_packet_counter_one()
+    var w = encrypted_world()
+    feed(w.a, host_acl(1, 2, s_data1()))
+    feed(w.b, host_acl(1, 2, s_data2()))
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+    events(var w, 3)
+    // The octets on air are those of the sample.
+    var seen1 = false
+    for p in w.air_a
+        if (p[0] & 3) == 2 and p[1] == 0x1F
+            seen1 = true
+            for i in 0..31
+                test.assert_eq(p[2 + i], s_air1()[i])
+    test.assert(seen1)
+    var seen2 = false
+    for p in w.air_b
+        if (p[0] & 3) == 2 and p[1] == 0x1F
+            seen2 = true
+            for i in 0..31
+                test.assert_eq(p[2 + i], s_air2()[i])
+    test.assert(seen2)
+    // The Hosts got the clear text.
+    let got_b = acl_data(w.hb)
+    test.assert_eq(list.len(got_b), 1)
+    test.assert_eq(got_b[0], s_data1())
+    let got_a = acl_data(w.ha)
+    test.assert_eq(list.len(got_a), 1)
+    test.assert_eq(got_a[0], s_data2())
+    test.assert_eq(w.a.links[0].tx_ctr, 2)
+    test.assert_eq(w.a.links[0].rx_ctr, 2)
+
+// A numbered message of `n` octets for the Host.
+fn message(k: Int, n: Int) -> [Int]
+    var d: [Int] = []
+    for i in 0..n
+        list.push(d, (k * 31 + i * 7) & 0xFF)
+    d
+
+@test
+fn test_a_stream_both_ways_arrives_in_order_through_losses_and_resends()
+    var w = encrypted_world()
+    var want_a: [[Int]] = []
+    var want_b: [[Int]] = []
+    var seen_a: [[Int]] = []
+    var seen_b: [[Int]] = []
+    for k in 0..40
+        let n = 1 + (k * 5) % 27
+        let da = message(k, n)
+        let db = message(k + 100, 1 + (k * 11) % 27)
+        list.push(want_b, da[:])
+        list.push(want_a, db[:])
+        feed(w.a, host_acl(1, 2, da))
+        feed(w.b, host_acl(1, 2, db))
+        host_read(var w.a, var w.ha)
+        host_read(var w.b, var w.hb)
+        // Every third event is unheard by the Peripheral, every fifth loses its answer.
+        if k % 3 == 1
+            event(w, true, false)
+        else if k % 5 == 2
+            event(w, false, true)
+        else
+            event(w, false, false)
+        event(w, false, false)
+    events(var w, 6)
+    seen_a = acl_data(w.ha)
+    seen_b = acl_data(w.hb)
+    test.assert_eq(list.len(seen_b), 40)
+    test.assert_eq(list.len(seen_a), 40)
+    for k in 0..40
+        test.assert_eq(seen_b[k], want_b[k])
+        test.assert_eq(seen_a[k], want_a[k])
+    test.assert(not w.a.links[0].closing)
+    test.assert(not w.b.links[0].closing)
+    // The counters of the two ends agree: what one sent the other received.
+    test.assert_eq(w.a.links[0].tx_ctr, w.b.links[0].rx_ctr)
+    test.assert_eq(w.b.links[0].tx_ctr, w.a.links[0].rx_ctr)
+
+// ── What the Hosts hear ─────────────────────────────────────────────
+
+fn changes(log: [Int]) -> [[Int]]
+    events_coded(log, 0x08)
+
+fn refreshes(log: [Int]) -> [[Int]]
+    events_coded(log, 0x30)
+
+fn disconnections(log: [Int]) -> [[Int]]
+    events_coded(log, 0x05)
+
+fn ltk_requests(log: [Int]) -> [[Int]]
+    meta_events(log, 0x05)
+
+// Start encryption with the sample key and answer the Peripheral's Host request with
+// the Reply (true) or the Negative Reply (false), then run the events.
+fn start_and_answer(var w: World, reply: Bool)
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 4)
+    test.assert_eq(list.len(ltk_requests(w.hb)), 1)
+    if reply
+        test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(s_ltk())), 0)
+    else
+        test.assert_eq(complete_of(var w.b, var w.hb, 0x201B, [1, 0]), 0)
+    events(var w, 6)
+
+// An LL Control PDU `op` with the payload octets `rest`.
+fn ctrl_pdu(op: Int, rest: [Int]) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var p, op)
+    for r in rest
+        let _a = ll_pdu.pdu_put(var p, r)
+    ll_data.dpdu_finish(var p)
+    p
+
+// An LL Data PDU with a payload.
+fn data_pdu(llid: Int, n: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var p, llid)
+    for i in 0..n
+        let _a = ll_data.dpdu_put(var p, i + 1)
+    ll_data.dpdu_finish(var p)
+    p
+
+// The PDU `p` reaches the Peripheral `c` as the radio program takes it: a new packet,
+// as the link expects, that acknowledges nothing.
+fn inject(var c: ctl_hci.Controller, var cc: ll_ccm.SoftCipher, var p: Pdu)
+    let hdr = (p.b[0] as Int) | (c.links[0].sn << 2) | (c.links[0].nesn << 3)
+    ll_link.link_note_rx(var c.links[0], c.now, true)
+    let _h = ll_link.link_rx_fast(var c.links[0], hdr)
+    ctl_hci.ctl_conn_rx_open(var c, 0, var cc, var p)
+    ctl_hci.ctl_conn_rx_slow(var c, 0, var p)
+
+// The peer's first feature octet is known to be `b0`.
+fn set_peer_features(var l: ll_link.Link, b0: Int)
+    l.have_feat = true
+    l.peer_feat[0] = b0 as u8
+
+fn ops_of(log: [[Int]]) -> [Int]
+    var out: [Int] = []
+    for p in log
+        if (p[0] & 3) == 3 and p[1] > 0
+            list.push(out, p[2])
+    out
+
+fn has(ops: [Int], op: Int) -> Bool
+    for o in ops
+        if o == op
+            return true
+    false
+
+// ── The Peripheral's Host has no key ────────────────────────────────
+
+@test
+fn test_a_host_without_the_key_refuses_and_the_link_goes_on_in_the_clear()
+    var w = world()
+    start_and_answer(var w, false)
+    let ch = changes(w.ha)
+    test.assert_eq(list.len(ch), 1)
+    test.assert_eq(ch[0][3], 0x06)
+    test.assert_eq(ch[0][6], 0)
+    test.assert_eq(list.len(changes(w.hb)), 0)
+    test.assert(not ll_link.link_encrypted(var w.a.links[0]))
+    test.assert(not ll_link.link_encrypted(var w.b.links[0]))
+    test.assert_eq(w.a.links[0].enc_ph, ll_link.ENC_IDLE)
+    test.assert_eq(w.b.links[0].enc_ph, ll_link.ENC_IDLE)
+    test.assert_eq(w.a.links[0].proc, ll_link.PROC_NONE)
+    // LL_REJECT_EXT_IND names LL_ENC_REQ.
+    test.assert(has(ops_of(w.air_b), 0x11))
+    // The key and the diversifier are gone.
+    for i in 0..16
+        test.assert_eq(w.a.links[0].ltk[i] as Int, 0)
+        test.assert_eq(w.b.links[0].skd[i] as Int, 0)
+    // Data goes in the clear: no MIC on air.
+    feed(w.a, host_acl(1, 2, message(1, 27)))
+    host_read(var w.a, var w.ha)
+    events(var w, 3)
+    test.assert_eq(acl_data(w.hb)[0], message(1, 27))
+    var plain = false
+    for p in w.air_a
+        if (p[0] & 3) == 2 and p[1] == 27
+            plain = true
+    test.assert(plain)
+
+@test
+fn test_a_peer_without_extended_reject_is_refused_with_ll_reject_ind()
+    var w = world()
+    set_peer_features(var w.b.links[0], 0x01)
+    start_and_answer(var w, false)
+    test.assert(has(ops_of(w.air_b), 0x0D))
+    test.assert(not has(ops_of(w.air_b), 0x11))
+    test.assert_eq(changes(w.ha)[0][3], 0x06)
+
+@test
+fn test_a_host_that_masks_the_key_request_event_has_no_key_to_give()
+    var a = host_ctl(0xA0, 0x3F)
+    var b = host_ctl(0xB0, 0x2F)
+    var req = conn_req(0x50655A12)
+    ll_link.link_open_central(var a.links[0], 1, var req, 1000)
+    ll_link.link_open(var b.links[0], 1, var req, 1000)
+    var w = World { a: a, b: b, ca: ll_ccm.soft_cipher_new(), cb: ll_ccm.soft_cipher_new(),
+                    ma: ll_pdu.pdu_new(), na: ll_pdu.pdu_new(), mb: ll_pdu.pdu_new(), nb: ll_pdu.pdu_new(),
+                    ha: [], hb: [], air_a: [], air_b: [], rnd_a: s_rnd_central(), rnd_b: s_rnd_peripheral(),
+                    bad_to_b: false, bad_to_a: false, count: 0, s: 0 }
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 6)
+    test.assert_eq(list.len(ltk_requests(w.hb)), 0)
+    test.assert_eq(changes(w.ha)[0][3], 0x06)
+
+@test
+fn test_a_peripheral_that_does_not_know_encryption_answers_unknown_and_the_host_hears_it()
+    var w = world()
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    secure(w)
+    // The Peripheral answers LL_UNKNOWN_RSP naming LL_ENC_REQ instead of LL_ENC_RSP.
+    var p = ctrl_pdu(0x07, [0x03])
+    ll_link.link_note_rx(var w.a.links[0], 0, true)
+    let _h = ll_link.link_rx_fast(var w.a.links[0], 0x01)
+    ctl_hci.ctl_conn_rx_slow(var w.a, 0, var p)
+    host_read(var w.a, var w.ha)
+    let ch = changes(w.ha)
+    test.assert_eq(list.len(ch), 1)
+    test.assert_eq(ch[0][3], 0x1A)
+
+// ── The refresh ─────────────────────────────────────────────────────
+
+@test
+fn test_encryption_pause_and_start_again_refresh_the_key()
+    var w = encrypted_world()
+    var old: [Int] = []
+    for i in 0..16
+        list.push(old, w.a.links[0].ek.sk[i] as Int)
+    // Traffic before the pause.
+    feed(w.a, host_acl(1, 2, message(2, 20)))
+    host_read(var w.a, var w.ha)
+    events(var w, 3)
+    let ltk2 = [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F]
+    let before_a = list.len(changes(w.ha))
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params([1, 2, 3, 4, 5, 6, 7, 8], 0x4321, ltk2)), 0)
+    // A second Start Encryption while the pause is under way is refused.
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params([1, 2, 3, 4, 5, 6, 7, 8], 0x4321, ltk2)), 0x0C)
+    events(var w, 10)
+    test.assert_eq(list.len(ltk_requests(w.hb)), 2)
+    let ask = ltk_requests(w.hb)[1]
+    test.assert_eq(ask[14] | (ask[15] << 8), 0x4321)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(ltk2)), 0)
+    events(var w, 8)
+    // Both Hosts hear Key Refresh Complete, and no second Encryption Change.
+    test.assert_eq(list.len(refreshes(w.ha)), 1)
+    test.assert_eq(list.len(refreshes(w.hb)), 1)
+    test.assert_eq(refreshes(w.ha)[0][3], 0)
+    test.assert_eq(list.len(changes(w.ha)), before_a)
+    test.assert(ll_link.link_encrypted(var w.a.links[0]))
+    test.assert(ll_link.link_encrypted(var w.b.links[0]))
+    var moved = false
+    for i in 0..16
+        if w.a.links[0].ek.sk[i] as Int != old[i]
+            moved = true
+        test.assert_eq(w.a.links[0].ek.sk[i], w.b.links[0].ek.sk[i])
+    test.assert(moved)
+    // The Central's LL_PAUSE_ENC_RSP is in the clear and the Peripheral's is encrypted
+    // (its opcode is not on air), and LL_ENC_REQ was sent twice.
+    test.assert_eq(ctrl_count(w.air_a, 0x0B), 1)
+    test.assert_eq(ctrl_count(w.air_b, 0x0B), 0)
+    test.assert_eq(ctrl_count(w.air_a, 0x03), 2)
+    // The counters began again with the new key: what follows is read by the other end.
+    feed(w.b, host_acl(1, 2, message(3, 25)))
+    feed(w.a, host_acl(1, 2, message(4, 26)))
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+    events(var w, 4)
+    let got_a = acl_data(w.ha)
+    let got_b = acl_data(w.hb)
+    test.assert_eq(got_a[list.len(got_a) - 1], message(3, 25))
+    test.assert_eq(got_b[list.len(got_b) - 1], message(4, 26))
+    test.assert(w.a.links[0].tx_ctr < 10)
+
+@test
+fn test_a_pause_whose_new_key_is_missing_ends_the_connection_with_pin_or_key_missing()
+    var w = encrypted_world()
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params([1, 2, 3, 4, 5, 6, 7, 8], 0x4321, s_ltk())), 0)
+    events(var w, 10)
+    test.assert_eq(list.len(ltk_requests(w.hb)), 2)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201B, [1, 0]), 0)
+    events(var w, 6)
+    let db = disconnections(w.hb)
+    let da = disconnections(w.ha)
+    test.assert_eq(list.len(db), 1)
+    test.assert_eq(db[0][3], 0)
+    test.assert_eq(db[0][6], 0x16)
+    test.assert_eq(list.len(da), 1)
+    test.assert_eq(da[0][6], 0x06)
+
+// ── MIC failure ─────────────────────────────────────────────────────
+
+@test
+fn test_a_changed_octet_ends_the_connection_with_mic_failure_at_the_receiver()
+    var w = encrypted_world()
+    feed(w.a, host_acl(1, 2, message(5, 20)))
+    host_read(var w.a, var w.ha)
+    w.bad_to_b = true
+    events(var w, 3)
+    let db = disconnections(w.hb)
+    test.assert_eq(list.len(db), 1)
+    test.assert_eq(db[0][6], 0x3D)
+    test.assert_eq(list.len(acl_data(w.hb)), 0)
+
+@test
+fn test_a_changed_octet_from_the_peripheral_ends_the_central_with_mic_failure()
+    var w = encrypted_world()
+    feed(w.b, host_acl(1, 2, message(6, 20)))
+    host_read(var w.b, var w.hb)
+    w.bad_to_a = true
+    events(var w, 3)
+    let da = disconnections(w.ha)
+    test.assert_eq(list.len(da), 1)
+    test.assert_eq(da[0][6], 0x3D)
+
+@test
+fn test_a_clear_pdu_with_a_payload_on_an_encrypted_link_fails_the_mic()
+    var w = encrypted_world()
+    var p = data_pdu(ll_data.LLID_START, 8)
+    inject(var w.b, var w.cb, var p)
+    test.assert(w.b.links[0].closing)
+    test.assert_eq(w.b.links[0].reason, 0x3D)
+    // A payload shorter than a MIC does as well.
+    var x = encrypted_world()
+    var q = data_pdu(ll_data.LLID_START, 3)
+    inject(var x.b, var x.cb, var q)
+    test.assert_eq(x.b.links[0].reason, 0x3D)
+
+@test
+fn test_a_resent_pdu_is_not_opened_again()
+    var w = encrypted_world()
+    feed(w.a, host_acl(1, 2, message(7, 12)))
+    host_read(var w.a, var w.ha)
+    // The Peripheral hears the Central, the answer is lost, and the Central sends again.
+    event(w, false, true)
+    event(w, false, false)
+    event(w, false, false)
+    test.assert_eq(list.len(acl_data(w.hb)), 1)
+    test.assert_eq(w.a.links[0].tx_ctr, w.b.links[0].rx_ctr)
+    test.assert(not w.b.links[0].closing)
+
+// ── Data during the procedure ───────────────────────────────────────
+
+@test
+fn test_an_ll_data_pdu_in_the_middle_of_the_procedure_ends_the_connection_with_mic_failure()
+    var w = world()
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 3)
+    // The Peripheral answered LL_ENC_RSP and waits for its Host's key.
+    test.assert_eq(w.b.links[0].enc_ph, ll_link.ENC_P_WAIT_LTK)
+    var p = data_pdu(ll_data.LLID_START, 4)
+    inject(var w.b, var w.cb, var p)
+    test.assert_eq(w.b.links[0].reason, 0x3D)
+
+@test
+fn test_the_central_may_still_receive_data_until_the_peripheral_answers()
+    var x = world()
+    events(var x, 2)
+    test.assert_eq(status_of(x.a, x.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    test.assert(not ll_link.enc_strict(var x.a.links[0]))
+    test.assert(not ll_link.enc_strict(var x.b.links[0]))
+    var q = data_pdu(ll_data.LLID_START, 4)
+    ll_link.link_note_rx(var x.a.links[0], 0, true)
+    let _h = ll_link.link_rx_fast(var x.a.links[0], (q.b[0] as Int) | (x.a.links[0].sn << 2) | (x.a.links[0].nesn << 3))
+    test.assert_eq(ll_link.link_rx_slow(var x.a.links[0], var q), ll_link.RX_TO_HOST)
+    test.assert_eq(x.a.links[0].reason, 0)
+
+@test
+fn test_acl_data_waits_for_the_procedure_and_goes_after_it()
+    var w = world()
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    feed(w.a, host_acl(1, 2, message(8, 10)))
+    host_read(var w.a, var w.ha)
+    events(var w, 3)
+    // The Peripheral's Host has not answered: the data is held at the Central.
+    test.assert_eq(list.len(acl_data(w.hb)), 0)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(s_ltk())), 0)
+    events(var w, 8)
+    test.assert_eq(list.len(acl_data(w.hb)), 1)
+    test.assert_eq(acl_data(w.hb)[0], message(8, 10))
+
+// ── A cipher that fails ─────────────────────────────────────────────
+
+@value
+struct FailCipher
+    n: Int
+
+fn fail_cipher() -> FailCipher
+    FailCipher { n: 0 }
+
+impl Cipher[] for FailCipher
+    fn seal(var self, var ek: EncKey, ctr: Int, dir: Int, var p: Pdu)
+        self.n = self.n + 1
+
+    fn open(var self, var ek: EncKey, ctr: Int, dir: Int, var p: Pdu) -> Bool
+        false
+
+    fn block(var self, var key: Vec[u8; 16], var blk: Vec[u8; 16]) -> Bool
+        false
+
+    fn faults(var self) -> Int
+        self.n
+
+fn set_phase(var l: ll_link.Link, ph: Int)
+    l.enc_ph = ph
+
+fn set_last_rx(var l: ll_link.Link, v: Int)
+    l.last_rx = v
+
+fn set_owed(var l: ll_link.Link, v: Int)
+    l.owed = v
+
+fn fill_cq(var l: ll_link.Link)
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_ping_req(var p)
+    for _ in 0..ll_link.CTRL_SLOTS
+        let _q = ll_link.ctrl_queue(var l, var p)
+
+fn start_params_h(h: Int, rand: [Int], ediv: Int, ltk: [Int]) -> [Int]
+    var p: [Int] = [h & 0xFF, h >>> 8]
+    for r in rand
+        list.push(p, r)
+    list.push(p, ediv & 0xFF)
+    list.push(p, (ediv >>> 8) & 0xFF)
+    for k in ltk
+        list.push(p, k)
+    p
+
+fn exhaust(var c: ctl_hci.Controller)
+    for _ in 0..64
+        let _s = ctl_pool.evt_begin(var c.pool, 0x08)
+
+fn enc_req_pdu() -> Pdu
+    var rest: [Int] = []
+    for i in 0..22
+        list.push(rest, i + 1)
+    ctrl_pdu(0x03, rest)
+
+fn cq_front(var l: ll_link.Link) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_link.slot_get_cq(var l, l.cq_head, var p)
+    p
+
+@test
+fn test_the_cipher_that_fails_the_key_ends_the_connection_with_hardware_failure()
+    var w = world()
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    set_phase(var w.a.links[0], ll_link.ENC_NEED_SK)
+    var f = fail_cipher()
+    var rnd = rnd_vec(w.rnd_a)
+    test.assert(not ctl_hci.ctl_secure_poll(var w.a, var f, var rnd, false))
+    test.assert(w.a.links[0].closing)
+    test.assert_eq(w.a.links[0].reason, 0x03)
+    // The key and the diversifier are gone.
+    for i in 0..16
+        test.assert_eq(w.a.links[0].ltk[i] as Int, 0)
+
+@test
+fn test_a_cipher_fault_ends_the_connection_of_either_slot()
+    var w = world()
+    ctl_hci.ctl_conn_fail(var w.a, 0)
+    test.assert_eq(w.a.links[0].reason, 0x03)
+    var x = world_in(1)
+    ctl_hci.ctl_conn_fail(var x.a, 1)
+    test.assert_eq(x.a.links[1].reason, 0x03)
+    var f = fail_cipher()
+    test.assert_eq(f.faults(), 0)
+    var p = data_pdu(ll_data.LLID_START, 3)
+    f.seal(var x.a.links[1].ek, 0, 1, var p)
+    test.assert_eq(f.faults(), 1)
+
+// ── LE Encrypt ──────────────────────────────────────────────────────
+
+fn encrypt_controller() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL | ctl_hci.CAP_ECB)
+    var trace: [Int] = []
+    test.assert_eq(complete_of(var c, var trace, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    c
+
+@test
+fn test_le_encrypt_answers_with_the_cipher()
+    var c = encrypt_controller()
+    send(c, 0x2017, cat(s_ltk(), [0x13, 0x02, 0xF1, 0xE0, 0xDF, 0xCE, 0xBD, 0xAC, 0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02]))
+    let _r = ctl_hci.ctl_step(var c)
+    test.assert_eq(ctl_hci.ctl_async_kind(var c), ctl_hci.PEND_ENCRYPT)
+    var cc = ll_ccm.soft_cipher_new()
+    ctl_hci.ctl_le_encrypt(var c, var cc)
+    var trace: [Int] = []
+    host_read(var c, var trace)
+    let done = events_coded(trace, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][6], 0)
+    for i in 0..16
+        test.assert_eq(done[0][7 + i], s_sk()[i])
+
+@test
+fn test_le_encrypt_answers_hardware_failure_when_the_cipher_fails()
+    var c = encrypt_controller()
+    send(c, 0x2017, cat(s_ltk(), s_ltk()))
+    let _r = ctl_hci.ctl_step(var c)
+    var f = fail_cipher()
+    ctl_hci.ctl_le_encrypt(var c, var f)
+    var trace: [Int] = []
+    host_read(var c, var trace)
+    let done = events_coded(trace, 0x0E)
+    test.assert_eq(done[0][6], 0x03)
+
+// ── The commands ────────────────────────────────────────────────────
+
+@test
+fn test_the_commands_answer_the_status_the_state_asks_for()
+    var w = world()
+    events(var w, 2)
+    // An unknown handle.
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params_h(5, s_rand(), 1, s_ltk())), 0x02)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, cat([5, 0], s_ltk())), 0x02)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201B, [5, 0]), 0x02)
+    // The Peripheral does not start encryption; nothing asked for a key.
+    test.assert_eq(status_of(w.b, w.hb, 0x2019, start_params(s_rand(), 1, s_ltk())), 0x0C)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(s_ltk())), 0x0C)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201B, [1, 0]), 0x0C)
+    // The Central answers no key request.
+    test.assert_eq(complete_of(var w.a, var w.ha, 0x201A, reply_params(s_ltk())), 0x0C)
+    test.assert_eq(complete_of(var w.a, var w.ha, 0x201B, [1, 0]), 0x0C)
+    // One procedure at a time.
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 1, s_ltk())), 0)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 1, s_ltk())), 0x0C)
+
+@test
+fn test_a_link_that_is_not_there_has_no_encryption()
+    var l = ll_link.link_new()
+    test.assert_eq(ll_link.link_start_encryption(var l, 1), 0x02)
+    test.assert_eq(ll_link.link_ltk_reply(var l), 0x02)
+    test.assert_eq(ll_link.link_ltk_negative(var l), 0x02)
+    test.assert(not ll_link.link_wants_random(var l))
+    test.assert(not ll_link.link_wants_cipher(var l))
+
+@test
+fn test_a_full_control_queue_refuses_the_pause()
+    var w = encrypted_world()
+    fill_cq(var w.a.links[0])
+    test.assert_eq(ll_link.link_start_encryption(var w.a.links[0], 1), 0x0C)
+    test.assert_eq(w.a.links[0].enc_ph, ll_link.ENC_IDLE)
+
+// ── LL_ENC_REQ at the wrong time ────────────────────────────────────
+
+@test
+fn test_ll_enc_req_is_refused_while_encrypted_or_busy_and_unknown_to_a_central()
+    // Encrypted: the request collides.
+    var w = encrypted_world()
+    var p = enc_req_pdu()
+    ll_link.ctrl_enc_req(var w.b.links[0], var p)
+    var r = cq_front(var w.b.links[0])
+    test.assert_eq(ll_data.dpdu_opcode(var r), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(ll_data.dpdu_byte(var r, 1), 0x03)
+    test.assert_eq(ll_data.dpdu_byte(var r, 2), 0x23)
+    // Busy with a procedure of its own.
+    var x = world()
+    events(var x, 2)
+    test.assert_eq(status_of(x.a, x.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var x, 3)
+    test.assert_eq(x.b.links[0].enc_ph, ll_link.ENC_P_WAIT_LTK)
+    var q = enc_req_pdu()
+    let before = x.b.links[0].cq_count
+    ll_link.ctrl_enc_req(var x.b.links[0], var q)
+    test.assert_eq(x.b.links[0].cq_count, before + 1)
+    // A Central does not know it.
+    var y = world()
+    var z = enc_req_pdu()
+    ll_link.ctrl_enc_req(var y.a.links[0], var z)
+    var u = cq_front(var y.a.links[0])
+    test.assert_eq(ll_data.dpdu_opcode(var u), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var u, 1), 0x03)
+
+// ── The events ──────────────────────────────────────────────────────
+
+@test
+fn test_masked_encryption_events_are_dropped_and_the_link_is_encrypted()
+    var w = world()
+    // Neither Encryption Change nor Key Refresh Complete is enabled on either Host.
+    test.assert_eq(complete_of(var w.a, var w.ha, 0x0C01, [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0x3F]), 0)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x0C01, [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0x3F]), 0)
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 4)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(s_ltk())), 0)
+    events(var w, 6)
+    test.assert(ll_link.link_encrypted(var w.a.links[0]))
+    test.assert(ll_link.link_encrypted(var w.b.links[0]))
+    test.assert_eq(list.len(changes(w.ha)), 0)
+    test.assert_eq(list.len(changes(w.hb)), 0)
+    // The refresh as well.
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params([1, 2, 3, 4, 5, 6, 7, 8], 0x4321, s_ltk())), 0)
+    events(var w, 10)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, reply_params(s_ltk())), 0)
+    events(var w, 8)
+    test.assert_eq(list.len(refreshes(w.ha)), 0)
+    test.assert_eq(list.len(refreshes(w.hb)), 0)
+    test.assert(ll_link.link_encrypted(var w.a.links[0]))
+
+@test
+fn test_a_full_packet_pool_holds_the_events_back()
+    var w = world()
+    exhaust(var w.a)
+    test.assert(not ctl_hci.ev_ltk_request(var w.a, 0))
+    test.assert(not ctl_hci.ev_enc_change(var w.a, 0))
+    test.assert(not ctl_hci.ev_key_refresh(var w.a, 0))
+    set_owed(var w.a.links[0], ll_link.EV_LTK_REQUEST)
+    test.assert(not ctl_hci.flush_link(var w.a, 0))
+    set_owed(var w.a.links[0], ll_link.EV_ENC_CHANGE)
+    test.assert(not ctl_hci.flush_link(var w.a, 0))
+    set_owed(var w.a.links[0], ll_link.EV_KEY_REFRESH)
+    test.assert(not ctl_hci.flush_link(var w.a, 0))
+
+// ── The second slot ─────────────────────────────────────────────────
+
+@test
+fn test_the_procedure_runs_on_the_second_link_of_both_ends()
+    var w = world_in(1)
+    events(var w, 2)
+    // The Peripheral's Host has no key the first time.
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params_h(2, s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 4)
+    test.assert_eq(list.len(ltk_requests(w.hb)), 1)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201B, [2, 0]), 0)
+    events(var w, 4)
+    test.assert_eq(changes(w.ha)[0][3], 0x06)
+    // And the second time it has.
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params_h(2, s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 4)
+    test.assert_eq(list.len(ltk_requests(w.hb)), 2)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, cat([2, 0], s_ltk())), 0)
+    events(var w, 8)
+    test.assert(ll_link.link_encrypted(var w.a.links[1]))
+    test.assert(ll_link.link_encrypted(var w.b.links[1]))
+    for i in 0..16
+        test.assert_eq(w.a.links[1].ek.sk[i], w.b.links[1].ek.sk[i])
+    feed(w.a, host_acl(2, 2, message(9, 20)))
+    feed(w.b, host_acl(2, 2, message(10, 22)))
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+    events(var w, 4)
+    test.assert_eq(acl_data(w.hb)[0], message(9, 20))
+    test.assert_eq(acl_data(w.ha)[0], message(10, 22))
+
+@test
+fn test_the_authenticated_payload_timer_runs_while_encrypted_and_stops_in_the_pause()
+    var w = world()
+    test.assert(not w.a.links[0].auth_on)
+    var x = encrypted_world()
+    test.assert(x.a.links[0].auth_on)
+    test.assert(x.b.links[0].auth_on)
+    // A packet with a valid MIC restarts it.
+    let before = x.b.links[0].auth_t0
+    feed(x.a, host_acl(1, 2, message(11, 9)))
+    host_read(var x.a, var x.ha)
+    events(var x, 2)
+    test.assert(x.b.links[0].auth_t0 > before)
+    // The pause switches it off on both ends, and the new key switches it on.
+    test.assert_eq(status_of(x.a, x.ha, 0x2019, start_params([1, 2, 3, 4, 5, 6, 7, 8], 0x4321, s_ltk())), 0)
+    events(var x, 6)
+    test.assert(not x.a.links[0].auth_on)
+    test.assert(not x.b.links[0].auth_on)
+    test.assert_eq(complete_of(var x.b, var x.hb, 0x201A, reply_params(s_ltk())), 0)
+    events(var x, 8)
+    test.assert(x.a.links[0].auth_on)
+    test.assert(x.b.links[0].auth_on)
+
+@test
+fn test_the_response_timer_runs_while_the_central_waits_for_the_peripheral()
+    var w = world()
+    events(var w, 2)
+    test.assert_eq(status_of(w.a, w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    // The Peripheral never answers LL_ENC_REQ: the Central waits in LL Response
+    // Timeout (0x22) after 40 s.
+    secure(w)
+    test.assert_eq(w.a.links[0].proc, ll_link.PROC_ENC)
+    set_last_rx(var w.a.links[0], w.a.links[0].now + 40000001)
+    ll_link.link_event_done(var w.a.links[0], w.a.links[0].now + 40000001)
+    test.assert_eq(w.a.links[0].reason, 0x22)
+
+@test
+fn test_a_start_request_that_comes_before_the_session_key_is_taken_when_the_key_is_there()
+    var w = world()
+    events(var w, 2)
+    test.assert(w.a.links[0].central)
+    set_phase(var w.a.links[0], ll_link.ENC_NEED_SK)
+    ll_link.ctrl_start_enc_req(var w.a.links[0])
+    // Not yet: the key is derived between the events.
+    test.assert_eq(w.a.links[0].enc_ph, ll_link.ENC_NEED_SK)
+    test.assert(w.a.links[0].start_early)
+    test.assert(not w.a.links[0].enc_tx)
+    var cc = ll_ccm.soft_cipher_new()
+    var rnd = rnd_vec(w.rnd_a)
+    let _used = ctl_hci.ctl_secure_poll(var w.a, var cc, var rnd, false)
+    test.assert_eq(w.a.links[0].enc_ph, ll_link.ENC_C_WAIT_START_RSP)
+    test.assert(w.a.links[0].enc_tx)
+    test.assert(w.a.links[0].enc_rx)
+    test.assert(not w.a.links[0].start_early)
+
+@test
+fn test_the_events_a_link_owes_reach_the_host_before_the_data_that_follows_them()
+    var w = world()
+    events(var w, 2)
+    var drained: [Int] = []
+    host_read(var w.b, var drained)
+    set_owed(var w.b.links[0], ll_link.EV_ENC_CHANGE)
+    var p = data_pdu(ll_data.LLID_START, 5)
+    inject(var w.b, var w.cb, var p)
+    var out: [Int] = []
+    host_read(var w.b, var out)
+    let pk = packets_of(out)
+    var enc_at = -1
+    var acl_at = -1
+    for i in 0..list.len(pk)
+        if pk[i][0] == 0x04 and pk[i][1] == 0x08
+            enc_at = i
+        if pk[i][0] == 0x02
+            acl_at = i
+    test.assert(enc_at >= 0)
+    test.assert(acl_at >= 0)
+    test.assert(enc_at < acl_at)

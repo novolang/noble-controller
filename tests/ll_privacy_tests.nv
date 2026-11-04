@@ -1,0 +1,320 @@
+// tests/ll_privacy_tests.nv — the resolving list and the Resolvable Private Addresses
+// of `src/ll_privacy.nv`.
+//
+// The sample data of [Vol 3] Part H, Section D.7 fixes `ah`.  The tests are here, not in the
+// module, because they run on the software cipher (`ll_ccm.nv`), and a module that names it
+// brings its tables into every image that uses the module.
+
+use std.test
+use ll_privacy
+use ll_cipher
+use ll_ccm
+use ll_pdu
+
+fn t6(a: [Int]) -> Vec[u8; 6]
+    var v: Vec[u8; 6] = Vec.new()
+    for x in a
+        let _p = v.push(x as u8)
+    v
+
+fn t16(a: [Int]) -> Vec[u8; 16]
+    var v: Vec[u8; 16] = Vec.new()
+    for x in a
+        let _p = v.push(x as u8)
+    v
+
+// The IRK of the sample data of [Vol 3] Part H, Section D.7, least significant octet first.
+fn t_irk() -> Vec[u8; 16]
+    t16([0x9B, 0x7D, 0x39, 0x0A, 0xA6, 0x10, 0x10, 0x34, 0x05, 0xAD, 0xC8, 0x57, 0xA3, 0x34, 0x02, 0xEC])
+
+fn t_zero16() -> Vec[u8; 16]
+    t16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+fn t_other_irk() -> Vec[u8; 16]
+    t16([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    t6([first, first + 1, first + 2, first + 3, first + 4, first + 5])
+
+// A list with one entry, the device 0x10..0x15, that has the sample IRK on both sides.
+fn t_list() -> ll_privacy.ResolvingList
+    var r = ll_privacy.rl_new()
+    var a = t_addr(0x10)
+    var irk = t_irk()
+    var loc = t_irk()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var a, var irk, var loc), 0)
+    r
+
+fn t_set(var r: ll_privacy.ResolvingList, enable: Bool, timeout: Int, epoch: Int)
+    r.enable = enable
+    r.timeout = timeout
+    r.epoch = epoch
+
+fn t_entropy(var r: ll_privacy.ResolvingList, v: Int)
+    var e: Vec[u8; 12] = Vec.new()
+    for k in 0..12
+        let _a = e.push(((v + k * 37) & 0xFF) as u8)
+    ll_privacy.rl_entropy_put(var r, var e)
+
+fn t_local(var r: ll_privacy.ResolvingList, i: Int) -> Vec[u8; 6]
+    t6([r.local_rpa[i * 6] as Int, r.local_rpa[i * 6 + 1] as Int, r.local_rpa[i * 6 + 2] as Int, r.local_rpa[i * 6 + 3] as Int, r.local_rpa[i * 6 + 4] as Int, r.local_rpa[i * 6 + 5] as Int])
+
+fn t_peer(var r: ll_privacy.ResolvingList, i: Int) -> Vec[u8; 6]
+    t6([r.peer_rpa[i * 6] as Int, r.peer_rpa[i * 6 + 1] as Int, r.peer_rpa[i * 6 + 2] as Int, r.peer_rpa[i * 6 + 3] as Int, r.peer_rpa[i * 6 + 4] as Int, r.peer_rpa[i * 6 + 5] as Int])
+
+@test
+fn test_ah_matches_the_sample_data_of_the_specification()
+    var r = t_list()
+    var c = ll_ccm.soft_cipher_new()
+    test.assert_eq(ll_privacy.rl_ah(var r, var c, 0, false, 0x708194), 0x0DFBAA)
+    test.assert_eq(ll_privacy.rl_ah(var r, var c, 0, true, 0x708194), 0x0DFBAA)
+
+@test
+fn test_an_address_made_from_the_sample_resolves()
+    var r = t_list()
+    var c = ll_ccm.soft_cipher_new()
+    // hash 0dfbaa, prand 708194, least significant octet first.
+    var a = t6([0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70])
+    test.assert(ll_privacy.is_rpa(var a))
+    test.assert_eq(ll_privacy.rpa_prand(var a), 0x708194)
+    test.assert_eq(ll_privacy.rpa_hash(var a), 0x0DFBAA)
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var a), 0)
+    test.assert(r.peer_ok[0])
+    // The next time it is a compare.
+    let before = r.hashed
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var a), 0)
+    test.assert_eq(r.hashed, before)
+    test.assert_eq(ll_privacy.rl_cached(var r, var a), 0)
+    // A changed hash, a static address and a plain address do not resolve.
+    var b = t6([0xAB, 0xFB, 0x0D, 0x94, 0x81, 0x70])
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var b), -1)
+    var s = t6([1, 2, 3, 4, 5, 0xC0])
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var s), -1)
+    var n = t6([1, 2, 3, 4, 5, 0x00])
+    test.assert(not ll_privacy.is_rpa(var n))
+    test.assert_eq(ll_privacy.rl_cached(var r, var b), -1)
+
+@test
+fn test_the_local_address_is_one_the_peer_resolves()
+    var r = t_list()
+    var c = ll_ccm.soft_cipher_new()
+    test.assert(not ll_privacy.rl_make_local(var r, var c, 0))
+    t_entropy(var r, 5)
+    test.assert_eq(ll_privacy.rl_entropy(var r), 12)
+    test.assert(ll_privacy.rl_make_local(var r, var c, 0))
+    test.assert_eq(ll_privacy.rl_entropy(var r), 9)
+    test.assert(r.local_ok[0])
+    var a = t_local(var r, 0)
+    test.assert(ll_privacy.is_rpa(var a))
+    // The peer IRK of the entry is the local one here, so the address resolves to the entry.
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var a), 0)
+    // The peer's address for directed advertising is made the same way.
+    test.assert(ll_privacy.rl_make_peer(var r, var c, 0))
+    var b = t_peer(var r, 0)
+    test.assert(ll_privacy.is_rpa(var b))
+    test.assert_eq(ll_privacy.rl_cached(var r, var b), 0)
+    // An entry with no IRK, or an entry not in use, makes none.
+    var d = t_addr(0x20)
+    var zero = t_zero16()
+    var zero2 = t_zero16()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var d, var zero, var zero2), 0)
+    test.assert(not ll_privacy.rl_make_local(var r, var c, 1))
+    test.assert(not ll_privacy.rl_make_peer(var r, var c, 1))
+    test.assert(not ll_privacy.rl_make_local(var r, var c, 5))
+    test.assert(not ll_privacy.rl_make_peer(var r, var c, 5))
+
+@test
+fn test_prand_has_its_top_bits_and_never_all_zero_or_all_one()
+    var r = ll_privacy.rl_new()
+    test.assert_eq(ll_privacy.rl_prand(var r), -1)
+    var e: Vec[u8; 12] = Vec.new()
+    for k in 0..12
+        let _a = e.push(0)
+    ll_privacy.rl_entropy_put(var r, var e)
+    let p0 = ll_privacy.rl_prand(var r)
+    test.assert_eq(p0 & 0xC00000, 0x400000)
+    test.assert(p0 & 0x3FFFFF != 0)
+    var f: Vec[u8; 12] = Vec.new()
+    for k in 0..12
+        let _b = f.push(0xFF)
+    ll_privacy.rl_entropy_put(var r, var f)
+    let p1 = ll_privacy.rl_prand(var r)
+    test.assert_eq(p1 & 0xC00000, 0x400000)
+    test.assert(p1 & 0x3FFFFF != 0x3FFFFF)
+    // Twelve octets make four of them.
+    test.assert(ll_privacy.rl_prand(var r) >= 0)
+    test.assert(ll_privacy.rl_prand(var r) >= 0)
+    test.assert(ll_privacy.rl_prand(var r) >= 0)
+    test.assert_eq(ll_privacy.rl_prand(var r), -1)
+
+@test
+fn test_add_remove_and_clear_follow_the_statuses_of_the_command()
+    var r = ll_privacy.rl_new()
+    var a = t_addr(0x10)
+    var irk = t_irk()
+    var loc = t_other_irk()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var a, var irk, var loc), 0)
+    test.assert_eq(ll_privacy.rl_count(var r), 1)
+    test.assert_eq(ll_privacy.rl_find(var r, 0, var a), 0)
+    test.assert_eq(ll_privacy.rl_find(var r, 1, var a), -1)
+    // The same identity, or the same non-zero peer IRK, is refused; a zero one is not.
+    var irk2 = t_irk()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var a, var irk2, var loc), 0x12)
+    var b = t_addr(0x20)
+    var irk3 = t_irk()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var b, var irk3, var loc), 0x12)
+    var zero = t_zero16()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var b, var zero, var loc), 0)
+    var c = t_addr(0x30)
+    var zero2 = t_zero16()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var c, var zero2, var loc), 0)
+    // A random identity must be static: the top two bits are 1.
+    var d = t_addr(0x40)
+    var irk4 = t_other_irk()
+    test.assert_eq(ll_privacy.rl_add(var r, 1, var d, var irk4, var loc), 0x12)
+    var e = t6([1, 2, 3, 4, 5, 0xC1])
+    test.assert_eq(ll_privacy.rl_add(var r, 1, var e, var irk4, var loc), 0)
+    // Fill the list: the next entry finds no room.
+    for k in 0..4
+        var f = t_addr(0x50 + k * 8)
+        var z = t_zero16()
+        let _s = ll_privacy.rl_add(var r, 0, var f, var z, var loc)
+    test.assert_eq(ll_privacy.rl_count(var r), 8)
+    var g = t_addr(0x90)
+    var zz = t_zero16()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var g, var zz, var loc), 0x07)
+    // Remove.
+    test.assert_eq(ll_privacy.rl_remove(var r, 0, var a), 0)
+    test.assert_eq(ll_privacy.rl_remove(var r, 0, var a), 0x02)
+    test.assert_eq(ll_privacy.rl_count(var r), 7)
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var g, var zz, var loc), 0)
+    ll_privacy.rl_clear(var r)
+    test.assert_eq(ll_privacy.rl_count(var r), 0)
+    // The mode of a new entry is network privacy mode.
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var a, var irk2, var loc), 0)
+    test.assert_eq(r.mode[0] as Int, ll_privacy.MODE_NETWORK)
+
+@test
+fn test_reset_restores_the_defaults()
+    var r = t_list()
+    t_set(r, true, 77, 5)
+    ll_privacy.rl_reset(var r)
+    test.assert_eq(ll_privacy.rl_count(var r), 0)
+    test.assert(not r.enable)
+    test.assert_eq(r.timeout, ll_privacy.RPA_TIMEOUT_DEFAULT)
+    test.assert_eq(r.epoch, 0)
+    test.assert(not ll_privacy.rl_peer_has_irk(var r, 0))
+
+@test
+fn test_the_rpa_timeout_runs_from_the_epoch()
+    var r = ll_privacy.rl_new()
+    t_set(r, false, 2, 1000000)
+    test.assert(not ll_privacy.rl_expired(var r, 2999999))
+    test.assert(ll_privacy.rl_expired(var r, 3000000))
+
+// ── A cipher that fails ─────────────────────────────────────────────
+
+@value
+struct FailCipher
+    n: Int
+
+fn fail_cipher() -> FailCipher
+    FailCipher { n: 0 }
+
+impl Cipher[] for FailCipher
+    fn seal(var self, var ek: EncKey, ctr: Int, dir: Int, var p: ll_pdu.Pdu)
+        self.n = self.n + 1
+
+    fn open(var self, var ek: EncKey, ctr: Int, dir: Int, var p: ll_pdu.Pdu) -> Bool
+        false
+
+    fn block(var self, var key: Vec[u8; 16], var blk: Vec[u8; 16]) -> Bool
+        false
+
+    fn faults(var self) -> Int
+        self.n
+
+@test
+fn test_an_engine_that_fails_makes_no_hash_and_no_address()
+    var r = t_list()
+    var f = fail_cipher()
+    test.assert_eq(ll_privacy.rl_ah(var r, var f, 0, false, 0x708194), -1)
+    t_entropy(var r, 9)
+    test.assert(not ll_privacy.rl_make_local(var r, var f, 0))
+    test.assert(not r.local_ok[0])
+    test.assert(not ll_privacy.rl_make_peer(var r, var f, 0))
+    test.assert(not r.peer_ok[0])
+    // No random octets: no address either.
+    var g = ll_ccm.soft_cipher_new()
+    var e = t_list()
+    test.assert(not ll_privacy.rl_make_peer(var e, var g, 0))
+
+// ── The lookups that read a PDU in place ────────────────────────────
+
+fn t_pdu_bytes(first_at: Int, a: Vec[u8; 6]) -> Vec[u8; 260]
+    var b: Vec[u8; 260] = Vec.new()
+    for _ in 0..260
+        let _z = b.push(0)
+    for k in 0..6
+        b[first_at + k] = a[k]
+    b
+
+@test
+fn test_the_lookups_in_place_compare_the_octets_at_the_offset()
+    var r = ll_privacy.rl_new()
+    var c = ll_ccm.soft_cipher_new()
+    var a0 = t_addr(0x10)
+    var a1 = t_addr(0x20)
+    var k0 = t_irk()
+    var k1 = t_other_irk()
+    var l0 = t_other_irk()
+    var l1 = t_irk()
+    test.assert_eq(ll_privacy.rl_add(var r, 0, var a0, var k0, var l0), 0)
+    var a1r = t6([0x20, 0x21, 0x22, 0x23, 0x24, 0xC5])
+    test.assert_eq(ll_privacy.rl_add(var r, 1, var a1r, var k1, var l1), 0)
+    // Entry 0's peer address is known; entry 1's is not.
+    var rpa = t6([0xAA, 0xFB, 0x0D, 0x94, 0x81, 0x70])
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var rpa), 0)
+    var at8 = t_pdu_bytes(8, rpa)
+    var other = t_pdu_bytes(8, t6([0xAB, 0xFB, 0x0D, 0x94, 0x81, 0x70]))
+    test.assert_eq(ll_privacy.rl_cached_at(var r, var at8, 8), 0)
+    test.assert_eq(ll_privacy.rl_cached_at(var r, var other, 8), -1)
+    // The identity, by kind and octets.
+    var id0 = t_pdu_bytes(2, a0)
+    var id1 = t_pdu_bytes(2, t6([0x20, 0x21, 0x22, 0x23, 0x24, 0xC5]))
+    test.assert_eq(ll_privacy.rl_find_at(var r, 0, var id0, 2), 0)
+    test.assert_eq(ll_privacy.rl_find_at(var r, 1, var id1, 2), 1)
+    test.assert_eq(ll_privacy.rl_find_at(var r, 0, var id1, 2), -1)
+    // The target address cache: an RPA that entry 1's local IRK made.
+    var made = ll_privacy.rl_new()
+    var mk = t_irk()
+    var ml = t_irk()
+    var ma = t_addr(0x40)
+    test.assert_eq(ll_privacy.rl_add(var made, 0, var ma, var mk, var ml), 0)
+    t_entropy(var made, 7)
+    test.assert(ll_privacy.rl_make_local(var made, var c, 0))
+    var target = t_local(var made, 0)
+    var tb = t_pdu_bytes(8, target)
+    test.assert_eq(ll_privacy.rl_seen_at(var r, var tb, 8), -1)
+    test.assert_eq(ll_privacy.rl_resolve_target(var r, var c, var target), 1)
+    test.assert_eq(ll_privacy.rl_seen_at(var r, var tb, 8), 1)
+    test.assert_eq(ll_privacy.rl_seen(var r, var target), 1)
+    test.assert_eq(ll_privacy.rl_seen_at(var r, var other, 8), -1)
+    // Looked up again it is found without a hash.
+    let before = r.hashed
+    test.assert_eq(ll_privacy.rl_resolve_target(var r, var c, var target), 1)
+    test.assert_eq(r.hashed, before)
+    // A static address is no RPA; one nobody made lands in the ring of strangers.
+    var s = t6([1, 2, 3, 4, 5, 0xC0])
+    test.assert_eq(ll_privacy.rl_resolve_target(var r, var c, var s), -1)
+    var n1 = t6([9, 9, 9, 9, 9, 0x59])
+    test.assert_eq(ll_privacy.rl_resolve_target(var r, var c, var n1), -1)
+    test.assert(ll_privacy.rl_is_negative(var r, var n1))
+    var n2 = t6([8, 9, 9, 9, 9, 0x59])
+    test.assert_eq(ll_privacy.rl_resolve(var r, var c, var n2), -1)
+    test.assert(ll_privacy.rl_is_negative(var r, var n2))
+    // The ring holds four and forgets the oldest.
+    for k in 0..4
+        var n = t6([k, 7, 7, 7, 7, 0x58])
+        test.assert_eq(ll_privacy.rl_resolve(var r, var c, var n), -1)
+    test.assert(not ll_privacy.rl_is_negative(var r, var n1))

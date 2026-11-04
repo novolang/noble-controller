@@ -1,0 +1,82 @@
+// src/ll_policy.nv — the points where a product decides for the
+// Link Layer of the Controller.
+//
+// Mechanism and policy.  What [Vol 6] Part B fixes belongs to the stack and a
+// product cannot change it: the connection event timing, the acknowledgement
+// of every packet, the LL Control procedures and their error codes, the
+// supervision timeout.  What the specification leaves to the implementation is
+// asked of a `LinkPolicy`: whether a connection request that passes the
+// parameter checks of Section 4.5 is taken or ignored, the Controller then
+// going on advertising.  The answer `false` is always spec-valid, since an
+// advertiser ignores a CONNECT_IND it does not want.  `DefaultLinkPolicy`
+// takes every request that passes the checks, and a Controller with no
+// product code behaves as the specification describes.
+//
+// The interface carries no effect row at this stage: a policy answers at
+// once, from the request, and does not block.
+//
+// Satisfies: REQ-BLE-CTL-013.
+
+use std.test
+
+// What a CONNECT_IND asks: the initiator's address, its type (0 public, 1
+// random), and the parameters of LLData in the units of the PDU (the interval
+// and the transmit window in 1.25 ms, the timeout in 10 ms).
+@value
+struct ConnRequest
+    peer_type: Int
+    peer: Vec[u8; 6]
+    interval: Int
+    latency: Int
+    timeout: Int
+    win_size: Int
+    win_offset: Int
+    hop: Int
+    sca: Int
+    chmap: Int
+
+@tier(embedded)
+fn conn_request_new() -> ConnRequest
+    var r = ConnRequest {
+        peer_type: 0, peer: Vec.new(), interval: 0, latency: 0, timeout: 0,
+        win_size: 0, win_offset: 0, hop: 0, sca: 0, chmap: 0 }
+    for _ in 0..6
+        let _a = r.peer.push(0)
+    r
+
+// The decisions the specification leaves to the implementation.
+trait LinkPolicy
+    // Whether to take a connection request that passed the checks of the
+    // Link Layer.  False ignores the request.
+    fn accept_connection(var self, req: ConnRequest) -> Bool
+
+// The policy that takes every request.
+@value
+struct DefaultLinkPolicy
+    asked: Int
+
+@tier(embedded)
+fn default_link_policy() -> DefaultLinkPolicy
+    DefaultLinkPolicy { asked: 0 }
+
+impl LinkPolicy for DefaultLinkPolicy
+    fn accept_connection(var self, req: ConnRequest) -> Bool
+        self.asked = self.asked + 1
+        true
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_default_policy_takes_every_request()
+    var p = default_link_policy()
+    var r = conn_request_new()
+    test.assert(p.accept_connection(r))
+    test.assert(p.accept_connection(r))
+    test.assert_eq(p.asked, 2)
+
+@test
+fn test_a_request_starts_with_an_empty_address()
+    let r = conn_request_new()
+    test.assert_eq(r.peer.len(), 6)
+    test.assert_eq(r.peer[5] as Int, 0)
+    test.assert_eq(r.peer_type, 0)

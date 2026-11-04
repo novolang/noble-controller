@@ -1,0 +1,15 @@
+# The Controller's part of the profile configs/ctl_iso.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/ctl_iso.toml`).  orbit/ble/configs/ctl_iso.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_cis = 4
+ctl_cigs = 1
+ctl_bigs = 2
+ctl_bis = 4
+ctl_pcl = true
+ctl_subrate = true
+ctl_featpages = true
+ctl_ploss = true
+ctl_peersca = true
+ctl_connrate = true
+ctl_framespace = true

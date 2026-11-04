@@ -1,0 +1,369 @@
+// src/ll_ploss.nv — path loss monitoring of the Link Layer: the zones, the thresholds with their hysteresis, the average of the
+// received signal strength and the arithmetic of the path loss.
+//
+// [Vol 6] Part B, Section 4.5.16 and [Vol 4] Part E, Sections 7.7.65.32, 7.8.119 and 7.8.120.  The path loss of a connection is the level the
+// peer transmits at less the average level this end receives, in dB.  The Host names a Low threshold and optionally a High threshold, each
+// with a hysteresis, and so three zones; the Controller reports the zone the path loss enters once it has stayed in it for a time counted in
+// connection events.  The transmit level of the peer is the one LE Power Control keeps (`ll_pcl.nv`).
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.ploss_on()`) says whether the build has the feature.  The state of a link is
+// one `Ploss` record that the per-link record of LE Power Control carries.
+
+use std.test
+
+// 1 in a build with path loss monitoring (feature bit 35), 0 in one without it.
+
+// Current_Path_Loss of the event when the path loss is not known; High_Threshold of the command when there is no High zone.
+const UNAVAILABLE = 0xFF
+const HIGH_UNUSED = 0xFF
+
+// The zones.
+const ZONE_LOW = 0
+const ZONE_MIDDLE = 1
+const ZONE_HIGH = 2
+
+// A transmit level of 127 dBm means the peer's level is not known (`ll_pcl.TX_UNAVAILABLE`).
+const LEVEL_UNKNOWN = 127
+
+// ── The record of a link ────────────────────────────────────────────
+
+// What the Controller keeps of the path loss monitoring of one link, in 16 octets: the thresholds with their hysteresis in dB and the
+// Min_Time_Spent the Host set, the switches (the parameters were set, reporting is on, the peer's level was asked for and is not yet known),
+// the zone last reported (-1: none yet), the zone the path loss is heading for (-1: none) with the events it has been heading there, and the
+// average received strength in quarters of a dB with 256 dB added (`avg_has_sample` says it has a sample).
+@value
+struct Ploss
+    min_time: u16
+    count: u16
+    avg: u16
+    high_t: u8
+    high_h: u8
+    low_t: u8
+    low_h: u8
+    zone: i8
+    cand: i8
+    params_set: Bool
+    reporting_on: Bool
+    peer_tried: Bool
+    avg_has_sample: Bool
+
+// A link with no parameters, no report and no measurement.
+@tier(embedded)
+@no_alloc
+fn ploss_new() -> Ploss
+    Ploss { min_time: 0, count: 0, avg: 0, high_t: 0, high_h: 0, low_t: 0, low_h: 0, zone: -1, cand: -1, params_set: false,
+            reporting_on: false, peer_tried: false, avg_has_sample: false }
+
+// Whether the parameters are acceptable (Section 7.8.119): the High threshold with its hysteresis fits an octet, the Low hysteresis is not
+// above the Low threshold, the Low threshold is not above the High one, and the Low zone's upward boundary is not above the High zone's downward one.
+@tier(embedded)
+@no_alloc
+fn params_ok(ht: Int, hh: Int, lt: Int, lh: Int) -> Bool
+    ht + hh <= 0xFF and lt >= lh and lt <= ht and lt + lh <= ht - hh
+
+// Set the parameters; the switches and the zone are kept.
+@tier(embedded)
+@no_alloc
+fn put_params(var p: Ploss, ht: Int, hh: Int, lt: Int, lh: Int, mt: Int)
+    p.high_t = ht as u8
+    p.high_h = hh as u8
+    p.low_t = lt as u8
+    p.low_h = lh as u8
+    p.min_time = mt as u16
+    p.params_set = true
+
+// Switch reporting on or off; either way the zone and the question for the peer's level start again.
+@tier(embedded)
+@no_alloc
+fn put_on(var p: Ploss, on: Bool)
+    p.reporting_on = on
+    p.zone = -1
+    p.peer_tried = false
+
+// The zone last reported, -1 before the first report.
+@tier(embedded)
+@no_alloc
+fn zone_of(p: Ploss) -> Int
+    p.zone as Int
+
+@tier(embedded)
+@no_alloc
+fn put_zone(var p: Ploss, z: Int)
+    p.zone = z as i8
+
+@tier(embedded)
+@no_alloc
+fn put_tried(var p: Ploss, on: Bool)
+    p.peer_tried = on
+
+// ── The zone the path loss is in ────────────────────────────────────
+
+// The zone of a path loss `loss` before any report: at or above the High threshold when there is one, at or above the Low threshold, below it.
+@tier(embedded)
+@no_alloc
+fn zone_start(p: Ploss, loss: Int) -> Int
+    if p.high_t != HIGH_UNUSED and loss >= (p.high_t as Int)
+        ZONE_HIGH
+    else if loss >= (p.low_t as Int)
+        ZONE_MIDDLE
+    else
+        ZONE_LOW
+
+// The zone the path loss `loss` leads to from the zone `z` last reported.  A boundary is the threshold plus the hysteresis going up and the
+// threshold less the hysteresis going down, and a zone is left at the boundary or beyond it; a path loss that crossed two boundaries leads two
+// zones away.  `z` itself when no boundary is crossed.
+@tier(embedded)
+@no_alloc
+fn zone_step(p: Ploss, z: Int, loss: Int) -> Int
+    let hi = p.high_t != HIGH_UNUSED
+    let low_up = (p.low_t as Int) + (p.low_h as Int)
+    let low_down = (p.low_t as Int) - (p.low_h as Int)
+    let high_up = (p.high_t as Int) + (p.high_h as Int)
+    let high_down = (p.high_t as Int) - (p.high_h as Int)
+    if z == ZONE_LOW
+        if loss < low_up
+            ZONE_LOW
+        else if hi and loss >= high_up
+            ZONE_HIGH
+        else
+            ZONE_MIDDLE
+    else if z == ZONE_MIDDLE
+        if loss <= low_down
+            ZONE_LOW
+        else if hi and loss >= high_up
+            ZONE_HIGH
+        else
+            ZONE_MIDDLE
+    else if loss > high_down
+        ZONE_HIGH
+    else if loss <= low_down
+        ZONE_LOW
+    else
+        ZONE_MIDDLE
+
+// ── The count toward a new zone ─────────────────────────────────────
+
+// The zone the path loss has been heading for, -1 for none.
+@tier(embedded)
+@no_alloc
+fn cand_of(p: Ploss) -> Int
+    p.cand as Int
+
+// The events it has been heading there.
+@tier(embedded)
+@no_alloc
+fn cand_count(p: Ploss) -> Int
+    p.count as Int
+
+// Forget the zone the path loss was heading for.
+@tier(embedded)
+@no_alloc
+fn clear_cand(var p: Ploss)
+    p.cand = -1
+    p.count = 0
+
+// One more event heading for the zone `t`, which is not the zone reported: the count restarts when the heading changes.
+@tier(embedded)
+@no_alloc
+fn cand_step(var p: Ploss, t: Int)
+    if (p.cand as Int) == t
+        p.count = ((p.count as Int) + 1) as u16
+    else
+        p.cand = t as i8
+        p.count = 1
+
+// Whether the count has reached the Min_Time_Spent (0 and 1 are reached by the first event).
+@tier(embedded)
+@no_alloc
+fn cand_reached(p: Ploss) -> Bool
+    p.count >= p.min_time
+
+// ── The average strength and the path loss ──────────────────────────
+
+// The sample `rssi` (dBm) added to the average, which is a running average with a weight of one quarter for the new sample; the first
+// sample is the average.  A sample is -127 to +20.
+@tier(embedded)
+@no_alloc
+fn avg_add(var p: Ploss, rssi: Int)
+    let s = 4 * rssi + 1024
+    var a = s
+    if p.avg_has_sample
+        a = (3 * (p.avg as Int) + s) >>> 2
+    p.avg = (a & 0xFFF) as u16
+    p.avg_has_sample = true
+
+// Forget the average and the heading together.
+@tier(embedded)
+@no_alloc
+fn clear_measure(var p: Ploss)
+    clear_cand(var p)
+    p.avg = 0
+    p.avg_has_sample = false
+
+// The average strength in dBm, rounded.
+@tier(embedded)
+@no_alloc
+fn avg_dbm(p: Ploss) -> Int
+    (((p.avg as Int) + 2) >>> 2) - 256
+
+// The path loss for the peer's transmit level `level` (dBm) and the average received strength `avg` (dBm): the difference, never below zero
+// and never the value 0xFF that stands for unknown; UNAVAILABLE when the level is not known.
+@tier(embedded)
+@no_alloc
+fn loss_of(level: Int, avg: Int) -> Int
+    if level >= LEVEL_UNKNOWN
+        return UNAVAILABLE
+    let d = level - avg
+    if d < 0
+        0
+    else if d > 0xFE
+        0xFE
+    else
+        d
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn sample() -> Ploss
+    // High 90 +- 4, Low 60 +- 6, Min_Time_Spent 3.
+    var p = ploss_new()
+    put_params(var p, 90, 4, 60, 6, 3)
+    p
+
+fn no_high() -> Ploss
+    var p = ploss_new()
+    put_params(var p, 255, 0, 60, 6, 0)
+    p
+
+@test
+fn test_parameters_are_checked_as_the_command_says()
+    test.assert(params_ok(90, 4, 60, 6))
+    test.assert(params_ok(0xFF, 0, 60, 6))
+    test.assert(not params_ok(0xFF, 1, 60, 6))
+    test.assert(not params_ok(90, 4, 5, 6))
+    test.assert(not params_ok(50, 0, 60, 0))
+    test.assert(not params_ok(70, 5, 60, 6))
+    test.assert(params_ok(70, 4, 60, 6))
+    test.assert(params_ok(20, 0, 10, 10))
+
+@test
+fn test_a_new_record_has_nothing_set_nothing_reported_and_no_sample()
+    let p = ploss_new()
+    test.assert(not p.params_set)
+    test.assert(not p.reporting_on)
+    test.assert(not p.peer_tried)
+    test.assert(not p.avg_has_sample)
+    test.assert_eq(zone_of(p), -1)
+    test.assert_eq(cand_of(p), -1)
+    test.assert_eq(cand_count(p), 0)
+
+@test
+fn test_the_parameters_are_kept_and_keep_the_switches()
+    var p = sample()
+    test.assert_eq(p.high_t as Int, 90)
+    test.assert_eq(p.high_h as Int, 4)
+    test.assert_eq(p.low_t as Int, 60)
+    test.assert_eq(p.low_h as Int, 6)
+    test.assert_eq(p.min_time as Int, 3)
+    test.assert(p.params_set)
+    test.assert(not p.reporting_on)
+    test.assert_eq(zone_of(p), -1)
+    put_on(var p, true)
+    put_zone(var p, ZONE_HIGH)
+    test.assert(p.reporting_on)
+    test.assert_eq(zone_of(p), ZONE_HIGH)
+    put_params(var p, 255, 0, 20, 1, 0xFFFF)
+    test.assert(p.reporting_on)
+    test.assert_eq(zone_of(p), ZONE_HIGH)
+    test.assert_eq(p.high_t as Int, 255)
+    test.assert_eq(p.low_t as Int, 20)
+    test.assert_eq(p.min_time as Int, 0xFFFF)
+    put_tried(var p, true)
+    put_on(var p, false)
+    test.assert(not p.reporting_on)
+    test.assert(not p.peer_tried)
+    test.assert_eq(zone_of(p), -1)
+    test.assert(p.params_set)
+    test.assert_eq(p.high_t as Int, 255)
+
+@test
+fn test_the_first_zone_is_taken_from_the_thresholds()
+    let p = sample()
+    test.assert_eq(zone_start(p, 10), ZONE_LOW)
+    test.assert_eq(zone_start(p, 59), ZONE_LOW)
+    test.assert_eq(zone_start(p, 60), ZONE_MIDDLE)
+    test.assert_eq(zone_start(p, 89), ZONE_MIDDLE)
+    test.assert_eq(zone_start(p, 90), ZONE_HIGH)
+    test.assert_eq(zone_start(no_high(), 200), ZONE_MIDDLE)
+
+@test
+fn test_a_boundary_has_a_hysteresis_in_each_direction()
+    let p = sample()
+    // Up from Low at 66 or more, down from Middle at 54 or less.
+    test.assert_eq(zone_step(p, ZONE_LOW, 65), ZONE_LOW)
+    test.assert_eq(zone_step(p, ZONE_LOW, 66), ZONE_MIDDLE)
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 55), ZONE_MIDDLE)
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 54), ZONE_LOW)
+    // Up from Middle at 94 or more, down from High at 86 or less.
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 93), ZONE_MIDDLE)
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 94), ZONE_HIGH)
+    test.assert_eq(zone_step(p, ZONE_HIGH, 87), ZONE_HIGH)
+    test.assert_eq(zone_step(p, ZONE_HIGH, 86), ZONE_MIDDLE)
+    // Two boundaries at once.
+    test.assert_eq(zone_step(p, ZONE_LOW, 120), ZONE_HIGH)
+    test.assert_eq(zone_step(p, ZONE_HIGH, 10), ZONE_LOW)
+    // No High zone: the path loss stays in Middle however high it goes.
+    test.assert_eq(zone_step(no_high(), ZONE_MIDDLE, 250), ZONE_MIDDLE)
+
+@test
+fn test_the_count_restarts_when_the_heading_changes()
+    var p = sample()
+    test.assert_eq(cand_of(p), -1)
+    cand_step(var p, ZONE_MIDDLE)
+    cand_step(var p, ZONE_MIDDLE)
+    test.assert_eq(cand_of(p), ZONE_MIDDLE)
+    test.assert_eq(cand_count(p), 2)
+    test.assert(not cand_reached(p))
+    cand_step(var p, ZONE_MIDDLE)
+    test.assert(cand_reached(p))
+    cand_step(var p, ZONE_LOW)
+    test.assert_eq(cand_count(p), 1)
+    test.assert(not cand_reached(p))
+    put_params(var p, 90, 4, 60, 6, 1)
+    test.assert(cand_reached(p))
+    put_params(var p, 90, 4, 60, 6, 0)
+    test.assert(cand_reached(p))
+    clear_cand(var p)
+    test.assert_eq(cand_of(p), -1)
+    test.assert_eq(cand_count(p), 0)
+
+@test
+fn test_the_average_follows_the_samples()
+    var p = ploss_new()
+    test.assert(not p.avg_has_sample)
+    avg_add(var p, -60)
+    test.assert(p.avg_has_sample)
+    test.assert_eq(avg_dbm(p), -60)
+    avg_add(var p, -80)
+    test.assert_eq(avg_dbm(p), -65)
+    for _ in 0..40
+        avg_add(var p, -80)
+    test.assert_eq(avg_dbm(p), -80)
+    avg_add(var p, -127)
+    avg_add(var p, 20)
+    test.assert(avg_dbm(p) > -127)
+    test.assert(avg_dbm(p) <= 20)
+    test.assert_eq(cand_of(p), -1)
+    cand_step(var p, ZONE_LOW)
+    clear_measure(var p)
+    test.assert(not p.avg_has_sample)
+    test.assert_eq(cand_of(p), -1)
+    test.assert_eq(cand_count(p), 0)
+
+@test
+fn test_the_path_loss_is_the_level_less_the_average()
+    test.assert_eq(loss_of(0, -60), 60)
+    test.assert_eq(loss_of(-20, -60), 40)
+    test.assert_eq(loss_of(8, -127), 135)
+    test.assert_eq(loss_of(-40, -30), 0)
+    test.assert_eq(loss_of(127, -60), UNAVAILABLE)
+    test.assert_eq(loss_of(126, -127), 253)

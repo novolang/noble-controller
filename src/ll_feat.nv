@@ -1,0 +1,103 @@
+// src/ll_feat.nv — the Feature Page Exchange of the Link Layer: the PDUs LL_FEATURE_EXT_REQ and LL_FEATURE_EXT_RSP, the
+// feature pages and the rules of the page numbers.
+//
+// [Vol 6] Part B, Sections 2.4.2.41, 4.6 and 5.1.4.3; [Vol 4] Part E, Sections 7.7.65.38, 7.8.128 and 7.8.129.  The feature set has page 0
+// (octets 0 to 7, the page LL_FEATURE_REQ and LL_FEATURE_RSP carry) and ten pages of 24 octets, numbered 1 to 10 (page 1 is octets 8 to
+// 31, feature bits 64 to 255).  A Controller with a feature bit of 64 or more sets feature 63, LL Extended Feature Set, and answers the
+// PDUs.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.feat_on()`) says whether the build has the feature.
+
+use ctl_limits
+use std.test
+use ll_pdu
+use ll_data
+
+// 1 in a build with the Feature Page Exchange (feature bit 63), 0 in one without it.
+
+// The highest page number, and the octets of one page above page 0.
+const PAGE_MAX = 10
+const PAGE_OCTETS = 24
+
+// Octet 7 of page 0 with feature 63, LL Extended Feature Set.
+const OCTET7_EXT = 0x80
+
+// The feature bits 64 to 79 of page 1 this build has (the first two octets of the page; the link keeps no more than 16 bits of it,
+// `ll_link.FX_LOCAL`).  The bits are `ctl_limits.page1_bits()`: 0x100, bit 72, Shorter Connection Intervals, in a build with
+// Connection Rate (`ctl_limits.rate_on()`), otherwise 0.  Bit 73, its Host Support, is the Host's to set with LE Set Host Feature and is kept in the
+// link.  Bit 65, Frame Space Update, is bit 1 of the page and is set in a build with `ctl_limits.fs_on()`.  The highest page with a bit is 0 when no bit is set and 1 otherwise.
+
+const E_INVALID_PARAMS = 0x1E
+
+// ── The pages ───────────────────────────────────────────────────────
+
+// The highest-numbered page that has a bit set, from the bits of page 1 (the first eight octets of it): 1 or, with none, 0.
+@tier(embedded)
+fn max_page(p1: Int) -> Int
+    if p1 != 0
+        1
+    else
+        0
+
+// Whether `page` is a page number the PDUs may carry.
+@tier(embedded)
+fn page_ok(page: Int) -> Bool
+    page >= 1 and page <= PAGE_MAX
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// The 24 octets of page 1 for the bits `p1` (the first eight octets; the others are zero).
+@tier(embedded)
+fn put_page(var p: Pdu, p1: Int)
+    for i in 0..8
+        let _a = ll_pdu.pdu_put(var p, (p1 >>> (8 * i)) & 0xFF)
+    for _ in 8..PAGE_OCTETS
+        let _b = ll_pdu.pdu_put(var p, 0)
+
+// LL_FEATURE_EXT_REQ or LL_FEATURE_EXT_RSP (`opcode`): the highest page with a bit, the page number and the page.  A page above 1 is zero.
+@tier(embedded)
+fn put_ext(var p: Pdu, opcode: Int, maxp: Int, page: Int, p1: Int)
+    ll_data.ctrl_begin(var p, opcode)
+    let _a = ll_pdu.pdu_put(var p, maxp)
+    let _b = ll_pdu.pdu_put(var p, page)
+    if page == 1
+        put_page(var p, p1)
+    else
+        put_page(var p, 0)
+    ll_data.dpdu_finish(var p)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_pdu_layouts()
+    var p = ll_pdu.pdu_new()
+    put_ext(var p, ll_data.OP_FEATURE_EXT_REQ, 1, 1, 0x0102)
+    test.assert_eq(ll_data.dpdu_len(var p), 27)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x2B)
+    test.assert_eq(ll_data.dpdu_byte(var p, 1), 1)
+    test.assert_eq(ll_data.dpdu_byte(var p, 2), 1)
+    test.assert_eq(ll_data.dpdu_byte(var p, 3), 0x02)
+    test.assert_eq(ll_data.dpdu_byte(var p, 4), 0x01)
+    test.assert_eq(ll_data.dpdu_byte(var p, 26), 0)
+    put_ext(var p, ll_data.OP_FEATURE_EXT_RSP, 0, 4, 0xFF)
+    test.assert_eq(ll_data.dpdu_len(var p), 27)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x2C)
+    test.assert_eq(ll_data.dpdu_byte(var p, 2), 4)
+    test.assert_eq(ll_data.dpdu_byte(var p, 3), 0)
+
+@test
+fn test_high_octets_of_the_page()
+    var p = ll_pdu.pdu_new()
+    put_ext(var p, ll_data.OP_FEATURE_EXT_RSP, 1, 1, 0x7F00000000000001)
+    test.assert_eq(ll_data.dpdu_byte(var p, 3), 1)
+    test.assert_eq(ll_data.dpdu_byte(var p, 10), 0x7F)
+    test.assert_eq(ll_data.dpdu_byte(var p, 11), 0)
+
+@test
+fn test_page_rules()
+    test.assert_eq(max_page(0), 0)
+    test.assert_eq(max_page(0x20), 1)
+    test.assert(not page_ok(0))
+    test.assert(page_ok(1))
+    test.assert(page_ok(10))
+    test.assert(not page_ok(11))

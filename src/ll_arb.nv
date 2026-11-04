@@ -1,0 +1,390 @@
+// src/ll_arb.nv — the radio arbiter: which of the Link Layer's
+// activities holds the radio next, and until when.
+//
+// The radio does one thing at a time.  Each class of activity books a start
+// time and an end time, and the arbiter grants the radio to the class of the
+// highest priority that is due, and tells a granted class the time it must
+// let go, which is the start of the next booking of a class with a higher
+// priority less a guard for the radio to ramp.  Classes are numbered from the
+// highest priority: isochronous events, connection events, advertising
+// events, scan windows.  A scan window is also the Initiating state's window.
+// Advertising events, scan windows and the connection events of both roles are
+// booked, each link its own class (`CLASS_ACL` plus the slot, `ACL_CLASSES` of them, all
+// of the same priority: the one whose booking began first has the radio);
+// the isochronous class is in the interface for the stage that follows, and booking
+// it needs no change here.
+//
+// The arbiter keeps no radio and no clock: the caller gives the time.
+//
+// The state is a value with inline storage; no function here allocates.
+
+use noble_controller_config
+use ctl_limits
+use std.test
+use ll_radio
+
+// The functions below take the state as a `var` parameter even where they only read
+// it, which passes its address.  A plain parameter is a copy, and a copy of a
+// struct of this size on every call costs time and stack.
+
+// The classes, highest priority first.  `class_per()` and the classes after it follow the Controller's link slots (`ctl_links` of the
+// package configuration): the three columns of `Arb` hold one class for each link and four more.  `class_per()` is the events of the periodic trains, the one this
+// device advertises and the ones it synchronizes to: they fall at fixed times that a receiver
+// listens for, so they come before the advertising events and the scan windows, which can move,
+// and after the connection events and the isochronous events, which a lost event costs more.
+const CLASS_ISO = 0
+const CLASS_ACL = 1
+const CLASS_ACL2 = 2
+const CLASS_ACL3 = 3
+
+@tier(embedded)
+const fn class_per() -> Int
+    CLASS_ACL + ctl_limits.arb_classes()
+
+@tier(embedded)
+const fn class_adv() -> Int
+    class_per() + 1
+
+@tier(embedded)
+const fn class_scan() -> Int
+    class_adv() + 1
+
+@tier(embedded)
+const fn classes() -> Int
+    class_scan() + 1
+
+// The answer when no class is due.
+const NONE = -1
+
+// The microseconds before its start a class is granted the radio: the time the program needs to point the radio
+// and the radio needs to ramp (`ll_radio.lead_us`).  A scan window opens at its start.  A connection event is
+// granted the radio longer ahead (`ll_radio.ACL_EXTRA_US`): the program may be partway through an HCI command or an
+// advertising PDU when it is due, and the receiver has to be listening when the window opens.  The lead, and the
+// guard a class keeps before a booking of a higher one, follow the radio's ramp-up (`arb_radio`).
+const LEAD_SCAN_US = 0
+
+// The shortest stretch of radio time worth granting to each class.  A scan
+// window with less than a millisecond before the next advertising event is
+// skipped, since the radio would ramp for nothing.
+const MIN_SLOT_US = 1000
+
+// `on` says the class has a booking, `start` and `end` are its times.
+@value
+struct Arb
+    on: Vec[Bool; noble_controller_config.CTL_LINKS + 4]
+    start: Vec[Int; noble_controller_config.CTL_LINKS + 4]
+    end: Vec[Int; noble_controller_config.CTL_LINKS + 4]
+    lead: Int
+    guard: Int
+    stream_guard: Int
+
+// An arbiter with nothing booked.
+@tier(embedded)
+fn arb_new() -> Arb
+    var a = Arb { on: Vec.new(), start: Vec.new(), end: Vec.new(), lead: 0, guard: 0, stream_guard: 0 }
+    arb_radio(var a, ll_radio.profile_assumed())
+    for _ in 0..classes()
+        let _a = a.on.push(false)
+        let _b = a.start.push(0)
+        let _c = a.end.push(0)
+    a
+
+// Derive the lead and the guards from the radio's ramp-up.
+@tier(embedded)
+fn arb_radio(var a: Arb, p: ll_radio.RadioProfile)
+    a.lead = ll_radio.lead_us(p)
+    a.guard = ll_radio.guard_us(p)
+    a.stream_guard = ll_radio.stream_guard_us(p)
+
+// Book `cls` from `start` to `end`, replacing its earlier booking.
+@tier(embedded)
+fn arb_book(var a: Arb, cls: Int, start: Int, end: Int)
+    if cls < 0 or cls >= classes()
+        return
+    a.on[cls] = true
+    a.start[cls] = start
+    a.end[cls] = end
+
+// Remove the booking of `cls`.
+@tier(embedded)
+fn arb_cancel(var a: Arb, cls: Int)
+    if cls < 0 or cls >= classes()
+        return
+    a.on[cls] = false
+
+// Whether `cls` has a booking.
+@tier(embedded)
+fn arb_booked(var a: Arb, cls: Int) -> Bool
+    cls >= 0 and cls < classes() and a.on[cls]
+
+// The start of the booking of `cls`.
+@tier(embedded)
+fn arb_start(var a: Arb, cls: Int) -> Int
+    a.start[cls]
+
+// The lead of a class.
+@tier(embedded)
+fn lead_of(var a: Arb, cls: Int) -> Int
+    if cls == class_scan()
+        LEAD_SCAN_US
+    else if cls >= CLASS_ACL and cls < class_adv()
+        a.lead + ll_radio.ACL_EXTRA_US
+    else
+        a.lead
+
+// The class to run at `now`: the highest-priority class whose booking has
+// begun, or begins within its lead, and has not ended.  `NONE` when none is
+// due.
+@satisfies("REQ-BLE-CTL-012")
+@satisfies("REQ-BLE-CTL-024")
+@tier(embedded)
+fn arb_pick(var a: Arb, now: Int) -> Int
+    for cls in 0..classes()
+        if a.on[cls] and a.start[cls] - lead_of(var a, cls) <= now and now < a.end[cls]
+            return earliest_acl(var a, cls, now)
+    NONE
+
+// `cls` is due.  Among the connection classes the earliest booking that is due and
+// began before `cls` does is granted the radio instead, whichever slot it is.
+@tier(embedded)
+fn earliest_acl(var a: Arb, cls: Int, now: Int) -> Int
+    if cls < CLASS_ACL or cls >= class_adv()
+        return cls
+    var best = cls
+    for other in cls + 1..class_adv()
+        if a.on[other] and a.start[other] < a.start[best]
+            if a.start[other] - lead_of(var a, other) <= now and now < a.end[other]
+                best = other
+    best
+
+// The time `cls` must let go of the radio: its own end, or the guard before
+// the next booking of a class with a higher priority, whichever is first.  A
+// booking that has begun already does not limit the class below it here:
+// `arb_pick` would have granted the radio to that class.
+@satisfies("REQ-BLE-CTL-012")
+@tier(embedded)
+fn arb_limit(var a: Arb, cls: Int, now: Int) -> Int
+    var limit = a.end[cls]
+    for other in 0..cls
+        if a.on[other] and a.start[other] > now
+            let stop = a.start[other] - a.guard
+            if stop < limit
+                limit = stop
+    limit
+
+// Whether no class above `cls` is booked to begin before `until` (less the guard) or is under way now:
+// a stretch of radio time from `now` to `until` that `cls` may take whole.
+@satisfies("REQ-BLE-CTL-012")
+@tier(embedded)
+fn arb_clear(var a: Arb, cls: Int, now: Int, until: Int) -> Bool
+    for other in 0..cls
+        if a.on[other] and a.end[other] > now and a.start[other] - a.guard < until
+            return false
+    true
+
+// Whether `cls` has at least `MIN_SLOT_US` of radio time from `now`.
+@tier(embedded)
+fn arb_worth_running(var a: Arb, cls: Int, now: Int) -> Bool
+    arb_limit(var a, cls, now) - now >= MIN_SLOT_US
+
+// The microseconds the main loop can spend on work that is not the radio's (the HCI stream, which a byte at a time is slow:
+// 10 microseconds an octet at 1 Mbaud) before the next booking needs the program: up to `guard` before the start of the soonest
+// booking that has not begun, a few microseconds when a booking is due already (the radio program comes next, and a booking
+// that cannot be run must not stop the stream for good), and a large number when nothing is booked.
+@tier(embedded)
+fn arb_room(var a: Arb, now: Int, guard: Int) -> Int
+    var room = ROOM_FREE_US
+    for cls in 0..classes()
+        if a.on[cls] and now < a.end[cls]
+            var r = a.start[cls] - guard - now
+            if a.start[cls] - lead_of(var a, cls) <= now
+                r = ROOM_DUE_US
+            if r < room
+                room = r
+    if room < 0
+        return 0
+    room
+
+// What `arb_room` answers when nothing is booked, and when a booking is due.
+const ROOM_FREE_US = 1000000
+const ROOM_DUE_US = 30
+
+// The soonest time any booked class begins, `NONE` when nothing is booked.
+@tier(embedded)
+fn arb_next_start(var a: Arb) -> Int
+    var best = NONE
+    for cls in 0..classes()
+        if a.on[cls] and (best == NONE or a.start[cls] < best)
+            best = a.start[cls]
+    best
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_room_before_a_booking_stops_a_guard_short_of_its_start()
+    var a = arb_new()
+    test.assert_eq(arb_room(var a, 1000, 350), ROOM_FREE_US)
+    arb_book(var a, CLASS_ISO, 20000, 21000)
+    // The class is not due until its lead (600) before the start: the main loop has the time up to the guard.
+    test.assert_eq(arb_room(var a, 1000, 350), 18650)
+    test.assert_eq(arb_room(var a, 19000, 350), 650)
+    // Due: a few microseconds, however far the start still is.
+    test.assert_eq(arb_room(var a, 19500, 350), ROOM_DUE_US)
+    // Past its end the booking does not count.
+    test.assert_eq(arb_room(var a, 21000, 350), ROOM_FREE_US)
+
+@test
+fn test_the_room_is_the_least_of_the_bookings()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 30000, 31000)
+    arb_book(var a, class_scan(), 25000, 26000)
+    test.assert_eq(arb_room(var a, 10000, 350), 14650)
+    arb_book(var a, CLASS_ACL, 12000, 13000)
+    test.assert_eq(arb_room(var a, 10000, 350), 1650)
+
+@test
+fn test_a_stretch_is_clear_until_the_next_booking_of_a_higher_class()
+    var a = arb_new()
+    test.assert(arb_clear(var a, class_scan(), 1000, 9000))
+    arb_book(var a, CLASS_ACL, 20000, 21000)
+    test.assert(arb_clear(var a, class_scan(), 1000, 19000))
+    test.assert(not arb_clear(var a, class_scan(), 1000, 19401))
+    // A booking of a class below does not count, nor one that has ended.
+    arb_book(var a, class_scan(), 2000, 3000)
+    test.assert(arb_clear(var a, CLASS_ACL, 1000, 25000))
+    test.assert(arb_clear(var a, class_scan(), 22000, 30000))
+    // One under way does.
+    test.assert(not arb_clear(var a, class_scan(), 20500, 20600))
+
+@test
+fn test_capacities_match_the_constants()
+    let a = arb_new()
+    test.assert_eq(a.on.capacity(), classes())
+    test.assert_eq(a.start.capacity(), classes())
+    test.assert_eq(a.end.capacity(), classes())
+
+@test
+fn test_nothing_booked_picks_nothing()
+    var a = arb_new()
+    test.assert_eq(arb_pick(var a, 1000), NONE)
+    test.assert_eq(arb_next_start(var a), NONE)
+
+@test
+fn test_a_class_is_picked_inside_its_booking_and_its_lead()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 10000, 12000)
+    test.assert_eq(arb_pick(var a, 9000), NONE)
+    test.assert_eq(arb_pick(var a, 9400), class_adv())
+    test.assert_eq(arb_pick(var a, 11999), class_adv())
+    test.assert_eq(arb_pick(var a, 12000), NONE)
+    // A scan window opens at its start, with no lead.
+    arb_book(var a, class_scan(), 20000, 30000)
+    test.assert_eq(arb_pick(var a, 19999), NONE)
+    test.assert_eq(arb_pick(var a, 20000), class_scan())
+
+@test
+fn test_the_higher_priority_class_wins_when_both_are_due()
+    var a = arb_new()
+    arb_book(var a, class_scan(), 0, 100000)
+    arb_book(var a, class_adv(), 50000, 52000)
+    test.assert_eq(arb_pick(var a, 1000), class_scan())
+    test.assert_eq(arb_pick(var a, 49500), class_adv())
+    test.assert_eq(arb_pick(var a, 51000), class_adv())
+    test.assert_eq(arb_pick(var a, 53000), class_scan())
+    arb_book(var a, CLASS_ACL, 51000, 51500)
+    test.assert_eq(arb_pick(var a, 51200), CLASS_ACL)
+    arb_book(var a, CLASS_ISO, 51100, 51300)
+    test.assert_eq(arb_pick(var a, 51200), CLASS_ISO)
+
+@test
+fn test_a_scan_window_is_cut_short_by_the_next_advertising_event()
+    var a = arb_new()
+    arb_book(var a, class_scan(), 0, 100000)
+    arb_book(var a, class_adv(), 30000, 32000)
+    test.assert_eq(arb_limit(var a, class_scan(), 1000), 30000 - a.guard)
+    test.assert(arb_worth_running(var a, class_scan(), 1000))
+    // Too close to the event for the radio to be worth starting.
+    test.assert(not arb_worth_running(var a, class_scan(), 29000))
+    // After the event the window runs to its own end.
+    arb_book(var a, class_adv(), 500000, 502000)
+    test.assert_eq(arb_limit(var a, class_scan(), 40000), 100000)
+
+@test
+fn test_the_highest_class_is_never_limited()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 0, 5000)
+    arb_book(var a, class_scan(), 100, 9000)
+    test.assert_eq(arb_limit(var a, class_adv(), 0), 5000)
+
+@test
+fn test_cancel_removes_the_booking()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 0, 5000)
+    test.assert(arb_booked(var a, class_adv()))
+    arb_cancel(var a, class_adv())
+    test.assert(not arb_booked(var a, class_adv()))
+    test.assert_eq(arb_pick(var a, 100), NONE)
+
+@test
+fn test_next_start_is_the_earliest_booking()
+    var a = arb_new()
+    arb_book(var a, class_scan(), 8000, 9000)
+    arb_book(var a, class_adv(), 5000, 6000)
+    test.assert_eq(arb_next_start(var a), 5000)
+    arb_cancel(var a, class_adv())
+    test.assert_eq(arb_next_start(var a), 8000)
+
+@test
+fn test_a_class_number_out_of_range_is_ignored()
+    var a = arb_new()
+    arb_book(var a, classes(), 0, 10)
+    arb_book(var a, -1, 0, 10)
+    test.assert_eq(arb_pick(var a, 5), NONE)
+    test.assert(not arb_booked(var a, classes()))
+
+@test
+fn test_a_connection_event_is_granted_the_radio_a_longer_lead_ahead()
+    var a = arb_new()
+    arb_book(var a, CLASS_ACL, 10000, 12000)
+    test.assert_eq(lead_of(var a, CLASS_ACL), 1000)
+    test.assert_eq(arb_pick(var a, 8999), NONE)
+    test.assert_eq(arb_pick(var a, 9000), CLASS_ACL)
+    // An advertising event that would run into it is cut short a guard before.
+    arb_book(var a, class_adv(), 0, 20000)
+    test.assert_eq(arb_limit(var a, class_adv(), 100), 10000 - a.guard)
+    test.assert_eq(lead_of(var a, class_adv()), 600)
+
+@test
+fn test_the_connection_event_due_first_has_the_radio()
+    var a = arb_new()
+    arb_book(var a, CLASS_ACL, 10000, 13000)
+    arb_book(var a, CLASS_ACL2, 11000, 14000)
+    // Both have begun at 11500; the first booking is the earlier.
+    test.assert_eq(arb_pick(var a, 11500), CLASS_ACL)
+    arb_book(var a, CLASS_ACL, 12000, 15000)
+    test.assert_eq(arb_pick(var a, 12500), CLASS_ACL2)
+    // The second link alone is granted at its lead.
+    arb_cancel(var a, CLASS_ACL)
+    test.assert_eq(lead_of(var a, CLASS_ACL2), 1000)
+    test.assert_eq(arb_pick(var a, 10000), CLASS_ACL2)
+    // The second booking has ended: the first is run, late as it is.
+    arb_book(var a, CLASS_ACL, 12000, 15000)
+    arb_book(var a, CLASS_ACL2, 9000, 12100)
+    test.assert_eq(arb_pick(var a, 12150), CLASS_ACL)
+
+@test
+fn test_the_lead_and_the_guards_follow_the_ramp_up_of_the_radio()
+    var a = arb_new()
+    test.assert_eq(a.lead, 600)
+    test.assert_eq(a.stream_guard, 350)
+    arb_radio(var a, ll_radio.profile_new(false, 300, 0))
+    test.assert_eq(lead_of(var a, CLASS_ISO), 755)
+    test.assert_eq(lead_of(var a, CLASS_ACL), 1155)
+    test.assert_eq(lead_of(var a, class_scan()), 0)
+    test.assert_eq(a.guard, 755)
+    test.assert_eq(a.stream_guard, 505)
+    arb_book(var a, CLASS_ISO, 20000, 21000)
+    test.assert_eq(arb_pick(var a, 19200), NONE)
+    test.assert_eq(arb_pick(var a, 19300), CLASS_ISO)
+    arb_book(var a, class_adv(), 0, 40000)
+    test.assert_eq(arb_limit(var a, class_adv(), 0), 19245)

@@ -1,0 +1,540 @@
+// src/ll_ext.nv — the extended advertising PDUs: the fields of the Extended Header, the
+// view a received PDU is judged by, and the values an LE Extended Advertising Report event carries.
+//
+// [Vol 6] Part B, Section 2.3.4.  ADV_EXT_IND, AUX_ADV_IND, AUX_SCAN_RSP, AUX_SYNC_IND and AUX_CHAIN_IND
+// share the PDU type 7.  The payload starts with one octet that holds the length of the Extended Header
+// (6 bits) and the AdvMode (2 bits: 0 neither connectable nor scannable, 1 connectable, 2 scannable).
+// The Extended Header is a flags octet and the fields the flags announce, in the order of the bits:
+//
+//   bit 0  AdvA        6 octets
+//   bit 1  TargetA     6
+//   bit 2  CTEInfo     1
+//   bit 3  ADI         2   the Advertising Data Info: DID in 12 bits and SID in 4
+//   bit 4  AuxPtr      3   the channel, the clock accuracy, the offset and its unit, the PHY
+//   bit 5  SyncInfo    18  the periodic advertising train
+//   bit 6  TxPower     1   a signed octet
+//
+// and, behind the fields up to the length the first octet gives, the Additional Controller Advertising Data.
+// The advertising data follows the Extended Header.  The length octet of the PDU is 6 bits wide on the
+// primary channels and 8 bits wide on the secondary channels, so a received PDU is read with its whole length
+// octet (`ll_air.get_ext`).
+//
+// A legacy PDU can be judged, filtered and answered by the code that was written for it, so a received
+// extended PDU is given a legacy shape (`legacy_view`): an AdvA, a TargetA, the address type bits and a
+// PDU type that tells whether the advertiser may be scanned, which the AdvMode decides.
+//
+// The state is a value with inline storage; no function here allocates.
+
+use std.test
+use ll_pdu
+use ll_phy
+use ll_init
+
+// The AdvMode values.
+const MODE_NONE = 0
+const MODE_CONN = 1
+const MODE_SCAN = 2
+
+// The bits of the Extended Header flags.
+const F_ADVA = 0
+const F_TARGETA = 1
+const F_CTE = 2
+const F_ADI = 3
+const F_AUX = 4
+const F_SYNC = 5
+const F_TXP = 6
+
+// The octets of an LE Extended Advertising Report event that are not data, with one report in it
+// (the subevent code, Num_Reports and the 24 octets of a report), and the most data one carries
+// (the event holds 255 octets of parameters).
+const REPORT_FIXED = 26
+const REPORT_DATA_MAX = 229
+
+// The Event_Type bits of an LE Extended Advertising Report ([Vol 4] Part E, Section 7.7.65.13): the
+// advertisement is connectable, scannable, directed, a scan response, in a legacy PDU; and the two bits
+// that say how much of the data this report holds (`DATA_*`, bits 5 and 6).
+const ET_CONN = 0x0001
+const ET_SCAN = 0x0002
+const ET_DIRECT = 0x0004
+const ET_RSP = 0x0008
+const ET_LEGACY = 0x0010
+const DATA_COMPLETE = 0
+const DATA_MORE = 1
+const DATA_TRUNCATED = 2
+
+// What Tx Power the report names when the PDU gave none, the PHY it names for none, the SID of a legacy
+// PDU, and the Address_Type of an anonymous advertisement.
+const TX_NONE = 0x7F
+const PHY_NONE = 0
+const SID_NONE = 0xFF
+const ADDR_ANON = 0xFF
+
+// Where the fields of an Extended Header are in a received PDU (octets from its first, -1 when absent) and
+// where the advertising data is.  `ok` says the PDU is a well-formed extended advertising PDU.
+@value
+struct ExtView
+    ok: Bool
+    mode: Int
+    adva: Int
+    targeta: Int
+    adi: Int
+    aux: Int
+    sync: Int
+    txp: Int
+    data_at: Int
+    data_len: Int
+    acad_at: Int
+    acad_len: Int
+
+// An empty view, for a PDU that is not extended.
+@tier(embedded)
+fn view_none() -> ExtView
+    ExtView { ok: false, mode: 0, adva: -1, targeta: -1, adi: -1, aux: -1, sync: -1, txp: -1, data_at: 0, data_len: 0, acad_at: 0, acad_len: 0 }
+
+// Parse the extended advertising PDU `rx`, whose `n` is the octets received with the header.  A PDU is
+// refused when its type is not 7 (nor 8, the AUX_CONNECT_RSP, which has the same layout), its length octet disagrees with `n`, the AdvMode is the reserved 3, or an
+// announced field lies past the Extended Header.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn ext_parse(var rx: Pdu) -> ExtView
+    let n = rx.n
+    let ty = (rx.b[0] as Int) & 0x0F
+    if n < 3 or (ty != ll_init.EXT_ADV and ty != ll_init.AUX_CONNECT_RSP) or (rx.b[1] as Int) + 2 != n
+        return view_none()
+    let hl = (rx.b[2] as Int) & 0x3F
+    let mode = ((rx.b[2] as Int) >>> 6) & 3
+    if mode == 3 or 3 + hl > n
+        return view_none()
+    var adva = -1
+    var targeta = -1
+    var adi = -1
+    var aux = -1
+    var sync = -1
+    var txp = -1
+    var acad_at = 3 + hl
+    if hl > 0
+        let flags = rx.b[3] as Int
+        var off = 4
+        for bit in 0..7
+            if ((flags >>> bit) & 1) != 0
+                let size = ll_init.ext_size(bit)
+                if off + size > 3 + hl
+                    return view_none()
+                if bit == F_ADVA
+                    adva = off
+                else if bit == F_TARGETA
+                    targeta = off
+                else if bit == F_ADI
+                    adi = off
+                else if bit == F_AUX
+                    aux = off
+                else if bit == F_SYNC
+                    sync = off
+                else if bit == F_TXP
+                    txp = off
+                off = off + size
+        acad_at = off
+    ExtView { ok: true, mode: mode, adva: adva, targeta: targeta, adi: adi, aux: aux, sync: sync, txp: txp,
+              data_at: 3 + hl, data_len: n - 3 - hl, acad_at: acad_at, acad_len: 3 + hl - acad_at }
+
+// The DID and the SID of the Advertising Data Info that starts at octet `adi` of `rx`.
+@tier(embedded)
+fn adi_did(var rx: Pdu, adi: Int) -> Int
+    (rx.b[adi] as Int) | (((rx.b[adi + 1] as Int) & 0x0F) << 8)
+
+@tier(embedded)
+fn adi_sid(var rx: Pdu, adi: Int) -> Int
+    ((rx.b[adi + 1] as Int) >>> 4) & 0x0F
+
+// The Tx Power of the PDU as the report carries it: the signed octet, or `TX_NONE`.
+@tier(embedded)
+fn tx_power(var rx: Pdu, v: ExtView) -> Int
+    if v.txp < 0
+        return TX_NONE
+    rx.b[v.txp] as Int
+
+// The Periodic_Advertising_Interval of the report, in units of 1.25 ms: the interval of the SyncInfo, 0 for
+// a PDU that has none.
+@tier(embedded)
+fn periodic_interval(var rx: Pdu, v: ExtView) -> Int
+    if v.sync < 0
+        return 0
+    (rx.b[v.sync + 2] as Int) | ((rx.b[v.sync + 3] as Int) << 8)
+
+// The Event_Type of a report for an AdvMode (and a TargetA), without the data status.
+@tier(embedded)
+fn event_type(mode: Int, directed: Bool) -> Int
+    var et = 0
+    if mode == MODE_CONN
+        et = ET_CONN
+    if mode == MODE_SCAN
+        et = ET_SCAN
+    if directed
+        et = et | ET_DIRECT
+    et
+
+// The Event_Type of the report of a legacy PDU of the type `ty` (ADV_IND, ADV_DIRECT_IND, ADV_SCAN_IND,
+// ADV_NONCONN_IND or SCAN_RSP), -1 for a type the report does not carry.  A SCAN_RSP is told apart by the
+// bits of the advertisement it answered, which the caller adds (`ET_CONN`, `ET_SCAN`).
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn legacy_event_type(ty: Int) -> Int
+    match ty
+        0 => ET_LEGACY | ET_CONN | ET_SCAN
+        1 => ET_LEGACY | ET_CONN | ET_DIRECT
+        6 => ET_LEGACY | ET_SCAN
+        2 => ET_LEGACY
+        4 => ET_LEGACY | ET_RSP
+        _ => -1
+
+// What the ADV_EXT_IND of an advertisement named, for the AUX_ADV_IND it points to: a non-connectable and
+// non-scannable advertiser may put its AdvA (and TargetA) in the ADV_EXT_IND and leave them out of the
+// AUX_ADV_IND ([Vol 6] Part B, Section 2.3.4.1).  `hdr` is the header octet of the PDU that named them, whose TxAdd
+// and RxAdd are their types.
+@value
+struct XPri
+    adva_ok: Bool
+    target_ok: Bool
+    hdr: Int
+    adva: Vec[u8; 6]
+    target: Vec[u8; 6]
+
+@tier(embedded)
+fn xpri_new() -> XPri
+    var p = XPri { adva_ok: false, target_ok: false, hdr: 0, adva: Vec.new(), target: Vec.new() }
+    for _ in 0..6
+        let _a = p.adva.push(0)
+        let _t = p.target.push(0)
+    p
+
+// Keep the AdvA and TargetA of the primary PDU `rx` (parsed as `x`), or forget them when it has none.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xpri_set(var p: XPri, var rx: Pdu, x: ExtView)
+    p.hdr = rx.b[0] as Int
+    p.adva_ok = x.ok and x.adva >= 0
+    p.target_ok = x.ok and x.targeta >= 0
+    if p.adva_ok
+        for k in 0..6
+            p.adva[k] = rx.b[x.adva + k]
+    if p.target_ok
+        for k in 0..6
+            p.target[k] = rx.b[x.targeta + k]
+
+// Make the legacy view of the extended PDU `rx` (parsed as `x`) in `v`: an ADV_SCAN_IND when the AdvMode is
+// scannable, an ADV_DIRECT_IND when there is a TargetA, else an ADV_NONCONN_IND, which no SCAN_REQ answers;
+// TxAdd and RxAdd as sent, the AdvA at payload offset 0 and the TargetA behind it.  A connectable PDU is
+// not scannable in the extended sense, so it takes the type that asks for no request.  An address the PDU lacks
+// is the one the primary PDU named (`pri`), with the header bits of that PDU.  False when there is no AdvA
+// (an anonymous advertisement).
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn legacy_view(var rx: Pdu, x: ExtView, var pri: XPri, var v: Pdu) -> Bool
+    if not x.ok or (x.adva < 0 and not pri.adva_ok)
+        return false
+    var hdr = rx.b[0] as Int
+    if x.adva < 0
+        hdr = pri.hdr
+    let directed = x.targeta >= 0 or (x.adva < 0 and pri.target_ok)
+    var ty = ll_pdu.ADV_NONCONN_IND
+    var len = 6
+    var addr_bits = hdr & ll_pdu.TXADD
+    if directed
+        ty = ll_pdu.ADV_DIRECT_IND
+        len = 12
+        addr_bits = addr_bits | (hdr & ll_pdu.RXADD)
+    else if x.mode == MODE_SCAN
+        ty = ll_pdu.ADV_SCAN_IND
+    v.b[0] = (ty | addr_bits) as u8
+    v.b[1] = len as u8
+    for k in 0..6
+        if x.adva >= 0
+            v.b[2 + k] = rx.b[x.adva + k]
+        else
+            v.b[2 + k] = pri.adva[k]
+    if directed
+        for k in 0..6
+            if x.targeta >= 0
+                v.b[8 + k] = rx.b[x.targeta + k]
+            else
+                v.b[8 + k] = pri.target[k]
+    v.n = len + 2
+    true
+
+// What an LE Extended Advertising Report names, kept from the PDU that opened the advertisement (the
+// AUX_ADV_IND, or the AUX_SCAN_RSP of its response) for the reports of the PDUs that chain after it: the
+// Event_Type without the data status, the Address_Type and the Address, the PHYs, the SID, the Tx Power, the
+// Periodic_Advertising_Interval, and the Direct_Address_Type and Direct_Address.  `did` is the DID of the
+// Advertising Data Info (-1 for none) and `live` says a chain is being reported.
+@value
+struct XCtx
+    live: Bool
+    et: Int
+    atype: Int
+    addr: Vec[u8; 6]
+    pphy: Int
+    sphy: Int
+    sid: Int
+    did: Int
+    txp: Int
+    pi: Int
+    dtype: Int
+    daddr: Vec[u8; 6]
+
+@tier(embedded)
+fn xctx_new() -> XCtx
+    var x = XCtx { live: false, et: 0, atype: 0, addr: Vec.new(), pphy: 1, sphy: 0, sid: SID_NONE, did: -1, txp: TX_NONE,
+                   pi: 0, dtype: 0, daddr: Vec.new() }
+    for _ in 0..6
+        let _a = x.addr.push(0)
+        let _d = x.daddr.push(0)
+    x
+
+// Put the report values of the legacy PDU `rx` into `xc`: the Event_Type of its type (a SCAN_RSP with the bits of
+// the advertisement it answered, `conn` saying that was an ADV_IND), TxAdd as the Address_Type plus
+// `ident` (2 for an address the resolving list resolved, which `rx` already holds as the identity), the
+// advertiser's Address, LE 1M as the primary PHY and no secondary PHY, and for a directed PDU the target.
+// False for a PDU the report does not carry.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xctx_legacy(var xc: XCtx, var rx: Pdu, conn: Bool, ident: Int, target_unresolved: Bool) -> Bool
+    let ty = ll_pdu.pdu_type(var rx)
+    var et = legacy_event_type(ty)
+    if et < 0
+        return false
+    if ty == ll_pdu.SCAN_RSP
+        et = et | ET_SCAN
+        if conn
+            et = et | ET_CONN
+    xc.live = true
+    xc.et = et
+    xc.atype = ll_pdu.pdu_tx_add(var rx) + ident
+    for k in 0..6
+        xc.addr[k] = rx.b[2 + k]
+    xc.pphy = ll_phy.PHY_1M
+    xc.sphy = PHY_NONE
+    xc.sid = SID_NONE
+    xc.did = -1
+    xc.txp = TX_NONE
+    xc.pi = 0
+    xc.dtype = 0
+    for k in 0..6
+        xc.daddr[k] = 0
+    if ty == ll_pdu.ADV_DIRECT_IND
+        xc.dtype = ll_pdu.pdu_rx_add(var rx)
+        if target_unresolved
+            xc.dtype = 0xFE
+        for k in 0..6
+            xc.daddr[k] = rx.b[8 + k]
+    true
+
+// Put the report values of the extended PDU `rx` (parsed as `x`) into `xc`: `rsp` says it is an AUX_SCAN_RSP,
+// `pphy` and `sphy` the PHYs it was heard on (the primary one of the ADV_EXT_IND that pointed to it), `src` and
+// `at` where the advertiser's address is (the octet of a PDU holding six octets, -1 for none: an anonymous
+// advertisement), with the type `atype`.  A scan response keeps the identity of the advertisement that
+// was answered (its address and SID) unless it names its own.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xctx_extended(var xc: XCtx, var rx: Pdu, x: ExtView, rsp: Bool, pphy: Int, sphy: Int, atype: Int, var src: Pdu, at: Int, ident: Int, conn_scan: Bool)
+    xc.live = true
+    var et = event_type(x.mode, x.targeta >= 0)
+    if rsp
+        et = ET_RSP | ET_SCAN
+        if conn_scan
+            et = et | ET_CONN
+    xc.et = et
+    xc.pphy = pphy
+    xc.sphy = sphy
+    xc.did = -1
+    xc.sid = SID_NONE
+    if x.adi >= 0
+        xc.did = adi_did(var rx, x.adi)
+        xc.sid = adi_sid(var rx, x.adi)
+    xc.txp = tx_power(var rx, x)
+    xc.pi = periodic_interval(var rx, x)
+    if at >= 0
+        xc.atype = atype + ident
+        for k in 0..6
+            xc.addr[k] = src.b[at + k]
+    else if not rsp
+        xc.atype = ADDR_ANON
+        for k in 0..6
+            xc.addr[k] = 0
+    xc.dtype = 0
+    for k in 0..6
+        xc.daddr[k] = 0
+    if x.targeta >= 0
+        xc.dtype = (rx.b[0] as Int) >>> 7
+        for k in 0..6
+            xc.daddr[k] = rx.b[x.targeta + k]
+
+// The octets of an AUX_ADV_IND, or any PDU of an auxiliary chain, that a scanner reads before it decides
+// whether to answer: up to the Auxiliary Pointer of a PDU with an AdvA, a TargetA, a CTEInfo and an ADI.
+const HEAD_READ = 24
+
+// The time a PDU of the LE 1M PHY with `n` octets takes beyond the start of the packet, and the longest
+// span one auxiliary packet and its answer take: the packet at the PHY's rate, a request, a response of the
+// same size and three interframe spaces.
+@tier(embedded)
+fn packet_span_us(phy: Int, n: Int) -> Int
+    ll_phy.air_us(phy, true, n)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// An extended PDU: the header with TxAdd `tx_add`, the AdvMode, the flags, and the fields in the order of the
+// flags (the caller lays out `fields` as the flags say), followed by `data_len` octets of data counting up from 1.
+@tier(app)
+fn t_ext(mode: Int, flags: Int, fields: [Int], data_len: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    t_fill(p, mode, flags, fields, data_len)
+    p
+
+@tier(app)
+fn t_fill(var p: Pdu, mode: Int, flags: Int, fields: [Int], data_len: Int)
+    var hl = 1
+    if flags == 0
+        hl = 0
+    else
+        hl = 1 + list.len(fields)
+    p.b[0] = (ll_init.EXT_ADV | ll_pdu.TXADD) as u8
+    p.b[2] = (hl | (mode << 6)) as u8
+    var at = 3
+    if hl > 0
+        p.b[3] = flags as u8
+        at = 4
+    for k in 0..list.len(fields)
+        p.b[at + k] = fields[k] as u8
+    at = at + list.len(fields)
+    for k in 0..data_len
+        p.b[at + k] = (k + 1) as u8
+    p.n = at + data_len
+    p.b[1] = (p.n - 2) as u8
+
+@tier(app)
+fn t_adva() -> [Int]
+    [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]
+
+@tier(app)
+fn t_grow(var p: Pdu)
+    p.n = p.n + 1
+
+@test
+fn test_a_connectable_pdu_with_adva_adi_aux_and_txpower_is_laid_out_in_flag_order()
+    var f: [Int] = t_adva()
+    // ADI: DID 0x123, SID 5; AuxPtr; TxPower -20.
+    for b in [0x23, 0x51, 12, 100, 0x00, 0xEC]
+        list.push(f, b)
+    var p = t_ext(MODE_CONN, 0x59, f, 3)
+    let x = ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.mode, MODE_CONN)
+    test.assert_eq(x.adva, 4)
+    test.assert_eq(x.targeta, -1)
+    test.assert_eq(x.adi, 10)
+    test.assert_eq(x.aux, 12)
+    test.assert_eq(x.txp, 15)
+    test.assert_eq(x.sync, -1)
+    test.assert_eq(x.data_at, 3 + 13)
+    test.assert_eq(x.data_len, 3)
+    test.assert_eq(adi_did(var p, x.adi), 0x123)
+    test.assert_eq(adi_sid(var p, x.adi), 5)
+    test.assert_eq(tx_power(var p, x), 0xEC)
+
+@test
+fn test_a_pdu_without_an_extended_header_has_all_its_payload_as_data()
+    var p = t_ext(MODE_NONE, 0, [], 4)
+    let x = ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(x.data_at, 3)
+    test.assert_eq(x.data_len, 4)
+    test.assert_eq(tx_power(var p, x), TX_NONE)
+
+@test
+fn test_a_field_past_the_extended_header_or_a_reserved_mode_is_refused()
+    // The flags announce AdvA and the Extended Header holds only the flags and 4 octets.
+    var p = t_ext(MODE_NONE, 0x01, [1, 2, 3, 4], 0)
+    test.assert(not ext_parse(var p).ok)
+    var q = t_ext(3, 0x01, t_adva(), 0)
+    test.assert(not ext_parse(var q).ok)
+    // The length octet disagrees with the octets received.
+    var r = t_ext(MODE_NONE, 0x01, t_adva(), 0)
+    t_grow(var r)
+    test.assert(not ext_parse(var r).ok)
+    // Another PDU type.
+    var s = t_ext(MODE_NONE, 0x01, t_adva(), 0)
+    s.b[0] = ll_pdu.ADV_IND as u8
+    test.assert(not ext_parse(var s).ok)
+
+@test
+fn test_the_periodic_interval_is_the_interval_of_the_sync_info()
+    var f: [Int] = t_adva()
+    for k in 0..18
+        list.push(f, 0)
+    f[6 + 2] = 0x40
+    f[6 + 3] = 0x01
+    var p = t_ext(MODE_NONE, 0x21, f, 0)
+    let x = ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.sync, 10)
+    test.assert_eq(periodic_interval(var p, x), 0x140)
+
+@test
+fn test_the_legacy_view_decides_whether_a_request_may_follow()
+    var v = ll_pdu.pdu_new()
+    var pri = xpri_new()
+    var s = t_ext(MODE_SCAN, 0x09, [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0x10, 0x00], 2)
+    test.assert(legacy_view(var s, ext_parse(var s), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_SCAN_IND)
+    test.assert_eq(ll_pdu.pdu_tx_add(var v), 1)
+    test.assert_eq(v.n, 8)
+    test.assert_eq(v.b[2] as Int, 0xA1)
+    test.assert(ll_pdu.pdu_well_formed(var v, 8))
+    var c = t_ext(MODE_CONN, 0x09, [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0x10, 0x00], 0)
+    test.assert(legacy_view(var c, ext_parse(var c), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_NONCONN_IND)
+    // A directed PDU names its target.
+    var d = t_ext(MODE_CONN, 0x0B, [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0x10, 0x00], 0)
+    test.assert(legacy_view(var d, ext_parse(var d), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(v.b[8] as Int, 0xB1)
+    test.assert(ll_pdu.pdu_well_formed(var v, 14))
+    // An anonymous advertisement has no view.
+    var a = t_ext(MODE_NONE, 0x08, [0x10, 0x00], 2)
+    test.assert(not legacy_view(var a, ext_parse(var a), var pri, var v))
+
+@test
+fn test_event_types_follow_the_report_of_the_core_specification()
+    test.assert_eq(event_type(MODE_CONN, false), 0x0001)
+    test.assert_eq(event_type(MODE_SCAN, false), 0x0002)
+    test.assert_eq(event_type(MODE_CONN, true), 0x0005)
+    test.assert_eq(event_type(MODE_NONE, false), 0)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_IND), 0x0013)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_DIRECT_IND), 0x0015)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_SCAN_IND), 0x0012)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_NONCONN_IND), 0x0010)
+    test.assert_eq(legacy_event_type(ll_pdu.SCAN_RSP), 0x0018)
+    test.assert_eq(legacy_event_type(ll_pdu.SCAN_REQ), -1)
+
+@test
+fn test_an_aux_adv_ind_without_an_adva_takes_the_address_the_adv_ext_ind_named()
+    var v = ll_pdu.pdu_new()
+    var pri = xpri_new()
+    // The ADV_EXT_IND of a non-connectable advertiser: AdvA 0xA1.., ADI, pointer; TxAdd set in its header.
+    var f: [Int] = t_adva()
+    for b in [0x23, 0x51, 12, 100, 0x00]
+        list.push(f, b)
+    var prim = t_ext(MODE_NONE, 0x19, f, 0)
+    xpri_set(var pri, var prim, ext_parse(var prim))
+    test.assert(pri.adva_ok)
+    test.assert(not pri.target_ok)
+    // The AUX_ADV_IND has an ADI and data only.
+    var aux = t_ext(MODE_NONE, 0x08, [0x23, 0x51], 4)
+    test.assert(legacy_view(var aux, ext_parse(var aux), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_NONCONN_IND)
+    test.assert_eq(ll_pdu.pdu_tx_add(var v), 1)
+    test.assert_eq(v.b[2] as Int, 0xA1)
+    test.assert_eq(v.b[7] as Int, 0xA6)
+    // With nothing named on the primary channel it is anonymous.
+    var none = xpri_new()
+    test.assert(not legacy_view(var aux, ext_parse(var aux), var none, var v))

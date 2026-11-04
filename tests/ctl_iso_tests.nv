@@ -1,0 +1,1582 @@
+// tests/ctl_iso_tests.nv — the Controller's isochronous channels as the Host sees them: the commands that
+// configure a group and set up a data path, the events of a stream, the LL Control PDUs that make and end one,
+// and the HCI ISO Data packets.  The Link Layer is driven by hand (`ctl_iso_ctrl` is given the PDUs the
+// radio program would read from the air), so what the Controller queued for the peer can be read; the same
+// stream on a simulated air, with a Central that sends and answers, is in `ctl_air_tests.nv`.
+//
+// The cases run in a build with isochronous channels (`ctl_iso`, `pc` or `audio_server` in configs/); in
+// one without, the Controller answers none of the commands and the first case says so.
+
+use std.test
+use hci_frame
+use ctl_hci
+use ctl_pool
+use ll_pdu
+use ll_data
+use ll_link
+use ll_iso
+use ll_big
+use ll_pcl
+use ll_sub
+use ll_ploss
+use ll_policy
+use h4_rx
+use ctl_limits
+use noble_controller_config
+// ── The Host's side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+fn packets_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i < list.len(bytes)
+        var n = 0
+        if bytes[i] == 0x04
+            n = 3 + bytes[i + 2]
+        else
+            n = 5 + bytes[i + 3] + ((bytes[i + 4] & 0x3F) << 8)
+        var e: [Int] = []
+        for k in 0..n
+            list.push(e, bytes[i + k])
+        list.push(out, e)
+        i = i + n
+    out
+
+fn events_coded(bytes: [Int], code: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x04 and e[1] == code
+            list.push(out, e[:])
+    out
+
+fn meta_events(bytes: [Int], sub: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in events_coded(bytes, 0x3E)
+        if e[3] == sub
+            list.push(out, e[:])
+    out
+
+// The Status of the Command Complete event of a command.
+fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(c, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
+    done[0][6]
+
+// The Status of the Command Status event of a command.
+fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(c, opcode, params)
+    let st = events_coded(r, 0x0F)
+    test.assert_eq(list.len(st), 1)
+    test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
+    st[0][3]
+
+// The Command Complete event of a command.
+fn complete_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    let r = run(c, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    done[0]
+
+fn iso_only(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x05
+            list.push(out, e[:])
+    out
+
+fn le16(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF]
+
+fn le24(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF]
+
+fn zeros(n: Int) -> [Int]
+    var v: [Int] = []
+    for _ in 0..n
+        list.push(v, 0)
+    v
+
+// A Controller whose Host enabled every event and the LE events of the streams, with the Host support
+// of the streams set.
+fn fresh() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(c, 0x2001, [0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x02, 0, 0]), 0)
+    c
+
+fn connect_ind(interval: Int, timeout: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0x10 + i)
+    for b in [0x12, 0x5A, 0x65, 0x50, 0x11, 0x22, 0x33, 2]
+        let _c = ll_pdu.pdu_put(var p, b)
+    for v in [0, interval, 0, timeout]
+        let _d = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _e = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _f = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A Controller with the Host support bit set and a Peripheral connection of 30 ms taken at 5000.
+fn connected() -> ctl_hci.Controller
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2074, [32, 1]), 0)
+    test.assert_eq(status_of(c, 0x2006, [0x20, 0, 0x20, 0, 0, 0, 0, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 7, 0]), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    ctl_hci.ctl_set_time(var c, 1000)
+    var pol = ll_policy.default_link_policy()
+    var p = connect_ind(24, 100)
+    test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
+    let _r = run(c, 0x1001, [])
+    c
+
+fn set_host_iso(var c: ctl_hci.Controller, v: Bool)
+    c.host_iso = v
+
+fn set_rr(var c: ctl_hci.Controller, v: Int)
+    c.iso_rr = v
+
+fn iso_on() -> Bool
+    ctl_limits.iso_on() and ctl_limits.cis_slots() >= 2 and ctl_limits.cig_slots() >= 1
+
+// The 15 octets of a CIG with one stream per entry of `ids`, in the form LE Set CIG Parameters Test takes:
+// SDU intervals 10 ms, FT 1 both ways, an ISO interval of 8 units, packing and framing 0.  Each stream: NSE 2,
+// SDUs of 100 octets, PDUs of 100, LE 1M or 2M, BN 1.
+fn cig_params(cig_id: Int, ids: [Int]) -> [Int]
+    var p: [Int] = [cig_id]
+    for v in le24(10000)
+        list.push(p, v)
+    for v in le24(10000)
+        list.push(p, v)
+    for v in [1, 1, 8, 0, 0, 0, 0, list.len(ids)]
+        list.push(p, v)
+    for id in ids
+        list.push(p, id)
+        list.push(p, 2)
+        for v in le16(100)
+            list.push(p, v)
+        for v in le16(100)
+            list.push(p, v)
+        for v in le16(100)
+            list.push(p, v)
+        for v in le16(100)
+            list.push(p, v)
+        list.push(p, 3)
+        list.push(p, 3)
+        list.push(p, 1)
+        list.push(p, 1)
+    p
+
+// ── What the Controller says it has ─────────────────────────────────
+
+@test
+fn test_a_build_without_isochronous_channels_answers_none_of_the_commands()
+    if ctl_limits.iso_on()
+        return
+    var c = fresh()
+    for op in [0x2060, 0x2061, 0x2063, 0x2065, 0x2066, 0x2067, 0x206E, 0x206F, 0x2074, 0x2075]
+        let r = run(c, op, [])
+        let done = events_coded(r, 0x0E)
+        test.assert_eq(done[0][6], ctl_hci.STATUS_UNKNOWN_COMMAND)
+    // The ISO packet indicator is a loss of synchronization, and the feature bits are not set.
+    ctl_hci.ctl_rx(var c, 0x05)
+    test.assert(h4_rx.h4_is_lost(var c.rx))
+    let g = run(c, 0x0C03, [])
+    let f = run(c, 0x2003, [])
+    test.assert_eq(f[7 + 3], 0)
+
+@test
+fn test_the_features_the_buffers_and_the_commands_of_the_streams_are_reported()
+    if not iso_on()
+        return
+    var c = fresh()
+    // LE Read Local Supported Features: Sleep Clock Accuracy Updates, Connected Isochronous Stream - Central and
+    // - Peripheral in octet 3; octet 4 has the Host support bit once the Host set it.
+    let f = complete_of(var c, 0x2003, [])
+    // With the broadcast isochronous groups (ctl_limits.big_on()) the Isochronous Broadcaster bit, 30, and the Synchronized Receiver bit, 31, are set as well.
+    var want3 = 0x34
+    if ctl_limits.big_on()
+        want3 = 0xF4
+    test.assert_eq(f[7 + 3], want3)
+    // With LE Power Control (ctl_limits.pcl_on()) the Power Control Request and Power Change Indication bits, 33 and 34, are set as well.
+    var base4 = 0
+    if ctl_limits.pcl_on()
+        base4 = 0x06
+    // With Connection Subrating (ctl_limits.sub_on()) the Connection Subrating bit, 37, is set; bit 38 is the Host's.
+    if ctl_limits.sub_on()
+        base4 = base4 | 0x20
+    // With path loss monitoring (ctl_limits.ploss_on()) the LE Path Loss Monitoring bit, 35, is set.
+    if ctl_limits.ploss_on()
+        base4 = base4 | 0x08
+    test.assert_eq(f[7 + 4], base4)
+    test.assert_eq(status_of(c, 0x2074, [32, 1]), 0)
+    let g = complete_of(var c, 0x2003, [])
+    test.assert_eq(g[7 + 4], base4 | 1)
+    test.assert_eq(status_of(c, 0x2074, [32, 0]), 0)
+    test.assert_eq(complete_of(var c, 0x2003, [])[7 + 4], base4)
+    // Only bit 32 is the Host's here.
+    test.assert_eq(status_of(c, 0x2074, [33, 1]), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(status_of(c, 0x2074, [32, 2]), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    // LE Read Buffer Size [v2]: the ACL buffers of v1, and the longest SDU and the SDUs held for the Host.
+    let b = complete_of(var c, 0x2060, [])
+    test.assert_eq(b[7] | (b[8] << 8), 251)
+    test.assert_eq(b[9], 3)
+    test.assert_eq(b[10] | (b[11] << 8), ll_iso.ISO_LOAD)
+    test.assert_eq(b[12], ll_iso.ISO_BUFFERS)
+    // Supported Commands lists the commands the Controller answers: octet 41 bits 5 to 6, octet 42 bits 0 and 2 to 4,
+    // octet 43 bits 3 and 4, octet 44 bits 1 and 2.
+    let sc = complete_of(var c, 0x1002, [])
+    test.assert_eq(sc[7 + 41] & 0x60, 0x60)
+    test.assert_eq(sc[7 + 42] & 0x1D, 0x1D)
+    if ctl_limits.big_on()
+        test.assert_eq(sc[7 + 42] & 0xE0, 0xE0)
+    test.assert_eq(sc[7 + 43] & 0x18, 0x18)
+    if ctl_limits.big_on()
+        test.assert_eq(sc[7 + 43] & 0x03, 0x03)
+    test.assert_eq(sc[7 + 44] & 0x06, 0x06)
+
+@test
+fn test_the_host_support_bit_cannot_be_set_while_a_connection_is_on_and_goes_to_the_peer()
+    if not iso_on()
+        return
+    var c = connected()
+    test.assert_eq(status_of(c, 0x2074, [32, 0]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert(c.host_iso)
+    // The feature set a Peripheral sends carries the bit.
+    var req = ll_link.t_ctrl(ll_data.OP_FEATURE_REQ, [0x1F, 0, 0, 0, 0, 0, 0, 0])
+    let _x = ll_link.t_packet(var c.links[0], var req, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_opcode(var c.links[0].nxt), ll_data.OP_FEATURE_RSP)
+    var want3 = 0x34
+    if ctl_limits.big_on()
+        want3 = 0xF4
+    test.assert_eq(ll_data.dpdu_byte(var c.links[0].nxt, 4), want3)
+    var want4 = 0x01
+    if ctl_limits.pcl_on()
+        want4 = 0x07
+    if ctl_limits.sub_on()
+        want4 = want4 | 0x20
+    if ctl_limits.ploss_on()
+        want4 = want4 | 0x08
+    test.assert_eq(ll_data.dpdu_byte(var c.links[0].nxt, 5), want4)
+
+// ── The group ───────────────────────────────────────────────────────
+
+@test
+fn test_a_group_of_two_streams_is_configured_and_each_stream_gets_its_handle()
+    if not iso_on()
+        return
+    var c = fresh()
+    let r = complete_of(var c, 0x2063, cig_params(7, [3, 4]))
+    test.assert_eq(r[6], 0)
+    // Status, CIG_ID, CIS_Count and the two handles.
+    test.assert_eq(r[7], 7)
+    test.assert_eq(r[8], 2)
+    test.assert_eq(r[9] | (r[10] << 8), ll_iso.HANDLE_BASE)
+    test.assert_eq(r[11] | (r[12] << 8), ll_iso.HANDLE_BASE + 1)
+    test.assert_eq(c.cigs[0].cig_id, 7)
+    test.assert_eq(c.cigs[0].state, ll_iso.G_CONFIGURABLE)
+    test.assert_eq(c.cis[0].state, ll_iso.S_CONFIG)
+    test.assert(c.cis[0].central)
+    test.assert_eq(c.cis[0].cis_id, 3)
+    test.assert_eq(c.cis[1].cis_id, 4)
+    test.assert_eq(c.cis[0].nse, 2)
+    test.assert_eq(c.cis[0].bn_c, 1)
+    test.assert_eq(c.cis[0].iso_int, 8)
+    // The PHY is the best both allow: LE 2M (the Host gave 3: 1M and 2M).
+    test.assert_eq(c.cis[0].phy, 2)
+    // Sub_Interval is SE_Length of the stream at that PHY: two packets of 100 octets and the two spaces.
+    test.assert_eq(c.cis[0].sub_int, ll_iso.se_len_us(var c.cis[0]))
+    // The same CIS_ID reconfigures the stream and gives the same handle.
+    let q = complete_of(var c, 0x2063, cig_params(7, [4]))
+    test.assert_eq(q[6], 0)
+    test.assert_eq(q[9] | (q[10] << 8), ll_iso.HANDLE_BASE + 1)
+
+@test
+fn test_the_group_commands_refuse_what_the_controller_cannot_take()
+    if not iso_on()
+        return
+    var c = fresh()
+    // The wrong length, and a CIG_ID outside 0 to 0xEF.
+    test.assert_eq(status_of(c, 0x2063, [1, 2, 3]), ctl_hci.STATUS_INVALID_PARAMETERS)
+    test.assert_eq(status_of(c, 0x2063, cig_params(0xF0, [1])), ctl_hci.STATUS_INVALID_PARAMETERS)
+    // Duplicate CIS_IDs in one command.
+    test.assert_eq(status_of(c, 0x2063, cig_params(1, [5, 5])), ctl_hci.STATUS_INVALID_PARAMETERS)
+    // A Framing above 2 is not a value.
+    var framing = cig_params(1, [1])
+    framing[13] = 3
+    test.assert_eq(status_of(c, 0x2063, framing), ctl_hci.STATUS_INVALID_PARAMETERS)
+    // A framed direction needs a PDU that can start an SDU: 6 octets.
+    var short = cig_params(1, [1])
+    short[13] = 1
+    short[15 + 6] = 5
+    short[15 + 7] = 0
+    test.assert_eq(status_of(c, 0x2063, short), ctl_hci.STATUS_INVALID_PARAMETERS)
+    // More streams than the Controller holds.
+    test.assert_eq(status_of(c, 0x2063, cig_params(1, [1, 2, 3, 4, 5, 6, 7, 8, 9])), ctl_hci.STATUS_MEMORY_CAPACITY_EXCEEDED)
+    // A PHY the Controller lacks (a reserved bit) and no PHY in common.
+    var phy = cig_params(1, [1])
+    phy[15 + 10] = 0x08
+    test.assert_eq(status_of(c, 0x2063, phy), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    var none = cig_params(1, [1])
+    none[15 + 10] = 1
+    none[15 + 11] = 2
+    test.assert_eq(status_of(c, 0x2063, none), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    // A stream whose subevents do not fit its interval: NSE 31 packets of 100 octets in 10 ms.
+    var tight = cig_params(1, [1])
+    tight[15 + 1] = 31
+    test.assert_eq(status_of(c, 0x2063, tight), ctl_hci.STATUS_INVALID_PARAMETERS)
+    // BN above NSE; BN 0 without PDU size 0.
+    var bn = cig_params(1, [1])
+    bn[15 + 12] = 3
+    test.assert_eq(status_of(c, 0x2063, bn), ctl_hci.STATUS_INVALID_PARAMETERS)
+    var zero = cig_params(1, [1])
+    zero[15 + 12] = 0
+    test.assert_eq(status_of(c, 0x2063, zero), ctl_hci.STATUS_INVALID_PARAMETERS)
+    // Nothing of the failed commands was kept.
+    test.assert(not c.cigs[0].used)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+
+@test
+fn test_a_framed_group_is_configured_by_both_commands()
+    if not iso_on()
+        return
+    var c = fresh()
+    // The Test form: Framing 1 is kept with the group and the stream.
+    var t = cig_params(7, [3])
+    t[13] = 1
+    test.assert_eq(status_of(c, 0x2063, t), 0)
+    test.assert_eq(c.cigs[0].framing, 1)
+    test.assert(c.cis[0].framed)
+    test.assert(not c.cis[0].unseg)
+    test.assert_eq(status_of(c, 0x2065, [7]), 0)
+    // LE Set CIG Parameters: SDU intervals of 8 ms with Framing 1 get an ISO interval of 8.75 ms, which unframed PDUs cannot have.
+    var p: [Int] = [7]
+    for v in le24(8000)
+        list.push(p, v)
+    for v in le24(8000)
+        list.push(p, v)
+    for v in [0, 0, 1]
+        list.push(p, v)
+    for v in le16(40)
+        list.push(p, v)
+    for v in le16(40)
+        list.push(p, v)
+    for v in [1, 3, 100, 0, 60, 0, 3, 3, 2, 2]
+        list.push(p, v)
+    let r = complete_of(var c, 0x2062, p)
+    test.assert_eq(r[6], 0)
+    test.assert(c.cis[0].framed)
+    test.assert_eq(c.cigs[0].iso_int, 7)
+    test.assert_eq(c.cis[0].iso_int, 7)
+    test.assert_eq(c.cis[0].max_pdu_c, ll_iso.framed_pdu(100, 8000, 8750))
+    test.assert_eq(c.cis[0].max_pdu_p, ll_iso.framed_pdu(60, 8000, 8750))
+    // Unframed, the same request has no ISO interval a multiple of both under 4 s that the rings can hold.
+    test.assert_eq(status_of(c, 0x2065, [7]), 0)
+    p[9] = 0
+    test.assert(status_of(c, 0x2062, p) != 0)
+    // Unsegmented mode (2): the same interval, the PDUs of whole SDUs with their 5 octets, no framing delay.
+    p[9] = 2
+    test.assert_eq(status_of(c, 0x2062, p), 0)
+    test.assert_eq(c.cigs[0].framing, 2)
+    test.assert(c.cis[0].framed)
+    test.assert(c.cis[0].unseg)
+    test.assert_eq(c.cis[0].max_pdu_c, ll_iso.unseg_pdu(100, 8000, 8750))
+    test.assert_eq(c.cis[0].max_pdu_p, ll_iso.unseg_pdu(60, 8000, 8750))
+    test.assert_eq(c.cis[0].bn_c, ll_iso.unseg_bn(100, 8000, 8750))
+    // The Test form with a PDU too short for a whole SDU and its header: Invalid HCI Command Parameters.
+    var u = cig_params(7, [3])
+    u[13] = 2
+    test.assert_eq(status_of(c, 0x2065, [7]), 0)
+    test.assert_eq(status_of(c, 0x2063, u), ctl_hci.STATUS_INVALID_PARAMETERS)
+
+@test
+fn test_a_group_made_again_is_not_taken_for_a_group_that_was_placed()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    test.assert(not c.cigs[0].ref_ok)
+    // The grid the first stream of a group sets is the group's own: it is gone with the group, whether LE Remove CIG or HCI Reset
+    // ends it, and a group made after it in the slot is placed afresh.
+    c.cigs[0].ref_ok = true
+    c.cigs[0].ref_t = 123456
+    test.assert_eq(status_of(c, 0x2065, [7]), 0)
+    test.assert(not c.cigs[0].ref_ok)
+    test.assert_eq(c.cigs[0].ref_t, 0)
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    test.assert(not c.cigs[0].ref_ok)
+    c.cigs[0].ref_ok = true
+    c.cigs[0].ref_t = 654321
+    test.assert_eq(status_of(c, 0x0C03, []), 0)
+    test.assert(not c.cigs[0].ref_ok)
+    test.assert_eq(c.cigs[0].ref_t, 0)
+    // A stale grid under a slot that is made again by the Test command (which the reset did not reach before) is not kept.
+    c.cigs[0].ref_ok = true
+    c.cigs[0].used = false
+    test.assert_eq(status_of(c, 0x2001, [0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x02, 0, 0]), 0)
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    test.assert(not c.cigs[0].ref_ok)
+
+@test
+fn test_remove_cig_deletes_the_group_and_its_handles()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3, 4])), 0)
+    let r = complete_of(var c, 0x2065, [9])
+    test.assert_eq(r[6], ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    let ok = complete_of(var c, 0x2065, [7])
+    test.assert_eq(ok[6], 0)
+    test.assert_eq(ok[7], 7)
+    test.assert(not c.cigs[0].used)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+    test.assert_eq(c.cis[1].state, ll_iso.S_FREE)
+    // A data path of a stream that is gone has no handle to name.
+    test.assert_eq(status_of(c, 0x206E, [0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+
+@test
+fn test_the_data_paths_of_a_configured_stream_are_set_up_and_removed_by_direction()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    // A Central's input is Central-to-Peripheral, its output the other way; both flow in this configuration.
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert(c.cis[0].dp_in)
+    test.assert(not c.cis[0].dp_out)
+    // The same direction twice, a vendor path and a direction of 2 are refused.
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert(c.cis[0].dp_out)
+    // Remove: bit 0 the input, bit 1 the output; one that is not set is refused.
+    test.assert_eq(status_of(c, 0x206F, [h & 0xFF, h >>> 8, 1]), 0)
+    test.assert(not c.cis[0].dp_in)
+    test.assert_eq(status_of(c, 0x206F, [h & 0xFF, h >>> 8, 1]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(status_of(c, 0x206F, [h & 0xFF, h >>> 8, 2]), 0)
+    test.assert_eq(status_of(c, 0x206F, [h & 0xFF, h >>> 8, 0]), ctl_hci.STATUS_INVALID_PARAMETERS)
+
+// ── A request from the Central ──────────────────────────────────────
+
+// An LL_CIS_REQ for the CIG 5, CIS 6, as the Central would send it: 10 ms ISO interval, unframed SDUs of 100 octets
+// in both directions, 2 subevents 1.5 ms apart on LE 2M, window 2.5 ms to 6 ms.
+fn req_pdu() -> Pdu
+    var x = ll_iso.cis_new()
+    ll_iso.t_set(var x, "central", 1)
+    ll_iso.t_set(var x, "phy", 2)
+    ll_iso.t_set(var x, "cig_id", 5)
+    ll_iso.t_set(var x, "cis_id", 6)
+    ll_iso.t_set(var x, "max_sdu_c", 100)
+    ll_iso.t_set(var x, "max_sdu_p", 100)
+    ll_iso.t_set(var x, "sdu_int_c", 10000)
+    ll_iso.t_set(var x, "sdu_int_p", 10000)
+    ll_iso.t_set(var x, "max_pdu_c", 100)
+    ll_iso.t_set(var x, "max_pdu_p", 100)
+    ll_iso.t_set(var x, "nse", 2)
+    ll_iso.t_set(var x, "sub_int", 1500)
+    ll_iso.t_set(var x, "bn_c", 1)
+    ll_iso.t_set(var x, "bn_p", 1)
+    ll_iso.t_set(var x, "ft_c", 1)
+    ll_iso.t_set(var x, "ft_p", 1)
+    ll_iso.t_set(var x, "iso_int", 8)
+    ll_iso.t_set(var x, "off_min", 2500)
+    ll_iso.t_set(var x, "off_max", 6000)
+    ll_iso.t_set(var x, "off_ev", 40)
+    var p = ll_pdu.pdu_new()
+    ll_iso.put_cis_req(var p, var x)
+    p
+
+// The next LL Control PDU the Controller has for the peer on the link in slot 0: its opcode and the
+// octets after it, -1 when there is none.
+fn queued_op(var c: ctl_hci.Controller) -> Int
+    if c.links[0].nxt_kind == ll_link.K_EMPTY
+        return -1
+    ll_data.dpdu_opcode(var c.links[0].nxt)
+
+fn queued_byte(var c: ctl_hci.Controller, i: Int) -> Int
+    ll_data.dpdu_byte(var c.links[0].nxt, i)
+
+fn pop_queued(var c: ctl_hci.Controller)
+    c.links[0].nxt_kind = ll_link.K_EMPTY
+    ll_data.dpdu_empty(var c.links[0].nxt)
+
+fn deliver(var c: ctl_hci.Controller, var p: Pdu)
+    ctl_hci.ctl_iso_ctrl(var c, 0, var p)
+
+@test
+fn test_a_request_without_the_host_support_bit_is_rejected_with_unsupported_remote_feature()
+    if not iso_on()
+        return
+    var c = connected()
+    // The bit goes off only while there is no connection; a Controller whose Host never set it is made by clearing the field.
+    set_host_iso(var c, false)
+    var p = req_pdu()
+    deliver(c, p)
+    test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var c, 1), ll_data.OP_CIS_REQ)
+    test.assert_eq(queued_byte(var c, 2), 0x1A)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+
+@test
+fn test_a_request_the_controller_cannot_take_is_rejected_with_the_code_of_the_reason()
+    if not iso_on()
+        return
+    var c = connected()
+    // Framed PDUs in Unsegmented mode whose PDU of 100 octets cannot hold an SDU of 100 and its 5 octets: Parameter Out Of Mandatory Range.
+    var p = req_pdu()
+    p.b[2 + 6] = ((p.b[2 + 6] as Int) | 0x80) as u8
+    p.b[2 + 8] = ((p.b[2 + 8] as Int) | 0x80) as u8
+    deliver(c, p)
+    test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var c, 2), 0x30)
+    pop_queued(var c)
+    // A framed direction whose PDU cannot start an SDU: Parameter Out Of Mandatory Range.
+    var f = req_pdu()
+    f.b[2 + 6] = ((f.b[2 + 6] as Int) | 0x80) as u8
+    f.b[2 + 15] = 5
+    f.b[2 + 16] = 0
+    deliver(c, f)
+    test.assert_eq(queued_byte(var c, 2), 0x30)
+    pop_queued(var c)
+    // Two PHYs named: the same code.
+    var q = req_pdu()
+    q.b[2 + 3] = 3
+    deliver(c, q)
+    test.assert_eq(queued_byte(var c, 2), 0x20)
+    pop_queued(var c)
+    // The first anchor window past the connection interval: Parameter Out Of Mandatory Range.
+    var r = req_pdu()
+    r.b[2 + 33] = 0x01
+    deliver(c, r)
+    test.assert_eq(queued_byte(var c, 2), 0x30)
+    pop_queued(var c)
+    // The Host masked the LE CIS Request event: the request is rejected as one the Host cannot answer.
+    test.assert_eq(status_of(c, 0x2001, [0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x02, 0, 0]), 0)
+    var s = req_pdu()
+    deliver(c, s)
+    test.assert_eq(queued_byte(var c, 2), 0x1A)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+
+@test
+fn test_a_request_is_put_to_the_host_which_accepts_and_the_response_goes_to_the_central()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    deliver(c, p)
+    test.assert_eq(c.cis[0].state, ll_iso.S_REQUESTED)
+    // LE CIS Request: the ACL handle, the stream's handle, the CIG and CIS identifiers.
+    let r = run(c, 0x1001, [])
+    let ev = meta_events(r, 0x1A)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][2], 7)
+    test.assert_eq(ev[0][4] | (ev[0][5] << 8), 1)
+    test.assert_eq(ev[0][6] | (ev[0][7] << 8), ll_iso.HANDLE_BASE)
+    test.assert_eq(ev[0][8], 5)
+    test.assert_eq(ev[0][9], 6)
+    // A data path before the Host accepted is refused for a Peripheral's stream.
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    // Accept: Command Status, and LL_CIS_RSP for the Central is queued with the window it gave.
+    test.assert_eq(cmd_status(var c, 0x2066, [h & 0xFF, h >>> 8]), 0)
+    test.assert_eq(c.cis[0].state, ll_iso.S_ACCEPTED)
+    let _s = run(c, 0x1001, [])
+    test.assert_eq(queued_op(var c), ll_data.OP_CIS_RSP)
+    test.assert_eq(queued_byte(var c, 1) | (queued_byte(var c, 2) << 8) | (queued_byte(var c, 3) << 16), 2500)
+    test.assert_eq(queued_byte(var c, 4) | (queued_byte(var c, 5) << 8) | (queued_byte(var c, 6) << 16), 6000)
+    test.assert_eq(queued_byte(var c, 7) | (queued_byte(var c, 8) << 8), 40)
+    // Accept twice: Command Disallowed.
+    test.assert_eq(cmd_status(var c, 0x2066, [h & 0xFF, h >>> 8]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    // The data paths now: the Peripheral's input is its direction to the Central.
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+
+@test
+fn test_a_framed_request_in_segmentable_mode_is_put_to_the_host()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    p.b[2 + 6] = ((p.b[2 + 6] as Int) | 0x80) as u8
+    deliver(c, p)
+    test.assert_eq(c.cis[0].state, ll_iso.S_REQUESTED)
+    test.assert(c.cis[0].framed)
+    test.assert(not c.cis[0].unseg)
+    test.assert_eq(list.len(meta_events(run(c, 0x1001, []), 0x1A)), 1)
+
+@test
+fn test_a_request_the_host_rejects_is_rejected_to_the_central_and_the_handle_is_deleted()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    deliver(c, p)
+    let _r = run(c, 0x1001, [])
+    let h = ll_iso.HANDLE_BASE
+    let ok = complete_of(var c, 0x2067, [h & 0xFF, h >>> 8, 0x0D])
+    test.assert_eq(ok[6], 0)
+    test.assert_eq(ok[7] | (ok[8] << 8), h)
+    test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var c, 1), ll_data.OP_CIS_REQ)
+    test.assert_eq(queued_byte(var c, 2), 0x0D)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+    let again = complete_of(var c, 0x2067, [h & 0xFF, h >>> 8, 0x0D])
+    test.assert_eq(again[6], ctl_hci.STATUS_UNKNOWN_CONNECTION)
+
+@test
+fn test_a_request_the_host_does_not_answer_is_rejected_when_the_accept_timeout_runs_out()
+    if not iso_on()
+        return
+    var c = connected()
+    ctl_hci.ctl_set_time(var c, 10000)
+    var p = req_pdu()
+    deliver(c, p)
+    let _r = run(c, 0x1001, [])
+    ctl_hci.ctl_set_time(var c, 10000 + ctl_hci.CIS_ACCEPT_TIMEOUT_US + 1)
+    let out = run(c, 0x1001, [])
+    test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var c, 2), 0x10)
+    // LE CIS Established with Connection Accept Timeout Exceeded.
+    let est = meta_events(out, 0x2A)
+    test.assert_eq(list.len(est), 1)
+    test.assert_eq(est[0][4], 0x10)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+
+@test
+fn test_a_second_request_for_one_stream_replaces_the_first()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    deliver(c, p)
+    var q = req_pdu()
+    deliver(c, q)
+    test.assert_eq(c.cis_log.rejected, 0)
+    test.assert_eq(c.cis[0].state, ll_iso.S_CLOSING)
+    test.assert_eq(c.cis[1].state, ll_iso.S_REQUESTED)
+
+// ── Scheduling, ending ──────────────────────────────────────────────
+
+@test
+fn test_the_indication_schedules_the_stream_at_the_offset_from_the_anchor_of_the_named_event()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    deliver(c, p)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(cmd_status(var c, 0x2066, [h & 0xFF, h >>> 8]), 0)
+    let _s = run(c, 0x1001, [])
+    pop_queued(var c)
+    // The ACL's event 0 is the one under way, its anchor 6000; the indication names event 3 and an offset of 3 ms.
+    ctl_hci.ctl_set_time(var c, 5000)
+    c.links[0].ev_anchor = true
+    c.links[0].anchor = 6000
+    var x = ll_iso.cis_new()
+    ll_iso.t_set(var x, "aa", 0x71B2E5A4)
+    ll_iso.t_set(var x, "cis_offset", 3000)
+    ll_iso.t_set(var x, "cig_sync", 4500)
+    ll_iso.t_set(var x, "cis_sync", 3000)
+    ll_iso.t_set(var x, "ind_ev", 3)
+    var q = ll_pdu.pdu_new()
+    ll_iso.put_cis_ind(var q, var x)
+    deliver(c, q)
+    test.assert_eq(c.cis[0].state, ll_iso.S_WAIT)
+    test.assert_eq(c.cis[0].aa, 0x71B2E5A4)
+    test.assert_eq(c.cis[0].anchor, 6000 + 3 * 30000 + 3000)
+    test.assert_eq(c.cis[0].cig_sync, 4500)
+    test.assert_eq(c.cis[0].cis_sync, 3000)
+    test.assert_eq(c.cis[0].sup_us, 1000000)
+    // The arbiter books the stream's class from the start of the window: the anchor less the widening.
+    ctl_hci.ctl_cis_book(var c)
+    test.assert(c.arb.on[0])
+    test.assert_eq(c.arb.start[0], c.cis[0].anchor - ctl_hci.ctl_cis_widening(var c, 0))
+    test.assert(c.arb.start[0] < c.cis[0].anchor)
+
+@test
+fn test_an_indication_for_an_event_that_has_passed_fails_the_stream()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    deliver(c, p)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(cmd_status(var c, 0x2066, [h & 0xFF, h >>> 8]), 0)
+    let _s = run(c, 0x1001, [])
+    ctl_hci.ctl_set_time(var c, 5000)
+    c.links[0].ev_count = 10
+    c.links[0].ev_anchor = true
+    c.links[0].anchor = 6000
+    var x = ll_iso.cis_new()
+    ll_iso.t_set(var x, "cis_offset", 3000)
+    ll_iso.t_set(var x, "ind_ev", 2)
+    var q = ll_pdu.pdu_new()
+    ll_iso.put_cis_ind(var q, var x)
+    deliver(c, q)
+    let out = run(c, 0x1001, [])
+    let est = meta_events(out, 0x2A)
+    test.assert_eq(list.len(est), 1)
+    test.assert_eq(est[0][4], 0x3E)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+
+@test
+fn test_the_acl_ending_ends_its_streams_with_its_reason()
+    if not iso_on()
+        return
+    var c = connected()
+    var p = req_pdu()
+    deliver(c, p)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(cmd_status(var c, 0x2066, [h & 0xFF, h >>> 8]), 0)
+    let _s = run(c, 0x1001, [])
+    pop_queued(var c)
+    ctl_hci.ctl_set_time(var c, 5000)
+    c.links[0].ev_anchor = true
+    c.links[0].anchor = 6000
+    var x = ll_iso.cis_new()
+    ll_iso.t_set(var x, "cis_offset", 3000)
+    ll_iso.t_set(var x, "ind_ev", 3)
+    var q = ll_pdu.pdu_new()
+    ll_iso.put_cis_ind(var q, var x)
+    deliver(c, q)
+    test.assert_eq(c.cis[0].state, ll_iso.S_WAIT)
+    c.cis[0].state = ll_iso.S_UP
+    ll_link.link_close(var c.links[0], 0x08)
+    ctl_hci.ctl_conn_done(var c, 0, 9000)
+    let out = run(c, 0x1001, [])
+    var found = 0
+    for e in events_coded(out, 0x05)
+        if (e[4] | (e[5] << 8)) == h
+            found = found + 1
+            test.assert_eq(e[6], 0x08)
+    test.assert_eq(found, 1)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+
+// ── ISO Data from the Host ──────────────────────────────────────────
+
+fn host_iso(handle: Int, pb: Int, ts: Bool, n: Int) -> [Int]
+    var body: [Int] = [1, 0, n & 0xFF, (n >>> 8) & 0x0F]
+    if ts
+        body = [0, 0, 0, 0, 1, 0, n & 0xFF, (n >>> 8) & 0x0F]
+    for i in 0..n
+        list.push(body, 0x40 + (i & 0x3F))
+    var flags = (handle >>> 8) | (pb << 4)
+    if ts
+        flags = flags | 0x40
+    var p: [Int] = [0x05, handle & 0xFF, flags, list.len(body) & 0xFF, (list.len(body) >>> 8) & 0x3F]
+    for b in body
+        list.push(p, b)
+    p
+
+// One HCI ISO Data packet of an SDU in fragments: Packet_Boundary_Flag `pb` (0 first, 1 continuation, 3 last), `n` octets of the
+// SDU from the octet `from` on.  A first fragment carries the sequence number 9 and the SDU length `total` (no Time_Stamp); the data of
+// octet `i` is `(i * 3 + 1) & 0xFF`.
+fn host_frag(handle: Int, pb: Int, total: Int, from: Int, n: Int, ts: Int) -> [Int]
+    var body: [Int] = []
+    if pb == 0
+        body = [9, 0, total & 0xFF, (total >>> 8) & 0x0F]
+    for i in 0..n
+        list.push(body, ((from + i) * 3 + 1) & 0xFF)
+    var flags = (handle >>> 8) | (pb << 4)
+    if ts == 1
+        flags = flags | 0x40
+    var p: [Int] = [0x05, handle & 0xFF, flags, list.len(body) & 0xFF, (list.len(body) >>> 8) & 0x3F]
+    for b in body
+        list.push(p, b)
+    p
+
+fn feed(var c: ctl_hci.Controller, bytes: [Int])
+    for b in bytes
+        ctl_hci.ctl_rx(var c, b)
+
+@test
+fn test_an_iso_data_packet_goes_to_the_ring_of_the_stream_that_has_an_input_path()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    // A stream that does not run takes no data, and the packet is counted as dropped.
+    feed(c, host_iso(h, 2, false, 50))
+    test.assert_eq(c.iso_dropped, 1)
+    test.assert_eq(c.cis[0].tx_wr, 0)
+    c.cis[0].state = ll_iso.S_UP
+    feed(c, host_iso(h, 2, false, 50))
+    test.assert_eq(c.iso_dropped, 1)
+    test.assert_eq(c.cis[0].tx_wr, 1)
+    test.assert_eq(c.cis[0].txl[0], 50)
+    test.assert_eq(c.cis[0].txd[0] as Int, 0x40)
+    test.assert_eq(c.cis[0].txd[49] as Int, 0x40 + 49)
+    // With a Time_Stamp the data starts four octets later.
+    feed(c, host_iso(h, 2, true, 30))
+    test.assert_eq(c.cis[0].tx_wr, 2)
+    test.assert_eq(c.cis[0].txl[1], 30)
+    // An SDU over the stream's maximum, an SDU whose length disagrees, a continuation with no first fragment and a packet for
+    // another handle are dropped.
+    feed(c, host_iso(h, 2, false, 101))
+    feed(c, host_iso(h + 1, 2, false, 10))
+    var bad = host_iso(h, 2, false, 10)
+    bad[7] = 15
+    feed(c, bad)
+    feed(c, host_frag(h, 3, 0, 0, 10, 0))
+    test.assert_eq(c.cis[0].tx_wr, 2)
+    test.assert_eq(c.iso_dropped, 5)
+    test.assert_eq(c.cis[0].n_host_drop, 4)
+    // The stream is not disturbed: the next command is read.
+    test.assert_eq(status_of(c, 0x2060, []), 0)
+
+// A stream of the Central with SDUs of 310 octets from the Central (two payloads of 251 and 59), the ring and the Host's input
+// path set, running.
+fn big_stream() -> ctl_hci.Controller
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c.cis[0].state = ll_iso.S_UP
+    ll_iso.t_set(var c.cis[0], "max_sdu_c", 310)
+    ll_iso.t_set(var c.cis[0], "max_sdu_p", 310)
+    ll_iso.t_set(var c.cis[0], "max_pdu_c", 251)
+    ll_iso.t_set(var c.cis[0], "max_pdu_p", 251)
+    ll_iso.t_set(var c.cis[0], "bn_c", 2)
+    ll_iso.t_set(var c.cis[0], "bn_p", 2)
+    c
+
+@test
+fn test_an_sdu_the_host_sends_in_fragments_is_put_together_and_cut_into_payloads()
+    if not iso_on()
+        return
+    var c = big_stream()
+    let h = ll_iso.HANDLE_BASE
+    // The first fragment holds 240 octets, a continuation 20 and the last 50: nothing is queued before the last arrives.
+    feed(c, host_frag(h, 0, 310, 0, 240, 0))
+    feed(c, host_frag(h, 1, 0, 240, 20, 0))
+    test.assert_eq(c.cis[0].tx_wr, 0)
+    test.assert(c.cis[0].h_open)
+    feed(c, host_frag(h, 3, 0, 260, 50, 0))
+    test.assert(not c.cis[0].h_open)
+    test.assert_eq(c.iso_dropped, 0)
+    test.assert_eq(c.cis[0].tx_wr, 2)
+    test.assert_eq(c.cis[0].txl[0], 251)
+    test.assert_eq(c.cis[0].txl[1], 59)
+    // LLID 1 for the first payload, 0 for the last, which also carries the end flag and the three packets it came in.
+    test.assert_eq(c.cis[0].txf[0], 1)
+    test.assert_eq(c.cis[0].txf[1], 0 | 4 | (3 << 8))
+    for i in 0..310
+        var at = i
+        var sl = 0
+        if i >= 251
+            at = i - 251
+            sl = 1
+        test.assert_eq(c.cis[0].txd[sl * ll_iso.SLOT_OCTETS + at] as Int, (i * 3 + 1) & 0xFF)
+    // A complete SDU is one packet and one credit; the Host has three credits back for the fragmented one.
+    feed(c, host_iso(h, 2, false, 100))
+    test.assert_eq(c.cis[0].tx_wr, 4)
+    test.assert_eq(c.cis[0].txf[3] >>> 8, 1)
+    ll_iso.tx_retire(var c.cis[0], false)
+    ll_iso.tx_retire(var c.cis[0], false)
+    let out = run(c, 0x1001, [])
+    let ev = events_coded(out, 0x13)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][6] | (ev[0][7] << 8), 3)
+
+@test
+fn test_fragments_that_do_not_follow_one_another_are_dropped_with_the_sdu_under_way()
+    if not iso_on()
+        return
+    var c = big_stream()
+    let h = ll_iso.HANDLE_BASE
+    // A last fragment short of the octets the first declared, a first fragment while one is open, a continuation that
+    // overruns the length, a Time_Stamp on a continuation, an SDU over the buffer, and a first fragment that holds it all.
+    feed(c, host_frag(h, 0, 310, 0, 240, 0))
+    feed(c, host_frag(h, 3, 0, 240, 50, 0))
+    test.assert(not c.cis[0].h_open)
+    test.assert_eq(c.iso_dropped, 1)
+    feed(c, host_frag(h, 0, 310, 0, 240, 0))
+    feed(c, host_frag(h, 0, 310, 0, 240, 0))
+    test.assert_eq(c.iso_dropped, 1)
+    test.assert(c.cis[0].h_open)
+    feed(c, host_frag(h, 1, 0, 240, 100, 0))
+    test.assert(not c.cis[0].h_open)
+    test.assert_eq(c.iso_dropped, 2)
+    feed(c, host_frag(h, 0, 310, 0, 240, 0))
+    feed(c, host_frag(h, 1, 0, 240, 20, 1))
+    test.assert(not c.cis[0].h_open)
+    test.assert_eq(c.iso_dropped, 3)
+    feed(c, host_frag(h, 0, ll_iso.SDU_MAX + 1, 0, 240, 0))
+    test.assert(not c.cis[0].h_open)
+    test.assert_eq(c.iso_dropped, 4)
+    feed(c, host_frag(h, 0, 100, 0, 100, 0))
+    test.assert_eq(c.iso_dropped, 5)
+    test.assert_eq(c.cis[0].tx_wr, 0)
+    // Every packet that came to nothing was credited back to the Host: the two packets of the SDU that ended short, the first one
+    // that a second first gave up, the second first and the continuation that overran it, the first and the continuation with the
+    // time stamp, and the three packets that were refused alone.
+    test.assert_eq(c.cis[0].comp, 2 + 1 + 2 + 2 + 1 + 1)
+    // The stream is not disturbed: the SDU that follows the right way goes through.
+    feed(c, host_frag(h, 0, 310, 0, 240, 0))
+    feed(c, host_frag(h, 3, 0, 240, 70, 0))
+    test.assert_eq(c.iso_dropped, 5)
+    test.assert_eq(c.cis[0].tx_wr, 2)
+
+@test
+fn test_an_iso_data_packet_for_a_framed_stream_is_cut_into_segments_with_the_time_offset_of_its_time_stamp()
+    if not iso_on()
+        return
+    var c = fresh()
+    var t = cig_params(7, [3])
+    t[13] = 1
+    // 100-octet PDUs and 100-octet SDUs: a Segmentation Header and a Time_Offset take 5 of them.
+    test.assert_eq(status_of(c, 0x2063, t), 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c.cis[0].state = ll_iso.S_UP
+    ll_iso.t_set(var c.cis[0], "anchor", 100000)
+    ctl_hci.ctl_set_time(var c, 95000)
+    // Without a Time_Stamp the SDU is due when it arrived: 5 ms before the anchor of event 0.
+    feed(c, host_iso(h, 2, false, 50))
+    test.assert_eq(c.cis[0].tx_wr, 1)
+    test.assert_eq(c.cis[0].txl[0], 55)
+    test.assert_eq(c.cis[0].txf[0] & 3, 2)
+    test.assert_eq(c.cis[0].txd[0] as Int, 2)
+    test.assert_eq(c.cis[0].txd[1] as Int, 53)
+    test.assert_eq((c.cis[0].txd[2] as Int) | ((c.cis[0].txd[3] as Int) << 8), 5000)
+    test.assert_eq(c.cis[0].txd[5] as Int, 0x40)
+    // With one, the Time_Stamp is it: 97000, 3 ms before the anchor; the Time_Stamp octets of host_iso are zero, so the 32-bit
+    // value is put in them here.
+    var withts = host_iso(h, 2, true, 30)
+    withts[5] = 97000 & 0xFF
+    withts[6] = (97000 >>> 8) & 0xFF
+    withts[7] = (97000 >>> 16) & 0xFF
+    feed(c, withts)
+    test.assert_eq(c.cis[0].fo_off, 3000)
+    // A Time_Stamp that is not near the Controller's clock is not taken for a time on it: the arrival time is.
+    var far = host_iso(h, 2, true, 30)
+    far[5] = 0x00
+    far[6] = 0x00
+    far[7] = 0x00
+    far[8] = 0x40
+    feed(c, far)
+    test.assert_eq(c.cis[0].fo_off, 5000)
+    test.assert_eq(c.iso_dropped, 0)
+
+@test
+fn test_sdus_the_stream_received_go_to_the_host_as_iso_data_packets_with_a_time_stamp()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c.cis[0].state = ll_iso.S_UP
+    ll_iso.t_set(var c.cis[0], "anchor", 100000)
+    // Two SDUs: one valid of 3 octets, one lost.
+    var pdu = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var pdu, 0)
+    for b in [7, 8, 9]
+        let _a = ll_pdu.pdu_put_data(var pdu, b)
+    ll_data.dpdu_finish(var pdu)
+    ll_iso.rx_note(var c.cis[0], 0, true, var pdu)
+    ll_iso.rx_note(var c.cis[0], 1, false, var pdu)
+    let out = run(c, 0x1001, [])
+    let pk = iso_only(out)
+    test.assert_eq(list.len(pk), 2)
+    // The first: handle, complete SDU, Time_Stamp present; time stamp, sequence 0, length 3 valid, the data.
+    test.assert_eq(pk[0][0], 0x05)
+    test.assert_eq(pk[0][1] | (pk[0][2] << 8), h | (2 << 12) | 0x4000)
+    test.assert_eq(pk[0][3] | ((pk[0][4] & 0x3F) << 8), 8 + 3)
+    test.assert_eq(pk[0][9] | (pk[0][10] << 8), 0)
+    test.assert_eq(pk[0][11] | (pk[0][12] << 8), 3)
+    test.assert_eq(pk[0][13], 7)
+    test.assert_eq(pk[0][15], 9)
+    // The time stamp of a Central's SDU from the Peripheral: the anchor of the event of the payload, the CIS delay less the
+    // CIG delay, and the SDU interval less the ISO interval (Part G, Section 3.2.2): here the anchor itself.
+    let ts = pk[0][5] | (pk[0][6] << 8) | (pk[0][7] << 16) | (pk[0][8] << 24)
+    test.assert_eq(ts, 100000)
+    // The second: sequence 1, lost (status 2), length 0.
+    test.assert_eq(pk[1][9] | (pk[1][10] << 8), 1)
+    test.assert_eq((pk[1][11] | (pk[1][12] << 8)) >>> 14, 2)
+    test.assert_eq(pk[1][11] | (pk[1][12] << 8), 2 << 14)
+    // A stream with no output path drops them.
+    test.assert_eq(status_of(c, 0x206F, [h & 0xFF, h >>> 8, 2]), 0)
+    ll_iso.rx_note(var c.cis[0], 2, true, var pdu)
+    let none = run(c, 0x1001, [])
+    test.assert_eq(list.len(iso_only(none)), 0)
+    test.assert_eq(c.cis[0].out_n, 0)
+
+// The payload `num` of an SDU of the Peripheral of `total` octets in payloads of 251, as the radio program hands it to the recombination:
+// the octet `i` of the SDU is `(i * 5 + 2) & 0xFF`.
+fn rx_payload(var x: ll_iso.Cis, num: Int, total: Int)
+    let per = 251
+    let up = (total + per - 1) / per
+    let k = num % up
+    var n = total - k * per
+    if n > per
+        n = per
+    var llid = 1
+    if k == up - 1
+        llid = 0
+    var pdu = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var pdu, llid)
+    for i in 0..n
+        let _a = ll_pdu.pdu_put_data(var pdu, ((k * per + i) * 5 + 2) & 0xFF)
+    ll_data.dpdu_finish(var pdu)
+    ll_iso.rx_note(var x, num, true, var pdu)
+
+@test
+fn test_an_sdu_over_the_packet_goes_to_the_host_in_fragments()
+    if not iso_on()
+        return
+    var c = big_stream()
+    let h = ll_iso.HANDLE_BASE
+    ll_iso.t_set(var c.cis[0], "anchor", 100000)
+    // 310 octets: a first fragment of 240 with the header and a last of 70.
+    rx_payload(var c.cis[0], 0, 310)
+    rx_payload(var c.cis[0], 1, 310)
+    var pk = iso_only(run(c, 0x1001, []))
+    test.assert_eq(list.len(pk), 2)
+    test.assert_eq(pk[0][1] | (pk[0][2] << 8), h | (0 << 12) | 0x4000)
+    test.assert_eq(pk[0][3] | ((pk[0][4] & 0x3F) << 8), 8 + 240)
+    test.assert_eq(pk[0][11] | (pk[0][12] << 8), 310)
+    test.assert_eq(pk[0][13], 2)
+    test.assert_eq(pk[0][13 + 239], (239 * 5 + 2) & 0xFF)
+    test.assert_eq(pk[1][1] | (pk[1][2] << 8), h | (3 << 12))
+    test.assert_eq(pk[1][3] | ((pk[1][4] & 0x3F) << 8), 70)
+    test.assert_eq(pk[1][5], (240 * 5 + 2) & 0xFF)
+    test.assert_eq(pk[1][5 + 69], (309 * 5 + 2) & 0xFF)
+    // An SDU of 503 octets (three payloads) goes in three: 240, 248 and 15.
+    var d = big_stream()
+    ll_iso.t_set(var d.cis[0], "max_sdu_p", 503)
+    ll_iso.t_set(var d.cis[0], "bn_p", 3)
+    ll_iso.t_set(var d.cis[0], "anchor", 100000)
+    rx_payload(var d.cis[0], 0, 503)
+    rx_payload(var d.cis[0], 1, 503)
+    rx_payload(var d.cis[0], 2, 503)
+    pk = iso_only(run(d, 0x1001, []))
+    test.assert_eq(list.len(pk), 3)
+    test.assert_eq(pk[0][1] | (pk[0][2] << 8), h | (0 << 12) | 0x4000)
+    test.assert_eq(pk[0][3] | ((pk[0][4] & 0x3F) << 8), 8 + 240)
+    test.assert_eq(pk[1][1] | (pk[1][2] << 8), h | (1 << 12))
+    test.assert_eq(pk[1][3] | ((pk[1][4] & 0x3F) << 8), 248)
+    test.assert_eq(pk[1][5], (240 * 5 + 2) & 0xFF)
+    test.assert_eq(pk[2][1] | (pk[2][2] << 8), h | (3 << 12))
+    test.assert_eq(pk[2][3] | ((pk[2][4] & 0x3F) << 8), 503 - 240 - 248)
+    test.assert_eq(pk[2][5 + 14], (502 * 5 + 2) & 0xFF)
+    test.assert_eq(d.cis[0].out_off, 0)
+    test.assert_eq(d.cis[0].out_n, 0)
+
+@test
+fn test_a_fragment_waits_for_a_free_slot_and_the_sdu_goes_on_where_it_stopped()
+    if not iso_on()
+        return
+    var c = big_stream()
+    ll_iso.t_set(var c.cis[0], "anchor", 100000)
+    // The pool holds four packets; three are taken, so the first fragment goes and the second finds the pool full.
+    rx_payload(var c.cis[0], 0, 310)
+    rx_payload(var c.cis[0], 1, 310)
+    let a = ctl_pool.pool_take(var c.pool)
+    let b = ctl_pool.pool_take(var c.pool)
+    let d = ctl_pool.pool_take(var c.pool)
+    test.assert(ctl_hci.ev_cis_data(var c, 0))
+    test.assert_eq(c.cis[0].out_off, 240)
+    test.assert_eq(c.cis[0].out_n, 1)
+    test.assert(not ctl_hci.ev_cis_data(var c, 0))
+    test.assert_eq(c.cis[0].out_off, 240)
+    // Slots come free and the last fragment follows the first, the SDU done.
+    ctl_pool.pool_give(var c.pool, a)
+    ctl_pool.pool_give(var c.pool, b)
+    ctl_pool.pool_give(var c.pool, d)
+    test.assert(ctl_hci.ev_cis_data(var c, 0))
+    test.assert_eq(c.cis[0].out_off, 0)
+    test.assert_eq(c.cis[0].out_n, 0)
+    let pk = iso_only(drain(var c))
+    test.assert_eq(list.len(pk), 2)
+    test.assert_eq((pk[0][2] >>> 4) & 3, 0)
+    test.assert_eq((pk[1][2] >>> 4) & 3, 3)
+
+@test
+fn test_the_flush_points_of_the_last_subevent_are_acted_on_at_the_end_of_the_event()
+    if not iso_on()
+        return
+    var c = connected()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c.cis[0].state = ll_iso.S_UP
+    c.cis[0].acl = 0
+    ll_iso.t_set(var c.cis[0], "central", 0)
+    ll_iso.t_set(var c.cis[0], "bn_c", 2)
+    ll_iso.t_set(var c.cis[0], "bn_p", 2)
+    ll_iso.t_set(var c.cis[0], "nse", 2)
+    // The Peripheral of a stream of BN 2 and NSE 2 has an SDU of 100 octets, one payload, and the event's burst is that and a
+    // padding payload.  Both are sent, the second in the last subevent, which no packet of the event acknowledges.
+    feed(c, host_iso(h, 2, false, 100))
+    test.assert_eq(c.cis[0].tx_wr, 1)
+    c.cis[0].ev = 0
+    c.cis[0].sub = 1
+    ll_iso.event_begin(var c.cis[0])
+    test.assert_eq(c.cis[0].tx_wr, 2)
+    ll_iso.tx_sent(var c.cis[0], 0)
+    ll_iso.tx_sent(var c.cis[0], 1)
+    // The first subevent is done: the event is not over, and the first payload (the SDU, flushed after one subevent) waits for the
+    // start of the next subevent to be acted on.
+    ctl_hci.ctl_cis_done(var c, 0, 20000)
+    test.assert_eq(c.cis[0].comp, 0)
+    test.assert_eq(c.cis[0].tx_num, 0)
+    // The last subevent is done and the event over: both payloads reached their flush points (U = 1 and 2) and the Host has the credit
+    // of the SDU now, before the next event begins.
+    ctl_hci.ctl_cis_done(var c, 0, 21000)
+    test.assert_eq(c.cis[0].tx_num, 2)
+    test.assert_eq(c.cis[0].n_flush_tx, 2)
+    test.assert_eq(c.cis[0].comp, 1)
+    test.assert_eq(c.cis[0].ev, 1)
+    let ev = events_coded(run(c, 0x1001, []), 0x13)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][6] | (ev[0][7] << 8), 1)
+
+// An SDU of 3 octets that stream `k` received as its payload number `num`.
+fn rx_three(var c: ctl_hci.Controller, k: Int, num: Int)
+    var pdu = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var pdu, 0)
+    for b in [7, 8, 9]
+        let _a = ll_pdu.pdu_put_data(var pdu, b)
+    ll_data.dpdu_finish(var pdu)
+    ll_iso.rx_note(var c.cis[k], num, true, var pdu)
+
+@test
+fn test_the_streams_take_turns_when_the_packets_of_the_first_fill_the_pool()
+    if not iso_on() or ctl_limits.cis_slots() < 4
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3, 4, 5, 6])), 0)
+    let h = ll_iso.HANDLE_BASE
+    for k in 0..4
+        test.assert_eq(status_of(c, 0x206E, [(h + k) & 0xFF, (h + k) >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+        c.cis[k].state = ll_iso.S_UP
+        ll_iso.t_set(var c.cis[k], "anchor", 100000)
+    // Two SDUs wait on each stream; the pool of four packets holds the SDUs of the first two and the third stream finds no slot.
+    for k in 0..4
+        rx_three(var c, k, 0)
+        rx_three(var c, k, 1)
+    set_rr(var c, 0)
+    ctl_hci.ctl_flush_events(var c)
+    var first = iso_only(drain(var c))
+    test.assert_eq(list.len(first), 4)
+    test.assert_eq(first[0][1] | ((first[0][2] & 0x0F) << 8), h)
+    test.assert_eq(first[3][1] | ((first[3][2] & 0x0F) << 8), h + 1)
+    test.assert_eq(c.cis[2].out_n, 2)
+    // The first two streams have more by the next step, but the third goes first: it was the one left behind.
+    rx_three(var c, 0, 2)
+    rx_three(var c, 0, 3)
+    rx_three(var c, 1, 2)
+    rx_three(var c, 1, 3)
+    ctl_hci.ctl_flush_events(var c)
+    var second = iso_only(drain(var c))
+    test.assert_eq(list.len(second), 4)
+    test.assert_eq(second[0][1] | ((second[0][2] & 0x0F) << 8), h + 2)
+    test.assert_eq(second[1][1] | ((second[1][2] & 0x0F) << 8), h + 2)
+    test.assert_eq(second[2][1] | ((second[2][2] & 0x0F) << 8), h + 3)
+    test.assert_eq(second[3][1] | ((second[3][2] & 0x0F) << 8), h + 3)
+
+@test
+fn test_the_work_an_iso_packet_starts_waits_for_a_turn_with_the_time_before_the_next_booking()
+    if not iso_on()
+        return
+    var c = big_stream()
+    let h = ll_iso.HANDLE_BASE
+    // A packet of 248 octets: every octet but the last is read as before, and the last waits for the 304 microseconds its work takes.
+    let pk = host_frag(h, 0, 310, 0, 240, 0)
+    for k in 0..(list.len(pk) - 1)
+        test.assert(ctl_hci.ctl_rx_fits(var c, 0))
+        ctl_hci.ctl_rx(var c, pk[k])
+    test.assert_eq(ctl_hci.ctl_rx_cost_us(var c), 60 + 244)
+    test.assert(not ctl_hci.ctl_rx_fits(var c, 100))
+    test.assert(ctl_hci.ctl_rx_fits(var c, 1000))
+    // After 25 turns without the time it is read anyway, so that bookings one after the other cannot keep the Host's SDU for ever.
+    for _ in 0..24
+        test.assert(not ctl_hci.ctl_rx_fits(var c, 100))
+    test.assert(ctl_hci.ctl_rx_fits(var c, 100))
+    ctl_hci.ctl_rx(var c, pk[list.len(pk) - 1])
+    test.assert(c.cis[0].h_open)
+    // The packets for the Host wait too: with 100 microseconds to the booking the first fragment of an SDU is not made, and with the
+    // time it is.
+    ll_iso.t_set(var c.cis[0], "anchor", 100000)
+    rx_payload(var c.cis[0], 0, 310)
+    rx_payload(var c.cis[0], 1, 310)
+    ctl_hci.ctl_set_room(var c, 100)
+    test.assert(not ctl_hci.ev_cis_data(var c, 0))
+    test.assert_eq(c.cis[0].out_n, 1)
+    ctl_hci.ctl_set_room(var c, 1000000)
+    test.assert(ctl_hci.ev_cis_data(var c, 0))
+    test.assert_eq(c.cis[0].out_off, 240)
+
+@test
+fn test_the_credits_for_the_sdus_a_stream_sent_come_back_as_number_of_completed_packets()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c.cis[0].state = ll_iso.S_UP
+    feed(c, host_iso(h, 2, false, 50))
+    feed(c, host_iso(h, 2, false, 50))
+    // The first payload is acknowledged and the second flushed.
+    ll_iso.tx_retire(var c.cis[0], false)
+    ll_iso.tx_retire(var c.cis[0], true)
+    let out = run(c, 0x1001, [])
+    let ev = events_coded(out, 0x13)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][3], 1)
+    test.assert_eq(ev[0][4] | (ev[0][5] << 8), h)
+    test.assert_eq(ev[0][6] | (ev[0][7] << 8), 2)
+    // The count is taken: nothing more is owed.
+    let again = run(c, 0x1001, [])
+    test.assert_eq(list.len(events_coded(again, 0x13)), 0)
+
+@test
+fn test_read_iso_tx_sync_names_the_last_sdu_and_its_cig_reference_point()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    // No input path and no SDU yet: Command Disallowed.
+    test.assert_eq(status_of(c, 0x2061, [h & 0xFF, h >>> 8]), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(status_of(c, 0x206E, [h & 0xFF, h >>> 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c.cis[0].state = ll_iso.S_UP
+    ll_iso.t_set(var c.cis[0], "anchor", 50000)
+    ll_iso.t_set(var c.cis[0], "cig_sync", 4000)
+    ll_iso.t_set(var c.cis[0], "cis_sync", 3000)
+    feed(c, host_iso(h, 2, false, 50))
+    feed(c, host_iso(h, 2, false, 50))
+    let r = complete_of(var c, 0x2061, [h & 0xFF, h >>> 8])
+    test.assert_eq(r[6], 0)
+    test.assert_eq(r[7] | (r[8] << 8), h)
+    // The sequence number of the last SDU (1), the CIG reference point of its event (event 1: the anchor less the
+    // gap between the two delays), no Time_Offset.
+    test.assert_eq(r[9] | (r[10] << 8), 1)
+    test.assert_eq(r[11] | (r[12] << 8) | (r[13] << 16) | (r[14] << 24), 50000 + 10000 - 1000)
+    test.assert_eq(r[15] | (r[16] << 8) | (r[17] << 16), 0)
+
+@test
+fn test_the_link_quality_counters_of_an_unknown_stream_are_refused()
+    if not iso_on()
+        return
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2075, [0x00, 0x01]), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    // A stream that is only a configuration has no counters.
+    test.assert_eq(status_of(c, 0x2075, [0x00, 0x01]), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+
+@test
+fn test_disconnect_names_a_stream_that_runs_and_not_one_that_is_a_configuration()
+    if not iso_on()
+        return
+    var c = connected()
+    test.assert_eq(status_of(c, 0x2063, cig_params(7, [3])), 0)
+    let h = ll_iso.HANDLE_BASE
+    // A configuration is not a connection.
+    test.assert_eq(cmd_status(var c, 0x0406, [h & 0xFF, h >>> 8, 0x13]), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    // A reason outside the list the Host may give is refused for a stream as for a link.
+    test.assert_eq(cmd_status(var c, 0x0406, [h & 0xFF, h >>> 8, 0x01]), ctl_hci.STATUS_INVALID_PARAMETERS)
+
+@test
+fn test_a_terminate_for_a_stream_that_is_not_there_is_ignored()
+    if not iso_on()
+        return
+    var c = connected()
+    var t = ll_pdu.pdu_new()
+    ll_iso.put_cis_terminate(var t, 1, 1, 0x13)
+    deliver(c, t)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+    let out = run(c, 0x1001, [])
+    test.assert_eq(list.len(events_coded(out, 0x05)), 0)
+
+@test
+fn test_slots_and_literals_match_the_profile()
+    test.assert_eq(ctl_limits.cis_slots(), max_one(limits_cis()))
+    test.assert_eq(ctl_limits.cig_slots(), max_one(limits_cigs()))
+    var feat = 0
+    if limits_cis() > 0
+        feat = 0x34
+    if noble_controller_config.CTL_BIGS > 0
+        feat = 0xF4
+    test.assert_eq(ctl_limits.features_octet3(), feat)
+    test.assert_eq(ctl_limits.big_slots(), max_one(noble_controller_config.CTL_BIGS))
+    test.assert_eq(ctl_limits.bis_slots(), max_one(noble_controller_config.CTL_BIS))
+    test.assert_eq(ctl_limits.big_on(), noble_controller_config.CTL_BIGS > 0)
+    test.assert_eq(ctl_limits.iso_on(), limits_cis() > 0)
+    let c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    test.assert_eq(c.cis.capacity(), ctl_limits.cis_slots())
+    test.assert_eq(c.cigs.capacity(), ctl_limits.cig_slots())
+    test.assert_eq(c.bis.capacity(), ctl_limits.bis_slots())
+    test.assert_eq(c.bigs.capacity(), ctl_limits.big_slots())
+
+fn max_one(n: Int) -> Int
+    if n < 1
+        1
+    else
+        n
+
+fn limits_cis() -> Int
+    noble_controller_config.CTL_CIS
+
+fn limits_cigs() -> Int
+    noble_controller_config.CTL_CIGS
+
+// ── The requests of an Android Central ───────────────────────────────
+
+// An LL_CIS_REQ as a phone's Controller builds it for one sink stream (Central to Peripheral only, BN_P and Max_PDU_P 0): `sdu` octets
+// every ISO interval of `iso` units of 1.25 ms, `nse` subevents `sub_int` microseconds apart, FT `ft`, on `phy`, framed or not.
+fn sink_req(phy: Int, iso: Int, sdu: Int, framed: Bool, nse: Int, sub_int: Int, ft: Int, pdu_p: Int) -> Pdu
+    var x = ll_iso.cis_new()
+    ll_iso.t_set(var x, "central", 1)
+    ll_iso.t_set(var x, "phy", phy)
+    ll_iso.t_set(var x, "cig_id", 1)
+    ll_iso.t_set(var x, "cis_id", 0)
+    ll_iso.t_set(var x, "max_sdu_c", sdu)
+    ll_iso.t_set(var x, "max_sdu_p", 0)
+    ll_iso.t_set(var x, "sdu_int_c", iso * 1250)
+    ll_iso.t_set(var x, "sdu_int_p", iso * 1250)
+    var pdu = sdu
+    if framed
+        pdu = sdu + 8
+        ll_iso.t_set(var x, "framed", 1)
+    if pdu > 251
+        pdu = 251
+    ll_iso.t_set(var x, "max_pdu_c", pdu)
+    ll_iso.t_set(var x, "max_pdu_p", pdu_p)
+    ll_iso.t_set(var x, "nse", nse)
+    ll_iso.t_set(var x, "sub_int", sub_int)
+    ll_iso.t_set(var x, "bn_c", 1)
+    ll_iso.t_set(var x, "bn_p", 0)
+    ll_iso.t_set(var x, "ft_c", ft)
+    ll_iso.t_set(var x, "ft_p", 1)
+    ll_iso.t_set(var x, "iso_int", iso)
+    ll_iso.t_set(var x, "off_min", 2500)
+    ll_iso.t_set(var x, "off_max", 6000)
+    ll_iso.t_set(var x, "off_ev", 40)
+    var p = ll_pdu.pdu_new()
+    ll_iso.put_cis_req(var p, var x)
+    p
+
+// The error code the Controller refuses `p` with (read from the refusal it queued), 0 when it is put to the Host.
+fn req_code(var c: ctl_hci.Controller, p: Pdu) -> Int
+    pop_queued(var c)
+    var q = p
+    deliver(c, q)
+    var code = 0
+    if queued_op(var c) == ll_data.OP_REJECT_EXT_IND
+        code = queued_byte(var c, 2)
+    for i in 0..ctl_limits.cis_slots()
+        ll_iso.cis_reset_run(var c.cis[i], ll_iso.S_FREE)
+    code
+
+// The sweep: the QoS of an LE Audio sink at 7.5 and 10 ms, 1M and 2M, with the Sub_Interval a Central derives from the longest packet of a
+// subevent (the least the specification allows: SE_Length with or without the MIC in MPT) and the FT a latency of up to 95 ms allows (9
+// at 10 ms), is not refused for a parameter the specification allows.  The radio is the nRF54's (fast ramp-up 45 microseconds).  An FT
+// of 9 for the direction the Peripheral receives was refused as not fitting the ring of 8, and a Sub_Interval without the MIC as too tight
+// for the radio; neither is a reason in the specification.
+@test
+fn test_the_requests_of_an_lc3_sink_at_the_least_sub_interval_are_taken()
+    if not iso_on()
+        return
+    var c = connected()
+    ctl_hci.ctl_set_radio(var c, ll_radio.profile_new(true, 145, 45))
+    var refused = 0
+    for phy in [1, 2]
+        for iso in [6, 8]
+            for sdu in [100, 120, 240]
+                for framed in [false, true]
+                    for nse in [1, 2, 3, 4, 5, 6, 7]
+                        for ft in [1, 2, 3, 5, 9]
+                            for mic in [0, 4]
+                                var pdu = sdu
+                                if framed
+                                    pdu = sdu + 8
+                                if pdu > 251
+                                    pdu = 251
+                                // MPT_C + T_IFS_CIS + MPT_P + T_MSS_CIS, MPT_P of an empty PDU, with the MIC of `mic` octets in each.
+                                let one = ll_phy.air_us(phy, true, 2 + pdu + mic) + 150 + ll_phy.air_us(phy, true, 2 + mic)
+                                let se = one + 150
+                                var sub = se
+                                var n = nse
+                                if nse == 1
+                                    sub = 0
+                                else if (nse - 1) * se + one > iso * 1250 or nse * se > iso * 1250
+                                    n = 0
+                                if n > 0
+                                    let code = req_code(var c, sink_req(phy, iso, sdu, framed, n, sub, ft, 0))
+                                    if code != 0
+                                        refused = refused + 1
+    test.assert_eq(refused, 0)
+
+// A bidirectional stream (a Pixel with a sink and a source ASE on one CIS) with an FT of up to 7 in the direction the earbud sends is
+// taken; at 8 and 9 the ring of 8 payloads is short, and the refusal is Parameter Out of Mandatory Range (0x30, the code the
+// specification names for a BN, FT or NSE the Peripheral does not support) with the ring named as the branch.
+@test
+fn test_a_bidirectional_request_is_taken_up_to_the_ring_and_refused_with_0x30_beyond()
+    if not iso_on()
+        return
+    var c = connected()
+    ctl_hci.ctl_set_radio(var c, ll_radio.profile_new(true, 145, 45))
+    for ft in [1, 3, 7]
+        var p = sink_req(2, 8, 100, false, 3, 1500, ft, 40)
+        p.b[2 + 23] = 0x11
+        p.b[2 + 25] = ft as u8
+        p.b[2 + 17] = 40
+        p.b[2 + 18] = 0
+        p.b[2 + 7] = 40
+        p.b[2 + 8] = 0
+        test.assert_eq(req_code(var c, p), 0)
+    var q = sink_req(2, 8, 100, false, 3, 1500, 1, 40)
+    q.b[2 + 23] = 0x11
+    q.b[2 + 25] = 8
+    q.b[2 + 17] = 40
+    q.b[2 + 7] = 40
+    test.assert_eq(req_code(var c, q), 0x30)
+    test.assert_eq(c.cis_log.why, ll_iso.WHY_RING)
+    test.assert_eq(c.cis_log.ft_p, 8)
+
+@test
+fn test_a_sink_request_is_taken_when_the_unused_direction_names_no_phy_or_another()
+    if not iso_on()
+        return
+    var c = connected()
+    test.assert_eq(req_code(var c, sink_req(2, 8, 100, false, 3, 1500, 1, 0)), 0)
+    // PHY_P_To_C is 0 or another PHY: BN_P is 0, so the direction sends nothing and its field is not used.
+    var none = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    none.b[2 + 4] = 0
+    test.assert_eq(req_code(var c, none), 0)
+    var other = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    other.b[2 + 3] = 2
+    other.b[2 + 4] = 1
+    test.assert_eq(req_code(var c, other), 0)
+    // Two directions that carry data with two different PHYs are taken: the Peripheral answers on the second.
+    var both = sink_req(2, 8, 100, false, 3, 1500, 1, 40)
+    both.b[2 + 23] = 0x11
+    both.b[2 + 25] = 1
+    both.b[2 + 17] = 40
+    both.b[2 + 18] = 0
+    both.b[2 + 7] = 40
+    both.b[2 + 8] = 0
+    both.b[2 + 3] = 2
+    both.b[2 + 4] = 1
+    test.assert_eq(req_code(var c, both), 0)
+
+@test
+fn test_a_request_for_a_stream_the_central_gave_up_replaces_the_earlier_attempt()
+    if not iso_on()
+        return
+    var c = connected()
+    pop_queued(var c)
+    var first = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    deliver(c, first)
+    test.assert_eq(c.cis[0].state, ll_iso.S_REQUESTED)
+    // The Host has not answered; the Central asks again for the same stream.
+    pop_queued(var c)
+    var again = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    deliver(c, again)
+    test.assert_eq(c.cis_log.rejected, 0)
+    test.assert_eq(c.cis[0].state, ll_iso.S_CLOSING)
+    test.assert_eq(c.cis[1].state, ll_iso.S_REQUESTED)
+    // A third request finds the second still waiting for the Host, and the first slot not yet free: no duplicate is left.
+    pop_queued(var c)
+    var third = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    deliver(c, third)
+    test.assert_eq(c.cis_log.rejected, 0)
+    test.assert_eq(c.cis[1].state, ll_iso.S_CLOSING)
+
+@test
+fn test_a_request_with_another_phy_back_is_read_and_answered_on_that_phy()
+    if not iso_on()
+        return
+    var q = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    q.b[2 + 3] = 2
+    q.b[2 + 4] = 1
+    var x = ll_iso.cis_new()
+    ll_iso.get_cis_req(var q, var x)
+    test.assert_eq(x.phy, 2)
+    test.assert_eq(ll_iso.phy_back(var x), 1)
+    // The same PHY both ways, and a Central's stream, answer on the one PHY.
+    var y = ll_iso.cis_new()
+    ll_iso.t_set(var y, "phy", 2)
+    test.assert_eq(ll_iso.phy_back(var y), 2)
+    // A field that names no single PHY is refused whatever the direction carries.
+    var c = connected()
+    var bad = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    bad.b[2 + 3] = 3
+    test.assert_eq(req_code(var c, bad), 0x20)
+    // The subevent is as long as the two packets on their own PHYs: LE 1M back takes longer than LE 2M.
+    var z = ll_iso.cis_new()
+    ll_iso.t_set(var z, "phy", 2)
+    ll_iso.t_set(var z, "max_pdu_c", 100)
+    ll_iso.t_set(var z, "max_pdu_p", 100)
+    let same = ll_iso.se_len_us(var z)
+    ll_iso.t_set(var z, "phy_p", 1)
+    test.assert_eq(ll_iso.se_len_us(var z) > same, true)
+
+// The counters of the requests: one taken and one refused, the code and the branch of the refusal and the fields of the refused request,
+// and a request of the wrong length dropped by the Link Layer.
+@test
+fn test_the_controller_counts_the_requests_it_saw_and_keeps_the_last_refusal()
+    if not iso_on()
+        return
+    var c = connected()
+    test.assert_eq(req_code(var c, req_pdu()), 0)
+    test.assert_eq(c.cis_log.seen, 1)
+    test.assert_eq(c.cis_log.rejected, 0)
+    var f = req_pdu()
+    f.b[2 + 3] = 3
+    test.assert_eq(req_code(var c, f), 0x20)
+    test.assert_eq(c.cis_log.seen, 2)
+    test.assert_eq(c.cis_log.rejected, 1)
+    test.assert_eq(c.cis_log.code, 0x20)
+    test.assert_eq(c.cis_log.why, ll_iso.WHY_PHY)
+    test.assert_eq(c.cis_log.nse, 2)
+    test.assert_eq(c.cis_log.iso_int, 8)
+    test.assert_eq(c.cis_log.sub_int, 1500)
+    var l = req_pdu()
+    l.b[1] = (l.b[1] as Int - 1) as u8
+    ll_link.ctrl_rx(var c.links[0], var l)
+    test.assert_eq(ctl_hci.cis_req_dropped(var c), 1)
+    test.assert_eq(c.cis_log.seen, 2)
+    // The Host's own refusal and the accept timeout are counted as refusals too.
+    var m = req_pdu()
+    deliver(c, m)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(c.cis_log.seen, 3)
+    let _ok = complete_of(var c, 0x2067, [h & 0xFF, h >>> 8, 0x0D])
+    test.assert_eq(c.cis_log.rejected, 2)
+    test.assert_eq(c.cis_log.code, 0x0D)
+    test.assert_eq(c.cis_log.why, ll_iso.WHY_HOST_REJECT)

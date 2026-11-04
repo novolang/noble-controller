@@ -1,0 +1,92 @@
+// src/ctl_budget.nv -- the RAM the Controller's storage adds up to, from the limits.
+//
+// The keys of the package configuration (`noble_controller_config`, schema in novo.toml) name every
+// capacity of the Controller's tables, and this module adds the storage up with the size rule measured
+// on the toolchain: a `Vec[T; N]` takes round8(8 + N * sizeof(T)) bytes, the 8 being its length.  The
+// assertion at the end holds the sum to `noble_controller_config.budget_bytes()`, the total that the
+// `bytes_expr` fields of the schema give (`novo config explain` prints it), so the schema and this
+// module agree on the size rule.  The figure is the size of the declared storage; the memory report of
+// the device build is what the image reserves.
+//
+// The record sizes below are those of the schema's `bytes_expr` fields.
+
+use noble_controller_config
+
+// The records of the Controller's tables (ctl_hci.nv and the ll_*.nv modules it holds).
+const CTL_CIS_RECORD = 4568
+const CTL_CIS_RECORD_OFF = 1088
+const CTL_CIG_RECORD = 128
+const CTL_BIG_RECORD = 576
+const CTL_XSET_RECORD = 288
+const CTL_XSET_DATA_OFF = 8
+const CTL_PADV_RECORD = 304
+const CTL_PSYNC_RECORD = 264
+const CTL_PER_FIXED = 152
+const CTL_PAST_RECORD = 32
+const CTL_SUB_RECORD = 136
+const CTL_FEAT_RECORD = 48
+const CTL_PCL_RECORD = 192
+const CTL_PAWR_ADV_RECORD = 144
+const CTL_PAWR_SYNC_RECORD = 64
+const CTL_PAWR_BUF_RECORD = 56
+
+// The larger of `n` and 1: a table of an absent feature keeps one record.  A `const fn` of another module cannot take part in
+// the `assert_const` below, so this module keeps its own copy of the one in ctl_limits.nv.
+@tier(embedded)
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+
+// `n` rounded up to a multiple of 8.
+@tier(embedded)
+const fn round8(n: Int) -> Int
+    (n + 7) / 8 * 8
+
+// The bytes of a `Vec[T; n]` whose element is `size` octets.
+@tier(embedded)
+const fn vec_bytes(n: Int, size: Int) -> Int
+    round8(8 + n * size)
+
+// The streams and groups of the isochronous channels, connected and broadcast; a build with none holds one slot of each,
+// and a stream slot without its buffers when the channels are out.
+@tier(embedded)
+const fn controller_iso_bytes() -> Int
+    let stream = if noble_controller_config.CTL_CIS > 0 then CTL_CIS_RECORD else CTL_CIS_RECORD_OFF
+    max1(noble_controller_config.CTL_CIS) * stream + max1(noble_controller_config.CTL_CIGS) * CTL_CIG_RECORD
+        + max1(noble_controller_config.CTL_BIS) * stream + max1(noble_controller_config.CTL_BIGS) * CTL_BIG_RECORD
+
+// The advertising sets, the periodic trains and synchronizations, the Periodic Advertiser List and the records of sync transfer,
+// subrating, feature pages and power control.
+@tier(embedded)
+const fn controller_adv_bytes() -> Int
+    let links = noble_controller_config.CTL_LINKS
+    let sets_on = noble_controller_config.CTL_ADV_SETS > 0
+    let data = if sets_on then noble_controller_config.CTL_ADV_DATA else CTL_XSET_DATA_OFF
+    let per_data = if noble_controller_config.CTL_PER_ADV > 0 and sets_on then noble_controller_config.CTL_ADV_DATA else CTL_XSET_DATA_OFF
+    let sets = max1(noble_controller_config.CTL_ADV_SETS) * (CTL_XSET_RECORD + 2 * round8(8 + data))
+    let trains = max1(noble_controller_config.CTL_PER_ADV) * (CTL_PADV_RECORD + round8(8 + per_data))
+    let syncs = max1(noble_controller_config.CTL_PER_SYNC) * CTL_PSYNC_RECORD + CTL_PER_FIXED
+    let transfer = 2 * vec_bytes(links, CTL_PAST_RECORD) + CTL_PAST_RECORD
+    let subrate = vec_bytes(if noble_controller_config.CTL_SUBRATE then links else 1, CTL_SUB_RECORD)
+    let pages = vec_bytes(links, CTL_FEAT_RECORD)
+    let power = vec_bytes(if noble_controller_config.CTL_PCL then links else 1, CTL_PCL_RECORD)
+    sets + trains + syncs + transfer + subrate + pages + power
+
+// Periodic advertising with responses: the buffers each train and each synchronization keeps, one record of a side that is off.
+@tier(embedded)
+const fn controller_pawr_bytes() -> Int
+    let on = noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC
+    let bufs = if on then noble_controller_config.CTL_PAWR_BUFS else 1
+    let data = if on then noble_controller_config.CTL_PAWR_DATA else 8
+    let rsp = if on then 2 * data + 8 else 8
+    let one = CTL_PAWR_BUF_RECORD + round8(data)
+    let adv = (if noble_controller_config.CTL_PAWR_ADV then max1(noble_controller_config.CTL_PER_ADV) else 1) * (CTL_PAWR_ADV_RECORD + bufs * one + round8(rsp))
+    let sync = (if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1) * (CTL_PAWR_SYNC_RECORD + bufs * one)
+    adv + sync
+
+// The Controller's storage, in bytes.
+@tier(embedded)
+const fn controller_bytes() -> Int
+    controller_iso_bytes() + controller_adv_bytes() + controller_pawr_bytes()
+
+// The Controller's storage is the total the schema's `bytes_expr` fields give, so the schema and this module agree on the size rule.
+assert_const(controller_bytes() == noble_controller_config.budget_bytes(), "noble-controller: ctl_budget.nv and the bytes_expr fields of novo.toml disagree on the storage total: correct the size rule in one of them (`novo config explain` prints the schema's rows)")

@@ -1,0 +1,383 @@
+// src/ll_dtm.nv — Direct Test Mode over HCI ([Vol 6] Part F, Section 4 and
+// [Vol 4] Part E, Sections 7.8.28 to 7.8.30): the state of a transmitter or receiver
+// test, the check of its parameters, the test packet and the packet interval.
+//
+// A test is started by LE Transmitter Test or LE Receiver Test and ended by LE Test End.
+// While one runs, the radio belongs to it: advertising, scanning, initiating and the
+// connections are not started, and a test is not started while one of them is on.  The
+// radio program (`ll_air.nv`, `dtm_slice`) reads this state and drives the `Radio`:
+//
+//   transmitter   one test packet at every packet interval on the channel and PHY given,
+//                 without whitening, with the access address 0x71764129 and the CRC seed
+//                 0x555555 (Section 4.1.2 and 4.1.3)
+//   receiver      listens on the channel and PHY given and counts the packets that arrive
+//                 with a good CRC; LE Test End reports the count
+//
+// The test packet is the two octets of the PDU header (the payload type in the low four
+// bits, then the length of the payload) and the payload (Section 4.1.4 and 4.1.5).  It is
+// the same packet every time, so the program writes it into the radio's buffer once.
+//
+// Not built: the Constant Tone Extension (the commands that carry one answer Unsupported
+// Feature or Parameter Value), a modulation index the Host can choose (the radio has one;
+// the receiver's setting is accepted and has no effect), and the synchronization of the
+// transmit power to a level finer than the radio's table (the nearest level is used).
+//
+// No function here allocates.
+
+use std.test
+use ll_pdu
+use ll_phy
+
+// The access address and CRC seed of every LE test packet.
+const ACCESS_ADDRESS = 0x71764129
+const CRC_INIT = 0x555555
+
+// What the test is.
+const MODE_OFF = 0
+const MODE_TX = 1
+const MODE_RX = 2
+
+// The payload types of Table 4.1 and Packet_Payload of the HCI command.
+const PAYLOAD_PRBS9 = 0
+const PAYLOAD_0F = 1
+const PAYLOAD_55 = 2
+const PAYLOAD_PRBS15 = 3
+const PAYLOAD_FF = 4
+const PAYLOAD_00 = 5
+const PAYLOAD_F0 = 6
+const PAYLOAD_AA = 7
+
+// Status codes of the commands.
+const STATUS_SUCCESS = 0x00
+const STATUS_COMMAND_DISALLOWED = 0x0C
+const STATUS_UNSUPPORTED_FEATURE = 0x11
+const STATUS_INVALID_PARAMETERS = 0x12
+
+// TX_Power_Level of LE Transmitter Test [v4]: the lowest and the highest level the
+// transmitter has.
+const POWER_MIN_PARAM = 0x7E
+const POWER_MAX_PARAM = 0x7F
+
+// `mode` is the test that runs.  `channel` is the RF channel index (0 to 39), `phy` the PHY
+// (`ll_phy.PHY_1M`, `PHY_2M` or `PHY_CODED`) and `s8` the coding of the LE Coded PHY the
+// transmitter sends.  `length` and `payload` describe the transmitter's packet, `power`
+// its level in dBm.  `stable` is the receiver's assumption about the modulation index.
+// `fresh` says the program has not set the radio up for this test yet.  `count` is the
+// packets the receiver took with a good CRC and `sent` those the transmitter sent.
+@value
+struct Dtm
+    mode: Int
+    channel: Int
+    phy: Int
+    s8: Bool
+    length: Int
+    payload: Int
+    power: Int
+    stable: Bool
+    fresh: Bool
+    count: Int
+    sent: Int
+
+@tier(embedded)
+fn dtm_new() -> Dtm
+    Dtm { mode: MODE_OFF, channel: 0, phy: ll_phy.PHY_1M, s8: true, length: 0, payload: 0,
+          power: 0, stable: false, fresh: false, count: 0, sent: 0 }
+
+// Whether a test runs.
+@no_alloc
+@tier(embedded)
+fn dtm_active(var d: Dtm) -> Bool
+    d.mode != MODE_OFF
+
+// The PHY of the HCI parameter `code` for a transmitter (1 LE 1M, 2 LE 2M, 3 LE Coded
+// S=8, 4 LE Coded S=2), -1 for a value the Controller has not.
+@tier(embedded)
+fn tx_phy_of(code: Int) -> Int
+    if code == 1
+        return ll_phy.PHY_1M
+    if code == 2
+        return ll_phy.PHY_2M
+    if code == 3 or code == 4
+        return ll_phy.PHY_CODED
+    -1
+
+// The PHY of the HCI parameter `code` for a receiver (1, 2 or 3).
+@tier(embedded)
+fn rx_phy_of(code: Int) -> Int
+    if code >= 1 and code <= 3
+        return tx_phy_of(code)
+    -1
+
+// The status of LE Transmitter Test with these parameters: Invalid HCI Command Parameters
+// for a channel above 39 or a payload type above 7, Unsupported Feature or Parameter Value
+// for a PHY the Controller does not have.
+@satisfies("REQ-BLE-CTL-071")
+@tier(embedded)
+fn tx_status(channel: Int, payload: Int, phy_code: Int) -> Int
+    if channel > 39 or payload > PAYLOAD_AA
+        return STATUS_INVALID_PARAMETERS
+    if tx_phy_of(phy_code) < 0
+        return STATUS_UNSUPPORTED_FEATURE
+    STATUS_SUCCESS
+
+// The status of LE Receiver Test with these parameters.
+@satisfies("REQ-BLE-CTL-071")
+@tier(embedded)
+fn rx_status(channel: Int, phy_code: Int, modulation: Int) -> Int
+    if channel > 39 or modulation > 1
+        return STATUS_INVALID_PARAMETERS
+    if rx_phy_of(phy_code) < 0
+        return STATUS_UNSUPPORTED_FEATURE
+    STATUS_SUCCESS
+
+// The status of the Constant Tone Extension parameters of the third and fourth versions
+// ([Vol 4] Part E, Sections 7.8.28 and 7.8.29): `cte_length` and `cte_type` are the
+// command's, `phy_code` its PHY parameter.  Success for no extension (length 0).  A length
+// that is neither 0 nor 2 to 20, or a type above 2, is Invalid HCI Command Parameters; an
+// extension on the LE Coded PHY (`coded`), which carries none, is Command Disallowed; a
+// valid extension is Unsupported Feature or Parameter Value, because the Controller has
+// none.
+@satisfies("REQ-BLE-CTL-071")
+@tier(embedded)
+fn cte_status(cte_length: Int, cte_type: Int, coded: Bool) -> Int
+    if cte_length == 0
+        return STATUS_SUCCESS
+    if cte_length == 1 or cte_length > 20 or cte_type > 2
+        return STATUS_INVALID_PARAMETERS
+    if coded
+        return STATUS_COMMAND_DISALLOWED
+    STATUS_UNSUPPORTED_FEATURE
+
+// The level in dBm of a TX_Power_Level parameter: the lowest and highest the radio has for
+// 0x7E and 0x7F, the signed value otherwise.
+@tier(embedded)
+fn power_of(param: Int, min_dbm: Int, max_dbm: Int) -> Int
+    if param == POWER_MIN_PARAM
+        return min_dbm
+    if param == POWER_MAX_PARAM
+        return max_dbm
+    if param >= 128
+        return param - 256
+    param
+
+// Start a transmitter test.  The caller has checked `tx_status`.
+@satisfies("REQ-BLE-CTL-071")
+@tier(embedded)
+fn dtm_start_tx(var d: Dtm, channel: Int, length: Int, payload: Int, phy_code: Int, power: Int)
+    d.mode = MODE_TX
+    d.channel = channel
+    d.length = length
+    d.payload = payload
+    d.phy = tx_phy_of(phy_code)
+    d.s8 = phy_code != 4
+    d.power = power
+    d.fresh = true
+    d.count = 0
+    d.sent = 0
+
+// Start a receiver test.  The caller has checked `rx_status`.
+@satisfies("REQ-BLE-CTL-071")
+@tier(embedded)
+fn dtm_start_rx(var d: Dtm, channel: Int, phy_code: Int, modulation: Int)
+    d.mode = MODE_RX
+    d.channel = channel
+    d.phy = rx_phy_of(phy_code)
+    d.s8 = phy_code != 4
+    d.stable = modulation == 1
+    d.fresh = true
+    d.count = 0
+    d.sent = 0
+
+// End the test.  The answer is the number of packets the receiver took (0 for a
+// transmitter test).
+@satisfies("REQ-BLE-CTL-071")
+@tier(embedded)
+fn dtm_end(var d: Dtm) -> Int
+    var n = 0
+    if d.mode == MODE_RX
+        n = d.count
+    d.mode = MODE_OFF
+    d.fresh = false
+    n & 0xFFFF
+
+// The length of a test packet in microseconds, from the first preamble bit to the end of
+// the CRC (Section 4.1.6): the PDU is the header, the length and `length` octets.
+@satisfies("REQ-BLE-CTL-072")
+@tier(embedded)
+fn packet_us(phy: Int, s8: Bool, length: Int) -> Int
+    ll_phy.air_us(phy, s8, 2 + length)
+
+// The packet interval I(L) = ceil((L + 249) / 625) * 625 microseconds for a packet of
+// L microseconds (Section 4.1.6).
+@satisfies("REQ-BLE-CTL-072")
+@tier(embedded)
+fn interval_us(phy: Int, s8: Bool, length: Int) -> Int
+    let l = packet_us(phy, s8, length)
+    ((l + 249 + 624) / 625) * 625
+
+// Fill `n` octets of `p` from index `at` with the pseudorandom sequence of a shift register
+// of `bits` stages (9 for PRBS9, 15 for PRBS15) whose stage `tap` is XORed with the last
+// stage and fed back to the first, initialised with ones, the first bit sent being the
+// least significant of the first octet (Section 4.1.5).
+@tier(embedded)
+fn prbs_fill(var p: Pdu, at: Int, n: Int, bits: Int, tap: Int)
+    let mask = (1 << bits) - 1
+    var s = mask
+    for i in 0..n
+        var v = 0
+        for k in 0..8
+            let out = (s >> (bits - 1)) & 1
+            let fb = ((s >> (tap - 1)) ^ (s >> (bits - 1))) & 1
+            s = ((s << 1) | fb) & mask
+            v = v | (out << k)
+        p.b[at + i] = v as u8
+
+// The octet a constant payload type repeats; -1 for a pseudorandom type.
+@tier(embedded)
+fn pattern_octet(payload: Int) -> Int
+    match payload
+        1 => 0x0F
+        2 => 0x55
+        4 => 0xFF
+        5 => 0x00
+        6 => 0xF0
+        7 => 0xAA
+        _ => -1
+
+// Build the test packet into `p`: the header octet (the payload type, the CP bit clear),
+// the length and the payload.
+@satisfies("REQ-BLE-CTL-072")
+@tier(embedded)
+fn dtm_packet(var p: Pdu, payload: Int, length: Int)
+    p.b[0] = payload as u8
+    p.b[1] = length as u8
+    p.n = 2 + length
+    let o = pattern_octet(payload)
+    if o >= 0
+        for i in 0..length
+            p.b[2 + i] = o as u8
+    else if payload == PAYLOAD_PRBS9
+        prbs_fill(var p, 2, length, 9, 5)
+    else
+        prbs_fill(var p, 2, length, 15, 14)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+// A value struct changes through a callee's `var`.
+fn t_count(var d: Dtm, v: Int)
+    d.count = v
+
+@test
+fn test_prbs9_begins_as_the_specification_gives_it()
+    // '11111111100000111101...' in transmission order: the octets FF C1 FB E8 4C, the
+    // sequence every BLE tester knows.
+    var p = ll_pdu.pdu_new()
+    dtm_packet(var p, PAYLOAD_PRBS9, 37)
+    test.assert_eq(p.b[0] as Int, 0)
+    test.assert_eq(p.b[1] as Int, 37)
+    test.assert_eq(p.n, 39)
+    test.assert_eq(p.b[2] as Int, 0xFF)
+    test.assert_eq(p.b[3] as Int, 0xC1)
+    test.assert_eq(p.b[4] as Int, 0xFB)
+    test.assert_eq(p.b[5] as Int, 0xE8)
+    test.assert_eq(p.b[6] as Int, 0x4C)
+
+@test
+fn test_prbs9_repeats_after_511_bits_and_prbs15_after_32767()
+    var p = ll_pdu.pdu_new()
+    // 511 bits: 63.875 octets, so the sequence is the same 511 bits later; check by the bit.
+    prbs_fill(var p, 2, 255, 9, 5)
+    var same = true
+    for k in 0..(255 * 8 - 511)
+        let a = ((p.b[2 + k / 8] as Int) >> (k % 8)) & 1
+        let j = k + 511
+        let b = ((p.b[2 + j / 8] as Int) >> (j % 8)) & 1
+        if a != b
+            same = false
+    test.assert(same)
+    // PRBS15 begins with 15 ones and is not PRBS9.
+    var q = ll_pdu.pdu_new()
+    prbs_fill(var q, 2, 4, 15, 14)
+    test.assert_eq(q.b[2] as Int, 0xFF)
+    test.assert_eq((q.b[3] as Int) & 0x7F, 0x7F)
+    test.assert((q.b[4] as Int) != 0xFF or (q.b[5] as Int) != 0xFF)
+
+@test
+fn test_constant_payloads_repeat_their_octet_and_the_header_names_the_type()
+    var p = ll_pdu.pdu_new()
+    let want = [0x00, 0x0F, 0x55, 0x00, 0xFF, 0x00, 0xF0, 0xAA]
+    for t in 1..8
+        if t != 3
+            dtm_packet(var p, t, 20)
+            test.assert_eq(p.b[0] as Int, t)
+            test.assert_eq(p.b[1] as Int, 20)
+            for i in 0..20
+                test.assert_eq(p.b[2 + i] as Int, want[t])
+    // The example of Section 4.1.4: 0x0F payload of 37 octets is 0x01 0x25 on air.
+    dtm_packet(var p, PAYLOAD_0F, 37)
+    test.assert_eq(p.b[0] as Int, 0x01)
+    test.assert_eq(p.b[1] as Int, 0x25)
+
+@test
+fn test_packet_interval_follows_the_formula_on_each_phy()
+    // LE 1M, 37 octets: 376 microseconds, I = ceil(625 / 625) * 625; 38 octets: 384, 1250.
+    test.assert_eq(packet_us(ll_phy.PHY_1M, true, 37), 376)
+    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 37), 625)
+    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 38), 1250)
+    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 0), 625)
+    // 255 octets: 2120 microseconds, I = ceil(2369 / 625) * 625 = 2500.
+    test.assert_eq(packet_us(ll_phy.PHY_1M, true, 255), 2120)
+    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 255), 2500)
+    // LE 2M, 255 octets: 1064 microseconds.
+    test.assert_eq(packet_us(ll_phy.PHY_2M, true, 255), 1064)
+    test.assert_eq(interval_us(ll_phy.PHY_2M, true, 255), 1875)
+    // LE Coded, empty payload: 462 microseconds at S=2, 720 at S=8 (Figure 4.2 gives
+    // 462 to 17040 for the two).
+    test.assert_eq(packet_us(ll_phy.PHY_CODED, false, 0), 462)
+    test.assert_eq(packet_us(ll_phy.PHY_CODED, true, 0), 720)
+    test.assert_eq(packet_us(ll_phy.PHY_CODED, true, 255), 17040)
+    test.assert_eq(interval_us(ll_phy.PHY_CODED, true, 255), 17500)
+
+@test
+fn test_parameters_are_checked_and_a_test_runs_until_it_is_ended()
+    test.assert_eq(tx_status(39, 7, 4), STATUS_SUCCESS)
+    test.assert_eq(tx_status(40, 0, 1), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(tx_status(0, 8, 1), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(tx_status(0, 0, 0), STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(tx_status(0, 0, 5), STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(rx_status(0, 3, 1), STATUS_SUCCESS)
+    test.assert_eq(rx_status(0, 4, 0), STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(rx_status(40, 1, 0), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(rx_status(0, 1, 2), STATUS_INVALID_PARAMETERS)
+    var d = dtm_new()
+    test.assert(not dtm_active(var d))
+    dtm_start_rx(var d, 19, 2, 0)
+    test.assert(dtm_active(var d))
+    test.assert_eq(d.phy, ll_phy.PHY_2M)
+    t_count(var d, 70000)
+    // The count is 16 bits; a transmitter reports none.
+    test.assert_eq(dtm_end(var d), 70000 & 0xFFFF)
+    test.assert(not dtm_active(var d))
+    dtm_start_tx(var d, 0, 10, 1, 3, 0)
+    test.assert(d.s8)
+    t_count(var d, 5)
+    test.assert_eq(dtm_end(var d), 0)
+    dtm_start_tx(var d, 0, 10, 1, 4, 0)
+    test.assert(not d.s8)
+
+@test
+fn test_the_tone_extension_parameters_have_their_codes()
+    test.assert_eq(cte_status(0, 0, false), STATUS_SUCCESS)
+    test.assert_eq(cte_status(0, 9, true), STATUS_SUCCESS)
+    test.assert_eq(cte_status(1, 0, false), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(cte_status(21, 0, false), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(cte_status(2, 3, false), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(cte_status(2, 0, true), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(cte_status(20, 2, false), STATUS_UNSUPPORTED_FEATURE)
+
+@test
+fn test_power_levels_map_the_parameter()
+    test.assert_eq(power_of(0x7E, -46, 8), -46)
+    test.assert_eq(power_of(0x7F, -46, 8), 8)
+    test.assert_eq(power_of(0xFC, -46, 8), -4)
+    test.assert_eq(power_of(4, -46, 8), 4)

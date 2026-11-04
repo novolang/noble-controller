@@ -1,0 +1,8 @@
+# The Controller's part of the profile configs/ctl_past_pawr.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/ctl_past_pawr.toml`).  orbit/ble/configs/ctl_past_pawr.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+extends = "noble-controller:ctl_pawr"
+
+[noble-controller]
+ctl_past = true
+ctl_pcl = true

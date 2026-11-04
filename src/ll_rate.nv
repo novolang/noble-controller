@@ -1,0 +1,285 @@
+// src/ll_rate.nv — Connection Rate of the Link Layer: the PDUs LL_CONNECTION_RATE_REQ and LL_CONNECTION_RATE_IND, the
+// connection intervals of the rounded set, and the arithmetic of the Central's answer to a request.
+//
+// [Vol 6] Part B, Sections 2.4.2.57, 2.4.2.58, 4.5.1, 4.5.10, 4.6.50, 5.1.32 and 5.1.33; [Vol 4] Part E, Sections 7.7.65.50, 7.8.154, 7.8.155 and
+// 7.8.156.  The Central changes the connection interval, the subrate factor, the Peripheral latency, the continuation number and the supervision
+// timeout together with LL_CONNECTION_RATE_IND, at an instant; the Peripheral asks for it with LL_CONNECTION_RATE_REQ.  The interval is a
+// multiple of 125 microseconds.  This Controller keeps the interval in units of 1.25 milliseconds, so it supports the rounded connInterval
+// values (RCV, the multiples of 1.25 ms, down to 1.25 ms) and no other value of the extended set; the PDU fields that carry such a value
+// are in units of 125 microseconds and a multiple of 10 of them.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.rate_on()`) says whether the build has the feature.
+
+use std.test
+use ll_pdu
+use ll_data
+use ll_sub
+
+// 1 in a build with Connection Rate (feature bit 72, Shorter Connection Intervals), 0 in one without it.
+
+// The units: one connection interval unit of the link (1.25 ms) is this many units of the PDU fields and of the HCI commands (125 us).
+const RATE_STEP = 10
+
+// The greatest interval, 4 s, and the least the commands may name, 375 us.
+const IV_MAX = 0x7D00
+const IV_MIN = 3
+
+// The least interval this Controller supports (1.25 ms), in units of 125 us, which LE Read Minimum Supported Connection Interval reports.
+const MIN_SUPPORTED = 10
+
+const E_INVALID_PARAMS = 0x1E
+const E_UNSUPPORTED_PARAM = 0x20
+const E_UNSUPPORTED_FEATURE = 0x11
+
+// T_IFS_ACL_CP and T_MCES, in microseconds, and the longest packet of the uncoded and of the LE Coded PHY that connIntervalUncodedMin and
+// connIntervalCodedMin add to connIntervalRequired.
+const T_IFS_ACL_CP_US = 150
+const T_MCES_US = 150
+const PACKET_UNCODED_US = 328
+const PACKET_CODED_US = 2704
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// LL_CONNECTION_RATE_REQ: the interval range, the subrate range, the greatest latency, the continuation number and the supervision timeout,
+// the preferred periodicity, the reference event and the first offset (the other three are not valid).
+@tier(embedded)
+fn put_req(var p: Pdu, imin: Int, imax: Int, fmin: Int, fmax: Int, lat: Int, cont: Int, timeout: Int, period: Int, ref: Int, off0: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_CONNECTION_RATE_REQ)
+    ll_sub.put16(var p, imin)
+    ll_sub.put16(var p, imax)
+    ll_sub.put16(var p, fmin)
+    ll_sub.put16(var p, fmax)
+    ll_sub.put16(var p, lat)
+    ll_sub.put16(var p, cont)
+    ll_sub.put16(var p, timeout)
+    ll_sub.put16(var p, period)
+    ll_sub.put16(var p, ref)
+    ll_sub.put16(var p, off0)
+    for _ in 0..3
+        ll_sub.put16(var p, 0xFFFF)
+    ll_data.dpdu_finish(var p)
+
+// LL_CONNECTION_RATE_IND: the transmit window offset and the interval (125 us), the instant, and the factor, latency, continuation number
+// and supervision timeout that apply from it.
+@tier(embedded)
+fn put_ind(var p: Pdu, win_offset: Int, interval: Int, instant: Int, factor: Int, lat: Int, cont: Int, timeout: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_CONNECTION_RATE_IND)
+    ll_sub.put16(var p, win_offset)
+    ll_sub.put16(var p, interval)
+    ll_sub.put16(var p, instant)
+    ll_sub.put16(var p, factor)
+    ll_sub.put16(var p, lat)
+    ll_sub.put16(var p, cont)
+    ll_sub.put16(var p, timeout)
+    ll_data.dpdu_finish(var p)
+
+// The offsets of an LL_CONNECTION_RATE_REQ in `rx` are valid: each is 0xFFFF (not valid) or below `imax`, the valid ones are different and
+// come before the invalid ones.
+@tier(embedded)
+fn offsets_ok(var rx: Pdu, imax: Int) -> Bool
+    var seen_invalid = false
+    for k in 0..4
+        let v = ll_sub.get16(var rx, 19 + 2 * k)
+        if v == 0xFFFF
+            seen_invalid = true
+        else
+            if seen_invalid or v >= imax
+                return false
+            for j in 0..k
+                if ll_sub.get16(var rx, 19 + 2 * j) == v
+                    return false
+    true
+
+// The first offset of the request in `rx` that is a multiple of 1.25 ms, in units of 1.25 ms; -1 when there is none.
+@tier(embedded)
+fn first_offset(var rx: Pdu) -> Int
+    for k in 0..4
+        let v = ll_sub.get16(var rx, 19 + 2 * k)
+        if v != 0xFFFF and v % RATE_STEP == 0
+            return v / RATE_STEP
+    -1
+
+// ── The intervals ───────────────────────────────────────────────────
+
+// Whether `v` (125 us) is a value of the rounded set that this Controller supports.
+@tier(embedded)
+fn rcv(v: Int) -> Bool
+    v >= MIN_SUPPORTED and v <= IV_MAX and v % RATE_STEP == 0
+
+// The least multiple of `period` that is also a multiple of 1.25 ms (10 units): the period times 1 to 10.
+@tier(embedded)
+fn lcm_step(period: Int) -> Int
+    for k in 1..11
+        if (period * k) % RATE_STEP == 0
+            return period * k
+    period * RATE_STEP
+
+// The interval the Central picks from the range `lo` to `hi` (125 us) that is not below `floor`: the longest multiple of the preferred
+// periodicity `period` (0 for none) inside the range when there is one, otherwise the longest supported value in it (Section 5.1.7); -1 when
+// no supported value is in the range.
+@tier(embedded)
+fn pick_interval(lo: Int, hi: Int, period: Int, floor: Int) -> Int
+    var a = lo
+    if floor > a
+        a = floor
+    a = ((a + RATE_STEP - 1) / RATE_STEP) * RATE_STEP
+    if a < MIN_SUPPORTED
+        a = MIN_SUPPORTED
+    let b = (hi / RATE_STEP) * RATE_STEP
+    if a > b
+        return -1
+    if period > 0
+        let step = lcm_step(period)
+        let m = (b / step) * step
+        if m >= a
+            return m
+    b
+
+// connIntervalRequired (Section 4.5.10) in microseconds: T_IFS_ACL_CP, T_MCES and the longer of the longest packet of the peer and a
+// packet of `rx_octets` octets at its shortest coding.  `rx_time` and `rx_octets` are connEffectiveMaxRxTime and connEffectiveMaxRxOctets.
+@tier(embedded)
+fn required_us(rx_time: Int, rx_octets: Int) -> Int
+    var p = rx_octets * 64 + 976
+    if rx_time < p
+        p = rx_time
+    T_IFS_ACL_CP_US + T_MCES_US + p
+
+// The least interval (125 us) the Central may pick on a connection whose connIntervalRequired is `required` microseconds: connIntervalUncodedMin
+// or, on the LE Coded PHY, connIntervalCodedMin.
+@tier(embedded)
+fn floor_units(required: Int, coded: Bool) -> Int
+    var add = PACKET_UNCODED_US
+    if coded
+        add = PACKET_CODED_US
+    (required + add + 124) / 125
+
+// ── The request ─────────────────────────────────────────────────────
+
+// Whether the values of a request are ones the specification allows (Section 2.4.2.57): the ranges, the subrate factor times (latency + 1)
+// within 500, and the preferred periodicity within the greatest interval.
+@tier(embedded)
+fn req_valid(imin: Int, imax: Int, fmin: Int, fmax: Int, lat: Int, cont: Int, to: Int, period: Int) -> Bool
+    imin >= IV_MIN and imax <= IV_MAX and imin <= imax and fmin >= 1 and fmax <= ll_sub.FACTOR_MAX and fmin <= fmax and lat <= 0x1F3
+        and cont <= 0x1F3 and to >= 10 and to <= 0x0C80 and fmax * (lat + 1) <= ll_sub.FACTOR_MAX and period <= imax
+
+// The Host's interval range as the pair packed in a Sub: `lo` in the low 16 bits, `hi` above.
+@tier(embedded)
+fn pack(lo: Int, hi: Int) -> Int
+    lo | (hi << 16)
+
+@tier(embedded)
+fn pack_lo(v: Int) -> Int
+    v & 0xFFFF
+
+@tier(embedded)
+fn pack_hi(v: Int) -> Int
+    (v >>> 16) & 0xFFFF
+
+// The interval a request inside the Host's limits gets: the range cut to what `s` allows, then `pick_interval`.  -1 when the ranges do not meet.
+@tier(embedded)
+fn accept_interval(var s: Sub, imin: Int, imax: Int, period: Int, floor: Int) -> Int
+    var lo = imin
+    if pack_lo(s.aiv) > lo
+        lo = pack_lo(s.aiv)
+    var hi = imax
+    if pack_hi(s.aiv) < hi
+        hi = pack_hi(s.aiv)
+    pick_interval(lo, hi, period, floor)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_pdu_layouts()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, 12, 40, 2, 8, 1, 3, 0x0100, 10, 0x1234, 20)
+    test.assert_eq(ll_data.dpdu_len(var p), 27)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3E)
+    test.assert_eq(ll_sub.get16(var p, 1), 12)
+    test.assert_eq(ll_sub.get16(var p, 3), 40)
+    test.assert_eq(ll_sub.get16(var p, 5), 2)
+    test.assert_eq(ll_sub.get16(var p, 7), 8)
+    test.assert_eq(ll_sub.get16(var p, 9), 1)
+    test.assert_eq(ll_sub.get16(var p, 11), 3)
+    test.assert_eq(ll_sub.get16(var p, 13), 0x0100)
+    test.assert_eq(ll_sub.get16(var p, 15), 10)
+    test.assert_eq(ll_sub.get16(var p, 17), 0x1234)
+    test.assert_eq(ll_sub.get16(var p, 19), 20)
+    test.assert_eq(ll_sub.get16(var p, 21), 0xFFFF)
+    test.assert_eq(ll_sub.get16(var p, 25), 0xFFFF)
+    put_ind(var p, 30, 60, 0x0102, 4, 1, 3, 0x0C80)
+    test.assert_eq(ll_data.dpdu_len(var p), 15)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3F)
+    test.assert_eq(ll_sub.get16(var p, 1), 30)
+    test.assert_eq(ll_sub.get16(var p, 3), 60)
+    test.assert_eq(ll_sub.get16(var p, 5), 0x0102)
+    test.assert_eq(ll_sub.get16(var p, 7), 4)
+    test.assert_eq(ll_sub.get16(var p, 13), 0x0C80)
+
+@test
+fn test_offsets()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, 12, 40, 1, 1, 0, 0, 100, 0, 0, 20)
+    test.assert(offsets_ok(var p, 40))
+    test.assert(not offsets_ok(var p, 20))
+    test.assert_eq(first_offset(var p), 2)
+    put_req(var p, 12, 40, 1, 1, 0, 0, 100, 0, 0, 25)
+    test.assert(offsets_ok(var p, 40))
+    test.assert_eq(first_offset(var p), -1)
+    put_req(var p, 12, 40, 1, 1, 0, 0, 100, 0, 0, 0xFFFF)
+    test.assert(offsets_ok(var p, 40))
+    test.assert_eq(first_offset(var p), -1)
+
+@test
+fn test_interval_rules()
+    test.assert(rcv(10))
+    test.assert(rcv(0x7D00))
+    test.assert(not rcv(9))
+    test.assert(not rcv(15))
+    test.assert(not rcv(0x7D0A))
+    test.assert_eq(pick_interval(6, 40, 0, 0), 40)
+    test.assert_eq(pick_interval(6, 47, 0, 0), 40)
+    test.assert_eq(pick_interval(11, 19, 0, 0), -1)
+    test.assert_eq(pick_interval(11, 20, 0, 0), 20)
+    // The preferred periodicity 30 and the step 10 meet at 30.
+    test.assert_eq(pick_interval(10, 100, 30, 0), 90)
+    test.assert_eq(pick_interval(10, 80, 25, 0), 50)
+    test.assert_eq(pick_interval(10, 40, 25, 0), 40)
+    test.assert_eq(pick_interval(10, 100, 0, 70), 100)
+    test.assert_eq(pick_interval(10, 60, 0, 70), -1)
+    test.assert_eq(pick_interval(3, 4, 0, 0), -1)
+
+@test
+fn test_required_interval()
+    // 27 octets at 328 us: 150 + 150 + 328.
+    test.assert_eq(required_us(328, 27), 628)
+    test.assert_eq(required_us(2120, 251), 150 + 150 + 2120)
+    test.assert_eq(required_us(17040, 27), 150 + 150 + 2704)
+    test.assert_eq(floor_units(628, false), 8)
+    test.assert_eq(floor_units(628, true), 27)
+
+@test
+fn test_request_ranges()
+    test.assert(req_valid(12, 40, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(2, 40, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 0x7D01, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(41, 40, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 40, 0, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 40, 5, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 40, 1, 501, 0, 0, 100, 0))
+    test.assert(not req_valid(12, 40, 100, 100, 5, 0, 100, 0))
+    test.assert(req_valid(12, 40, 100, 100, 4, 0, 100, 0))
+    test.assert(not req_valid(12, 40, 1, 4, 1, 3, 9, 0))
+    test.assert(not req_valid(12, 40, 1, 4, 1, 3, 100, 41))
+
+@test
+fn test_accept_interval_follows_the_hosts_range()
+    var v: Vec[Sub; 1] = Vec.new()
+    let _a = v.push(ll_sub.sub_new())
+    v[0].aiv = pack(20, 80)
+    test.assert_eq(pack_lo(v[0].aiv), 20)
+    test.assert_eq(pack_hi(v[0].aiv), 80)
+    test.assert_eq(accept_interval(var v[0], 10, 100, 0, 0), 80)
+    test.assert_eq(accept_interval(var v[0], 10, 50, 0, 0), 50)
+    test.assert_eq(accept_interval(var v[0], 81, 100, 0, 0), -1)
+    test.assert_eq(accept_interval(var v[0], 10, 25, 0, 0), 20)
+    test.assert_eq(ll_sub.ALLOW_IV, pack(0x3C, 0x7D00))

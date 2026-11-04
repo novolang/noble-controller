@@ -1,0 +1,5 @@
+# The Controller's part of the profile configs/ctl_per.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/ctl_per.toml`).  orbit/ble/configs/ctl_per.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_past = true

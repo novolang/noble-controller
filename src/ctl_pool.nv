@@ -1,0 +1,602 @@
+// src/ctl_pool.nv — the Controller's packet buffers: a fixed pool
+// of slots, a queue of the slots that wait to be sent, and the builder of
+// an HCI Event packet in a slot.
+//
+// A slot holds one packet with its HCI packet indicator first, so the
+// transport sends a slot's bytes as they stand.  The pool is a value: its
+// bytes, lengths and queue are inline, a module-level `var` of it sits in
+// `.bss`, and no function here allocates.  Building a packet takes a slot,
+// appends to it and queues it; the transport takes the bytes of the slot at
+// the front of the queue one at a time and gives the slot back after the
+// last one.
+//
+// The capacities of the `Vec` types are literals, since a named constant
+// cannot size a storage type; `SLOT_OCTETS` and `SLOTS` state the same
+// numbers for the code, and a test compares them with the types.
+
+use std.test
+use hci_frame
+
+// The functions below take the pool as a `var` parameter even where they only read
+// it, which passes its address.  A plain parameter is a copy, and a copy of a
+// struct of this size on every call costs time and stack.
+
+// The longest HCI Event packet: the packet indicator, the event code, the
+// length and 255 octets of parameters ([Vol 4] Part E, Section 5.4.4).
+const SLOT_OCTETS = 258
+
+// The packets the pool can hold at once.
+const SLOTS = 4
+
+// A slot number that names no slot.
+const NO_SLOT = -1
+
+// `bytes` holds `SLOTS` slots of `SLOT_OCTETS` octets, slot `s` at
+// `s * SLOT_OCTETS`.  `len` is the octets written to each slot, `busy` says
+// which slots are taken.  `queue` lists the slots to send, `head` is the
+// index of the first and `queued` their number; `sent` is the octets of the
+// first one already handed to the transport.
+//
+// The Host tells the Controller the ACL packets it can take: Host Buffer Size
+// gives `hlen`, the longest data of one HCI ACL Data packet, and `htotal`, how
+// many packets the Host holds, and Set Controller To Host Flow Control turns
+// the count on (`hfc`).  Flow control on with no Host Buffer Size seen (`htotal`
+// of 0) counts nothing: the Host's buffers are unlimited until the size
+// arrives ([Vol 4] Part E, Section 4.2).  `hout` is the ACL packets sent that
+// the Host has not returned with Host Number Of Completed Packets.  `cut` is the end of the
+// packet being sent (an ACL packet longer than `hlen` goes out in pieces) and
+// `rest` the data octets of it that follow the piece being sent.  `hlen` of
+// 0 means the Host gave no size: nothing is cut and nothing is counted
+// ([Vol 4] Part E, Sections 7.3.38 to 7.3.40).
+@value
+struct PacketPool
+    bytes: Vec[u8; 1032]
+    len: Vec[u16; 4]
+    busy: Vec[Bool; 4]
+    queue: Vec[u8; 4]
+    head: u8
+    queued: u8
+    sent: u16
+    hfc: Bool
+    hlen: u16
+    htotal: u16
+    hout: u16
+    cut: u16
+    rest: u16
+
+// A pool with every slot free.
+@satisfies("REQ-BLE-CTL-003")
+@tier(embedded)
+fn pool_new() -> PacketPool
+    var p = PacketPool {
+        bytes: Vec.new(), len: Vec.new(), busy: Vec.new(), queue: Vec.new(),
+        head: 0, queued: 0, sent: 0, hfc: false, hlen: 0, htotal: 0, hout: 0, cut: 0, rest: 0 }
+    for _ in 0..(SLOTS * SLOT_OCTETS)
+        let _a = p.bytes.push(0)
+    for _ in 0..SLOTS
+        let _b = p.len.push(0)
+        let _c = p.busy.push(false)
+        let _d = p.queue.push(0)
+    p
+
+// The slots that are free.
+@tier(embedded)
+fn pool_free(var p: PacketPool) -> Int
+    var n = 0
+    for s in 0..SLOTS
+        if not p.busy[s]
+            n = n + 1
+    n
+
+// Take the lowest free slot, empty.  `NO_SLOT` when every slot is taken.
+@satisfies("REQ-BLE-CTL-003")
+@tier(embedded)
+fn pool_take(var p: PacketPool) -> Int
+    for s in 0..SLOTS
+        if not p.busy[s]
+            p.busy[s] = true
+            p.len[s] = 0
+            return s
+    NO_SLOT
+
+// Give a slot back, whatever it holds.  A slot that is queued is not
+// given back: the transport does that after it has sent the packet.
+@tier(embedded)
+fn pool_give(var p: PacketPool, slot: Int)
+    if slot < 0 or slot >= SLOTS
+        return
+    if pool_is_queued(var p, slot)
+        return
+    p.busy[slot] = false
+    p.len[slot] = 0
+
+// Whether `slot` waits in the queue.
+@tier(embedded)
+fn pool_is_queued(var p: PacketPool, slot: Int) -> Bool
+    for k in 0..(p.queued as Int)
+        if (p.queue[(((p.head as Int) + k) % SLOTS)] as Int) == slot
+            return true
+    false
+
+// Append one octet to `slot`.  False, with nothing written, when the slot
+// is not taken or is full.
+@no_alloc
+@tier(embedded)
+fn pool_put(var p: PacketPool, slot: Int, b: Int) -> Bool
+    if slot < 0 or slot >= SLOTS or not p.busy[slot]
+        return false
+    let n = p.len[slot] as Int
+    if n >= SLOT_OCTETS
+        return false
+    p.bytes[slot * SLOT_OCTETS + n] = (b & 0xFF) as u8
+    p.len[slot] = (n + 1) as u16
+    true
+
+// Append a 16-bit value to `slot`, least significant octet first.
+@tier(embedded)
+fn pool_put_u16(var p: PacketPool, slot: Int, v: Int) -> Bool
+    pool_put(var p, slot, v & 0xFF) and pool_put(var p, slot, (v >>> 8) & 0xFF)
+
+// Replace the octet at `index` of `slot`, which has been written.
+@tier(embedded)
+fn pool_patch(var p: PacketPool, slot: Int, index: Int, b: Int)
+    if slot < 0 or slot >= SLOTS or index < 0 or index >= (p.len[slot] as Int)
+        return
+    p.bytes[slot * SLOT_OCTETS + index] = (b & 0xFF) as u8
+
+// The octet at `index` of `slot`, -1 when `index` is past what was written.
+@tier(embedded)
+fn pool_get(var p: PacketPool, slot: Int, index: Int) -> Int
+    if slot < 0 or slot >= SLOTS or index < 0 or index >= (p.len[slot] as Int)
+        return -1
+    p.bytes[slot * SLOT_OCTETS + index] as Int
+
+// The octets written to `slot`.
+@tier(embedded)
+fn pool_len(var p: PacketPool, slot: Int) -> Int
+    if slot < 0 or slot >= SLOTS
+        0
+    else
+        p.len[slot] as Int
+
+// Put `slot` at the back of the queue.  False when the slot is not taken,
+// is queued already or holds nothing.
+@tier(embedded)
+fn pool_queue(var p: PacketPool, slot: Int) -> Bool
+    if slot < 0 or slot >= SLOTS or not p.busy[slot] or p.len[slot] == 0
+        return false
+    if pool_is_queued(var p, slot)
+        return false
+    let tail = ((p.head as Int) + (p.queued as Int)) % SLOTS
+    p.queue[tail] = slot as u8
+    p.queued = p.queued + 1
+    true
+
+// The HCI ACL Data packet indicator at the front of a slot.
+@no_alloc
+@tier(embedded)
+fn pool_is_acl(var p: PacketPool, slot: Int) -> Bool
+    p.len[slot] > 0 and (p.bytes[slot * SLOT_OCTETS] as Int) == hci_frame.H4_PKT_ACL
+
+// Whether the packet in `slot` may start now: everything but an ACL Data
+// packet always may, and an ACL Data packet may while the Host has a buffer
+// free, or when it has not asked for flow control or has given no count.
+@no_alloc
+@tier(embedded)
+fn pool_may_start(var p: PacketPool, slot: Int) -> Bool
+    not p.hfc or p.htotal == 0 or not pool_is_acl(var p, slot) or p.hout < p.htotal
+
+// The Host's size for the data of an ACL Data packet and the number of
+// packets it holds (Host Buffer Size).  The octets already sent and not
+// returned stay counted.
+@tier(embedded)
+fn pool_host_size(var p: PacketPool, length: Int, total: Int)
+    p.hlen = length as u16
+    p.htotal = total as u16
+
+// Whether the count of the Host's ACL buffers is on.
+@tier(embedded)
+fn pool_host_flow_on(var p: PacketPool) -> Bool
+    p.hfc
+
+// Turn the count of the Host's ACL buffers on or off (Set Controller To Host
+// Flow Control).  Turning it on starts it with every buffer free; with no Host
+// Buffer Size yet the count is unlimited.
+@tier(embedded)
+fn pool_host_flow(var p: PacketPool, on: Bool)
+    if on and not p.hfc
+        p.hout = 0
+    p.hfc = on
+
+// The Host returned `count` buffers (Host Number Of Completed Packets).  More
+// than it holds are not believed; the command is ignored while flow control is
+// off or no Host Buffer Size was seen ([Vol 4] Part E, Section 7.3.40).
+@tier(embedded)
+fn pool_host_completed(var p: PacketPool, count: Int)
+    if not p.hfc or p.htotal == 0
+        return
+    if count >= (p.hout as Int)
+        p.hout = 0
+    else
+        p.hout = p.hout - (count as u16)
+
+// The Host's buffers no packet holds, 0 while flow control is off.
+@tier(embedded)
+fn pool_host_free(var p: PacketPool) -> Int
+    if p.hfc and p.htotal > 0 then (p.htotal as Int) - (p.hout as Int) else 0
+
+// Forget what the Host told (Reset).
+@tier(embedded)
+fn pool_host_reset(var p: PacketPool)
+    p.hfc = false
+    p.hlen = 0
+    p.htotal = 0
+    p.hout = 0
+
+// Whether octets can go to the Host now: a packet is under way, or one waits
+// that may start.
+@no_alloc
+@tier(embedded)
+fn pool_tx_pending(var p: PacketPool) -> Bool
+    if p.queued == 0
+        return false
+    if p.sent > 0 or not p.hfc
+        return true
+    for k in 0..(p.queued as Int)
+        if pool_may_start(var p, p.queue[(((p.head as Int) + k) % SLOTS)] as Int)
+            return true
+    false
+
+// Put the first packet that may start at the front of the queue, the others
+// keeping their order, and begin it: it takes a buffer of the Host, and when
+// the Host's size is shorter than its data it goes in pieces.  False when no
+// packet may start.
+@no_alloc
+@tier(embedded)
+fn pool_tx_start(var p: PacketPool) -> Bool
+    var pick = -1
+    for k in 0..(p.queued as Int)
+        if pick < 0 and pool_may_start(var p, p.queue[(((p.head as Int) + k) % SLOTS)] as Int)
+            pick = k
+    if pick < 0
+        return false
+    let chosen = p.queue[(((p.head as Int) + pick) % SLOTS)]
+    for j in 0..pick
+        let k = pick - j
+        p.queue[(((p.head as Int) + k) % SLOTS)] = p.queue[(((p.head as Int) + k - 1) % SLOTS)]
+    p.queue[p.head as Int] = chosen
+    let slot = chosen as Int
+    p.cut = p.len[slot]
+    p.rest = 0
+    if pool_is_acl(var p, slot)
+        let data = (p.len[slot] as Int) - 5
+        if p.hlen > 0 and data > (p.hlen as Int)
+            p.rest = (data - (p.hlen as Int)) as u16
+            p.cut = (5 + (p.hlen as Int)) as u16
+            p.bytes[slot * SLOT_OCTETS + 3] = ((p.hlen as Int) & 0xFF) as u8
+            p.bytes[slot * SLOT_OCTETS + 4] = (((p.hlen as Int) >>> 8) & 0xFF) as u8
+        if p.hfc and p.htotal > 0
+            p.hout = p.hout + 1
+    true
+
+// The piece of an ACL Data packet that has gone: what follows moves to the
+// front of the slot under a header that continues the packet.
+@no_alloc
+@tier(embedded)
+fn pool_tx_continue(var p: PacketPool, slot: Int)
+    let base = slot * SLOT_OCTETS
+    let from = 5 + (p.hlen as Int)
+    let rest = p.rest as Int
+    for i in 0..rest
+        p.bytes[base + 5 + i] = p.bytes[base + from + i]
+    p.bytes[base + 2] = (((p.bytes[base + 2] as Int) & 0x0F) | (1 << 4)) as u8
+    p.bytes[base + 3] = (rest & 0xFF) as u8
+    p.bytes[base + 4] = ((rest >>> 8) & 0xFF) as u8
+    p.len[slot] = (5 + rest) as u16
+    p.sent = 0
+    p.rest = 0
+
+// The next octet of the packet at the front of the queue, -1 when the queue
+// is empty or no packet may start.  After the last octet the slot is free
+// again.
+@no_alloc
+@tier(embedded)
+fn pool_tx_next(var p: PacketPool) -> Int
+    if p.queued == 0
+        return -1
+    if p.sent == 0 and not pool_tx_start(var p)
+        return -1
+    let slot = p.queue[p.head as Int] as Int
+    let b = p.bytes[slot * SLOT_OCTETS + (p.sent as Int)] as Int
+    p.sent = p.sent + 1
+    if (p.sent as Int) >= (p.cut as Int)
+        if p.rest > 0
+            pool_tx_continue(var p, slot)
+        else
+            p.sent = 0
+            p.head = (((p.head as Int) + 1) % SLOTS) as u8
+            p.queued = p.queued - 1
+            p.busy[slot] = false
+            p.len[slot] = 0
+    b
+
+// Drop every packet that has not begun to be sent, and give its slot back.
+// The packet the transport is in the middle of stays, so the stream keeps
+// its framing.
+@tier(embedded)
+fn pool_flush(var p: PacketPool)
+    if p.queued == 0
+        return
+    let keep = if p.sent > 0 then 1 else 0
+    for k in keep..(p.queued as Int)
+        let slot = p.queue[(((p.head as Int) + k) % SLOTS)] as Int
+        p.busy[slot] = false
+        p.len[slot] = 0
+    p.queued = keep as u8
+
+// ── HCI Event packets ───────────────────────────────────────────────
+
+// Start an HCI Event packet with the event code `code` in a free slot: the
+// packet indicator, the code and a length of zero.  `NO_SLOT` when the pool
+// is exhausted.
+@tier(embedded)
+fn evt_begin(var p: PacketPool, code: Int) -> Int
+    let slot = pool_take(var p)
+    if slot == NO_SLOT
+        return NO_SLOT
+    let _a = pool_put(var p, slot, hci_frame.H4_PKT_EVENT)
+    let _b = pool_put(var p, slot, code)
+    let _c = pool_put(var p, slot, 0)
+    slot
+
+// Finish the event in `slot`: write the length of its parameters and queue
+// it.  A slot that is not an event under construction is left alone.
+@no_alloc
+@tier(embedded)
+fn evt_send(var p: PacketPool, slot: Int) -> Bool
+    let n = pool_len(var p, slot)
+    if n < 3
+        return false
+    pool_patch(var p, slot, 2, n - 3)
+    pool_queue(var p, slot)
+
+// ── HCI ACL Data packets ────────────────────────────────────────────
+
+// Start an HCI ACL Data packet for the connection `handle` with the
+// Packet_Boundary_Flag `pb` (2 first, 1 continuing) in a free slot: the packet
+// indicator, the handle with the flags, and a length of zero.  `NO_SLOT` when
+// the pool is exhausted.
+@tier(embedded)
+fn acl_begin(var p: PacketPool, handle: Int, pb: Int) -> Int
+    let slot = pool_take(var p)
+    if slot == NO_SLOT
+        return NO_SLOT
+    let _a = pool_put(var p, slot, hci_frame.H4_PKT_ACL)
+    let _b = pool_put_u16(var p, slot, (handle & 0x0FFF) | ((pb & 3) << 12))
+    let _c = pool_put_u16(var p, slot, 0)
+    slot
+
+// Finish the ACL Data packet in `slot`: write the length of its data and queue
+// it.  A slot that is not an ACL Data packet under construction is left alone.
+@no_alloc
+@tier(embedded)
+fn acl_send(var p: PacketPool, slot: Int) -> Bool
+    let n = pool_len(var p, slot)
+    if n < 5
+        return false
+    pool_patch(var p, slot, 3, (n - 5) & 0xFF)
+    pool_patch(var p, slot, 4, ((n - 5) >>> 8) & 0xFF)
+    pool_queue(var p, slot)
+
+// ── HCI ISO Data packets ────────────────────────────────────────────
+
+// Start an HCI ISO Data packet for the stream `handle` with the Packet_Boundary_Flag
+// `pb` (2, a complete SDU) and the Time_Stamp flag `ts` in a free slot: the packet
+// indicator, the handle with the flags, and a length of zero.  `NO_SLOT` when the pool is
+// exhausted.
+@tier(embedded)
+fn iso_begin(var p: PacketPool, handle: Int, pb: Int, ts: Bool) -> Int
+    let slot = pool_take(var p)
+    if slot == NO_SLOT
+        return NO_SLOT
+    var flags = (pb & 3) << 12
+    if ts
+        flags = flags | 0x4000
+    let _a = pool_put(var p, slot, hci_frame.H4_PKT_ISO)
+    let _b = pool_put_u16(var p, slot, (handle & 0x0FFF) | flags)
+    let _c = pool_put_u16(var p, slot, 0)
+    slot
+
+// Finish the ISO Data packet in `slot`: write the length of its data (14 bits) and queue it.
+@no_alloc
+@tier(embedded)
+fn iso_send(var p: PacketPool, slot: Int) -> Bool
+    let n = pool_len(var p, slot)
+    if n < 5
+        return false
+    pool_patch(var p, slot, 3, (n - 5) & 0xFF)
+    pool_patch(var p, slot, 4, ((n - 5) >>> 8) & 0x3F)
+    pool_queue(var p, slot)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_iso_packet_is_framed_with_handle_flags_and_length()
+    var p = pool_new()
+    let s = iso_begin(var p, 0x0101, 2, true)
+    test.assert_eq(s, 0)
+    for i in 0..3
+        test.assert(pool_put(var p, s, 0x40 + i))
+    test.assert(iso_send(p, s))
+    var out: [Int] = []
+    while pool_tx_pending(var p)
+        list.push(out, pool_tx_next(var p))
+    test.assert_eq(out, [0x05, 0x01, 0x61, 0x03, 0x00, 0x40, 0x41, 0x42])
+
+@test
+fn test_acl_packet_is_framed_with_handle_flags_and_length()
+    var p = pool_new()
+    let s = acl_begin(var p, 0x0041, 2)
+    test.assert_eq(s, 0)
+    for i in 0..5
+        test.assert(pool_put(var p, s, 0x30 + i))
+    test.assert(acl_send(var p, s))
+    var out: [Int] = []
+    while pool_tx_pending(var p)
+        list.push(out, pool_tx_next(var p))
+    test.assert_eq(out, [0x02, 0x41, 0x20, 0x05, 0x00, 0x30, 0x31, 0x32, 0x33, 0x34])
+
+@test
+fn test_acl_packet_refuses_an_empty_header_or_an_exhausted_pool()
+    var p = pool_new()
+    for _ in 0..SLOTS
+        test.assert(acl_begin(var p, 1, 1) != NO_SLOT)
+    test.assert_eq(acl_begin(var p, 1, 1), NO_SLOT)
+    var q = pool_new()
+    let s = pool_take(var q)
+    test.assert(pool_put(var q, s, 0x02))
+    test.assert(not acl_send(var q, s))
+
+@test
+fn test_capacities_match_the_constants()
+    let p = pool_new()
+    test.assert_eq(p.bytes.capacity(), SLOTS * SLOT_OCTETS)
+    test.assert_eq(p.len.capacity(), SLOTS)
+    test.assert_eq(p.busy.capacity(), SLOTS)
+    test.assert_eq(p.queue.capacity(), SLOTS)
+    test.assert_eq(p.bytes.len(), SLOTS * SLOT_OCTETS)
+
+@test
+fn test_slots_are_taken_in_order_and_given_back()
+    var p = pool_new()
+    test.assert_eq(pool_free(var p), SLOTS)
+    for want in 0..SLOTS
+        test.assert_eq(pool_take(var p), want)
+    test.assert_eq(pool_take(var p), NO_SLOT)
+    test.assert_eq(pool_free(var p), 0)
+    pool_give(var p, 2)
+    test.assert_eq(pool_free(var p), 1)
+    test.assert_eq(pool_take(var p), 2)
+
+@test
+fn test_put_stops_at_the_slot_size()
+    var p = pool_new()
+    let s = pool_take(var p)
+    for i in 0..SLOT_OCTETS
+        test.assert(pool_put(var p, s, i))
+    test.assert(not pool_put(var p, s, 1))
+    test.assert_eq(pool_len(var p, s), SLOT_OCTETS)
+    test.assert_eq(pool_get(var p, s, 5), 5)
+    test.assert_eq(pool_get(var p, s, SLOT_OCTETS), -1)
+    // The neighbouring slot is untouched.
+    let t = pool_take(var p)
+    test.assert_eq(pool_len(var p, t), 0)
+    test.assert(pool_put(var p, t, 0xAB))
+    test.assert_eq(pool_get(var p, s, SLOT_OCTETS - 1), (SLOT_OCTETS - 1) & 0xFF)
+
+@test
+fn test_put_refuses_a_slot_that_is_not_taken()
+    var p = pool_new()
+    test.assert(not pool_put(var p, 1, 7))
+    test.assert(not pool_put(var p, -1, 7))
+    test.assert(not pool_put(var p, SLOTS, 7))
+
+@test
+fn test_queue_sends_packets_in_order_and_frees_their_slots()
+    var p = pool_new()
+    let a = pool_take(var p)
+    let b = pool_take(var p)
+    let _x = pool_put(var p, a, 0x11)
+    let _y = pool_put(var p, a, 0x12)
+    let _z = pool_put(var p, b, 0x21)
+    test.assert(pool_queue(var p, a))
+    test.assert(pool_queue(var p, b))
+    test.assert(not pool_queue(var p, a))
+    test.assert(pool_tx_pending(var p))
+    test.assert_eq(pool_tx_next(var p), 0x11)
+    test.assert_eq(pool_tx_next(var p), 0x12)
+    test.assert_eq(pool_free(var p), SLOTS - 1)
+    test.assert_eq(pool_tx_next(var p), 0x21)
+    test.assert(not pool_tx_pending(var p))
+    test.assert_eq(pool_tx_next(var p), -1)
+    test.assert_eq(pool_free(var p), SLOTS)
+
+@test
+fn test_queue_wraps_round_the_slots()
+    var p = pool_new()
+    for round in 0..10
+        let s = pool_take(var p)
+        test.assert(s >= 0)
+        let _a = pool_put(var p, s, round)
+        test.assert(pool_queue(var p, s))
+        test.assert_eq(pool_tx_next(var p), round)
+    test.assert_eq(pool_free(var p), SLOTS)
+
+@test
+fn test_queue_refuses_an_empty_slot()
+    var p = pool_new()
+    let s = pool_take(var p)
+    test.assert(not pool_queue(var p, s))
+
+@test
+fn test_a_queued_slot_is_not_given_back_early()
+    var p = pool_new()
+    let s = pool_take(var p)
+    let _a = pool_put(var p, s, 1)
+    test.assert(pool_queue(var p, s))
+    pool_give(var p, s)
+    test.assert_eq(pool_free(var p), SLOTS - 1)
+
+@test
+fn test_flush_keeps_the_packet_under_way()
+    var p = pool_new()
+    let a = pool_take(var p)
+    let b = pool_take(var p)
+    let _w = pool_put(var p, a, 1)
+    let _x = pool_put(var p, a, 2)
+    let _y = pool_put(var p, b, 3)
+    let _z = pool_queue(var p, a)
+    let _v = pool_queue(var p, b)
+    test.assert_eq(pool_tx_next(var p), 1)
+    pool_flush(var p)
+    test.assert_eq(pool_tx_next(var p), 2)
+    test.assert_eq(pool_tx_next(var p), -1)
+    test.assert_eq(pool_free(var p), SLOTS)
+
+@test
+fn test_flush_drops_packets_not_begun()
+    var p = pool_new()
+    let a = pool_take(var p)
+    let _w = pool_put(var p, a, 1)
+    let _v = pool_queue(var p, a)
+    pool_flush(var p)
+    test.assert(not pool_tx_pending(var p))
+    test.assert_eq(pool_free(var p), SLOTS)
+
+@test
+fn test_event_is_framed_with_its_length()
+    var p = pool_new()
+    let s = evt_begin(var p, 0x10)
+    test.assert(s >= 0)
+    let _a = pool_put(var p, s, 0x01)
+    test.assert(evt_send(var p, s))
+    test.assert_eq(pool_tx_next(var p), 0x04)
+    test.assert_eq(pool_tx_next(var p), 0x10)
+    test.assert_eq(pool_tx_next(var p), 0x01)
+    test.assert_eq(pool_tx_next(var p), 0x01)
+    test.assert_eq(pool_tx_next(var p), -1)
+
+@test
+fn test_event_begin_reports_an_exhausted_pool()
+    var p = pool_new()
+    for _ in 0..SLOTS
+        test.assert(evt_begin(var p, 0x0E) >= 0)
+    test.assert_eq(evt_begin(var p, 0x0E), NO_SLOT)
+
+@test
+fn test_u16_is_written_least_significant_octet_first()
+    var p = pool_new()
+    let s = pool_take(var p)
+    test.assert(pool_put_u16(var p, s, 0x0C03))
+    test.assert_eq(pool_get(var p, s, 0), 0x03)
+    test.assert_eq(pool_get(var p, s, 1), 0x0C)

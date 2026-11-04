@@ -1,0 +1,9 @@
+# The Controller's part of the profile configs/ctl_pawr.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/ctl_pawr.toml`).  orbit/ble/configs/ctl_pawr.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_per_sync = 1
+ctl_pawr_adv = true
+ctl_pawr_sync = true
+ctl_pawr_data = 100
+ctl_pawr_bufs = 4

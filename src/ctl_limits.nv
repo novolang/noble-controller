@@ -1,0 +1,229 @@
+// src/ctl_limits.nv -- the values the build limits of the Controller derive.
+//
+// The limits are the package configuration (docs/config.md): the keys `ctl_*` of orbit/ble/novo.toml,
+// read as `noble_controller_config.CTL_CIS`.  This module holds what the keys do not say by themselves, each a
+// parameterless `const fn` over `ble_config`:
+//
+//   * the switches of the features (`iso_on`, `per_on`, `past_on`, ...): a feature is in when its key
+//     says so and the features it needs are in;
+//   * the number of slots of a table (`cis_slots`, `sets`, `padv_n`, ...), never below 1, since a
+//     `Vec` holds at least one element and a build without the feature keeps one;
+//   * the octets of the LE feature set the Controller answers (`features_octet1`, ...);
+//   * the buffers the isochronous channels keep, which are 8 octets when they are out.
+//
+// A `const` item cannot read a constant of the configuration module, and a capacity cannot call a
+// `const fn` of another module, so a type that sizes a `Vec` from a key writes the expression in its
+// own module with that module's `max1` (`Vec[Cis; max1(noble_controller_config.CTL_CIS)]`), and a test beside it
+// compares the capacity with the function here.
+
+use noble_controller_config
+
+// The larger of `n` and 1: a table of an absent feature keeps one record.
+@tier(embedded)
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+
+// ── The Controller's features: which are in the build ───────────────────────────────────────────────
+// ctl_hci.nv answers the commands of a feature that is out with Unknown HCI Command and leaves its LE
+// feature bits clear.
+
+// Isochronous channels (ll_iso.nv).
+@tier(embedded)
+const fn iso_on() -> Bool
+    noble_controller_config.CTL_CIS > 0
+
+// The ISO test commands: isochronous channels and broadcast groups.
+@tier(embedded)
+const fn test_on() -> Bool
+    noble_controller_config.CTL_CIS > 0 and noble_controller_config.CTL_BIGS > 0
+
+// Broadcast isochronous groups (ll_big.nv).
+@tier(embedded)
+const fn big_on() -> Bool
+    noble_controller_config.CTL_BIGS > 0 and noble_controller_config.CTL_CIS > 0
+
+// Extended advertising (ll_xadv.nv).
+@tier(embedded)
+const fn xadv_on() -> Bool
+    noble_controller_config.CTL_ADV_SETS > 0
+
+// Periodic advertising and synchronization (ll_per.nv).
+@tier(embedded)
+const fn per_on() -> Bool
+    noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0
+
+// Periodic Advertising Sync Transfer (ll_past.nv).
+@tier(embedded)
+const fn past_on() -> Bool
+    noble_controller_config.CTL_PAST and per_on()
+
+// Periodic advertising with responses (ll_pawr.nv): the advertiser, the synchronizer, either.
+@tier(embedded)
+const fn pawr_adv_on() -> Bool
+    noble_controller_config.CTL_PAWR_ADV and per_on()
+
+@tier(embedded)
+const fn pawr_sync_on() -> Bool
+    noble_controller_config.CTL_PAWR_SYNC and per_on()
+
+@tier(embedded)
+const fn pawr_on() -> Bool
+    pawr_adv_on() or pawr_sync_on()
+
+// LE Power Control (ll_pcl.nv), Connection Subrating (ll_sub.nv), feature pages (ll_feat.nv), Connection Rate (ll_rate.nv),
+// path loss monitoring (ll_ploss.nv), the Sleep Clock Accuracy request (ll_sca.nv) and Frame Space Update (ll_fs.nv).
+@tier(embedded)
+const fn pcl_on() -> Bool
+    noble_controller_config.CTL_PCL
+
+@tier(embedded)
+const fn sub_on() -> Bool
+    noble_controller_config.CTL_SUBRATE
+
+@tier(embedded)
+const fn feat_on() -> Bool
+    noble_controller_config.CTL_FEATPAGES
+
+@tier(embedded)
+const fn rate_on() -> Bool
+    noble_controller_config.CTL_CONNRATE
+
+@tier(embedded)
+const fn ploss_on() -> Bool
+    noble_controller_config.CTL_PLOSS
+
+@tier(embedded)
+const fn sca_on() -> Bool
+    noble_controller_config.CTL_PEERSCA
+
+@tier(embedded)
+const fn fs_on() -> Bool
+    noble_controller_config.CTL_FRAMESPACE
+
+// ── The Controller's tables: the slots of each, at least 1 ──────────────────────────────────────────
+@tier(embedded)
+const fn cis_slots() -> Int
+    max1(noble_controller_config.CTL_CIS)
+
+@tier(embedded)
+const fn cig_slots() -> Int
+    max1(noble_controller_config.CTL_CIGS)
+
+@tier(embedded)
+const fn big_slots() -> Int
+    max1(noble_controller_config.CTL_BIGS)
+
+@tier(embedded)
+const fn bis_slots() -> Int
+    max1(noble_controller_config.CTL_BIS)
+
+// Advertising sets, periodic trains, synchronizations and the entries of the Periodic Advertiser List.
+@tier(embedded)
+const fn sets() -> Int
+    max1(noble_controller_config.CTL_ADV_SETS)
+
+@tier(embedded)
+const fn padv_n() -> Int
+    max1(noble_controller_config.CTL_PER_ADV)
+
+@tier(embedded)
+const fn psync_n() -> Int
+    max1(noble_controller_config.CTL_PER_SYNC)
+
+@tier(embedded)
+const fn pal_n() -> Int
+    if per_on() then max1(noble_controller_config.CTL_PER_LIST) else 1
+
+// Octets of one advertising data buffer and of the data of a periodic train; a build without extended advertising keeps 8.  The
+// train's buffer is the size of a set's because `ll_xadv.ext_build` takes either as an `AdvData`: a build with sets and no periodic
+// train (`ctl3`, `peripheral`) did not compile while the train's buffer was 8, and keeps one train record with the full buffer.
+@tier(embedded)
+const fn data_max() -> Int
+    if xadv_on() then noble_controller_config.CTL_ADV_DATA else 8
+
+@tier(embedded)
+const fn per_data() -> Int
+    data_max()
+
+// Periodic advertising with responses: the buffers, the octets of one and the octets of staged responses
+// (a build with neither side keeps one buffer of 8 octets).
+@tier(embedded)
+const fn pw_bufs() -> Int
+    if pawr_on() then noble_controller_config.CTL_PAWR_BUFS else 1
+
+@tier(embedded)
+const fn pw_data() -> Int
+    if pawr_on() then noble_controller_config.CTL_PAWR_DATA else 8
+
+@tier(embedded)
+const fn pw_rsp() -> Int
+    if pawr_on() then 2 * noble_controller_config.CTL_PAWR_DATA + 8 else 8
+
+// The records of the trains and the synchronizations with responses.
+@tier(embedded)
+const fn pwa_slots() -> Int
+    if noble_controller_config.CTL_PAWR_ADV then max1(noble_controller_config.CTL_PER_ADV) else 1
+
+@tier(embedded)
+const fn pws_slots() -> Int
+    if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1
+
+// The records of Connection Subrating and LE Power Control: one for each link, or one when the feature is out.
+@tier(embedded)
+const fn sub_slots() -> Int
+    if noble_controller_config.CTL_SUBRATE then noble_controller_config.CTL_LINKS else 1
+
+@tier(embedded)
+const fn pcl_slots() -> Int
+    if noble_controller_config.CTL_PCL then noble_controller_config.CTL_LINKS else 1
+
+// The classes of the arbiter of ll_arb.nv that belong to a connection: one for each link.  The arbiter holds
+// four more (the isochronous events, the periodic trains, the advertising events and the scan windows), so its columns have
+// `noble_controller_config.CTL_LINKS + 4` elements.
+@tier(embedded)
+const fn arb_classes() -> Int
+    noble_controller_config.CTL_LINKS
+
+// The buffers of ll_iso.nv: the transmit data, the Host's fragments and the SDUs for the Host.
+@tier(embedded)
+const fn iso_txd() -> Int
+    if iso_on() then 2048 else 8
+
+@tier(embedded)
+const fn iso_hbuf() -> Int
+    if iso_on() then 512 else 8
+
+@tier(embedded)
+const fn iso_outd() -> Int
+    if iso_on() then 1024 else 8
+
+// ── The LE feature set (ll_link.nv) ────────────────────────────────────────────────────────
+// Octet 1: LE 2M, LE Coded, Channel Selection #2 and the bits of extended and periodic advertising.
+@tier(embedded)
+const fn features_octet1() -> Int
+    if xadv_on()
+        if per_on() then 0x79 else 0x59
+    else
+        0x49
+
+// Octet 3: Sleep Clock Accuracy Updates and the Connected Isochronous Stream roles (0x34), the broadcast
+// roles on top of them (0xF4) and the sync transfer sender and recipient (0x03).
+@tier(embedded)
+const fn features_octet3() -> Int
+    let iso = if iso_on() then (if noble_controller_config.CTL_BIGS > 0 then 0xF4 else 0x34) else 0
+    iso + (if past_on() then 0x03 else 0)
+
+// Octet 4: Power Control Request and Power Change Indication (33, 34), Path Loss Monitoring (35) and Connection Subrating (37).
+@tier(embedded)
+const fn features_octet4() -> Int
+    (if pcl_on() then 0x06 else 0) + (if ploss_on() then 0x08 else 0) + (if sub_on() then 0x20 else 0)
+
+// Octet 5: ISOAL Unsegmented Framed Mode (45) and periodic advertising with responses, advertiser (43) and synchronizer (44).
+@tier(embedded)
+const fn features_octet5() -> Int
+    (if iso_on() then 0x20 else 0) + (if pawr_adv_on() then 0x08 else 0) + (if pawr_sync_on() then 0x10 else 0)
+
+// Feature page 1 (ll_feat.nv): Shorter Connection Intervals (bit 72) of a build with Connection Rate, Frame Space Update (bit 65).
+@tier(embedded)
+const fn page1_bits() -> Int
+    (if rate_on() then 0x100 else 0) + (if fs_on() then 0x2 else 0)

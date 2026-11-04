@@ -1,0 +1,8 @@
+# The Controller's part of the profile configs/ctl3.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/ctl3.toml`).  orbit/ble/configs/ctl3.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_links = 3
+ctl_peripheral = 3
+ctl_per_adv = 0
+ctl_per_sync = 0

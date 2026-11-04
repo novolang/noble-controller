@@ -1,0 +1,1056 @@
+// tests/ctl_ll_tests.nv — the legacy Link Layer inside the Controller: the
+// Broadcaster and Observer commands as the Host's UART drives them, and the
+// advertising and scanning activities run against a simulated air.
+//
+// The simulated air is a list of what the Controller transmitted and a script
+// of what its peers transmit.  Its executor follows the contract a radio
+// program follows (ll_air.nv): ask `ctl_ll_pick`, run the advertising
+// event PDU by PDU with `ll_adv` or a scan slice with `ll_scan`, hand every
+// PDU received to the Controller, and give the time.  T_IFS is 150
+// microseconds, the PHY is LE 1M, and a PDU takes `airtime_us` microseconds.
+
+use std.test
+use hci_frame
+use ctl_hci
+use ctl_pool
+use ll_pdu
+use ll_adv
+use ll_scan
+use ll_arb
+
+// ── The Host's side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+// A Command, its answer.
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+// The Status of the Command Complete a command is answered with.
+fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(c, opcode, params)
+    test.assert_eq(list.len(r) >= 7, true)
+    test.assert_eq(r[1], 0x0E)
+    test.assert_eq(r[4] | (r[5] << 8), opcode)
+    r[6]
+
+fn fresh() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    // The Host enables the LE Meta event, as its bring-up does.
+    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    c
+
+fn zeros(n: Int) -> [Int]
+    var v: [Int] = []
+    for _ in 0..n
+        list.push(v, 0)
+    v
+
+fn le16(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF]
+
+// LE Set Advertising Parameters.
+fn adv_params(int_min: Int, int_max: Int, ty: Int, own: Int, peer_type: Int, chmap: Int, policy: Int) -> [Int]
+    var p = le16(int_min)
+    list.push(p, int_max & 0xFF)
+    list.push(p, (int_max >>> 8) & 0xFF)
+    list.push(p, ty)
+    list.push(p, own)
+    list.push(p, peer_type)
+    for i in 0..6
+        list.push(p, 0x70 + i)
+    list.push(p, chmap)
+    list.push(p, policy)
+    p
+
+// The 32 octets of LE Set Advertising Data: the length and 31 octets.
+fn data31(data: [Int]) -> [Int]
+    var p: [Int] = [list.len(data)]
+    for d in data
+        list.push(p, d)
+    for _ in list.len(data)..31
+        list.push(p, 0)
+    p
+
+fn scan_params(ty: Int, interval: Int, window: Int, own: Int, policy: Int) -> [Int]
+    var p: [Int] = [ty]
+    list.push(p, interval & 0xFF)
+    list.push(p, (interval >>> 8) & 0xFF)
+    list.push(p, window & 0xFF)
+    list.push(p, (window >>> 8) & 0xFF)
+    list.push(p, own)
+    list.push(p, policy)
+    p
+
+// Start advertising with the default parameters but for the type, the map and
+// the policy.
+fn advertise(var c: ctl_hci.Controller, ty: Int, chmap: Int, policy: Int)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, ty, 0, 0, chmap, policy)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+
+fn scan_on(var c: ctl_hci.Controller, ty: Int, interval: Int, window: Int, policy: Int, dup: Int)
+    test.assert_eq(status_of(c, 0x200B, scan_params(ty, interval, window, 0, policy)), 0)
+    test.assert_eq(status_of(c, 0x200C, [1, dup]), 0)
+
+// Stop advertising.
+fn test_off(var c: ctl_hci.Controller)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+
+// Add a device to the Filter Accept List.
+fn fal_add(var c: ctl_hci.Controller, kind: Int, first: Int)
+    var p: [Int] = [kind]
+    for i in 0..6
+        list.push(p, first + i)
+    test.assert_eq(status_of(c, 0x2011, p), 0)
+
+// Split the octets of the events the Controller sent into events.
+fn events_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i + 3 <= list.len(bytes)
+        let n = bytes[i + 2]
+        var e: [Int] = []
+        for k in 0..(3 + n)
+            list.push(e, bytes[i + k])
+        list.push(out, e)
+        i = i + 3 + n
+    out
+
+// The LE Advertising Report events among them.
+fn reports_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    for e in events_of(bytes)
+        if e[1] == 0x3E and e[3] == 0x02
+            list.push(out, e[:])
+    out
+
+// ── The simulated air ───────────────────────────────────────────────
+
+// `tx_*` log what the Controller sent: the time of the first bit of the
+// preamble, the channel, the PDU type and the PDU octets.  `in_*` script the
+// peers the Controller can hear: the PDU with its start time and channel, the
+// PDU the peer sends in answer to a SCAN_REQ (an empty one for none) and the
+// RSSI.  A peer that scans or initiates answers the Controller's PDU on
+// `peer_ch` with `peer_req`, `peer_count` times (-1 for always).
+struct Air
+    var now: Int
+    var tx_t: [Int]
+    var tx_ch: [Int]
+    var tx_ty: [Int]
+    var tx_n: [Int]
+    var in_t: [Int]
+    var in_ch: [Int]
+    var in_pdu: [Pdu]
+    var in_rsp: [Pdu]
+    var in_rssi: [Int]
+    var in_done: [Bool]
+    var peer_ch: Int
+    var peer_req: Pdu
+    var peer_count: Int
+    var heard_req_end: Int
+    var heard_rsp_start: Int
+    var host: [Int]
+    var host_reads: Bool
+
+fn air_new() -> Air
+    Air { now: 0, tx_t: [], tx_ch: [], tx_ty: [], tx_n: [], in_t: [], in_ch: [], in_pdu: [],
+          in_rsp: [], in_rssi: [], in_done: [], peer_ch: -1, peer_req: ll_pdu.pdu_new(),
+          peer_count: 0, heard_req_end: 0, heard_rsp_start: 0, host: [], host_reads: true }
+
+fn log_tx(var air: Air, t: Int, ch: Int, ty: Int, n: Int)
+    list.push(air.tx_t, t)
+    list.push(air.tx_ch, ch)
+    list.push(air.tx_ty, ty)
+    list.push(air.tx_n, n)
+
+// A peer advertiser sends `pdu` on `ch` at `t`, and `rsp` to a SCAN_REQ.
+fn air_hear(var air: Air, t: Int, ch: Int, pdu: Pdu, rsp: Pdu, rssi: Int)
+    list.push(air.in_t, t)
+    list.push(air.in_ch, ch)
+    list.push(air.in_pdu, pdu)
+    list.push(air.in_rsp, rsp)
+    list.push(air.in_rssi, rssi)
+    list.push(air.in_done, false)
+
+fn pdu_addr(ty: Int, tx_add: Int, first: Int, data_len: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var a: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _x = a.push((first + i) as u8)
+    ll_pdu.pdu_begin(var p, ty, tx_add, 0)
+    ll_pdu.pdu_put_addr(var p, var a)
+    for i in 0..data_len
+        let _y = ll_pdu.pdu_put(var p, 0xD0 + i)
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn no_pdu() -> Pdu
+    ll_pdu.pdu_new()
+
+// A SCAN_REQ or CONNECT_IND from the peer 0x40..0x45 (public) to the address
+// 0x10..0x15 of `rx_add`.
+fn peer_pdu(ty: Int, rx_add: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var from: Vec[u8; 6] = Vec.new()
+    var to: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _x = from.push((0x40 + i) as u8)
+        let _y = to.push((0x10 + i) as u8)
+    ll_pdu.pdu_begin(var p, ty, 0, rx_add)
+    ll_pdu.pdu_put_addr(var p, var from)
+    ll_pdu.pdu_put_addr(var p, var to)
+    if ty == ll_pdu.CONNECT_IND
+        for _ in 0..22
+            let _z = ll_pdu.pdu_put(var p, 0)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// How long the advertiser listens for a request that does not come: the
+// T_IFS, the preamble and access address, and a margin.
+const LISTEN_US = 214
+
+// Run one advertising event on the simulated air.
+fn sim_adv_event(var c: ctl_hci.Controller, var air: Air)
+    var more = true
+    while more
+        let ch = ll_adv.adv_channel(var c.adv)
+        let start = ll_adv.adv_due(var c.adv)
+        if start > air.now
+            air.now = start
+        ctl_hci.ctl_set_time(var c, air.now)
+        ll_adv.adv_pdu_start(var c.adv, air.now)
+        let n = c.adv.pdu.n
+        log_tx(var air, air.now, ch, ll_pdu.pdu_type(var c.adv.pdu), n)
+        var end = air.now + ll_pdu.airtime_us(n)
+        if ll_adv.adv_listens(var c.adv)
+            if air.peer_ch == ch and air.peer_count != 0
+                let req_end = end + 150 + ll_pdu.airtime_us(air.peer_req.n)
+                if air.peer_count > 0
+                    air.peer_count = air.peer_count - 1
+                var req = air.peer_req
+                let act = ctl_hci.ctl_adv_rx(var c, var req, req.n)
+                air.heard_req_end = req_end
+                end = req_end
+                if act == ll_adv.RX_SCAN_REQ
+                    let rsp_start = req_end + 150
+                    air.heard_rsp_start = rsp_start
+                    log_tx(var air, rsp_start, ch, ll_pdu.SCAN_RSP, c.adv.rsp_pdu.n)
+                    ll_adv.adv_scan_rsp_sent(var c.adv)
+                    end = rsp_start + ll_pdu.airtime_us(c.adv.rsp_pdu.n)
+            else
+                end = end + 150 + LISTEN_US
+        air.now = end
+        ctl_hci.ctl_set_time(var c, air.now)
+        ctl_hci.ctl_adv_pdu_end(var c, end)
+        more = c.adv.enabled and not ll_adv.adv_at_event_start(var c.adv)
+
+// The index of the earliest scripted peer PDU on `ch` that starts at or after
+// `now` and ends by `limit`, -1 for none.
+fn next_heard(var air: Air, ch: Int, now: Int, limit: Int) -> Int
+    var best = -1
+    for i in 0..list.len(air.in_t)
+        if not air.in_done[i] and air.in_ch[i] == ch and air.in_t[i] >= now
+            let end = air.in_t[i] + ll_pdu.airtime_us(air.in_pdu[i].n)
+            if end <= limit and (best < 0 or air.in_t[i] < air.in_t[best])
+                best = i
+    best
+
+// Run one scan slice on the simulated air: listen to the end of the window
+// or the next advertising event, take what arrives.
+fn sim_scan_slice(var c: ctl_hci.Controller, var air: Air)
+    let ch = ll_scan.scan_channel(var c.scan, air.now)
+    let limit = ctl_hci.ctl_ll_scan_limit(var c)
+    let i = next_heard(var air, ch, air.now, limit)
+    if i < 0
+        air.now = limit
+        return
+    air.in_done[i] = true
+    let n = air.in_pdu[i].n
+    air.now = air.in_t[i] + ll_pdu.airtime_us(n)
+    ctl_hci.ctl_set_time(var c, air.now)
+    var rx = air.in_pdu[i]
+    let act = ctl_hci.ctl_scan_rx(var c, var rx, n, air.in_rssi[i])
+    if (act & ll_scan.ACT_REQUEST) != 0
+        let req_start = air.now + 150
+        log_tx(var air, req_start, ch, ll_pdu.SCAN_REQ, c.scan.req.n)
+        let req_end = req_start + ll_pdu.airtime_us(c.scan.req.n)
+        var rsp = air.in_rsp[i]
+        if rsp.n > 0
+            air.now = req_end + 150 + ll_pdu.airtime_us(rsp.n)
+            ctl_hci.ctl_set_time(var c, air.now)
+            let _r = ctl_hci.ctl_scan_rsp_rx(var c, var rsp, rsp.n, air.in_rssi[i])
+        else
+            air.now = req_end + 150 + LISTEN_US
+            ll_scan.scan_rsp_missed(var c.scan)
+
+// The time the next booked activity wants the radio.
+fn wake_time(var c: ctl_hci.Controller) -> Int
+    var best = -1
+    ctl_hci.ctl_ll_book(var c)
+    for cls in 0..ll_arb.classes()
+        if c.arb.on[cls]
+            let t = c.arb.start[cls] - ll_arb.lead_of(var c.arb, cls)
+            if best < 0 or t < best
+                best = t
+    best
+
+// The Host reads what the Controller has queued.
+fn host_read(var c: ctl_hci.Controller, var air: Air)
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(air.host, ctl_hci.ctl_tx_next(var c))
+
+// Everything the Host has read so far, and what is queued now.
+fn heard(var c: ctl_hci.Controller, var air: Air) -> [Int]
+    host_read(var c, var air)
+    air.host[:]
+
+// Run the Link Layer on the simulated air until `until`.  The Host reads
+// every event as it is queued, unless the test says it does not.
+fn sim_run(var c: ctl_hci.Controller, var air: Air, until: Int)
+    var guard = 0
+    while air.now < until and guard < 100000
+        guard = guard + 1
+        if air.host_reads
+            host_read(var c, var air)
+        ctl_hci.ctl_set_time(var c, air.now)
+        let cls = ctl_hci.ctl_ll_pick(var c, false)
+        if cls == ll_arb.class_adv()
+            sim_adv_event(var c, var air)
+        else if cls == ll_arb.class_scan()
+            sim_scan_slice(var c, var air)
+        else
+            let t = wake_time(var c)
+            if t < 0 or t > until
+                air.now = until
+            else if t > air.now
+                air.now = t
+            else
+                air.now = air.now + 1
+    test.assert(guard < 100000)
+
+// The times of the first PDU of each event in the log, for the channel the
+// event starts on.
+fn event_starts(var air: Air, first_ch: Int) -> [Int]
+    var out: [Int] = []
+    for i in 0..list.len(air.tx_t)
+        if air.tx_ch[i] == first_ch and air.tx_ty[i] != ll_pdu.SCAN_RSP and air.tx_ty[i] != ll_pdu.SCAN_REQ
+            list.push(out, air.tx_t[i])
+    out
+
+fn count_tx(var air: Air, ty: Int) -> Int
+    var n = 0
+    for i in 0..list.len(air.tx_t)
+        if air.tx_ty[i] == ty
+            n = n + 1
+    n
+
+// ── The Broadcaster commands ────────────────────────────────────────
+
+@test
+fn test_advertising_parameters_are_accepted_and_checked()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x4000, 0, 0, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x1F, 0x20, 0, 0, 0, 7, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x40, 0x20, 0, 0, 0, 7, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 5, 0, 0, 7, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 0, 0, 0, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 0, 0, 8, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 0, 0, 7, 4)), 0x12)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 0, 2, 7, 0)), 0x12)
+    // The own address types that ask for a resolvable private address are served.
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 2, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 3, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 4, 0, 7, 0)), 0x12)
+    // A refused command changes nothing.
+    test.assert_eq(c.adv.int_min, 0x20)
+    test.assert_eq(c.adv.ty as Int, 0)
+    // The five types are all accepted.
+    for ty in 0..5
+        test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, ty, 0, 0, 7, 0)), 0)
+
+@test
+fn test_advertising_parameters_are_refused_while_advertising()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 0, 0, 7, 0)), 0x0C)
+    test.assert_eq(c.adv.ty as Int, 3)
+    // Data can change while advertising.
+    test.assert_eq(status_of(c, 0x2008, data31([2, 1, 6])), 0)
+    test.assert_eq(status_of(c, 0x2009, data31([2, 9, 0x41])), 0)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 0, 0, 7, 0)), 0)
+
+@test
+fn test_advertising_data_is_kept_with_its_length()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2008, data31([2, 1, 6, 4, 9, 0x4E, 0x6F, 0x76])), 0)
+    test.assert_eq(c.adv.data_len as Int, 8)
+    test.assert_eq(c.adv.data[0] as Int, 2)
+    test.assert_eq(c.adv.data[7] as Int, 0x76)
+    var long = data31([])
+    long[0] = 32
+    test.assert_eq(status_of(c, 0x2008, long), 0x12)
+    test.assert_eq(status_of(c, 0x2009, long), 0x12)
+    test.assert_eq(c.adv.data_len as Int, 8)
+    test.assert_eq(status_of(c, 0x2009, data31([3, 8, 0x41, 0x42])), 0)
+    test.assert_eq(c.adv.rsp_len as Int, 4)
+    // A parameter block of the wrong size is refused.
+    test.assert_eq(status_of(c, 0x2008, [1, 2, 3]), 0x12)
+
+@test
+fn test_advertising_enable_needs_an_address_of_the_own_type()
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    // No public address: the all-zero address of a fresh Controller.
+    test.assert_eq(status_of(c, 0x200A, [1]), 0x12)
+    test.assert(not c.adv.enabled)
+    // Random own address type without LE Set Random Address.
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 0, 1, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0x12)
+    test.assert_eq(status_of(c, 0x2005, [0xC1, 2, 3, 4, 5, 0xC6]), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert(c.adv.enabled)
+    test.assert_eq(c.adv.addr_type as Int, 1)
+
+@test
+fn test_advertising_enable_value_is_checked_and_repeats_are_harmless()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x200A, [2]), 0x12)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert(c.adv.enabled)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+    test.assert(not c.adv.enabled)
+
+@test
+fn test_set_random_address_is_refused_while_advertising_or_scanning()
+    var c = fresh()
+    let addr = [0xC1, 2, 3, 4, 5, 0xC6]
+    advertise(var c, 3, 7, 0)
+    test.assert_eq(status_of(c, 0x2005, addr), 0x0C)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+    test.assert_eq(status_of(c, 0x2005, addr), 0)
+    scan_on(var c, 0, 16, 16, 0, 0)
+    test.assert_eq(status_of(c, 0x2005, addr), 0x0C)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(status_of(c, 0x2005, addr), 0)
+
+@test
+fn test_transmit_power_commands_report_the_radio_setting_and_range()
+    var c = fresh()
+    let a = run(c, 0x2007, [])
+    test.assert_eq(a, [0x04, 0x0E, 0x05, 0x01, 0x07, 0x20, 0x00, 0x00])
+    let b = run(c, 0x204B, [])
+    test.assert_eq(b, [0x04, 0x0E, 0x06, 0x01, 0x4B, 0x20, 0x00, 0xD2, 0x08])
+
+@test
+fn test_supported_states_are_the_legacy_states_initiating_and_the_connection_roles()
+    var c = fresh()
+    let r = run(c, 0x201C, [])
+    // Bits 0 to 21, 24 to 27, 29 to 37 and 41: 0x023FEF3FFFFF.  Scanning together
+    // with the Initiating state (22, 23) and the second link of a role (28, 38 to
+    // 40) are left out.
+    test.assert_eq(r, [0x04, 0x0E, 0x0C, 0x01, 0x1C, 0x20, 0x00, 0xFF, 0xFF, 0x3F, 0xEF, 0x3F, 0x02, 0, 0])
+    var bare = ctl_hci.controller_new(0)
+    let z = run(bare, 0x201C, [])
+    test.assert_eq(z, [0x04, 0x0E, 0x0C, 0x01, 0x1C, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0])
+
+@test
+fn test_the_link_layer_commands_are_unknown_without_a_link_layer()
+    var c = ctl_hci.controller_new(0)
+    for op in [0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x200B, 0x200C, 0x204B]
+        test.assert_eq(status_of(c, op, zeros(0)), 0x01)
+
+@test
+fn test_supported_commands_list_the_link_layer_commands()
+    var c = fresh()
+    let r = run(c, 0x1002, [])
+    // The field starts after the 7 octets of the event header and status.
+    let base = 7
+    test.assert((r[base + 25] & 0xE0) != 0)
+    test.assert_eq(r[base + 25] & 0xE0, 0xE0)
+    test.assert_eq(r[base + 26] & 0x0F, 0x0F)
+    test.assert_eq(r[base + 38] & 0x80, 0x80)
+
+@test
+fn test_reset_stops_advertising_and_scanning_and_restores_the_parameters()
+    var c = fresh()
+    advertise(var c, 3, 5, 0)
+    scan_on(var c, 1, 160, 48, 1, 1)
+    test.assert_eq(status_of(c, 0x2008, data31([2, 1, 6])), 0)
+    test.assert_eq(status_of(c, 0x0C03, zeros(0)), 0)
+    test.assert(not c.adv.enabled)
+    test.assert(not c.scan.enabled)
+    test.assert_eq(c.adv.ty as Int, 0)
+    test.assert_eq(c.adv.chmap as Int, 7)
+    test.assert_eq(c.adv.data_len as Int, 0)
+    test.assert_eq(c.scan.interval, 16)
+    test.assert_eq(c.scan.ty as Int, 0)
+    test.assert(not ctl_hci.ctl_ll_on(var c))
+
+// ── The Observer commands ───────────────────────────────────────────
+
+@test
+fn test_scan_parameters_are_accepted_and_checked()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 0, 0)), 0)
+    test.assert_eq(status_of(c, 0x200B, scan_params(1, 0x4000, 0x4000, 1, 1)), 0)
+    test.assert_eq(status_of(c, 0x200B, scan_params(2, 16, 16, 0, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 3, 3, 0, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 17, 0, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 4, 0)), 0x12)
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 0, 4)), 0x12)
+    test.assert_eq(c.scan.interval, 0x4000)
+    // The filter policies 2 and 3 are served too (the Host sets the interval again).
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 0, 2)), 0)
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 0, 3)), 0)
+    test.assert_eq(status_of(c, 0x200B, scan_params(1, 0x4000, 0x4000, 1, 1)), 0)
+    // The own address types that ask for a resolvable private address are served.
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 2, 0)), 0)
+    test.assert_eq(c.scan.own as Int, 2)
+
+@test
+fn test_scan_parameters_are_refused_while_scanning()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    test.assert_eq(status_of(c, 0x200B, scan_params(1, 16, 16, 0, 0)), 0x0C)
+    test.assert_eq(c.scan.ty as Int, 0)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(status_of(c, 0x200B, scan_params(1, 16, 16, 0, 0)), 0)
+
+@test
+fn test_scan_enable_checks_its_values_and_the_address()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x200C, [2, 0]), 0x12)
+    test.assert_eq(status_of(c, 0x200C, [1, 2]), 0x12)
+    test.assert_eq(status_of(c, 0x200B, scan_params(0, 16, 16, 1, 0)), 0)
+    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0x12)
+    test.assert(not c.scan.enabled)
+    test.assert_eq(status_of(c, 0x2005, [0xC1, 2, 3, 4, 5, 0xC6]), 0)
+    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0)
+    test.assert(c.scan.enabled)
+    // Disabling a scanner that is off is harmless, and so is enabling twice.
+    test.assert_eq(status_of(c, 0x200C, [1, 1]), 0)
+    test.assert(c.scan.filter_dup)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+
+// ── Advertising on the air ──────────────────────────────────────────
+
+@test
+fn test_an_event_sends_one_pdu_on_each_channel_in_order()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    var air = air_new()
+    sim_run(var c, var air, 200000)
+    test.assert(list.len(air.tx_t) >= 6)
+    test.assert_eq(air.tx_ch[0], 37)
+    test.assert_eq(air.tx_ch[1], 38)
+    test.assert_eq(air.tx_ch[2], 39)
+    test.assert_eq(air.tx_ch[3], 37)
+    for i in 0..6
+        test.assert_eq(air.tx_ty[i], ll_pdu.ADV_NONCONN_IND)
+    // The PDUs of an event start within 10 ms of each other.
+    test.assert(air.tx_t[1] - air.tx_t[0] <= 10000)
+    test.assert(air.tx_t[2] - air.tx_t[1] <= 10000)
+    test.assert(air.tx_t[1] > air.tx_t[0] + ll_pdu.airtime_us(air.tx_n[0]))
+
+@test
+fn test_the_event_interval_plus_the_delay_stays_in_bounds()
+    var c = fresh()
+    // 100 ms: 160 units.
+    test.assert_eq(status_of(c, 0x2006, adv_params(160, 160, 3, 0, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    var air = air_new()
+    sim_run(var c, var air, 30000000)
+    let starts = event_starts(var air, 37)
+    test.assert(list.len(starts) > 250)
+    var lo = 1000000000
+    var hi = 0
+    for i in 1..list.len(starts)
+        let d = starts[i] - starts[i - 1]
+        if d < lo
+            lo = d
+        if d > hi
+            hi = d
+    test.assert(lo >= 100000)
+    test.assert(hi <= 110000)
+    // The delay is drawn over the range, not fixed.
+    test.assert(hi - lo > 8000)
+
+@test
+fn test_a_channel_map_selects_the_channels()
+    var c = fresh()
+    advertise(var c, 3, 5, 0)
+    var air = air_new()
+    sim_run(var c, var air, 100000)
+    for i in 0..list.len(air.tx_ch)
+        test.assert(air.tx_ch[i] == 37 or air.tx_ch[i] == 39)
+    test.assert_eq(air.tx_ch[0], 37)
+    test.assert_eq(air.tx_ch[1], 39)
+    test.assert_eq(air.tx_ch[2], 37)
+
+@test
+fn test_the_pdu_on_air_carries_the_address_type_and_data()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2005, [0xC1, 2, 3, 4, 5, 0xC6]), 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 3, 1, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x2008, data31([2, 1, 6, 3, 9, 0x4E, 0x56])), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    var air = air_new()
+    sim_run(var c, var air, 5000)
+    test.assert(list.len(air.tx_t) >= 1)
+    var p = c.adv.pdu
+    test.assert_eq(ll_pdu.pdu_type(var p), ll_pdu.ADV_NONCONN_IND)
+    test.assert_eq(ll_pdu.pdu_tx_add(var p), 1)
+    test.assert_eq(ll_pdu.pdu_get(var p, 2), 0xC1)
+    test.assert_eq(ll_pdu.pdu_get(var p, 7), 0xC6)
+    test.assert_eq(ll_pdu.pdu_len(var p), 6 + 7)
+    test.assert_eq(ll_pdu.pdu_get(var p, 8), 2)
+    test.assert_eq(ll_pdu.pdu_get(var p, 14), 0x56)
+
+@test
+fn test_data_changed_while_advertising_goes_out_in_a_later_event()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    var air = air_new()
+    sim_run(var c, var air, 50000)
+    test.assert_eq(ll_pdu.pdu_len(var c.adv.pdu), 6)
+    test.assert_eq(status_of(c, 0x2008, data31([2, 1, 6])), 0)
+    sim_run(var c, var air, 2000000)
+    test.assert_eq(ll_pdu.pdu_len(var c.adv.pdu), 9)
+
+@test
+fn test_a_scan_request_is_answered_t_ifs_after_it_and_the_event_goes_on()
+    var c = fresh()
+    advertise(var c, 0, 7, 0)
+    test.assert_eq(status_of(c, 0x2009, data31([2, 9, 0x41])), 0)
+    var air = air_new()
+    air.peer_ch = 38
+    air.peer_req = peer_pdu(ll_pdu.SCAN_REQ, 0)
+    air.peer_count = 1
+    sim_run(var c, var air, 3000)
+    // ADV_IND on 37, ADV_IND on 38, SCAN_RSP on 38, ADV_IND on 39.
+    test.assert_eq(air.tx_ch[0], 37)
+    test.assert_eq(air.tx_ty[0], ll_pdu.ADV_IND)
+    test.assert_eq(air.tx_ch[1], 38)
+    test.assert_eq(air.tx_ty[1], ll_pdu.ADV_IND)
+    test.assert_eq(air.tx_ty[2], ll_pdu.SCAN_RSP)
+    test.assert_eq(air.tx_ch[2], 38)
+    test.assert_eq(air.tx_ch[3], 39)
+    test.assert_eq(air.tx_ty[3], ll_pdu.ADV_IND)
+    // The response starts 150 microseconds after the request ended.
+    test.assert_eq(air.tx_t[2] - air.heard_req_end, 150)
+    test.assert_eq(c.adv.scan_reqs, 1)
+    test.assert_eq(c.adv.scan_rsps, 1)
+    test.assert_eq(ll_pdu.pdu_len(var c.adv.rsp_pdu), 6 + 3)
+
+@test
+fn test_a_request_for_a_non_scannable_advertiser_gets_no_response()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    var air = air_new()
+    air.peer_ch = 38
+    air.peer_req = peer_pdu(ll_pdu.SCAN_REQ, 0)
+    air.peer_count = -1
+    sim_run(var c, var air, 200000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)
+    test.assert_eq(c.adv.scan_reqs, 0)
+
+@test
+fn test_a_request_for_another_address_gets_no_response()
+    var c = fresh()
+    advertise(var c, 0, 7, 0)
+    var air = air_new()
+    air.peer_ch = 37
+    // The right address but the wrong type bit names another device.
+    air.peer_req = peer_pdu(ll_pdu.SCAN_REQ, 1)
+    air.peer_count = -1
+    sim_run(var c, var air, 200000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)
+
+@test
+fn test_the_filter_policy_gates_scan_requests_by_the_accept_list()
+    var c = fresh()
+    advertise(var c, 0, 7, 1)
+    var air = air_new()
+    air.peer_ch = 37
+    air.peer_req = peer_pdu(ll_pdu.SCAN_REQ, 0)
+    air.peer_count = -1
+    sim_run(var c, var air, 200000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)
+    // The peer is added to the list, with advertising off while the list changes:
+    // it is answered.
+    test_off(var c)
+    fal_add(var c, 0, 0x40)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    sim_run(var c, var air, 600000)
+    test.assert(count_tx(var air, ll_pdu.SCAN_RSP) > 0)
+
+@test
+fn test_a_connection_request_is_counted_and_advertising_goes_on()
+    var c = fresh()
+    advertise(var c, 0, 7, 0)
+    var air = air_new()
+    air.peer_ch = 38
+    air.peer_req = peer_pdu(ll_pdu.CONNECT_IND, 0)
+    air.peer_count = 1
+    sim_run(var c, var air, 200000)
+    test.assert_eq(c.adv.connect_inds, 1)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)
+    test.assert(c.adv.enabled)
+    test.assert(list.len(air.tx_t) > 6)
+    // No event reports a connection.
+    test.assert_eq(list.len(events_of(heard(var c, var air))), 0)
+
+@test
+fn test_high_duty_directed_advertising_times_out_and_tells_the_host()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2006, adv_params(0, 0, 1, 0, 0, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    var air = air_new()
+    sim_run(var c, var air, 2000000)
+    test.assert(not c.adv.enabled)
+    // Events ran back to back until 1.28 s: no PDU on a channel is more than
+    // 3.75 ms after the last on that channel.
+    var last37 = -1
+    for i in 0..list.len(air.tx_t)
+        test.assert_eq(air.tx_ty[i], ll_pdu.ADV_DIRECT_IND)
+        if air.tx_ch[i] == 37
+            if last37 >= 0
+                test.assert(air.tx_t[i] - last37 <= 3750)
+            last37 = air.tx_t[i]
+    let end = air.tx_t[list.len(air.tx_t) - 1]
+    test.assert(end >= 1280000 - 4000)
+    test.assert(end <= 1280000 + 4000)
+    // LE Connection Complete with Advertising Timeout.
+    let evs = events_of(heard(var c, var air))
+    test.assert_eq(list.len(evs), 1)
+    test.assert_eq(evs[0][1], 0x3E)
+    test.assert_eq(evs[0][2], 19)
+    test.assert_eq(evs[0][3], 0x01)
+    test.assert_eq(evs[0][4], 0x3C)
+
+@test
+fn test_low_duty_directed_advertising_names_the_target_and_has_no_timeout()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2006, adv_params(0x20, 0x20, 4, 0, 1, 7, 0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    var air = air_new()
+    sim_run(var c, var air, 3000000)
+    test.assert(c.adv.enabled)
+    var p = c.adv.pdu
+    test.assert_eq(ll_pdu.pdu_type(var p), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(ll_pdu.pdu_rx_add(var p), 1)
+    test.assert_eq(ll_pdu.pdu_get(var p, 8), 0x70)
+    test.assert_eq(ll_pdu.pdu_get(var p, 13), 0x75)
+
+@test
+fn test_disabling_stops_the_events()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    var air = air_new()
+    sim_run(var c, var air, 100000)
+    let before = list.len(air.tx_t)
+    test.assert(before > 0)
+    test.assert_eq(status_of(c, 0x200A, [0]), 0)
+    sim_run(var c, var air, 1000000)
+    test.assert_eq(list.len(air.tx_t), before)
+
+// ── Scanning on the air ─────────────────────────────────────────────
+
+@test
+fn test_a_passive_scanner_reports_the_advertisements_it_hears()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    // Continuous scanning: 10 ms windows rotate 37, 38, 39.
+    var p1 = pdu_addr(ll_pdu.ADV_IND, 1, 0x30, 5)
+    var p2 = pdu_addr(ll_pdu.ADV_NONCONN_IND, 0, 0x50, 0)
+    air_hear(var air, 2000, 37, p1, no_pdu(), -61)
+    air_hear(var air, 12000, 38, p2, no_pdu(), -72)
+    sim_run(var c, var air, 30000)
+    let r = reports_of(heard(var c, var air))
+    test.assert_eq(list.len(r), 2)
+    // Num_Reports 1, Event_Type, Address_Type, Address, Data_Length, Data, RSSI.
+    test.assert_eq(r[0][4], 1)
+    test.assert_eq(r[0][5], 0)
+    test.assert_eq(r[0][6], 1)
+    test.assert_eq(r[0][7], 0x30)
+    test.assert_eq(r[0][12], 0x35)
+    test.assert_eq(r[0][13], 5)
+    test.assert_eq(r[0][14], 0xD0)
+    test.assert_eq(r[0][19], 0xC3)
+    test.assert_eq(r[0][2], 17)
+    test.assert_eq(r[1][5], 3)
+    test.assert_eq(r[1][6], 0)
+    test.assert_eq(r[1][13], 0)
+    test.assert_eq(r[1][14], 0xB8)
+
+@test
+fn test_a_scanner_hears_only_the_channel_of_the_window()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 0)
+    // The window at 0 is on 37, the window at 10 ms on 38.
+    air_hear(var air, 2000, 38, p, no_pdu(), -50)
+    air_hear(var air, 4000, 39, p, no_pdu(), -50)
+    sim_run(var c, var air, 9000)
+    test.assert_eq(list.len(reports_of(heard(var c, var air))), 0)
+
+@test
+fn test_duplicates_are_filtered_when_the_host_asks()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 1)
+    var air = air_new()
+    var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 0)
+    for k in 0..6
+        air_hear(var air, 1000 + k * 30000, 37 + (k * 3) % 3, p, no_pdu(), -50)
+    // All on 37 at 1, 31, 61... ms: only those inside a window on 37 are
+    // heard; the windows on 37 are at 0, 30, 60, ... ms.
+    sim_run(var c, var air, 200000)
+    test.assert_eq(list.len(reports_of(heard(var c, var air))), 1)
+    test.assert(c.scan.duplicates >= 1)
+
+@test
+fn test_every_advertisement_is_reported_without_the_filter()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 0)
+    for k in 0..4
+        air_hear(var air, 1000 + k * 30000, 37, p, no_pdu(), -50)
+    sim_run(var c, var air, 200000)
+    test.assert_eq(list.len(reports_of(heard(var c, var air))), 4)
+
+@test
+fn test_the_scan_window_bounds_what_is_heard()
+    var c = fresh()
+    // Interval 100 ms, window 20 ms.
+    scan_on(var c, 0, 160, 32, 0, 0)
+    var air = air_new()
+    var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 0)
+    // On 37 in the first window (0 to 20 ms), after it, and in the window on
+    // 37 again at 300 ms.
+    air_hear(var air, 5000, 37, p, no_pdu(), -50)
+    air_hear(var air, 40000, 37, p, no_pdu(), -50)
+    air_hear(var air, 305000, 37, p, no_pdu(), -50)
+    air_hear(var air, 325000, 37, p, no_pdu(), -50)
+    sim_run(var c, var air, 400000)
+    test.assert_eq(list.len(reports_of(heard(var c, var air))), 2)
+
+@test
+fn test_filtered_scanning_reports_only_listed_devices()
+    var c = fresh()
+    fal_add(var c, 1, 0x50)
+    scan_on(var c, 0, 16, 16, 1, 0)
+    var air = air_new()
+    var listed = pdu_addr(ll_pdu.ADV_IND, 1, 0x50, 0)
+    var other = pdu_addr(ll_pdu.ADV_IND, 1, 0x60, 0)
+    var wrong_type = pdu_addr(ll_pdu.ADV_IND, 0, 0x50, 0)
+    air_hear(var air, 1000, 37, other, no_pdu(), -50)
+    air_hear(var air, 3000, 37, listed, no_pdu(), -50)
+    air_hear(var air, 5000, 37, wrong_type, no_pdu(), -50)
+    sim_run(var c, var air, 9000)
+    let r = reports_of(heard(var c, var air))
+    test.assert_eq(list.len(r), 1)
+    test.assert_eq(r[0][7], 0x50)
+    test.assert_eq(r[0][6], 1)
+
+@test
+fn test_an_active_scanner_asks_t_ifs_after_the_advertisement_and_reports_the_answer()
+    var c = fresh()
+    scan_on(var c, 1, 16, 16, 0, 0)
+    var air = air_new()
+    var adv = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 2)
+    var rsp = pdu_addr(ll_pdu.SCAN_RSP, 0, 0x30, 4)
+    air_hear(var air, 2000, 37, adv, rsp, -55)
+    sim_run(var c, var air, 9000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 1)
+    let end = 2000 + ll_pdu.airtime_us(adv.n)
+    test.assert_eq(air.tx_t[0], end + 150)
+    test.assert_eq(air.tx_ch[0], 37)
+    // ScanA is the public address, AdvA the advertiser's.
+    var req = c.scan.req
+    test.assert_eq(ll_pdu.pdu_get(var req, 2), 0x10)
+    test.assert_eq(ll_pdu.pdu_get(var req, 8), 0x30)
+    let r = reports_of(heard(var c, var air))
+    test.assert_eq(list.len(r), 2)
+    test.assert_eq(r[0][5], 0)
+    test.assert_eq(r[1][5], 4)
+    test.assert_eq(r[1][13], 4)
+
+@test
+fn test_a_passive_scanner_sends_nothing()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    var adv = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 2)
+    var rsp = pdu_addr(ll_pdu.SCAN_RSP, 0, 0x30, 4)
+    air_hear(var air, 2000, 37, adv, rsp, -55)
+    sim_run(var c, var air, 9000)
+    test.assert_eq(list.len(air.tx_t), 0)
+
+@test
+fn test_an_active_scanner_does_not_ask_a_device_that_has_answered()
+    var c = fresh()
+    scan_on(var c, 1, 16, 16, 0, 0)
+    var air = air_new()
+    var adv = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 2)
+    var rsp = pdu_addr(ll_pdu.SCAN_RSP, 0, 0x30, 4)
+    for k in 0..4
+        air_hear(var air, 2000 + k * 30000, 37, adv, rsp, -55)
+    sim_run(var c, var air, 200000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 1)
+
+@test
+fn test_a_missing_scan_response_is_a_failure_and_the_scanner_asks_again()
+    var c = fresh()
+    scan_on(var c, 1, 16, 16, 0, 0)
+    var air = air_new()
+    var adv = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 2)
+    air_hear(var air, 2000, 37, adv, no_pdu(), -55)
+    air_hear(var air, 32000, 37, adv, no_pdu(), -55)
+    sim_run(var c, var air, 100000)
+    test.assert_eq(c.scan.misses, 2)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 2)
+    // Two failures in a row double the backoff limit.
+    test.assert_eq(c.scan.upper, 2)
+
+@test
+fn test_an_event_mask_without_the_report_event_keeps_the_host_quiet()
+    var c = fresh()
+    // LE Set Event Mask with every bit but the advertising report's.
+    test.assert_eq(status_of(c, 0x2001, [0x1D, 0, 0, 0, 0, 0, 0, 0]), 0)
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 0)
+    air_hear(var air, 1000, 37, p, no_pdu(), -50)
+    sim_run(var c, var air, 9000)
+    test.assert_eq(list.len(events_of(heard(var c, var air))), 0)
+    test.assert_eq(c.scan.reports, 1)
+
+@test
+fn test_reports_leave_a_slot_for_the_next_commands_answer()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    air.host_reads = false
+    for k in 0..8
+        var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30 + k * 8, 0)
+        air_hear(var air, 1000 + k * 500, 37, p, no_pdu(), -50)
+    // The Host reads nothing while the events pile up.
+    sim_run(var c, var air, 9000)
+    test.assert_eq(ctl_pool.pool_free(var c.pool), 1)
+    test.assert(c.dropped_events > 0)
+    // The Host can still send a command and get its answer.
+    let r = heard(var c, var air)
+    test.assert(list.len(r) > 0)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+
+// ── Advertising and scanning together ───────────────────────────────
+
+@test
+fn test_advertising_events_keep_their_time_while_scanning()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    // A peer that advertises every 7 ms on all three channels.
+    var p = pdu_addr(ll_pdu.ADV_IND, 0, 0x30, 0)
+    for k in 0..300
+        air_hear(var air, 3000 + k * 7000, 37 + k % 3, p, no_pdu(), -50)
+    sim_run(var c, var air, 2000000)
+    let starts = event_starts(var air, 37)
+    test.assert(list.len(starts) > 10)
+    // The interval of 20 ms plus the delay is kept between events.
+    for i in 1..list.len(starts)
+        let d = starts[i] - starts[i - 1]
+        test.assert(d >= 20000)
+        test.assert(d <= 30000)
+    test.assert(c.scan.reports > 20)
+    // Every event is whole.
+    test.assert_eq(count_tx(var air, ll_pdu.ADV_NONCONN_IND) % 3, 0)
+
+@test
+fn test_a_scan_window_too_short_to_use_before_an_event_is_skipped()
+    var c = fresh()
+    advertise(var c, 3, 7, 0)
+    scan_on(var c, 0, 16, 16, 0, 0)
+    var air = air_new()
+    sim_run(var c, var air, 1000000)
+    // No scan slice overlapped an advertising PDU: nothing was sent while the
+    // arbiter held the radio for the scanner.
+    test.assert(list.len(air.tx_t) > 30)
+    for i in 1..list.len(air.tx_t)
+        test.assert(air.tx_t[i] > air.tx_t[i - 1])
+
+@test
+fn test_the_filter_accept_list_cannot_change_while_advertising_uses_it()
+    var c = fresh()
+    fal_add(var c, 0, 0x40)
+    // Advertising that ignores the list leaves it free.
+    advertise(var c, 0, 7, 0)
+    test.assert_eq(status_of(c, 0x2011, [0, 1, 2, 3, 4, 5, 6]), 0)
+    test_off(var c)
+    // A policy that reads the list locks it while advertising is on.
+    advertise(var c, 0, 7, 1)
+    test.assert_eq(status_of(c, 0x2011, [0, 1, 2, 3, 4, 5, 6]), 0x0C)
+    test.assert_eq(status_of(c, 0x2012, [0, 1, 2, 3, 4, 5, 6]), 0x0C)
+    test.assert_eq(status_of(c, 0x2010, []), 0x0C)
+    test_off(var c)
+    test.assert_eq(status_of(c, 0x2012, [0, 1, 2, 3, 4, 5, 6]), 0)
+    test.assert_eq(status_of(c, 0x2010, []), 0)
+
+@test
+fn test_directed_advertising_ignores_the_policy_so_the_list_stays_free()
+    var c = fresh()
+    advertise(var c, 4, 7, 3)
+    test.assert_eq(status_of(c, 0x2011, [0, 1, 2, 3, 4, 5, 6]), 0)
+
+@test
+fn test_the_filter_accept_list_cannot_change_while_scanning_uses_it()
+    var c = fresh()
+    scan_on(var c, 0, 16, 16, 0, 0)
+    test.assert_eq(status_of(c, 0x2011, [0, 1, 2, 3, 4, 5, 6]), 0)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    scan_on(var c, 0, 16, 16, 1, 0)
+    test.assert_eq(status_of(c, 0x2011, [1, 1, 2, 3, 4, 5, 6]), 0x0C)
+    test.assert_eq(status_of(c, 0x2010, []), 0x0C)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(status_of(c, 0x2010, []), 0)
+
+@test
+fn test_a_scan_request_the_policy_refused_is_counted_with_its_sender()
+    var c = fresh()
+    advertise(var c, 0, 7, 1)
+    var air = air_new()
+    air.peer_ch = 38
+    air.peer_req = peer_pdu(ll_pdu.SCAN_REQ, 0)
+    air.peer_count = -1
+    sim_run(var c, var air, 300000)
+    test.assert(c.adv.filtered > 3)
+    test.assert_eq(c.adv.filt_type as Int, 0)
+    test.assert_eq(c.adv.filt_addr[0] as Int, 0x40)
+    test.assert_eq(c.adv.filt_addr[5] as Int, 0x45)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)

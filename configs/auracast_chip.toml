@@ -1,0 +1,8 @@
+# The Controller's part of the profile configs/auracast_chip.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/auracast_chip.toml`).  orbit/ble/configs/auracast_chip.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_cis = 1
+ctl_cigs = 1
+ctl_bigs = 1
+ctl_bis = 1

@@ -1,0 +1,1580 @@
+// tests/ctl_central_tests.nv — the Link Layer's Initiating state and its connection
+// as Central inside the Controller, with a second link beside it: the Host's
+// commands as its UART carries them, the Initiating state run against simulated
+// advertisers, the connection events run against a simulated Peripheral, and the
+// events and data the Host gets back.
+//
+// The simulated Peripheral keeps its own SN, NESN and queue, so the
+// acknowledgement of both ends is checked against an independent implementation
+// of the rules of [Vol 6] Part B, Section 4.5.9.  The Controller is driven with the
+// calls the radio program makes (ll_air.nv): `ctl_ll_pick`, `ctl_init_decide`
+// and `ctl_init_sent` for the Initiating state, and for a connection event
+// `ctl_conn_begin`, `link_first_header`, `link_note_rx`, `link_rx_fast`,
+// `ctl_conn_rx_slow` and `ctl_conn_done`.  T_IFS is 150 microseconds and a PDU takes
+// `airtime_us` microseconds.
+
+use std.test
+use hci_frame
+use ctl_hci
+use ctl_pool
+use ll_pdu
+use ll_adv
+use ll_arb
+use ll_data
+use ll_init
+use ll_link
+use ll_policy
+
+// ── The Host's side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+// Split the octets the Controller sent into packets: events (0x04) and ACL Data
+// (0x02).  Each packet is its octets from the indicator.
+fn packets_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i < list.len(bytes)
+        var n = 0
+        if bytes[i] == 0x04
+            n = 3 + bytes[i + 2]
+        else
+            n = 5 + bytes[i + 3] + (bytes[i + 4] << 8)
+        var e: [Int] = []
+        for k in 0..n
+            list.push(e, bytes[i + k])
+        list.push(out, e)
+        i = i + n
+    out
+
+fn events_coded(bytes: [Int], code: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x04 and e[1] == code
+            list.push(out, e[:])
+    out
+
+fn meta_events(bytes: [Int], sub: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in events_coded(bytes, 0x3E)
+        if e[3] == sub
+            list.push(out, e[:])
+    out
+
+fn acl_packets(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x02
+            list.push(out, e[:])
+    out
+
+// The Status of the Command Complete event of a command.
+fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(c, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
+    done[0][6]
+
+// The Status of the Command Status event a command is answered with.
+fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(c, opcode, params)
+    let st = events_coded(r, 0x0F)
+    test.assert_eq(list.len(st), 1)
+    test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
+    st[0][3]
+
+// A Controller whose Host enables every event and the LE events of its bring-up.
+fn fresh() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0xA0 + i)
+    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(c, 0x2001, [0x1F, 0, 0, 0, 0, 0, 0, 0]), 0)
+    c
+
+fn le16(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF]
+
+fn host_acl(handle: Int, pb: Int, data: [Int]) -> [Int]
+    var p: [Int] = [0x02, handle & 0xFF, ((handle >>> 8) & 0x0F) | (pb << 4), list.len(data), 0]
+    for d in data
+        list.push(p, d)
+    p
+
+fn feed(var c: ctl_hci.Controller, bytes: [Int])
+    for b in bytes
+        ctl_hci.ctl_rx(var c, b)
+
+// The parameters of LE Create Connection: a scan interval of 100 ms and window of
+// 30 ms, the policy, the peer 0x10..0x15 of `peer_type`, the own address type, a
+// connection interval of `interval` units, no latency, a timeout of `timeout`.
+fn create_params(policy: Int, peer_type: Int, own: Int, interval: Int, timeout: Int) -> [Int]
+    var p = le16(160)
+    for b in le16(48)
+        list.push(p, b)
+    list.push(p, policy)
+    list.push(p, peer_type)
+    for i in 0..6
+        list.push(p, 0x10 + i)
+    list.push(p, own)
+    for v in [interval, interval, 0, timeout, 0, 0]
+        for b in le16(v)
+            list.push(p, b)
+    p
+
+fn create(var c: ctl_hci.Controller) -> Int
+    cmd_status(var c, 0x200D, create_params(0, 0, 0, 24, 400))
+
+// ── The advertiser and the Peripheral ───────────────────────────────
+
+// ADV_IND from the public address 0x10..0x15 (or `first`) with 3 octets of data.
+fn adv_ind(first: Int, tx_add: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.ADV_IND, tx_add, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, first + i)
+    for k in 0..3
+        let _b = ll_pdu.pdu_put(var p, k)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A CONNECT_IND from the random address 0x40..0x45 to the advertiser 0xA0..0xA5,
+// with the access address `aa`, an interval of `interval` units, a timeout of
+// `timeout`, a transmit window of 2 units, all 37 channels, hop 7, SCA class 0.
+fn connect_ind(aa: Int, interval: Int, timeout: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0xA0 + i)
+    for k in 0..4
+        let _c = ll_pdu.pdu_put(var p, (aa >>> (8 * k)) & 0xFF)
+    for b in [0x11, 0x22, 0x33, 2]
+        let _d = ll_pdu.pdu_put(var p, b)
+    for v in [0, interval, 0, timeout]
+        let _e = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _f = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _g = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// The simulated Peripheral: its sequence numbers, the PDU in flight and the data
+// waiting, what it received from the Central, and what it is told to do.  `mute`
+// stops it answering, `bad` is the number of its next answers sent with a CRC
+// error.
+struct Per
+    var sn: Int
+    var nesn: Int
+    var cur: Pdu
+    var queue: [Pdu]
+    var got: [Pdu]
+    var mute: Bool
+    var bad: Int
+    var heard: Int
+    var log_ch: [Int]
+    var log_t: [Int]
+
+fn per_new() -> Per
+    var empty = ll_pdu.pdu_new()
+    ll_data.dpdu_empty(var empty)
+    Per { sn: 0, nesn: 0, cur: empty, queue: [], got: [], mute: false, bad: 0, heard: 0,
+          log_ch: [], log_t: [] }
+
+fn data_pdu(llid: Int, n: Int, first: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var p, llid)
+    for i in 0..n
+        let _a = ll_pdu.pdu_put(var p, first + i)
+    ll_data.dpdu_finish(var p)
+    p
+
+fn ctrl_pdu(op: Int, rest: [Int]) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var p, op)
+    for b in rest
+        let _a = ll_pdu.pdu_put(var p, b)
+    ll_data.dpdu_finish(var p)
+    p
+
+fn per_send(var per: Per, p: Pdu)
+    list.push(per.queue, p)
+
+fn t_len(p: Pdu) -> Int
+    var w = p
+    ll_data.dpdu_len(var w)
+
+fn t_llid(p: Pdu) -> Int
+    var w = p
+    ll_data.dpdu_llid(var w)
+
+fn t_op(p: Pdu) -> Int
+    var w = p
+    ll_data.dpdu_opcode(var w)
+
+fn t_byte(p: Pdu, i: Int) -> Int
+    var w = p
+    ll_data.dpdu_byte(var w, i)
+
+// The Peripheral takes the Central's packet (header octet `hdr`, PDU `pdu`) and
+// answers: the header octet of its reply, with the PDU in `reply`.
+fn per_answer(var per: Per, hdr: Int, pdu: Pdu, var reply: Pdu) -> Int
+    let sn_c = (hdr >>> 3) & 1
+    let nesn_c = (hdr >>> 2) & 1
+    if nesn_c != per.sn
+        per.sn = per.sn ^ 1
+        if list.len(per.queue) > 0
+            per.cur = per.queue[0]
+            var rest: [Pdu] = []
+            for i in 1..list.len(per.queue)
+                list.push(rest, per.queue[i])
+            per.queue = rest
+        else
+            var empty = ll_pdu.pdu_new()
+            ll_data.dpdu_empty(var empty)
+            per.cur = empty
+    if sn_c == per.nesn
+        per.nesn = per.nesn ^ 1
+        if t_len(pdu) > 0 or t_llid(pdu) == ll_data.LLID_CONTROL
+            list.push(per.got, pdu)
+    reply.n = per.cur.n
+    for i in 0..per.cur.n
+        reply.b[i] = per.cur.b[i]
+    var md = 0
+    if list.len(per.queue) > 0
+        md = 1
+    t_llid(per.cur) | (per.nesn << 2) | (per.sn << 3) | (md << 4)
+
+// ── The links by slot ───────────────────────────────────────────────
+
+fn first_header(var c: ctl_hci.Controller, slot: Int) -> Int
+    if slot == 0
+        ll_link.link_first_header(var c.links[0])
+    else
+        ll_link.link_first_header(var c.links[1])
+
+fn in_flight(var c: ctl_hci.Controller, slot: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    if slot == 0
+        ll_link.pdu_copy(var p, var c.links[0].cur)
+    else
+        ll_link.pdu_copy(var p, var c.links[1].cur)
+    p
+
+fn note_rx(var c: ctl_hci.Controller, slot: Int, t: Int, good: Bool)
+    if slot == 0
+        ll_link.link_note_rx(var c.links[0], t, good)
+    else
+        ll_link.link_note_rx(var c.links[1], t, good)
+
+// The header the Central sends after the Peripheral's reply `h`; the PDU it
+// sends is left in `next`.  The answer is the header octet.
+fn rx_fast(var c: ctl_hci.Controller, slot: Int, h: Int, var next: Pdu) -> Int
+    if slot == 0
+        let out = ll_link.link_rx_fast(var c.links[0], h)
+        if c.links[0].use_nxt
+            ll_link.pdu_copy(var next, var c.links[0].nxt)
+        else
+            ll_link.pdu_copy(var next, var c.links[0].cur)
+        out
+    else
+        let out = ll_link.link_rx_fast(var c.links[1], h)
+        if c.links[1].use_nxt
+            ll_link.pdu_copy(var next, var c.links[1].nxt)
+        else
+            ll_link.pdu_copy(var next, var c.links[1].cur)
+        out
+
+fn continues(var c: ctl_hci.Controller, slot: Int) -> Bool
+    if slot == 0
+        c.links[0].cont and not c.links[0].closing
+    else
+        c.links[1].cont and not c.links[1].closing
+
+fn due_of(var c: ctl_hci.Controller, slot: Int) -> Int
+    if slot == 0
+        c.links[0].due
+    else
+        c.links[1].due
+
+// One connection event of the Central in `slot`, at its anchor point, against the
+// Peripheral.  The answer is the time the event ended.
+fn central_event(var c: ctl_hci.Controller, slot: Int, var per: Per) -> Int
+    let t0 = due_of(var c, slot)
+    let ch = ctl_hci.ctl_conn_begin(var c, slot)
+    list.push(per.log_ch, ch)
+    list.push(per.log_t, t0)
+    var t = t0
+    var tx = in_flight(var c, slot)
+    var hdr = first_header(var c, slot)
+    var n = 0
+    var open = true
+    while open and n < 8
+        var reply = ll_pdu.pdu_new()
+        let h = per_answer(var per, hdr, tx, var reply)
+        t = t + ll_pdu.airtime_us(tx.n) + 150
+        if per.mute
+            open = false
+        else
+            var good = true
+            if per.bad > 0
+                good = false
+                per.bad = per.bad - 1
+            note_rx(var c, slot, t, good)
+            if not good
+                open = false
+            else
+                per.heard = per.heard + 1
+                var next = ll_pdu.pdu_new()
+                let nh = rx_fast(c, slot, h, next)
+                ctl_hci.ctl_conn_rx_slow(var c, slot, var reply)
+                t = t + ll_pdu.airtime_us(reply.n) + 150
+                n = n + 1
+                open = continues(c, slot)
+                tx = next
+                hdr = nh
+    ctl_hci.ctl_conn_done(var c, slot, t)
+    t
+
+fn host_read(var c: ctl_hci.Controller, var out: [Int])
+    let _ran = ctl_hci.ctl_step(var c)
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+
+// A Controller in the Initiating state, the CONNECT_IND sent at time 5000 (it
+// ended at `end_us`), the Central link open in slot 0 and its first anchor 1.25 ms
+// after the end.
+fn central_up(end_us: Int) -> ctl_hci.Controller
+    var c = fresh()
+    ctl_hci.ctl_set_time(var c, 1000)
+    test.assert_eq(create(c), 0)
+    var adv = adv_ind(0x10, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var adv, 11))
+    test.assert(ctl_hci.ctl_init_sent(var c, end_us))
+    c
+
+// Run the Central link in slot 0 until `until`, the Host reading every event.
+fn run_events(var c: ctl_hci.Controller, var per: Per, until: Int, var host: [Int])
+    var guard = 0
+    while due_of(var c, 0) < until and ctl_hci.ctl_conn_active(var c, 0) and guard < 100000
+        guard = guard + 1
+        host_read(var c, var host)
+        ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+        let _end = central_event(var c, 0, var per)
+    test.assert(guard < 100000)
+    host_read(var c, var host)
+
+// ── Entering the Initiating state ───────────────────────────────────
+
+@test
+fn test_create_connection_enters_the_initiating_state_and_books_its_windows()
+    var c = fresh()
+    ctl_hci.ctl_set_time(var c, 1000)
+    test.assert_eq(create(c), 0)
+    test.assert(c.init.enabled)
+    test.assert(ctl_hci.ctl_init_active(var c))
+    test.assert(ctl_hci.ctl_ll_on(var c))
+    test.assert_eq(c.init.interval, 160)
+    test.assert_eq(c.init.c_max, 24)
+    // The first window starts when the command was run and takes the scan class.
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.class_scan())
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
+    test.assert_eq(ll_init.init_channel(var c.init, 1000), 37)
+    test.assert_eq(ll_init.init_channel(var c.init, 101000), 38)
+    test.assert_eq(ll_init.init_channel(var c.init, 201000), 39)
+    ctl_hci.ctl_set_time(var c, 40000)
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.NONE)
+    test.assert_eq(ctl_hci.ctl_ll_next_start(var c), 101000)
+    test.assert(ctl_hci.ctl_ll_scan_limit(var c) > 0)
+
+@test
+fn test_create_connection_is_refused_in_the_states_and_with_the_values_the_command_names()
+    var c = fresh()
+    // Out of range values.
+    var bad = create_params(0, 0, 0, 24, 400)
+    bad[12] = 5
+    test.assert_eq(cmd_status(var c, 0x200D, bad), 0x12)
+    // The peer types and own types beyond the four are reserved.
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 4, 0, 24, 400)), 0x12)
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 4, 24, 400)), 0x12)
+    // A random own address the Host never set.
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 1, 24, 400)), 0x12)
+    test.assert(not c.init.enabled)
+    // A command of the wrong length.
+    let r = run(c, 0x200D, [1, 2, 3])
+    test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
+    // Scanning on, or initiating on, disallows it.
+    test.assert_eq(status_of(c, 0x200B, [1, 0x10, 0, 0x10, 0, 0, 0]), 0)
+    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0)
+    test.assert_eq(create(c), 0x0C)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(create(c), 0)
+    test.assert_eq(create(c), 0x0C)
+    // Scanning does not start beside the Initiating state either.
+    test.assert(c.init.enabled)
+    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0x0C)
+    test.assert(not c.scan.enabled)
+    // Stopping a scan that is not on is a success.
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+
+@test
+fn test_a_random_own_address_is_used_when_the_host_set_it()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2005, [0x01, 0x02, 0x03, 0x04, 0x05, 0xC6]), 0)
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 1, 24, 400)), 0)
+    test.assert_eq(c.init.addr_type as Int, 1)
+    test.assert_eq(c.init.addr[0] as Int, 0x01)
+    test.assert_eq(ll_pdu.pdu_tx_add(var c.init.req), 1)
+
+@test
+fn test_create_connection_cancel_ends_the_state_and_tells_the_host_after_its_answer()
+    var c = fresh()
+    // Without a pending LE Create Connection the command is disallowed.
+    test.assert_eq(status_of(c, 0x200E, []), 0x0C)
+    test.assert_eq(create(c), 0)
+    ctl_hci.ctl_set_time(var c, 1000)
+    let _x = ctl_hci.ctl_ll_pick(var c, false)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
+    let r = run(c, 0x200E, [])
+    // The Command Complete is first, the LE Connection Complete follows it at the
+    // next step.
+    test.assert_eq(list.len(events_coded(r, 0x0E)), 1)
+    test.assert_eq(list.len(meta_events(r, 0x01)), 0)
+    test.assert(not c.init.enabled)
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
+    let s = run(c, 0x1001, [])
+    let ev = meta_events(s, 0x01)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][2], 19)
+    test.assert_eq(ev[0][4], 0x02)
+    for k in 5..22
+        test.assert_eq(ev[0][k], 0)
+    // Only once.
+    test.assert_eq(list.len(meta_events(run(c, 0x1001, []), 0x01)), 0)
+    test.assert_eq(c.init.cancels, 1)
+    test.assert(not ctl_hci.ctl_ll_on(var c))
+
+@test
+fn test_the_event_of_a_cancel_is_enhanced_or_masked_as_the_host_chose()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(create(c), 0)
+    test.assert_eq(status_of(c, 0x200E, []), 0)
+    let r = run(c, 0x1001, [])
+    let ev = meta_events(r, 0x0A)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][2], 31)
+    test.assert_eq(ev[0][4], 0x02)
+    var d = fresh()
+    test.assert_eq(status_of(d, 0x2001, zeros(8)), 0)
+    test.assert_eq(create(d), 0)
+    test.assert_eq(status_of(d, 0x200E, []), 0)
+    let s = run(d, 0x1001, [])
+    test.assert_eq(list.len(events_coded(s, 0x3E)), 0)
+    test.assert_eq(d.init_event, 0)
+
+fn zeros(n: Int) -> [Int]
+    var v: [Int] = []
+    for _ in 0..n
+        list.push(v, 0)
+    v
+
+@test
+fn test_the_cancel_event_waits_for_a_free_slot()
+    var c = fresh()
+    test.assert_eq(create(c), 0)
+    test.assert_eq(status_of(c, 0x200E, []), 0)
+    var held: [Int] = []
+    for _ in 0..16
+        let k = ctl_pool.pool_take(var c.pool)
+        if k >= 0
+            list.push(held, k)
+    test.assert_eq(c.init_event, 0x02)
+    ctl_hci.ctl_flush_events(var c)
+    test.assert_eq(c.init_event, 0x02)
+    for k in held
+        ctl_pool.pool_give(var c.pool, k)
+    ctl_hci.ctl_flush_events(var c)
+    test.assert_eq(c.init_event, 0)
+    test.assert_eq(list.len(meta_events(drain(var c), 0x01)), 1)
+
+// ── The filter policy ───────────────────────────────────────────────
+
+@test
+fn test_the_initiator_connects_to_the_named_peer_only()
+    var c = fresh()
+    test.assert_eq(create(c), 0)
+    var other = adv_ind(0x20, 0)
+    test.assert(not ctl_hci.ctl_init_decide(var c, var other, 11))
+    var random = adv_ind(0x10, 1)
+    test.assert(not ctl_hci.ctl_init_decide(var c, var random, 11))
+    test.assert(not c.init.sent)
+    var peer = adv_ind(0x10, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+    test.assert(c.init.sent)
+
+@test
+fn test_the_list_policy_connects_to_a_listed_device_and_freezes_the_list()
+    var c = fresh()
+    var add = [0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25]
+    test.assert_eq(status_of(c, 0x2011, add), 0)
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(1, 0, 0, 24, 400)), 0)
+    // The list does not change while the Initiating state reads it.
+    test.assert_eq(status_of(c, 0x2011, [0, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35]), 0x0C)
+    test.assert_eq(status_of(c, 0x2012, add), 0x0C)
+    test.assert_eq(status_of(c, 0x2010, []), 0x0C)
+    var stranger = adv_ind(0x10, 0)
+    test.assert(not ctl_hci.ctl_init_decide(var c, var stranger, 11))
+    var listed = adv_ind(0x20, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var listed, 11))
+    test.assert(ctl_hci.ctl_init_sent(var c, 8000))
+    // The state is over, and the list can change again.
+    test.assert_eq(status_of(c, 0x2012, add), 0)
+    test.assert(has_addr(c.init.req, 6, 0x20))
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var x: Vec[u8; 6] = Vec.new()
+    for k in 0..6
+        let _a = x.push((first + k) as u8)
+    x
+
+@test
+fn test_a_connect_ind_that_did_not_go_on_air_lets_the_state_go_on()
+    var c = fresh()
+    test.assert_eq(create(c), 0)
+    var peer = adv_ind(0x10, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+    test.assert(not ctl_hci.ctl_init_decide(var c, var peer, 11))
+    ctl_hci.ctl_init_unsent(var c)
+    test.assert(not c.init.sent)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+
+// ── The connection as Central ───────────────────────────────────────
+
+@test
+fn test_the_connect_ind_opens_the_central_link_and_ends_the_initiating_state()
+    var c = central_up(5000)
+    test.assert(not c.init.enabled)
+    test.assert(ll_link.link_live(var c.links[0]))
+    test.assert(c.links[0].central)
+    test.assert_eq(c.links[0].handle, 1)
+    test.assert_eq(c.links[0].due, 5000 + 1250)
+    test.assert_eq(c.links[0].interval, 24)
+    test.assert_eq(c.links[0].timeout, 400)
+    test.assert_eq(c.links[0].peer[0] as Int, 0x10)
+    test.assert_eq(c.links[0].own[0] as Int, 0xA0)
+    test.assert_eq(c.links[0].n_used, 37)
+    // The event is booked at its anchor in the connection class, and the Initiating
+    // state's window is not.
+    let _p = ctl_hci.ctl_ll_pick(var c, false)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
+    test.assert_eq(c.arb.start[ll_arb.CLASS_ACL], 5000 + 1250)
+    // The Host is told nothing until the Peripheral has answered.
+    test.assert_eq(list.len(events_coded(run(c, 0x1001, []), 0x3E)), 0)
+
+@test
+fn test_the_host_gets_le_connection_complete_with_role_central_after_the_first_answer()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    let _e = central_event(var c, 0, var per)
+    host_read(var c, var host)
+    let ev = meta_events(host, 0x01)
+    test.assert_eq(list.len(ev), 1)
+    let e = ev[0]
+    test.assert_eq(e[2], 19)
+    test.assert_eq(e[4], 0)
+    test.assert_eq(e[5] | (e[6] << 8), 1)
+    // Role Central, the advertiser's public address 0x10..0x15, the interval,
+    // latency and timeout the Central asked for.
+    test.assert_eq(e[7], 0)
+    test.assert_eq(e[8], 0)
+    test.assert_eq(e[9], 0x10)
+    test.assert_eq(e[14], 0x15)
+    test.assert_eq(e[15] | (e[16] << 8), 24)
+    test.assert_eq(e[17] | (e[18] << 8), 0)
+    test.assert_eq(e[19] | (e[20] << 8), 400)
+    test.assert_eq(per.heard, 1)
+    // The Peripheral's first packet came at the first anchor, on the first channel
+    // of the hop sequence.
+    test.assert_eq(per.log_t[0], 6250)
+    test.assert_eq(per.log_ch[0], c.links[0].hop % 37)
+
+@test
+fn test_the_enhanced_event_replaces_the_plain_one_for_a_central()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
+    ctl_hci.ctl_set_time(var c, 1000)
+    test.assert_eq(create(c), 0)
+    var peer = adv_ind(0x10, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+    test.assert(ctl_hci.ctl_init_sent(var c, 5000))
+    var per = per_new()
+    ctl_hci.ctl_set_time(var c, 6250)
+    let _e = central_event(var c, 0, var per)
+    var host: [Int] = []
+    host_read(var c, var host)
+    let ev = meta_events(host, 0x0A)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][2], 31)
+    test.assert_eq(ev[0][7], 0)
+    test.assert_eq(ev[0][9], 0x10)
+
+@test
+fn test_connection_events_keep_the_interval_and_hop_through_the_channels()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    run_events(var c, var per, 5000 + 1250 + 24 * 1250 * 40, var host)
+    test.assert(per.heard >= 40)
+    // Event spacing is the interval to the microsecond: the Central owns the clock.
+    for i in 1..list.len(per.log_t)
+        test.assert_eq(per.log_t[i] - per.log_t[i - 1], 24 * 1250)
+    // Channel selection #1 with hop 7 from the CONNECT_IND, over all 37 channels.
+    let hop = c.links[0].hop
+    var unmapped = 0
+    for i in 0..list.len(per.log_ch)
+        unmapped = (unmapped + hop) % 37
+        test.assert_eq(per.log_ch[i], unmapped)
+    test.assert(ll_link.link_live(var c.links[0]))
+
+@test
+fn test_data_crosses_both_ways_in_order_with_flow_control()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    // The Host sends a message of 64 octets as three fragments of at most 27; the
+    // Peripheral sends 40 octets back as two PDUs.
+    var msg: [Int] = []
+    for i in 0..64
+        list.push(msg, 0x30 + i)
+    feed(c, host_acl(1, 0, msg[0:27]))
+    feed(c, host_acl(1, 1, msg[27:54]))
+    feed(c, host_acl(1, 1, msg[54:64]))
+    per_send(var per, data_pdu(ll_data.LLID_START, 27, 0x80))
+    per_send(var per, data_pdu(ll_data.LLID_CONTINUE, 13, 0xA0))
+    run_events(var c, var per, 6250 + 24 * 1250 * 12, var host)
+    // The Peripheral got the three fragments in order, with the LLIDs of the Host.
+    var got: [Int] = []
+    var llids: [Int] = []
+    for p in per.got
+        if t_llid(p) != ll_data.LLID_CONTROL
+            list.push(llids, t_llid(p))
+            for i in 0..t_len(p)
+                list.push(got, t_byte(p, i))
+    test.assert_eq(llids, [2, 1, 1])
+    test.assert_eq(got, msg)
+    // The Host got the two PDUs as ACL Data with flags 2 and 1, and the three
+    // buffers back in Number Of Completed Packets.
+    let acl = acl_packets(host)
+    test.assert_eq(list.len(acl), 2)
+    test.assert_eq(acl[0][2] >>> 4, 2)
+    test.assert_eq(acl[0][3], 27)
+    test.assert_eq(acl[0][5], 0x80)
+    test.assert_eq(acl[1][2] >>> 4, 1)
+    test.assert_eq(acl[1][3], 13)
+    var done = 0
+    for e in events_coded(host, 0x13)
+        done = done + e[6] + (e[7] << 8)
+    test.assert_eq(done, 3)
+    test.assert_eq(c.links[0].data_in, 2)
+    test.assert_eq(c.links[0].data_out, 3)
+
+@test
+fn test_sixty_rounds_of_data_both_ways_arrive_once()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    var sent = 0
+    var seen = 0
+    for round in 0..60
+        feed(c, host_acl(1, 0, [round, round + 1, round + 2]))
+        per_send(var per, data_pdu(ll_data.LLID_START, 4, round))
+        ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+        let _e = central_event(var c, 0, var per)
+        host_read(var c, var host)
+        let _f = acl_packets(host)
+    run_events(var c, var per, due_of(var c, 0) + 24 * 1250 * 4, var host)
+    var firsts: [Int] = []
+    for p in per.got
+        if t_llid(p) == ll_data.LLID_START
+            list.push(firsts, t_byte(p, 0))
+    test.assert_eq(list.len(firsts), 60)
+    for i in 0..60
+        test.assert_eq(firsts[i], i)
+    test.assert_eq(list.len(acl_packets(host)), 60)
+    test.assert(ll_link.link_live(var c.links[0]))
+
+@test
+fn test_a_bad_answer_ends_the_event_and_the_pdu_is_sent_again()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    feed(c, host_acl(1, 0, [1, 2, 3]))
+    // The first packet the Peripheral answers with a CRC error: the Central closes
+    // the event, supervision is not reset, and the same data goes next event.
+    per.bad = 1
+    let _a = central_event(var c, 0, var per)
+    test.assert_eq(per.heard, 0)
+    test.assert_eq(c.links[0].bad_run, 1)
+    test.assert(not c.links[0].synced)
+    test.assert_eq(c.links[0].last_rx, 5000)
+    ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+    let _b = central_event(var c, 0, var per)
+    ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+    let _d = central_event(var c, 0, var per)
+    // The fragment reached the Peripheral once.
+    var n = 0
+    for p in per.got
+        if t_llid(p) == ll_data.LLID_START
+            n = n + 1
+    test.assert_eq(n, 1)
+
+@test
+fn test_the_central_sends_what_the_peripheral_did_not_acknowledge_again()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    feed(c, host_acl(1, 0, [9, 8, 7]))
+    // The Peripheral hears the first event but its answer is lost.
+    ctl_hci.ctl_set_time(var c, 6250)
+    let _a = central_event(var c, 0, var per)
+    per.mute = true
+    ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+    let _b = central_event(var c, 0, var per)
+    per.mute = false
+    ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+    let _d = central_event(var c, 0, var per)
+    var n = 0
+    for p in per.got
+        if t_llid(p) == ll_data.LLID_START
+            n = n + 1
+    test.assert_eq(n, 1)
+    host_read(var c, var host)
+
+// ── Ending the connection ───────────────────────────────────────────
+
+@test
+fn test_a_central_that_gets_no_answer_fails_to_establish_and_the_host_is_told()
+    var c = central_up(5000)
+    var per = per_new()
+    per.mute = true
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    var n = 0
+    while ctl_hci.ctl_conn_active(var c, 0) and n < 40
+        ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+        let _e = central_event(var c, 0, var per)
+        n = n + 1
+    test.assert(n >= 6 and n <= 9)
+    host_read(var c, var host)
+    // LE Connection Complete with 0x3E, and no Disconnection Complete.
+    let ev = meta_events(host, 0x01)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], 0x3E)
+    test.assert_eq(ev[0][7], 0)
+    test.assert_eq(list.len(events_coded(host, 0x05)), 0)
+    test.assert(not ll_link.link_live(var c.links[0]))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    // The slot is free for the next connection.
+    assert_slot_free(var c)
+
+fn assert_slot_free(var c: ctl_hci.Controller)
+    test.assert(ctl_hci.free_slot(var c) == 0)
+
+@test
+fn test_supervision_timeout_ends_a_made_connection_with_disconnection_complete()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    let _a = central_event(var c, 0, var per)
+    per.mute = true
+    var n = 0
+    while ctl_hci.ctl_conn_active(var c, 0) and n < 400
+        ctl_hci.ctl_set_time(var c, due_of(var c, 0))
+        let _e = central_event(var c, 0, var per)
+        n = n + 1
+    host_read(var c, var host)
+    let ds = events_coded(host, 0x05)
+    test.assert_eq(list.len(ds), 1)
+    test.assert_eq(ds[0][3], 0)
+    test.assert_eq(ds[0][4] | (ds[0][5] << 8), 1)
+    test.assert_eq(ds[0][6], 0x08)
+    // 400 units of 10 ms is 4 s: 133 events of 30 ms.
+    test.assert(n >= 130 and n <= 140)
+
+@test
+fn test_the_host_disconnects_a_central_link_and_the_peripheral_acknowledges()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    let _a = central_event(var c, 0, var per)
+    test.assert_eq(cmd_status(var c, 0x0406, [1, 0, 0x13]), 0)
+    // A second Disconnect is refused.
+    test.assert_eq(cmd_status(var c, 0x0406, [1, 0, 0x13]), 0x0C)
+    run_events(var c, var per, due_of(var c, 0) + 24 * 1250 * 4, var host)
+    var terminated = false
+    for p in per.got
+        if t_op(p) == ll_data.OP_TERMINATE_IND
+            terminated = true
+            test.assert_eq(t_byte(p, 1), 0x13)
+    test.assert(terminated)
+    let ds = events_coded(host, 0x05)
+    test.assert_eq(list.len(ds), 1)
+    test.assert_eq(ds[0][6], 0x16)
+
+@test
+fn test_the_peripheral_terminates_the_connection()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    per_send(var per, ctrl_pdu(ll_data.OP_TERMINATE_IND, [0x13]))
+    run_events(var c, var per, 6250 + 24 * 1250 * 6, var host)
+    let ds = events_coded(host, 0x05)
+    test.assert_eq(list.len(ds), 1)
+    test.assert_eq(ds[0][6], 0x13)
+    test.assert(not ll_link.link_live(var c.links[0]))
+
+@test
+fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
+    var c = central_up(5000)
+    let skipped = ctl_hci.ctl_conn_catch_up(var c, 0, 6250 + 24 * 1250 * 3 + 1)
+    test.assert_eq(skipped, 4)
+    test.assert(ctl_hci.ctl_conn_active(var c, 0))
+    let more = ctl_hci.ctl_conn_catch_up(var c, 0, 10000000)
+    test.assert(more > 0)
+    test.assert(not ctl_hci.ctl_conn_active(var c, 0))
+    var host: [Int] = []
+    host_read(var c, var host)
+    let ev = meta_events(host, 0x01)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], 0x3E)
+
+// ── Remote information ──────────────────────────────────────────────
+
+@test
+fn test_a_central_reads_the_features_and_version_of_the_peripheral()
+    var c = central_up(5000)
+    var per = per_new()
+    var host: [Int] = []
+    ctl_hci.ctl_set_time(var c, 6250)
+    let _a = central_event(var c, 0, var per)
+    test.assert_eq(cmd_status(var c, 0x2016, [1, 0]), 0)
+    // One procedure waits at a time.
+    test.assert_eq(cmd_status(var c, 0x041D, [1, 0]), 0x0C)
+    per_send(var per, ctrl_pdu(ll_data.OP_FEATURE_RSP, [0x13, 0, 0, 0, 0, 0, 0, 0]))
+    run_events(var c, var per, due_of(var c, 0) + 24 * 1250 * 4, var host)
+    test.assert_eq(cmd_status(var c, 0x041D, [1, 0]), 0)
+    per_send(var per, ctrl_pdu(ll_data.OP_VERSION_IND, [0x0E, 0x59, 0x00, 0x01, 0x00]))
+    run_events(var c, var per, due_of(var c, 0) + 24 * 1250 * 4, var host)
+    // The Central asked with LL_FEATURE_REQ and sent its version.
+    var asked = false
+    var versioned = false
+    for p in per.got
+        if t_op(p) == ll_data.OP_FEATURE_REQ
+            asked = true
+        if t_op(p) == ll_data.OP_VERSION_IND
+            versioned = true
+            test.assert_eq(t_byte(p, 1), 0x11)
+    test.assert(asked)
+    test.assert(versioned)
+    let f = meta_events(host, 0x04)
+    test.assert_eq(list.len(f), 1)
+    test.assert_eq(f[0][4], 0)
+    test.assert_eq(f[0][7], 0x13)
+    let v = events_coded(host, 0x0C)
+    test.assert_eq(list.len(v), 1)
+    test.assert_eq(v[0][6], 0x0E)
+
+// ── Two links ───────────────────────────────────────────────────────
+
+// The Central link in slot 0 is up, and the Controller advertises connectably; a
+// CONNECT_IND from another Central is taken in slot 1 as Peripheral.
+fn two_links() -> ctl_hci.Controller
+    var c = central_up(5000)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    var pol = ll_policy.default_link_policy()
+    var p = connect_ind(0x50655A12, 24, 400)
+    test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 9000))
+    c
+
+fn adv_params(ty: Int) -> [Int]
+    var p = le16(0x20)
+    list.push(p, 0x20)
+    list.push(p, 0)
+    list.push(p, ty)
+    list.push(p, 0)
+    list.push(p, 0)
+    for i in 0..6
+        list.push(p, 0x70 + i)
+    list.push(p, 7)
+    list.push(p, 0)
+    p
+
+@test
+fn test_a_peripheral_link_opens_beside_the_central_link()
+    var c = two_links()
+    test.assert(ll_link.link_live(var c.links[0]))
+    test.assert(ll_link.link_live(var c.links[1]))
+    test.assert(c.links[0].central)
+    test.assert(not c.links[1].central)
+    test.assert_eq(c.links[1].handle, 2)
+    test.assert_eq(ctl_hci.role_count(var c, true), 1)
+    test.assert_eq(ctl_hci.role_count(var c, false), 1)
+    test.assert(not c.adv.enabled)
+    // The two bookings are in their own classes.
+    let _p = ctl_hci.ctl_ll_pick(var c, false)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL2))
+    test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.CLASS_ACL), 0)
+    test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.CLASS_ACL2), 1)
+    test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.class_adv()), -1)
+    // The Peripheral's LE Connection Complete names handle 2 and role 1.
+    var host: [Int] = []
+    host_read(var c, var host)
+    let ev = meta_events(host, 0x01)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][5], 2)
+    test.assert_eq(ev[0][7], 1)
+
+@test
+fn test_each_role_is_limited_to_one_link_and_the_slots_to_two()
+    // These cases are the limits of the default profile: one Peripheral link and one Central
+    // link in two slots.  A profile with other limits (configs/ctl3.toml) has its own tests.
+    if not ctl_hci.default_caps()
+        return
+    var c = two_links()
+    // The limits answer Connection Limit Exceeded; the device the Central is connected to
+    // answers Connection Already Exists.
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 0, 24, 400)), 0x0B)
+    test.assert_eq(cmd_status(var c, 0x200D, create_params(1, 0, 0, 24, 400)), 0x09)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0x09)
+    // Non-connectable advertising is not limited by the links.
+    test.assert_eq(status_of(c, 0x2006, adv_params(2)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    // A second Peripheral CONNECT_IND is not taken either.
+    var pol = ll_policy.default_link_policy()
+    var p = connect_ind(0x6A5A9A5A, 24, 400)
+    test.assert(not ctl_hci.ctl_connect_ind(var c, var pol, var p, 20000))
+
+@test
+fn test_the_initiating_state_keeps_a_slot_for_the_central_link()
+    // These cases are the limits of the default profile: one Peripheral link and one Central
+    // link in two slots.  A profile with other limits (configs/ctl3.toml) has its own tests.
+    if not ctl_hci.default_caps()
+        return
+    var c = fresh()
+    var pol = ll_policy.default_link_policy()
+    advertise_connectable(var c)
+    var p = connect_ind(0x50655A12, 24, 400)
+    ctl_hci.ctl_set_time(var c, 1000)
+    test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
+    // One Peripheral link is on, and a free slot is left; the Initiating state
+    // takes it, so a connectable advertisement has none and the limit says so.
+    test.assert_eq(create(c), 0)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0x09)
+    test.assert_eq(status_of(c, 0x200E, []), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0x09)
+    // The Peripheral limit holds without the Initiating state as well.
+    test.assert_eq(ctl_hci.free_slots(var c), 1)
+    var peer = adv_ind(0x10, 0)
+    test.assert_eq(create(c), 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+    test.assert(ctl_hci.ctl_init_sent(var c, 9000))
+    test.assert(ctl_hci.slot_central(var c, 1))
+    test.assert_eq(c.links[1].handle, 2)
+
+fn advertise_connectable(var c: ctl_hci.Controller)
+    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+
+@test
+fn test_the_initiating_state_runs_beside_advertising_and_the_peripheral_link()
+    var c = fresh()
+    advertise_connectable(var c)
+    test.assert_eq(create(c), 0)
+    test.assert(c.adv.enabled)
+    test.assert(c.init.enabled)
+    ctl_hci.ctl_set_time(var c, 1000)
+    let _p = ctl_hci.ctl_ll_pick(var c, false)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_adv()))
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
+
+@test
+fn test_both_links_run_their_events_against_their_own_peers_through_the_arbiter()
+    var c = two_links()
+    var per0 = per_new()
+    var per1 = per_new()
+    var host: [Int] = []
+    // Data for each link goes to its own queue by handle.
+    feed(c, host_acl(1, 0, [0x11, 0x12]))
+    feed(c, host_acl(2, 0, [0x21, 0x22, 0x23]))
+    feed(c, host_acl(3, 0, [0x31]))
+    test.assert_eq(c.dropped_acl, 1)
+    per_send(var per0, data_pdu(ll_data.LLID_START, 2, 0xB0))
+    per_send(var per1, data_pdu(ll_data.LLID_START, 3, 0xC0))
+    var now = 6000
+    var guard = 0
+    var events0 = 0
+    var events1 = 0
+    while now < 400000 and guard < 100000
+        guard = guard + 1
+        host_read(var c, var host)
+        ctl_hci.ctl_set_time(var c, now)
+        let cls = ctl_hci.ctl_ll_pick(var c, false)
+        let slot = ctl_hci.ctl_class_slot(cls)
+        if slot >= 0 and ctl_hci.ctl_conn_active(var c, slot)
+            var at = due_of(var c, slot)
+            if now < at
+                now = at
+            ctl_hci.ctl_set_time(var c, now)
+            if slot == 0
+                now = central_event(var c, 0, var per0)
+                events0 = events0 + 1
+            else
+                now = peripheral_event(var c, var per1)
+                events1 = events1 + 1
+            ctl_hci.ctl_set_time(var c, now)
+        else
+            let t = wake_time(var c)
+            if t < 0 or t > 400000
+                now = 400000
+            else if t > now
+                now = t
+            else
+                now = now + 1
+    test.assert(guard < 100000)
+    host_read(var c, var host)
+    test.assert(events0 > 10)
+    test.assert(events1 > 10)
+    // Each Peripheral got only its own data.
+    test.assert_eq(t_byte(per0.got[0], 0), 0x11)
+    test.assert_eq(t_byte(per1.got[0], 0), 0x21)
+    var tags: [Int] = []
+    for e in acl_packets(host)
+        list.push(tags, e[1] | (e[2] << 8) & 0x0FFF)
+        list.push(tags, e[5])
+    test.assert_eq(tags[0] & 0xFFF, 1)
+    test.assert_eq(tags[1], 0xB0)
+
+// The Peripheral link in slot 1 against a simulated Central: its packets at the
+// anchor (the link's own due time, plus 100 microseconds), the answers following
+// the contract of the radio program.  Returns the time the event ended.
+fn peripheral_event(var c: ctl_hci.Controller, var per: Per) -> Int
+    let win_start = ll_link.link_listen_start(var c.links[1])
+    let t0 = c.links[1].due + 100
+    test.assert(t0 >= win_start)
+    let _ch = ctl_hci.ctl_conn_begin(var c, 1)
+    ll_link.link_note_rx(var c.links[1], t0, true)
+    var empty = ll_pdu.pdu_new()
+    ll_data.dpdu_empty(var empty)
+    let _h = ll_link.link_rx_fast(var c.links[1], 1 | ((c.links[1].sn ^ 1) << 2) | (c.links[1].nesn << 3))
+    // The Central acknowledged the PDU in flight, so the next one is what the
+    // Peripheral sent now; the Central keeps it when it carries data.
+    if c.links[1].use_nxt and c.links[1].nxt.n > 2
+        var sent = ll_pdu.pdu_new()
+        ll_link.pdu_copy(var sent, var c.links[1].nxt)
+        list.push(per.got, sent)
+    ctl_hci.ctl_conn_rx_slow(var c, 1, var empty)
+    ctl_hci.ctl_conn_done(var c, 1, t0 + 600)
+    t0 + 600
+
+// The time the next booked activity wants the radio.
+fn wake_time(var c: ctl_hci.Controller) -> Int
+    var best = -1
+    ctl_hci.ctl_ll_book(var c)
+    for cls in 0..ll_arb.classes()
+        if c.arb.on[cls]
+            let t = c.arb.start[cls] - ll_arb.lead_of(var c.arb, cls)
+            if best < 0 or t < best
+                best = t
+    best
+
+@test
+fn test_commands_name_the_link_by_handle_and_a_handle_that_is_not_on_is_unknown()
+    var c = two_links()
+    test.assert_eq(cmd_status(var c, 0x0406, [3, 0, 0x13]), 0x02)
+    test.assert_eq(cmd_status(var c, 0x041D, [3, 0]), 0x02)
+    test.assert_eq(cmd_status(var c, 0x2016, [3, 0]), 0x02)
+    // The version is asked on handle 2 and the features on handle 1; a second
+    // procedure on handle 2 waits for the first.
+    test.assert_eq(cmd_status(var c, 0x041D, [2, 0]), 0)
+    test.assert_eq(cmd_status(var c, 0x2016, [2, 0]), 0x0C)
+    test.assert_eq(cmd_status(var c, 0x2016, [1, 0]), 0)
+    test.assert(c.links[1].ver_sent)
+    test.assert_eq(c.links[1].proc, ll_link.PROC_VERSION)
+    test.assert_eq(c.links[0].proc, ll_link.PROC_FEATURES)
+    test.assert(not c.links[0].ver_sent)
+    // Read Channel Map answers each link's own map, and Unknown Connection for a
+    // handle that is not on.
+    let r2 = run(c, 0x2015, [2, 0])
+    let m = events_coded(r2, 0x0E)[0]
+    test.assert_eq(m[6], 0)
+    test.assert_eq(m[9], 0xFF)
+    test.assert_eq(m[13], 0x1F)
+    let r3 = run(c, 0x2015, [3, 0])
+    test.assert_eq(events_coded(r3, 0x0E)[0][6], 0x02)
+    // Disconnect on handle 2 leaves handle 1 alone.
+    test.assert_eq(cmd_status(var c, 0x0406, [2, 0, 0x13]), 0)
+    test.assert(c.links[1].term_sent)
+    test.assert(not c.links[0].term_sent)
+
+@test
+fn test_the_second_slot_reports_its_events_and_ends_on_its_own()
+    var c = two_links()
+    var host: [Int] = []
+    host_read(var c, var host)
+    // Events the second link owes: updated, version, features, completed.
+    owe_all_on_slot_1(var c)
+    ctl_hci.ctl_flush_events(var c)
+    let r = drain(var c)
+    test.assert_eq(list.len(meta_events(r, 0x03)), 1)
+    test.assert_eq(list.len(events_coded(r, 0x0C)), 1)
+    test.assert_eq(list.len(meta_events(r, 0x04)), 1)
+    let nc = events_coded(r, 0x13)
+    test.assert_eq(list.len(nc), 1)
+    test.assert_eq(nc[0][4] | (nc[0][5] << 8), 2)
+    test.assert_eq(nc[0][6] | (nc[0][7] << 8), 2)
+    // The link ends: Disconnection Complete names handle 2, the Central link stays.
+    ll_link.link_close(var c.links[1], 0x08)
+    ctl_hci.ctl_conn_done(var c, 1, 12000)
+    ctl_hci.ctl_flush_events(var c)
+    let ds = events_coded(drain(var c), 0x05)
+    test.assert_eq(list.len(ds), 1)
+    test.assert_eq(ds[0][4] | (ds[0][5] << 8), 2)
+    test.assert(ll_link.link_live(var c.links[0]))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL2))
+    // The slot is free once the event is sent, and a Central can use it.
+    test.assert_eq(ctl_hci.free_slot(var c), 1)
+
+// The second link owes the Host an update, the remote version and features, and
+// two completed packets.
+fn feat_octets(var l: Link)
+    for i in 0..8
+        l.peer_feat[i] = (i + 1) as u8
+
+fn owe_all_on_slot_1(var c: ctl_hci.Controller)
+    c.links[1].ver_status = 0
+    c.links[1].peer_ver = 0x0E
+    c.links[1].feat_status = 0
+    feat_octets(var c.links[1])
+    c.links[1].owed = c.links[1].owed | ll_link.EV_UPDATED | ll_link.EV_VERSION | ll_link.EV_FEATURES | ll_link.EV_COMPLETED
+    c.links[1].completed = 2
+
+fn both_links_taken(var c: ctl_hci.Controller, on: Bool)
+    c.links[0].live = on
+    c.links[1].live = on
+
+fn has_addr(p: Pdu, off: Int, first: Int) -> Bool
+    var w = p
+    var a = t_addr(first)
+    ll_pdu.pdu_addr_is(var w, off, var a)
+
+@test
+fn test_the_second_slot_is_caught_up_and_queried_by_slot()
+    var c = two_links()
+    test.assert(ctl_hci.ctl_conn_active(var c, 1))
+    test.assert(ctl_hci.slot_live(var c, 1))
+    test.assert(not ctl_hci.slot_central(var c, 1))
+    test.assert(ctl_hci.slot_central(var c, 0))
+    test.assert_eq(ctl_hci.handle_slot(var c, 2), 1)
+    test.assert_eq(ctl_hci.slot_class(1), ll_arb.CLASS_ACL2)
+    test.assert_eq(ctl_hci.slot_aa(var c, 1), 0x50655A12)
+    let skipped = ctl_hci.ctl_conn_catch_up(var c, 1, 9000 + 1250 + 2500 + 24 * 1250 * 2 + 100)
+    test.assert(skipped >= 2)
+    let more = ctl_hci.ctl_conn_catch_up(var c, 1, 100000000)
+    test.assert(more > 0)
+    test.assert(not ctl_hci.ctl_conn_active(var c, 1))
+    test.assert_eq(ctl_hci.slot_aa(var c, 1), 0)
+
+@test
+fn test_a_new_central_access_address_differs_from_the_ones_in_use()
+    var c = central_up(5000)
+    let first = c.links[0].aa
+    test.assert_eq(first, ll_init_aa(c.init.req))
+    // A Peripheral link with the access address the next Central would draw is
+    // avoided.
+    var d = fresh()
+    ctl_hci.ctl_set_time(var d, 1000)
+    advertise_connectable(var d)
+    var pol = ll_policy.default_link_policy()
+    var p = connect_ind(first, 24, 400)
+    test.assert(ctl_hci.ctl_connect_ind(var d, var pol, var p, 5000))
+    test.assert_eq(create(d), 0)
+    test.assert(ll_init_aa(d.init.req) != first)
+
+fn ll_init_aa(req: Pdu) -> Int
+    (req.b[14] as Int) | ((req.b[15] as Int) << 8) | ((req.b[16] as Int) << 16) | ((req.b[17] as Int) << 24)
+
+// ── Slots, no free link, reset ──────────────────────────────────────
+
+@test
+fn test_a_connect_ind_sent_with_no_link_free_is_reported_as_a_limit()
+    // These cases are the limits of the default profile: one Peripheral link and one Central
+    // link in two slots.  A profile with other limits (configs/ctl3.toml) has its own tests.
+    if not ctl_hci.default_caps()
+        return
+    var c = fresh()
+    ctl_hci.ctl_set_time(var c, 1000)
+    test.assert_eq(create(c), 0)
+    var peer = adv_ind(0x10, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+    // Both links are taken after the Initiating state started (which a Controller
+    // that keeps its reservation never allows).
+    both_links_taken(var c, true)
+    test.assert(not ctl_hci.ctl_init_sent(var c, 5000))
+    test.assert(not c.init.enabled)
+    test.assert_eq(c.init_event, 0x09)
+    both_links_taken(var c, false)
+    let ev = meta_events(run(c, 0x1001, []), 0x01)
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], 0x09)
+
+@test
+fn test_reset_ends_the_initiating_state_and_both_links_without_events()
+    var c = two_links()
+    var host: [Int] = []
+    host_read(var c, var host)
+    test.assert_eq(status_of(c, 0x0C03, []), 0)
+    test.assert(not ll_link.link_live(var c.links[0]))
+    test.assert(not ll_link.link_live(var c.links[1]))
+    test.assert(not ctl_hci.ctl_ll_on(var c))
+    var d = fresh()
+    test.assert_eq(create(d), 0)
+    test.assert_eq(status_of(d, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF, 0x0F]), 0)
+    test.assert_eq(status_of(d, 0x0C03, []), 0)
+    test.assert(not d.init.enabled)
+    test.assert_eq(d.chmap, ll_init.CHMAP_ALL)
+    test.assert_eq(d.init_event, 0)
+
+// ── The channel map ─────────────────────────────────────────────────
+
+@test
+fn test_the_host_classification_is_the_map_of_the_next_connection_as_central()
+    var c = fresh()
+    ctl_hci.ctl_set_time(var c, 1000)
+    // The refusals: a bit past channel 36, and no channel at all.
+    test.assert_eq(status_of(c, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0x12)
+    test.assert_eq(status_of(c, 0x2014, [0, 0, 0, 0, 0]), 0x12)
+    test.assert_eq(status_of(c, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF]), 0x12)
+    test.assert_eq(status_of(c, 0x2014, [0xFF, 0x0F, 0, 0, 0x10]), 0)
+    test.assert_eq(c.chmap, 0x1000000FFF)
+    test.assert_eq(create(c), 0)
+    var peer = adv_ind(0x10, 0)
+    test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
+    test.assert(ctl_hci.ctl_init_sent(var c, 5000))
+    test.assert_eq(c.links[0].chmap, 0x1000000FFF)
+    test.assert_eq(c.links[0].n_used, 13)
+    // LE Read Channel Map returns it.
+    let m = events_coded(run(c, 0x2015, [1, 0]), 0x0E)[0]
+    test.assert_eq(m[9], 0xFF)
+    test.assert_eq(m[10], 0x0F)
+    test.assert_eq(m[13], 0x10)
+    // The channels of the events are the used ones.
+    var per = per_new()
+    var host: [Int] = []
+    run_events(var c, var per, 5000 + 1250 + 24 * 1250 * 30, var host)
+    for ch in per.log_ch
+        test.assert(ch < 12 or ch == 36)
+
+@test
+fn test_fewer_than_two_classified_channels_connect_with_all_37()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2014, [0x01, 0, 0, 0, 0]), 0)
+    test.assert_eq(create(c), 0)
+    test.assert_eq(ll_init_chmap(c.init.req), ll_init.CHMAP_ALL)
+
+fn ll_init_chmap(req: Pdu) -> Int
+    var v = 0
+    for k in 0..5
+        v = v | ((req.b[30 + k] as Int) << (8 * k))
+    v
+
+// ── The commands the Controller lists ───────────────────────────────
+
+@test
+fn test_the_supported_commands_list_the_central_commands_and_the_states_the_roles()
+    var c = fresh()
+    let r = run(c, 0x1002, [])
+    let base = 7
+    test.assert_eq(r[base + 26] & 0x30, 0x30)
+    test.assert_eq(r[base + 27] & 0x08, 0x08)
+    // The states: Initiating (bit 6), with advertising (16, 17, 32 to 34), with the
+    // Central role (18, 19, 24, 25, 35 to 37) and with the Peripheral link (41).
+    let s = run(c, 0x201C, [])
+    var states = 0
+    for i in 0..8
+        states = states | (s[7 + i] << (8 * i))
+    for bit in [6, 7, 16, 17, 18, 19, 24, 25, 32, 33, 34, 35, 36, 37, 41]
+        test.assert_eq((states >>> bit) & 1, 1)
+    for bit in [22, 23, 28, 38, 39, 40]
+        test.assert_eq((states >>> bit) & 1, 0)
+    // Without a Link Layer the commands are unknown.
+    var bare = ctl_hci.controller_new(0)
+    for op in [0x200D, 0x200E, 0x2014, 0x2043]
+        test.assert_eq(status_of(bare, op, []), 0x01)
+    // LE Extended Create Connection is octet 37 bit 7 ([Vol 4] Part E, Section 6.27); octet 38 bit 0 is LE Periodic Advertising
+    // Create Sync, which this Controller answers.
+    test.assert_eq((r[base + 37] >>> 7) & 0x01, 0x01)
+    test.assert_eq(r[base + 38] & 0x01, 0x01)
+
+// LE Extended Create Connection [v2] (0x2085, Supported Commands octet 47 bit 0) is the [v1] command behind an Advertising_Handle and a Subevent: both
+// 0xFF is the [v1] command, one of them is Invalid HCI Command Parameters, and both set name a train of Periodic Advertising with Responses, which
+// this Controller does not run (Unsupported Feature or Parameter Value).
+fn ext_params2(handle: Int, sub: Int, phys: Int, sets: [[Int]]) -> [Int]
+    var p: [Int] = [handle, sub]
+    for b in ext_params(0, 0, 0, phys, sets)
+        list.push(p, b)
+    p
+
+@test
+fn test_extended_create_connection_v2_is_the_v1_command_for_a_handle_and_a_subevent_of_0xff()
+    var c = fresh()
+    send(c, 0x1002, [])
+    let _s = ctl_hci.ctl_step(var c)
+    let sup = drain(var c)
+    test.assert_eq(sup[7 + 47] & 0x01, 0x01)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(24, 24, 400)])), 0)
+    test.assert(c.init.enabled)
+    test.assert(c.init.ext)
+    test.assert_eq(c.init.phys, 1)
+    test.assert_eq(c.init.c_max, 24)
+    test.assert_eq(c.init.timeout, 400)
+    test.assert_eq(status_of(c, 0x200E, []), 0)
+    // The sets of two PHYs follow the two octets, in the order of the bits.
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 3, [ext_set(24, 24, 400), ext_set(40, 60, 300)])), 0)
+    test.assert_eq(c.init.x_min, 40)
+    test.assert_eq(c.init.x_timeout, 300)
+    test.assert_eq(status_of(c, 0x200E, []), 0)
+    // One of the two octets 0xFF: Invalid HCI Command Parameters; a train of PAwR: Unsupported Feature or Parameter Value.
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0, 0xFF, 1, [ext_set(24, 24, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 3, 1, [ext_set(24, 24, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(1, 3, 1, [ext_set(24, 24, 400)])), 0x11)
+    test.assert(not c.init.enabled)
+    // The checks of [v1] hold.
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 0, [])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(5, 6, 400)])), 0x12)
+    // A length that is not the sets the PHYs name is Invalid HCI Command Parameters; one command is pending at a time.
+    test.assert_eq(status_of(c, 0x2085, ext_params2(0xFF, 0xFF, 1, [])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(24, 24, 400)])), 0)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(24, 24, 400)])), 0x0C)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400)])), 0x0C)
+
+// ── A program that was away ─────────────────────────────────────────
+
+@test
+fn test_a_link_whose_booking_ran_out_while_the_program_was_away_is_run_again()
+    var c = central_up(5000)
+    // The first event was due at 6250 and its booking covered 3 ms past it.  The
+    // program comes back 20 ms later: the link must still be granted the radio.
+    ctl_hci.ctl_set_time(var c, 6250 + 20000)
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.CLASS_ACL)
+    // The event skips the windows that closed and moves the schedule past now.
+    let skipped = ctl_hci.ctl_conn_catch_up(var c, 0, 6250 + 20000)
+    test.assert(skipped >= 1)
+    test.assert(c.links[0].due > 6250 + 20000)
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.NONE)
+    ctl_hci.ctl_set_time(var c, c.links[0].due)
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.CLASS_ACL)
+
+@test
+fn test_a_peripheral_link_is_run_again_after_the_program_was_away_too()
+    var c = two_links()
+    ctl_hci.ctl_set_time(var c, 9000 + 1250 + 2500 + 5 * 24 * 1250)
+    var picked = ctl_hci.ctl_ll_pick(var c, false)
+    test.assert(picked == ll_arb.CLASS_ACL or picked == ll_arb.CLASS_ACL2)
+    let a = ctl_hci.ctl_conn_catch_up(var c, 1, c.now)
+    test.assert(a >= 1)
+    let b = ctl_hci.ctl_conn_catch_up(var c, 0, c.now)
+    test.assert(b >= 1)
+    test.assert(ll_link.link_live(var c.links[1]))
+
+// ── The second slot as Peripheral, and the seed ─────────────────────
+
+@test
+fn test_data_the_central_sends_on_the_second_link_reaches_the_host_with_its_handle()
+    var c = two_links()
+    var host: [Int] = []
+    host_read(var c, var host)
+    var pdu = data_pdu(ll_data.LLID_START, 5, 0x70)
+    var next = ll_pdu.pdu_new()
+    let _h = rx_fast(c, 1, 2 | ((c.links[1].sn ^ 1) << 2) | (c.links[1].nesn << 3), next)
+    ctl_hci.ctl_conn_rx_slow(var c, 1, var pdu)
+    host_read(var c, var host)
+    let acl = acl_packets(host)
+    test.assert_eq(list.len(acl), 1)
+    test.assert_eq(acl[0][1] | ((acl[0][2] & 0x0F) << 8), 2)
+    test.assert_eq(acl[0][2] >>> 4, 2)
+    test.assert_eq(acl[0][5], 0x70)
+
+@test
+fn test_events_of_the_second_link_wait_for_a_free_slot()
+    var c = two_links()
+    var held: [Int] = []
+    for _ in 0..16
+        let k = ctl_pool.pool_take(var c.pool)
+        if k >= 0
+            list.push(held, k)
+    owe_all_on_slot_1(var c)
+    ctl_hci.ctl_flush_events(var c)
+    test.assert(ll_link.link_owes(var c.links[1], ll_link.EV_UPDATED))
+    for k in held
+        ctl_pool.pool_give(var c.pool, k)
+    for _ in 0..3
+        ctl_hci.ctl_flush_events(var c)
+        let _r = drain(var c)
+    test.assert_eq(c.links[1].owed, 0)
+
+@test
+fn test_seeding_changes_the_access_address_the_next_connection_asks_for()
+    var a = fresh()
+    var b = fresh()
+    ctl_hci.ctl_seed(var b, 123456789)
+    test.assert_eq(create(a), 0)
+    test.assert_eq(create(b), 0)
+    test.assert(ll_init_aa(a.init.req) != ll_init_aa(b.init.req))
+
+// ── LE Extended Create Connection ───────────────────────────────────
+
+// The set of one PHY in LE Extended Create Connection: a scan interval of 100 ms and window of 30 ms
+// (not read for LE 2M), the connection interval range `lo` to `hi`, no latency, the timeout `timeout`.
+fn ext_set(lo: Int, hi: Int, timeout: Int) -> [Int]
+    var p: [Int] = []
+    for v in [160, 48, lo, hi, 0, timeout, 0, 0]
+        for b in le16(v)
+            list.push(p, b)
+    p
+
+// The parameters of LE Extended Create Connection to the peer 0x10..0x15 of `peer_type` with the
+// Initiating_PHYs `phys` and the sets `sets`, one after the other.
+fn ext_params(policy: Int, peer_type: Int, own: Int, phys: Int, sets: [[Int]]) -> [Int]
+    var p: [Int] = [policy, own, peer_type]
+    for i in 0..6
+        list.push(p, 0x10 + i)
+    list.push(p, phys)
+    for set in sets
+        for b in set
+            list.push(p, b)
+    p
+
+fn ext_create(var c: ctl_hci.Controller) -> Int
+    cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400)]))
+
+@test
+fn test_extended_create_connection_enters_the_initiating_state_with_the_sets_of_its_phys()
+    var c = fresh()
+    test.assert_eq(ext_create(var c), 0)
+    test.assert(c.init.enabled)
+    test.assert(c.init.ext)
+    test.assert_eq(c.init.phys, 1)
+    test.assert_eq(c.init.interval, 160)
+    test.assert_eq(c.init.window, 48)
+    test.assert_eq(c.init.c_max, 24)
+    test.assert_eq(c.init.timeout, 400)
+    test.assert_eq(c.init.aux_phy, 0)
+    test.assert_eq((c.init.req.b[24] as Int) | ((c.init.req.b[25] as Int) << 8), 24)
+    // The sets of LE 1M and LE 2M, in the order of the bits.
+    var d = fresh()
+    test.assert_eq(cmd_status(var d, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400), ext_set(40, 60, 300)])), 0)
+    test.assert_eq(d.init.phys, 3)
+    test.assert_eq(d.init.c_max, 24)
+    test.assert_eq(d.init.x_min, 40)
+    test.assert_eq(d.init.x_max, 60)
+    test.assert_eq(d.init.x_timeout, 300)
+    test.assert_eq(d.init.y_timeout, 400)
+    // The state is the same as LE Create Connection's: it takes the scan class and is ended by the cancel.
+    test.assert_eq(ctl_hci.ctl_ll_pick(var d, false), ll_arb.class_scan())
+    test.assert_eq(status_of(d, 0x200E, []), 0)
+    test.assert(not d.init.enabled)
+    // LE Create Connection after it is a state of its own.
+    test.assert_eq(create(d), 0)
+    test.assert(not d.init.ext)
+
+@test
+fn test_extended_create_connection_checks_the_phys_the_sets_and_the_state()
+    var c = fresh()
+    // Initiating_PHYs: none, only LE 2M, a reserved bit: invalid; LE Coded: unsupported by a radio that lacks it.
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 0, [])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 2, [ext_set(24, 24, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 9, [ext_set(24, 24, 400), ext_set(24, 24, 400)])), 0x12)
+    ctl_hci.ctl_set_coded(var c, false)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 5, [ext_set(24, 24, 400), ext_set(24, 24, 400)])), 0x11)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 4, [ext_set(24, 24, 400)])), 0x11)
+    ctl_hci.ctl_set_coded(var c, true)
+    // The set of LE Coded is checked like the others, in the position of the set that scans.
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 4, [ext_set(5, 6, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 5, [ext_set(24, 24, 400), ext_set(5, 6, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 7, [ext_set(24, 24, 400), ext_set(24, 24, 400), ext_set(5, 6, 400)])), 0x12)
+    // The values of a set, of LE 1M and of LE 2M.
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(5, 6, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400), ext_set(5, 6, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(2, 0, 0, 1, [ext_set(24, 24, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 4, 0, 1, [ext_set(24, 24, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 4, 1, [ext_set(24, 24, 400)])), 0x12)
+    // A random own address the Host never set.
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 1, 1, [ext_set(24, 24, 400)])), 0x12)
+    test.assert(not c.init.enabled)
+    // A set missing, a set too many, no parameters.
+    var r = run(c, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400)]))
+    test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
+    r = run(c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400), ext_set(24, 24, 400)]))
+    test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
+    r = run(c, 0x2043, [])
+    test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
+    // Scanning on, or initiating on, disallows it, as it does LE Create Connection.
+    test.assert_eq(status_of(c, 0x200B, [1, 0x10, 0, 0x10, 0, 0, 0]), 0)
+    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0)
+    test.assert_eq(ext_create(var c), 0x0C)
+    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(ext_create(var c), 0)
+    test.assert_eq(ext_create(var c), 0x0C)
+    test.assert_eq(create(c), 0x0C)
+    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0x0C)
+
+@test
+fn test_extended_create_connection_to_a_connected_peer_answers_connection_already_exists()
+    var c = central_up(5000)
+    test.assert(c.links[0].live)
+    // The peer is 0x10..0x15, public, as LE Create Connection's.
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400)])), 0x0B)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(1, 0, 0, 1, [ext_set(24, 24, 400)])), 0x09)
+
+@test
+fn test_extended_create_connection_in_the_list_policy_and_with_a_random_own_address()
+    var c = fresh()
+    test.assert_eq(status_of(c, 0x2005, [0x01, 0x02, 0x03, 0x04, 0x05, 0xC6]), 0)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(1, 0, 1, 1, [ext_set(24, 24, 400)])), 0)
+    test.assert_eq(c.init.policy as Int, 1)
+    test.assert_eq(c.init.addr_type as Int, 1)
+    test.assert_eq(c.init.addr[0] as Int, 0x01)
+    test.assert_eq(ll_pdu.pdu_tx_add(var c.init.req), 1)

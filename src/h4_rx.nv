@@ -1,0 +1,589 @@
+// src/h4_rx.nv — the Controller's side of the HCI UART Transport
+// Layer: the octets the Host sends, cut into HCI packets.
+//
+// [Vol 4] Part A, Section 2: every packet starts with a packet indicator,
+// and the length field in its header says how many octets follow.  The
+// Host sends HCI Command packets (0x01) and HCI ACL Data packets (0x02).
+// A Command packet is kept for the dispatcher.  An ACL Data packet is kept for the
+// connection it names: its payload is at most `LL_ACL_OCTETS`, the 251 octets of the
+// longest data PDU that LE Read Buffer Size reports, and goes out in pieces when the
+// data length in force is shorter.  A longer one is a loss of synchronization, and a
+// packet with no payload carries nothing, so it is read to its last octet and dropped.
+//
+// Section 4: a packet indicator that is not one the Host may send, or a
+// length that is out of range, is a loss of synchronization.  The Controller
+// then tells the Host with a Hardware Error event and discards every octet
+// until the HCI_Reset command appears in the stream, which both resets the
+// Controller and ends the loss.  `h4_feed` answers `FEED_LOST` once, at the
+// octet that shows the loss; the caller sends the event.
+//
+// A build with isochronous channels (`ctl_limits.iso_on()`) also takes HCI ISO Data packets (0x05):
+// their header is the handle with the flags and a 14-bit length, and the payload is kept in the
+// buffer the ACL payload uses (an ISO Data packet and an ACL Data packet are never read at once).
+// Every other build, and the Synchronous Data indicator, are a loss of synchronization like any
+// other.
+//
+// The state is a value with inline storage; no function here allocates.
+
+use ctl_limits
+use std.test
+use hci_frame
+use ll_iso
+
+// The functions below take the reader as a `var` parameter even where they only read
+// it, which passes its address.  A plain parameter is a copy, and a copy of a
+// struct of this size on every call costs time and stack.
+
+// What `h4_feed` found at the octet it was given.
+const FEED_NONE = 0
+const FEED_COMMAND = 1
+const FEED_LOST = 2
+const FEED_DISCARDED = 3
+const FEED_ACL = 4
+const FEED_ISO = 5
+
+// The largest HCI ACL Data packet payload the stream may frame; a longer
+// length field is a loss of synchronization.
+const ACL_OCTETS = 251
+
+// The largest HCI ACL Data packet payload the Controller takes, the
+// LE_ACL_Data_Packet_Length it reports: the payload of a data PDU with the Data
+// Length Extension.  A connection whose data length is shorter takes the packet and
+// sends it in pieces (`ll_link.take_acl`).
+const LL_ACL_OCTETS = 251
+
+// The octets of `acl` before the payload: the room for the 2-octet header of the data PDU
+// the payload goes out in, so that the Link Layer can take the whole buffer as the PDU
+// with one copy (`ll_link.link_queue_acl`).
+const ACL_LEAD = 2
+
+// The reader's states.
+const RX_IDLE = 0
+const RX_HEADER = 1
+const RX_COMMAND_PARAMETERS = 2
+const RX_DATA = 3
+const RX_LOST = 4
+
+// The octets of an HCI Command header (the opcode and the length) and of
+// an HCI ACL Data header (the handle with its flags, and the length).
+const COMMAND_HEADER = 3
+const ACL_HEADER = 4
+
+// The longest HCI Command packet after its packet indicator: the header and
+// 255 octets of parameters.
+const COMMAND_OCTETS = 258
+
+// The HCI_Reset command after its packet indicator is the opcode 0x0C03 and
+// a length of zero.  A lost stream is read for the indicator and these three
+// octets.
+const RESET_OPCODE_LOW = 0x03
+const RESET_OPCODE_HIGH = 0x0C
+
+// `cmd` holds the Command packet being read, without its indicator: the
+// opcode, the length, then the parameters.  `ready` is set when it is
+// complete and stays set until the caller takes it.  `header` holds the
+// ACL header octets and `acl` the payload of the ACL packet read, `acl_n`
+// the octets of it kept.  `seen` counts the octets of the header read, `left`
+// the octets of the payload still to come, and `match_at` how much of the
+// Reset command a lost stream has shown.  The four counters are for a
+// caller that reports them.
+@value
+struct H4Rx
+    state: u8
+    kind: u8
+    seen: u8
+    match_at: u8
+    ready: Bool
+    left: u16
+    cmd: Vec[u8; 258]
+    header: Vec[u8; 4]
+    acl: Vec[u8; 260]
+    acl_n: u8
+    commands: Int
+    discarded: Int
+    lost: Int
+
+// A reader waiting for a packet indicator.
+@tier(embedded)
+fn h4_new() -> H4Rx
+    H4Rx {
+        state: RX_IDLE as u8, kind: 0, seen: 0, match_at: 0, ready: false, left: 0,
+        cmd: Vec.new(), header: Vec.new(), acl: init_acl(), acl_n: 0,
+        commands: 0, discarded: 0, lost: 0 }
+
+// The octets of the ACL payload buffer, zero.
+@tier(embedded)
+fn init_acl() -> Vec[u8; 260]
+    var a: Vec[u8; 260] = Vec.new()
+    for _ in 0..260
+        let _a = a.push(0)
+    a
+
+// Back to waiting for a packet indicator, with no packet kept.  The
+// counters stay.
+@tier(embedded)
+fn h4_reset(var r: H4Rx)
+    r.state = RX_IDLE as u8
+    r.kind = 0
+    r.seen = 0
+    r.match_at = 0
+    r.ready = false
+    r.left = 0
+    r.acl_n = 0
+    r.cmd.clear()
+    r.header.clear()
+
+// The connection handle of the ACL or ISO packet read last: the low 12 bits of the
+// first two octets of its header.
+@tier(embedded)
+fn h4_acl_handle(var r: H4Rx) -> Int
+    ((r.header[0] as Int) | ((r.header[1] as Int) << 8)) & 0x0FFF
+
+// Its Packet_Boundary_Flag: 0 and 2 start an L2CAP message, 1 continues one.
+@tier(embedded)
+fn h4_acl_pb(var r: H4Rx) -> Int
+    ((r.header[1] as Int) >>> 4) & 3
+
+// The Time_Stamp flag of the ISO Data packet read last.
+@tier(embedded)
+fn h4_iso_ts(var r: H4Rx) -> Bool
+    ((r.header[1] as Int) & 0x40) != 0
+
+// The octets of its payload, which start at `ACL_LEAD` in `acl`.
+@tier(embedded)
+fn h4_acl_len(var r: H4Rx) -> Int
+    r.acl_n as Int
+
+// Whether the reader is inside a packet: the rest of it follows.
+@tier(embedded)
+fn h4_in_packet(var r: H4Rx) -> Bool
+    let st = r.state as Int
+    st == RX_HEADER or st == RX_COMMAND_PARAMETERS or st == RX_DATA
+
+// Whether the octet the reader takes next is the last of an HCI ISO Data packet, which the Controller then cuts into payloads and puts in the
+// ring of its stream (`ctl_hci.iso_to_cis`): work of hundreds of microseconds for a packet of 250 octets, not of one octet.
+@no_alloc
+@tier(embedded)
+fn h4_iso_last(var r: H4Rx) -> Bool
+    (r.state as Int) == RX_DATA and (r.kind as Int) == hci_frame.H4_PKT_ISO and (r.left as Int) == 1
+
+// The octets the packet has when the last one is taken: those read and that one.
+@no_alloc
+@tier(embedded)
+fn h4_iso_octets(var r: H4Rx) -> Int
+    (r.acl_n as Int) + 1
+
+// Whether the reader is discarding octets until the Reset command.
+@tier(embedded)
+fn h4_is_lost(var r: H4Rx) -> Bool
+    (r.state as Int) == RX_LOST
+
+// Whether a complete Command packet waits in `cmd`.
+@tier(embedded)
+fn h4_has_command(var r: H4Rx) -> Bool
+    r.ready
+
+// The opcode of the packet in `cmd`.
+@tier(embedded)
+fn h4_opcode(var r: H4Rx) -> Int
+    (r.cmd[0] as Int) | ((r.cmd[1] as Int) << 8)
+
+// The number of parameter octets of the packet in `cmd`.
+@tier(embedded)
+fn h4_param_len(var r: H4Rx) -> Int
+    r.cmd[2] as Int
+
+// Parameter octet `i` of the packet in `cmd`, -1 past its end.
+@tier(embedded)
+fn h4_param(var r: H4Rx, i: Int) -> Int
+    if i < 0 or i >= h4_param_len(var r)
+        -1
+    else
+        r.cmd[COMMAND_HEADER + i] as Int
+
+// The Command packet in `cmd` has been dispatched: wait for the next.
+@tier(embedded)
+fn h4_done(var r: H4Rx)
+    r.ready = false
+    r.cmd.clear()
+    r.commands = r.commands + 1
+
+// The stream is lost: count it and wait for the Reset command.
+@tier(embedded)
+fn lose(var r: H4Rx) -> Int
+    r.state = RX_LOST as u8
+    r.match_at = 0
+    r.ready = false
+    r.cmd.clear()
+    r.header.clear()
+    r.lost = r.lost + 1
+    FEED_LOST
+
+// The Command packet is complete.
+@tier(embedded)
+fn complete(var r: H4Rx) -> Int
+    r.state = RX_IDLE as u8
+    r.ready = true
+    FEED_COMMAND
+
+// Read the octets of a lost stream for the Reset command.  Only the packet
+// indicator can start a match, so a mismatch falls back to the start, or to
+// the first octet when the mismatching octet is itself an indicator.
+@tier(embedded)
+fn scan_for_reset(var r: H4Rx, b: Int) -> Int
+    let m = r.match_at as Int
+    var next = 0
+    if b == hci_frame.H4_PKT_COMMAND
+        next = 1
+    if m == 1 and b == RESET_OPCODE_LOW
+        next = 2
+    if m == 2 and b == RESET_OPCODE_HIGH
+        next = 3
+    if m == 3 and b == 0
+        r.cmd.clear()
+        let _a = r.cmd.push(RESET_OPCODE_LOW as u8)
+        let _b = r.cmd.push(RESET_OPCODE_HIGH as u8)
+        let _c = r.cmd.push(0)
+        r.match_at = 0
+        return complete(var r)
+    r.match_at = next as u8
+    FEED_NONE
+
+// A packet indicator.
+@tier(embedded)
+fn begin_packet(var r: H4Rx, b: Int) -> Int
+    if b == hci_frame.H4_PKT_COMMAND
+        r.kind = hci_frame.H4_PKT_COMMAND as u8
+        r.seen = 0
+        r.cmd.clear()
+        r.state = RX_HEADER as u8
+        return FEED_NONE
+    if b == hci_frame.H4_PKT_ACL or (b == hci_frame.H4_PKT_ISO and ctl_limits.iso_on())
+        r.kind = b as u8
+        r.seen = 0
+        r.acl_n = 0
+        r.header.clear()
+        r.state = RX_HEADER as u8
+        return FEED_NONE
+    lose(var r)
+
+// An octet of a Command header.
+@tier(embedded)
+fn command_header_octet(var r: H4Rx, b: Int) -> Int
+    let _a = r.cmd.push(b as u8)
+    r.seen = r.seen + 1
+    if (r.seen as Int) < COMMAND_HEADER
+        return FEED_NONE
+    if b == 0
+        return complete(var r)
+    r.left = b as u16
+    r.state = RX_COMMAND_PARAMETERS as u8
+    FEED_NONE
+
+// An octet of an ACL Data header.  The payload follows.
+@tier(embedded)
+fn acl_header_octet(var r: H4Rx, b: Int) -> Int
+    let _a = r.header.push(b as u8)
+    r.seen = r.seen + 1
+    if (r.seen as Int) < ACL_HEADER
+        return FEED_NONE
+    var n = (r.header[2] as Int) | ((r.header[3] as Int) << 8)
+    if (r.kind as Int) == hci_frame.H4_PKT_ISO
+        n = n & 0x3FFF
+    if n > ACL_OCTETS
+        return lose(var r)
+    if n == 0
+        r.state = RX_IDLE as u8
+        r.discarded = r.discarded + 1
+        return FEED_DISCARDED
+    r.left = n as u16
+    r.state = RX_DATA as u8
+    FEED_NONE
+
+// Give the reader the next octet of the stream.  The answer says what the
+// octet completed: `FEED_COMMAND` when a Command packet is ready (the
+// caller reads it with `h4_opcode` and `h4_param`, and ends it with
+// `h4_done`), `FEED_DISCARDED` when an ACL Data packet ended, `FEED_LOST`
+// when the stream was lost at this octet, `FEED_NONE` otherwise.  While a
+// Command packet waits, the caller does not feed: the octet would start
+// the next packet over the one the dispatcher has not read.
+@satisfies("REQ-BLE-CTL-001")
+@no_alloc
+@tier(embedded)
+fn h4_feed(var r: H4Rx, b: Int) -> Int
+    let st = r.state as Int
+    if st == RX_LOST
+        return scan_for_reset(var r, b)
+    if st == RX_IDLE
+        return begin_packet(var r, b)
+    if st == RX_HEADER
+        if (r.kind as Int) == hci_frame.H4_PKT_COMMAND
+            return command_header_octet(var r, b)
+        return acl_header_octet(var r, b)
+    if st == RX_COMMAND_PARAMETERS
+        let _a = r.cmd.push(b as u8)
+        r.left = r.left - 1
+        if r.left == 0
+            return complete(var r)
+        return FEED_NONE
+    // RX_DATA
+    r.acl[ACL_LEAD + (r.acl_n as Int)] = b as u8
+    r.acl_n = r.acl_n + 1
+    r.left = r.left - 1
+    if r.left == 0
+        r.state = RX_IDLE as u8
+        if (r.kind as Int) == hci_frame.H4_PKT_ISO
+            return FEED_ISO
+        return FEED_ACL
+    FEED_NONE
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_capacities_match_the_constants()
+    let r = h4_new()
+    test.assert_eq(r.cmd.capacity(), COMMAND_OCTETS)
+    test.assert_eq(r.header.capacity(), ACL_HEADER)
+    test.assert_eq(r.acl.capacity(), 260)
+    test.assert_eq(LL_ACL_OCTETS, ACL_OCTETS)
+    test.assert(ACL_LEAD + LL_ACL_OCTETS <= r.acl.capacity())
+
+@test
+fn test_the_reader_says_when_it_is_inside_a_packet()
+    var r = h4_new()
+    test.assert(not h4_in_packet(var r))
+    let _a = h4_feed(var r, 0x02)
+    test.assert(h4_in_packet(var r))
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x00)
+    let _d = h4_feed(var r, 0x02)
+    let _e = h4_feed(var r, 0x00)
+    test.assert(h4_in_packet(var r))
+    let _f = h4_feed(var r, 0x11)
+    test.assert_eq(h4_feed(var r, 0x22), FEED_ACL)
+    test.assert(not h4_in_packet(var r))
+    let _g = h4_feed(var r, 0x01)
+    let _h = h4_feed(var r, 0x01)
+    let _i = h4_feed(var r, 0x0C)
+    let _j = h4_feed(var r, 0x02)
+    test.assert(h4_in_packet(var r))
+    let _k = h4_feed(var r, 0x04)
+    test.assert_eq(h4_feed(var r, 0x05), FEED_COMMAND)
+    test.assert(not h4_in_packet(var r))
+    var q = h4_new()
+    let _l = h4_feed(var q, 0x04)
+    test.assert(not h4_in_packet(var q))
+
+@test
+fn test_a_command_without_parameters_is_ready_at_its_length_octet()
+    var r = h4_new()
+    test.assert_eq(h4_feed(var r, 0x01), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x03), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x0C), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+    test.assert(h4_has_command(var r))
+    test.assert_eq(h4_opcode(var r), 0x0C03)
+    test.assert_eq(h4_param_len(var r), 0)
+    h4_done(var r)
+    test.assert(not h4_has_command(var r))
+    test.assert_eq(r.commands, 1)
+
+@test
+fn test_a_command_with_parameters_is_ready_at_its_last_octet()
+    var r = h4_new()
+    let wire = [0x01, 0x01, 0x0C, 0x08, 1, 2, 3, 4, 5, 6, 7, 8]
+    var last = FEED_NONE
+    for i in 0..11
+        last = h4_feed(var r, wire[i])
+        test.assert_eq(last, FEED_NONE)
+    test.assert_eq(h4_feed(var r, wire[11]), FEED_COMMAND)
+    test.assert_eq(h4_opcode(var r), 0x0C01)
+    test.assert_eq(h4_param_len(var r), 8)
+    test.assert_eq(h4_param(var r, 0), 1)
+    test.assert_eq(h4_param(var r, 7), 8)
+    test.assert_eq(h4_param(var r, 8), -1)
+    test.assert_eq(h4_param(var r, -1), -1)
+
+@test
+fn test_the_longest_command_fits()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x01)
+    let _b = h4_feed(var r, 0x00)
+    let _c = h4_feed(var r, 0xFC)
+    let _d = h4_feed(var r, 255)
+    for i in 0..254
+        test.assert_eq(h4_feed(var r, i & 0xFF), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x55), FEED_COMMAND)
+    test.assert_eq(h4_param_len(var r), 255)
+    test.assert_eq(h4_param(var r, 254), 0x55)
+    test.assert_eq(h4_param(var r, 253), 253)
+
+@test
+fn test_commands_follow_one_another()
+    var r = h4_new()
+    for round in 0..3
+        let _a = h4_feed(var r, 0x01)
+        let _b = h4_feed(var r, round)
+        let _c = h4_feed(var r, 0x20)
+        test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+        test.assert_eq(h4_opcode(var r), 0x2000 + round)
+        h4_done(var r)
+    test.assert_eq(r.commands, 3)
+
+@test
+fn test_an_acl_packet_that_fits_a_data_pdu_is_kept_for_its_connection()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x02)
+    let _b = h4_feed(var r, 0x41)
+    let _c = h4_feed(var r, 0x20)
+    let _d = h4_feed(var r, 0x03)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 1), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 2), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 3), FEED_ACL)
+    test.assert_eq(h4_acl_handle(var r), 0x0041)
+    test.assert_eq(h4_acl_pb(var r), 2)
+    test.assert_eq(h4_acl_len(var r), 3)
+    test.assert_eq(r.acl[ACL_LEAD] as Int, 1)
+    test.assert_eq(r.acl[ACL_LEAD + 2] as Int, 3)
+    test.assert_eq(r.discarded, 0)
+    // The stream is back at a packet boundary.
+    let _e = h4_feed(var r, 0x01)
+    let _f = h4_feed(var r, 0x03)
+    let _g = h4_feed(var r, 0x0C)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+
+@test
+fn test_an_acl_packet_of_the_largest_data_pdu_is_kept()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x02)
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x10)
+    let _d = h4_feed(var r, LL_ACL_OCTETS)
+    let _e = h4_feed(var r, 0x00)
+    for i in 0..(LL_ACL_OCTETS - 1)
+        test.assert_eq(h4_feed(var r, i), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 250), FEED_ACL)
+    test.assert_eq(h4_acl_len(var r), 251)
+    test.assert_eq(h4_acl_pb(var r), 1)
+    test.assert_eq(r.acl[ACL_LEAD + 26] as Int, 26)
+    test.assert_eq(r.acl[ACL_LEAD + 250] as Int, 250)
+    test.assert_eq(r.discarded, 0)
+    // The stream is back at a packet boundary.
+    let _f = h4_feed(var r, 0x01)
+    let _g = h4_feed(var r, 0x03)
+    let _h = h4_feed(var r, 0x0C)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+
+@test
+fn test_an_acl_packet_without_data_ends_at_its_header()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x02)
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x00)
+    let _d = h4_feed(var r, 0x00)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_DISCARDED)
+
+@test
+fn test_the_largest_acl_packet_is_accepted_and_one_more_octet_is_not()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x02)
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x00)
+    let _d = h4_feed(var r, ACL_OCTETS)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_NONE)
+    test.assert(not h4_is_lost(var r))
+    var q = h4_new()
+    let _e = h4_feed(var q, 0x02)
+    let _f = h4_feed(var q, 0x01)
+    let _g = h4_feed(var q, 0x00)
+    let _h = h4_feed(var q, ACL_OCTETS + 1)
+    test.assert_eq(h4_feed(var q, 0x00), FEED_LOST)
+    test.assert(h4_is_lost(var q))
+
+@test
+fn test_an_acl_length_above_eight_bits_is_read_from_both_octets()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x02)
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x00)
+    let _d = h4_feed(var r, 0x00)
+    test.assert_eq(h4_feed(var r, 0x01), FEED_LOST)
+
+@test
+fn test_an_indicator_the_host_may_not_send_loses_the_stream()
+    for ind in [0x00, 0x03, 0x04, 0x06, 0xFF]
+        var r = h4_new()
+        test.assert_eq(h4_feed(var r, ind), FEED_LOST)
+        test.assert(h4_is_lost(var r))
+        test.assert_eq(r.lost, 1)
+    // ISO Data is one the Host may send to a build that has isochronous channels.
+    var q = h4_new()
+    if ctl_limits.iso_on()
+        test.assert_eq(h4_feed(var q, 0x05), FEED_NONE)
+        test.assert(h4_in_packet(var q))
+    else
+        test.assert_eq(h4_feed(var q, 0x05), FEED_LOST)
+
+@test
+fn test_a_lost_stream_discards_everything_but_reset()
+    var r = h4_new()
+    test.assert_eq(h4_feed(var r, 0x04), FEED_LOST)
+    for b in [0x01, 0x01, 0x0C, 0x00, 0x02, 0x00, 0x00, 0x03, 0x0C]
+        test.assert_eq(h4_feed(var r, b), FEED_NONE)
+        test.assert(not h4_has_command(var r))
+    test.assert(h4_is_lost(var r))
+
+@test
+fn test_reset_in_a_lost_stream_ends_the_loss()
+    var r = h4_new()
+    let _x = h4_feed(var r, 0x09)
+    for b in [0x55, 0x01, 0x03, 0x0C]
+        test.assert_eq(h4_feed(var r, b), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+    test.assert(not h4_is_lost(var r))
+    test.assert_eq(h4_opcode(var r), 0x0C03)
+    test.assert_eq(h4_param_len(var r), 0)
+    h4_done(var r)
+    // A command after it is read as usual.
+    let _a = h4_feed(var r, 0x01)
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x10)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+    test.assert_eq(h4_opcode(var r), 0x1001)
+
+@test
+fn test_reset_is_found_after_a_partial_match()
+    var r = h4_new()
+    let _x = h4_feed(var r, 0x07)
+    // 01 03 01 03 0C 00: the second indicator restarts the match.
+    for b in [0x01, 0x03, 0x01, 0x03, 0x0C]
+        test.assert_eq(h4_feed(var r, b), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
+    // 01 03 0C 01 00: not a reset, and the 01 starts a new match.
+    var q = h4_new()
+    let _y = h4_feed(var q, 0x07)
+    for b in [0x01, 0x03, 0x0C, 0x01, 0x00]
+        test.assert_eq(h4_feed(var q, b), FEED_NONE)
+    test.assert(h4_is_lost(var q))
+
+@test
+fn test_parameter_octets_equal_to_an_indicator_do_not_end_a_command()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x01)
+    let _b = h4_feed(var r, 0x01)
+    let _c = h4_feed(var r, 0x0C)
+    let _d = h4_feed(var r, 0x08)
+    for b in [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04]
+        test.assert_eq(h4_feed(var r, b), FEED_NONE)
+    test.assert_eq(h4_feed(var r, 0x04), FEED_COMMAND)
+    test.assert_eq(h4_param(var r, 0), 4)
+
+@test
+fn test_reset_clears_the_state_and_keeps_the_counters()
+    var r = h4_new()
+    let _a = h4_feed(var r, 0x04)
+    h4_reset(var r)
+    test.assert(not h4_is_lost(var r))
+    test.assert_eq(r.lost, 1)
+    test.assert_eq(h4_feed(var r, 0x01), FEED_NONE)

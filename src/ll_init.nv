@@ -1,0 +1,1224 @@
+// src/ll_init.nv — the Initiating state of the Link Layer: the scan
+// windows it listens in, the filter policy, the judgement of every advertising
+// PDU it receives, and the CONNECT_IND it sends.
+//
+// [Vol 6] Part B, Section 4.4.4.  An initiator listens for scanWindow every
+// scanInterval, on the next advertising channel each window, as a scanner does.
+// A connectable PDU (ADV_IND, or ADV_DIRECT_IND that names the initiator) from the
+// device the filter policy lets through is answered with a CONNECT_IND, T_IFS
+// after it.  The Link Layer then leaves the Initiating state and enters the
+// Connection state as Central (`ll_link.link_open_central`).
+//
+// The initiator makes the CONNECT_IND when it is enabled: its address as InitA, a
+// random access address, a random CRC seed, the transmit window, the connection
+// parameters the Host gave, the channel map, a random hop increment and the sleep
+// clock accuracy class of this Controller.  Answering an advertisement only
+// patches the advertiser's address and its type into the PDU, so that the
+// judgement fits the time T_IFS leaves.
+//
+// This module holds no radio.  A caller that owns a radio asks `init_in_window`
+// and `init_channel` where the windows are, hands every PDU it received to
+// `init_decide`, and reports the CONNECT_IND on air with `init_sent`.
+//
+// The state is a value with inline storage; no function here allocates.
+//
+// Satisfies: REQ-BLE-CTL-021.
+
+use std.test
+use ll_pdu
+use ll_adv
+use ll_phy
+
+// The functions below take the state as a `var` parameter even where they only read
+// it, which passes its address.  A plain parameter is a copy, and a copy of a
+// struct of this size on every call costs time and stack.
+
+// The limits of the scan interval and window in units of 0.625 ms, and of the
+// connection parameters in the units of LE Create Connection ([Vol 4] Part E,
+// Section 7.8.12).
+const SCAN_UNIT_MIN = 0x0004
+const SCAN_UNIT_MAX = 0x4000
+const CONN_INTERVAL_MIN = 6
+const CONN_INTERVAL_MAX = 3200
+const LATENCY_MAX = 499
+const TIMEOUT_MIN = 10
+const TIMEOUT_MAX = 3200
+
+// Initiator_Filter_Policy values this Controller serves: the peer address given,
+// and the devices of the Filter Accept List.
+const POLICY_PEER = 0
+const POLICY_LIST = 1
+
+// What `init_decide` found.
+const ACT_CONNECT = 1
+
+// The transmit window the CONNECT_IND asks for, in units of 1.25 ms: the Central
+// sends at the start of it, so a window of 2 only gives the Peripheral time to
+// wake.
+const WIN_SIZE = 2
+
+// The sleep clock accuracy class of this Controller's clock, 5 for 31 to 50 ppm
+// ([Vol 6] Part B, Table 2.1), which the CONNECT_IND carries.
+const SCA_CLASS = 5
+
+// The channel map of a new connection when the Host has classified none: the 37
+// data channels.
+const CHMAP_ALL = 0x1FFFFFFFFF
+
+// The access address the advertising channels use.
+const ADV_ACCESS_ADDRESS = 0x8E89BED6
+
+// `enabled` says the Controller is in the Initiating state.  `interval`,
+// `window`, `policy`, `peer_type`, `peer` and `own` are the parameters of LE Create
+// Connection (interval and window in units of 0.625 ms), `addr` and `addr_type`
+// the initiator's address of the running state.  The connection parameters are
+// `c_min`, `c_max`, `latency` and `timeout`.  `start` is the time the state was
+// entered, the start of the first window.  `rng` makes the random numbers of the
+// CONNECT_IND.  `req` is the CONNECT_IND; `sent` says it went on air.  The last
+// counters are for a caller that reports them.
+//
+// LE Extended Create Connection ([Vol 4] Part E, Section 7.8.66) sets `ext` and `phys`, the
+// Initiating_PHYs as a mask (bit 0 LE 1M, bit 1 LE 2M, bit 2 LE Coded).  LE Coded has a set of its own: the
+// connection parameters `z_*` and the scan interval and window `k_interval` and `k_window`, which take turns with
+// those of LE 1M in each interval when both PHYs are named (`both_phys`), the interval being that of LE 1M; when LE
+// Coded is the only scanning PHY the fields above hold its scan interval and window.  The connection parameters of LE 1M
+// are the fields above (`y_*` keeps them while a set of LE 2M is in use) and those of LE 2M
+// are `x_*`; the set that applies is the one of the PHY of the advertising packet the
+// connection is made from (`init_use_phy`).  `aux_phy` is that PHY (`ll_phy.PHY_1M` or
+// `PHY_2M`) when the CONNECT_IND goes out as an AUX_CONNECT_REQ on the secondary channel, 0
+// when it answers a legacy advertisement on the primary channel.  The `aux_*` counters are
+// for a caller that reports them.
+@value
+struct Init
+    enabled: Bool
+    interval: Int
+    window: Int
+    policy: u8
+    peer_type: u8
+    peer: Vec[u8; 6]
+    own: u8
+    addr: Vec[u8; 6]
+    addr_type: u8
+    c_min: Int
+    c_max: Int
+    latency: Int
+    timeout: Int
+    start: Int
+    rng: Int
+    req: Pdu
+    sent: Bool
+    seen: Int
+    filtered: Int
+    connects: Int
+    cancels: Int
+    ext: Bool
+    phys: Int
+    aux_phy: Int
+    y_min: Int
+    y_max: Int
+    y_latency: Int
+    y_timeout: Int
+    x_min: Int
+    x_max: Int
+    x_latency: Int
+    x_timeout: Int
+    z_min: Int
+    z_max: Int
+    z_latency: Int
+    z_timeout: Int
+    k_interval: Int
+    k_window: Int
+    aux_seen: Int
+    aux_followed: Int
+    aux_skipped: Int
+    aux_missed: Int
+    aux_rsp_missed: Int
+    aux_connects: Int
+
+// An initiator in its power-on state: off.
+@tier(embedded)
+fn init_new() -> Init
+    var i = Init {
+        enabled: false, interval: 0, window: 0, policy: 0, peer_type: 0, peer: Vec.new(),
+        own: 0, addr: Vec.new(), addr_type: 0, c_min: 0, c_max: 0, latency: 0, timeout: 0,
+        start: 0, rng: 0x2545F491, req: ll_pdu.pdu_new(), sent: false, seen: 0,
+        filtered: 0, connects: 0, cancels: 0, ext: false, phys: 1, aux_phy: 0,
+        y_min: 0, y_max: 0, y_latency: 0, y_timeout: 0, x_min: 0, x_max: 0, x_latency: 0, x_timeout: 0,
+        z_min: 0, z_max: 0, z_latency: 0, z_timeout: 0, k_interval: 0, k_window: 0,
+        aux_seen: 0, aux_followed: 0, aux_skipped: 0, aux_missed: 0, aux_rsp_missed: 0, aux_connects: 0 }
+    for _ in 0..6
+        let _a = i.peer.push(0)
+        let _b = i.addr.push(0)
+    i
+
+// The state a Reset restores: initiating off.  The generator and the counters
+// stay.
+@tier(embedded)
+fn init_reset(var i: Init)
+    i.enabled = false
+    i.sent = false
+
+// Seed the generator of the access address, the CRC seed and the hop.
+@tier(embedded)
+fn init_seed(var i: Init, seed: Int)
+    i.rng = ll_adv.rng_step(seed ^ 0x2545F491)
+
+// ── The command ─────────────────────────────────────────────────────
+
+// The Status of LE Create Connection for the values given: Success (0),
+// Invalid HCI Command Parameters (0x12) for a value out of range, a window longer
+// than the interval, a minimum interval above the maximum, a supervision timeout
+// that the interval and latency do not leave twice the time of one event in, or
+// a minimum connection event length above the maximum; or Unsupported Feature
+// or Parameter Value (0x11) for an address type or filter policy that needs the
+// resolving list.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn init_params_status(interval: Int, window: Int, policy: Int, peer_type: Int, own: Int, c_min: Int, c_max: Int, latency: Int, timeout: Int, ce_min: Int, ce_max: Int) -> Int
+    if interval < SCAN_UNIT_MIN or interval > SCAN_UNIT_MAX
+        return 0x12
+    if window < SCAN_UNIT_MIN or window > SCAN_UNIT_MAX or window > interval
+        return 0x12
+    if policy > 1
+        return 0x12
+    if peer_type > 3 or own > 3
+        return 0x12
+    conn_params_status(c_min, c_max, latency, timeout, ce_min, ce_max)
+
+// The Status for the connection parameters alone (the last six of LE Create Connection, and
+// the set of each PHY of LE Extended Create Connection): 0, or Invalid HCI Command
+// Parameters (0x12).
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn conn_params_status(c_min: Int, c_max: Int, latency: Int, timeout: Int, ce_min: Int, ce_max: Int) -> Int
+    if c_min < CONN_INTERVAL_MIN or c_max > CONN_INTERVAL_MAX or c_min > c_max
+        return 0x12
+    if latency > LATENCY_MAX
+        return 0x12
+    if timeout < TIMEOUT_MIN or timeout > TIMEOUT_MAX or timeout * 4 <= (1 + latency) * c_max
+        return 0x12
+    if ce_min > ce_max
+        return 0x12
+    0
+
+// Enter the Initiating state at `now`, with the parameters of the command and
+// the initiator's address `addr` of `addr_type`.  The channel map of the
+// connection is `chmap`; `avoid_a` and `avoid_b` are access addresses of
+// connections that exist, which the new one differs from.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn init_enable(var i: Init, now: Int, interval: Int, window: Int, policy: Int, peer_type: Int, var peer: Vec[u8; 6], var addr: Vec[u8; 6], addr_type: Int, c_min: Int, c_max: Int, latency: Int, timeout: Int, chmap: Int, avoid_a: Int, avoid_b: Int)
+    i.interval = interval
+    i.window = window
+    i.policy = policy as u8
+    i.peer_type = (peer_type & 1) as u8
+    for k in 0..6
+        i.peer[k] = peer[k]
+        i.addr[k] = addr[k]
+    i.addr_type = addr_type as u8
+    i.c_min = c_min
+    i.c_max = c_max
+    i.latency = latency
+    i.timeout = timeout
+    i.start = now
+    i.sent = false
+    i.enabled = true
+    i.ext = false
+    i.phys = 1
+    i.aux_phy = 0
+    i.rng = ll_adv.rng_step(i.rng ^ (now & 0xFFFFFFFF))
+    prepare(var i, chmap, avoid_a, avoid_b)
+
+// The state `init_enable` entered is one of LE Extended Create Connection: the advertising
+// PDUs of the extended kind are followed to their secondary channel for the PHYs of the mask
+// `phys` (bit 0 LE 1M, bit 1 LE 2M).  The set of LE 1M is the one `init_enable` took;
+// `x_min` to `x_timeout` are the connection parameters of LE 2M.
+@satisfies("REQ-BLE-CTL-080")
+@tier(embedded)
+fn init_ext_enable(var i: Init, phys: Int, x_min: Int, x_max: Int, x_latency: Int, x_timeout: Int)
+    i.ext = true
+    i.phys = phys
+    i.y_min = i.c_min
+    i.y_max = i.c_max
+    i.y_latency = i.latency
+    i.y_timeout = i.timeout
+    i.x_min = x_min
+    i.x_max = x_max
+    i.x_latency = x_latency
+    i.x_timeout = x_timeout
+
+// The state is one of LE Extended Create Connection with LE Coded among the PHYs: `z_min` to `z_timeout` are the connection
+// parameters of LE Coded, `k_interval` and `k_window` its scan interval and window.
+@satisfies("REQ-BLE-CTL-092")
+@tier(embedded)
+fn init_coded_enable(var i: Init, z_min: Int, z_max: Int, z_latency: Int, z_timeout: Int, k_interval: Int, k_window: Int)
+    i.z_min = z_min
+    i.z_max = z_max
+    i.z_latency = z_latency
+    i.z_timeout = z_timeout
+    i.k_interval = k_interval
+    i.k_window = k_window
+
+// Leave the Initiating state.
+@tier(embedded)
+fn init_disable(var i: Init)
+    i.enabled = false
+
+// ── The windows ─────────────────────────────────────────────────────
+
+// The microseconds of the interval and of the window.
+@tier(embedded)
+fn init_interval_us(var i: Init) -> Int
+    i.interval * ll_adv.UNIT_US
+
+@tier(embedded)
+fn init_window_us(var i: Init) -> Int
+    i.window * ll_adv.UNIT_US
+
+// Whether the initiator scans on LE 1M and on LE Coded, which take turns in each interval.
+@tier(embedded)
+fn both_phys(var i: Init) -> Bool
+    i.ext and (i.phys & 1) != 0 and (i.phys & 4) != 0
+
+// The microseconds of the first window of an interval (LE 1M when the initiator takes turns) and of all it listens.
+@tier(embedded)
+fn init_first_us(var i: Init) -> Int
+    if both_phys(i)
+        return ll_phy.split_first(init_interval_us(var i), init_window_us(var i), i.k_window * ll_adv.UNIT_US)
+    init_window_us(var i)
+
+@tier(embedded)
+fn init_listen_us(var i: Init) -> Int
+    if both_phys(i)
+        return init_first_us(var i) + ll_phy.split_second(init_interval_us(var i), init_window_us(var i), i.k_window * ll_adv.UNIT_US)
+    init_window_us(var i)
+
+// The PHY the window `now` is in or follows listens on: LE Coded for an initiator of LE Coded alone and in the second window of
+// one that takes turns, else LE 1M.
+@satisfies("REQ-BLE-CTL-092")
+@tier(embedded)
+fn init_phy(var i: Init, now: Int) -> Int
+    if not i.ext or (i.phys & 4) == 0
+        return ll_phy.PHY_1M
+    if (i.phys & 1) == 0
+        return ll_phy.PHY_CODED
+    if now < i.start
+        return ll_phy.PHY_1M
+    if ((now - i.start) % init_interval_us(var i)) < init_first_us(var i)
+        return ll_phy.PHY_1M
+    ll_phy.PHY_CODED
+
+// The number of the window `now` is in or follows, counted from 0.
+@tier(embedded)
+fn init_index(var i: Init, now: Int) -> Int
+    if now < i.start
+        return 0
+    (now - i.start) / init_interval_us(var i)
+
+// Whether `now` is inside a window.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn init_in_window(var i: Init, now: Int) -> Bool
+    if not i.enabled or now < i.start
+        return false
+    ((now - i.start) % init_interval_us(var i)) < init_listen_us(var i)
+
+// The channel of the window `now` is in or follows: each window listens on the
+// next advertising channel.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn init_channel(var i: Init, now: Int) -> Int
+    37 + (init_index(var i, now) % 3)
+
+// The end of the window `now` is in or follows.
+@tier(embedded)
+fn init_window_end(var i: Init, now: Int) -> Int
+    var len = init_listen_us(var i)
+    if both_phys(i) and (now - i.start) % init_interval_us(var i) < init_first_us(var i)
+        len = init_first_us(var i)
+    i.start + init_index(var i, now) * init_interval_us(var i) + len
+
+// The start of the next window at or after `now`; `now` itself inside a window.
+@tier(embedded)
+fn init_next_start(var i: Init, now: Int) -> Int
+    if now < i.start
+        return i.start
+    if init_in_window(var i, now)
+        return now
+    i.start + (init_index(var i, now) + 1) * init_interval_us(var i)
+
+// ── The access address and the other random numbers ─────────────────
+
+// One step of the generator, the 32-bit value.
+@tier(embedded)
+fn draw(var i: Init) -> Int
+    i.rng = ll_adv.rng_step(i.rng)
+    i.rng
+
+// The number of bits in which `a` and `b` differ.
+@tier(embedded)
+fn bits_differ(a: Int, b: Int) -> Int
+    var n = 0
+    let x = (a ^ b) & 0xFFFFFFFF
+    for k in 0..32
+        n = n + ((x >>> k) & 1)
+    n
+
+// Whether `aa` is an access address a connection may use ([Vol 6] Part B,
+// Section 2.1.2): not the advertising channels' address nor one bit from it, not
+// four equal octets, no run of more than six equal bits, at most 24 transitions,
+// and at least two transitions in the six most significant bits.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn aa_valid(aa: Int) -> Bool
+    if bits_differ(aa, ADV_ACCESS_ADDRESS) <= 1
+        return false
+    let o = aa & 0xFF
+    if ((aa >>> 8) & 0xFF) == o and ((aa >>> 16) & 0xFF) == o and ((aa >>> 24) & 0xFF) == o
+        return false
+    var run = 1
+    var longest = 1
+    var transitions = 0
+    var top = 0
+    for k in 1..32
+        if ((aa >>> k) & 1) == ((aa >>> (k - 1)) & 1)
+            run = run + 1
+            if run > longest
+                longest = run
+        else
+            run = 1
+            transitions = transitions + 1
+            if k >= 27
+                top = top + 1
+    longest <= 6 and transitions <= 24 and top >= 2
+
+// A new access address that is valid and differs from `avoid_a` and `avoid_b`.
+// Nearly every second draw is valid, so the 64 redraws are a bound that a working
+// generator never reaches.
+@tier(embedded)
+fn make_aa(var i: Init, avoid_a: Int, avoid_b: Int) -> Int
+    var aa = draw(var i)
+    for _ in 0..64
+        if aa_valid(aa) and aa != avoid_a and aa != avoid_b
+            break
+        aa = draw(var i)
+    aa
+
+// ── The CONNECT_IND ─────────────────────────────────────────────────
+
+// One 16-bit field of the LLData, least significant octet first.
+@tier(embedded)
+@no_alloc
+fn put_le16(var p: Pdu, v: Int)
+    let _a = ll_pdu.pdu_put(var p, v & 0xFF)
+    let _b = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+
+// Make the CONNECT_IND of the running state: the initiator's address as InitA and
+// an AdvA to be filled in; the LLData of the connection.
+@tier(embedded)
+fn prepare(var i: Init, chmap: Int, avoid_a: Int, avoid_b: Int)
+    let aa = make_aa(i, avoid_a, avoid_b)
+    let crc = draw(var i) & 0xFFFFFF
+    let hop = 5 + (draw(var i) % 12)
+    ll_pdu.pdu_begin(var i.req, ll_pdu.CONNECT_IND, i.addr_type as Int, 0)
+    ll_pdu.pdu_put_addr(var i.req, var i.addr)
+    for _ in 0..6
+        let _a = ll_pdu.pdu_put(var i.req, 0)
+    for k in 0..4
+        let _b = ll_pdu.pdu_put(var i.req, (aa >>> (8 * k)) & 0xFF)
+    for k in 0..3
+        let _c = ll_pdu.pdu_put(var i.req, (crc >>> (8 * k)) & 0xFF)
+    let _d = ll_pdu.pdu_put(var i.req, WIN_SIZE)
+    // WinOffset, Interval, Latency and Timeout.
+    put_le16(var i.req, 0)
+    put_le16(var i.req, i.c_max)
+    put_le16(var i.req, i.latency)
+    put_le16(var i.req, i.timeout)
+    for k in 0..5
+        let _g = ll_pdu.pdu_put(var i.req, (chmap >>> (8 * k)) & 0xFF)
+    let _h = ll_pdu.pdu_put(var i.req, hop | (SCA_CLASS << 5))
+    ll_pdu.pdu_finish(var i.req)
+
+// Change the initiator's address while the state is on, as a new Resolvable Private
+// Address does, and make the CONNECT_IND carry it.
+@tier(embedded)
+fn init_set_addr(var i: Init, var addr: Vec[u8; 6], addr_type: Int)
+    for k in 0..6
+        i.addr[k] = addr[k]
+        i.req.b[2 + k] = addr[k]
+    i.addr_type = addr_type as u8
+    i.req.b[0] = (((i.req.b[0] as Int) & 0xBF) | (addr_type << 6)) as u8
+
+// Address the CONNECT_IND to the advertiser whose address is at payload offset 0
+// of `rx`: its AdvA, and the advertiser's address type as RxAdd.
+@tier(embedded)
+fn build_connect(var i: Init, var rx: Pdu)
+    let tx_add = (rx.b[0] as Int) & ll_pdu.TXADD
+    let ch_sel = (rx.b[0] as Int) & ll_pdu.CHSEL
+    i.req.b[0] = (((i.req.b[0] as Int) & 0x5F) | (tx_add << 1) | ch_sel) as u8
+    for k in 0..6
+        i.req.b[8 + k] = rx.b[2 + k]
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// Whether the advertiser (the address at payload offset 0 of `rx`, its type in
+// TxAdd) is the one the Host named.
+@tier(embedded)
+fn is_peer(var i: Init, var rx: Pdu) -> Bool
+    ll_pdu.pdu_tx_add(var rx) == (i.peer_type as Int) and ll_pdu.pdu_addr_is(var rx, 0, var i.peer)
+
+// The judgement of an advertising PDU received with a good CRC, which a
+// CONNECT_IND waits for.  `got` is the octets received including the header, of
+// which the first 14 are read; `listed` says the advertiser is in the Filter Accept
+// List.  The answer is `ACT_CONNECT` when the CONNECT_IND in `req` is to go out: the
+// PDU is connectable, comes from the device the filter policy names, and, if
+// directed, names this initiator.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn init_decide(var i: Init, var rx: Pdu, got: Int, listed: Bool) -> Int
+    if not i.enabled or i.sent or not ll_pdu.pdu_well_formed(var rx, got)
+        return 0
+    let ty = ll_pdu.pdu_type(var rx)
+    if ty != ll_pdu.ADV_IND and ty != ll_pdu.ADV_DIRECT_IND
+        return 0
+    i.seen = i.seen + 1
+    if (i.policy as Int) == POLICY_LIST
+        if not listed
+            i.filtered = i.filtered + 1
+            return 0
+    else if not is_peer(var i, var rx)
+        i.filtered = i.filtered + 1
+        return 0
+    if ty == ll_pdu.ADV_DIRECT_IND
+        if not ll_pdu.pdu_addr_is(var rx, 6, var i.addr) or ll_pdu.pdu_rx_add(var rx) != (i.addr_type as Int)
+            i.filtered = i.filtered + 1
+            return 0
+    build_connect(var i, var rx)
+    i.sent = true
+    i.connects = i.connects + 1
+    ACT_CONNECT
+
+// Take the advertisement `rx` as the one to answer, when the caller judged it: the
+// resolving list found the advertiser, which `init_decide` cannot know.  The answer is
+// `ACT_CONNECT` when the CONNECT_IND in `req` is to go out.
+@satisfies("REQ-BLE-CTL-021")
+@tier(embedded)
+fn init_accept(var i: Init, var rx: Pdu) -> Int
+    if not i.enabled or i.sent
+        return 0
+    i.seen = i.seen + 1
+    build_connect(var i, var rx)
+    i.sent = true
+    i.connects = i.connects + 1
+    ACT_CONNECT
+
+// The CONNECT_IND that `init_decide` accepted did not go on air: the state goes on
+// listening, and the connection is not counted.
+@tier(embedded)
+fn init_unsent(var i: Init)
+    if i.sent
+        i.sent = false
+        i.connects = i.connects - 1
+        if i.ext
+            i.aux_phy = 0
+            init_use_phy(var i, ll_phy.PHY_1M)
+
+// ── The connection from an extended advertisement ───────────────────
+//
+// [Vol 6] Part B, Section 2.3.4 and 4.4.4.  An extended advertising event starts with an ADV_EXT_IND
+// on the primary channels (LE 1M) that carries no AdvA and no data: its Auxiliary Pointer says on
+// which channel, on which PHY and how long after the start of the ADV_EXT_IND the AUX_ADV_IND comes.
+// The AUX_ADV_IND of a connectable advertiser holds AdvA (and TargetA, if directed).  The initiator
+// listens on the secondary channel for it, answers it with an AUX_CONNECT_REQ T_IFS after it, which
+// has the layout of a CONNECT_IND, and the advertiser answers that with an AUX_CONNECT_RSP.  The
+// initiator is in the Connection state when the response has come.
+
+// The PDU type of ADV_EXT_IND and AUX_ADV_IND, and of AUX_CONNECT_RSP.
+const EXT_ADV = 7
+const AUX_CONNECT_RSP = 8
+
+// The longest wait for an AUX_ADV_IND the initiator accepts, from the start of the ADV_EXT_IND:
+// the program holds the radio that long.
+const AUX_FOLLOW_MAX_US = 10000
+
+// The octets of an extended advertising PDU the program reads: the header, the Extended Header
+// Length and AdvMode octet, the flags and the fields up to TargetA and the ADI.
+const EXT_READ_OCTETS = 24
+
+// The size of the field the flag `bit` of the Extended Header announces: AdvA, TargetA, CTEInfo,
+// ADI, AuxPtr, SyncInfo, TxPower.
+@tier(embedded)
+fn ext_size(bit: Int) -> Int
+    match bit
+        0 => 6
+        1 => 6
+        2 => 1
+        3 => 2
+        4 => 3
+        5 => 18
+        _ => 1
+
+// The octet of the PDU `rx` (its header included) where the field of the flag `bit` starts, -1
+// when the Extended Header lacks the field or the field lies past the octets the program read.
+@satisfies("REQ-BLE-CTL-080")
+@tier(embedded)
+fn ext_field(var rx: Pdu, bit: Int) -> Int
+    let hl = (rx.b[2] as Int) & 0x3F
+    if hl == 0
+        return -1
+    let flags = rx.b[3] as Int
+    if ((flags >>> bit) & 1) == 0
+        return -1
+    var off = 4
+    for k in 0..bit
+        if ((flags >>> k) & 1) != 0
+            off = off + ext_size(k)
+    if off + ext_size(bit) > 3 + hl or off + ext_size(bit) > EXT_READ_OCTETS or off + ext_size(bit) > rx.n
+        return -1
+    off
+
+// The AdvMode of an extended advertising PDU: 0 non-connectable and non-scannable, 1 connectable,
+// 2 scannable.
+@tier(embedded)
+fn ext_mode(var rx: Pdu) -> Int
+    ((rx.b[2] as Int) >>> 6) & 3
+
+// The fields of the Auxiliary Pointer that starts at octet `at`.  The channel index is 0 to 63 (the
+// valid ones 0 to 36), `aux_unit_us` the unit of the offset (30 or 300 microseconds), `aux_offset_us`
+// the offset in microseconds from the start of the packet that holds the pointer to the start of
+// the AUX_ADV_IND, `aux_phy_of` the PHY as `ll_phy` numbers it (0 for the reserved values) and
+// `aux_ca` the clock accuracy of the advertiser (0 for 51 to 500 ppm, 1 for 0 to 50 ppm).
+@tier(embedded)
+fn aux_channel(var rx: Pdu, at: Int) -> Int
+    (rx.b[at] as Int) & 0x3F
+
+@tier(embedded)
+fn aux_ca(var rx: Pdu, at: Int) -> Int
+    ((rx.b[at] as Int) >>> 6) & 1
+
+@tier(embedded)
+fn aux_unit_us(var rx: Pdu, at: Int) -> Int
+    if (((rx.b[at] as Int) >>> 7) & 1) == 1
+        300
+    else
+        30
+
+@tier(embedded)
+fn aux_offset_us(var rx: Pdu, at: Int) -> Int
+    (((rx.b[at + 1] as Int) | (((rx.b[at + 2] as Int) & 0x1F) << 8))) * aux_unit_us(var rx, at)
+
+@tier(embedded)
+fn aux_phy_of(var rx: Pdu, at: Int) -> Int
+    match ((rx.b[at + 2] as Int) >>> 5) & 7
+        0 => ll_phy.PHY_1M
+        1 => ll_phy.PHY_2M
+        2 => ll_phy.PHY_CODED
+        _ => 0
+
+// How much earlier than the nominal start the receiver opens and how much later it gives up: the
+// uncertainty of the offset (one unit), the clocks of the two ends (the advertiser's accuracy
+// class and 50 ppm for this end's clock) over the offset, and a margin of 20 microseconds.
+@tier(embedded)
+fn aux_widen_us(var rx: Pdu, at: Int) -> Int
+    var ppm = 550
+    if aux_ca(var rx, at) == 1
+        ppm = 100
+    aux_unit_us(var rx, at) + aux_offset_us(var rx, at) * ppm / 1000000 + 20
+
+// The Auxiliary Pointer of the ADV_EXT_IND `rx` (`n` octets in all, the first `EXT_READ_OCTETS` of them in `rx`)
+// that the state follows: the octet where it starts, -1 when the state is not one of LE Extended
+// Create Connection, the PDU is not a connectable ADV_EXT_IND with a pointer to a channel and a PHY
+// the command asked for, or the offset is longer than the program waits.
+@satisfies("REQ-BLE-CTL-080")
+@tier(embedded)
+fn aux_plan(var i: Init, var rx: Pdu, n: Int) -> Int
+    if not i.enabled or not i.ext or i.sent or n < 4 or ((rx.b[0] as Int) & 0x0F) != EXT_ADV
+        return -1
+    rx.n = n
+    i.aux_seen = i.aux_seen + 1
+    if (rx.b[1] as Int) + 2 != n or ext_mode(var rx) != 1
+        return -1
+    let at = ext_field(var rx, 4)
+    if at < 0 or aux_channel(var rx, at) > 36 or aux_offset_us(var rx, at) > AUX_FOLLOW_MAX_US
+        return -1
+    let phy = aux_phy_of(var rx, at)
+    if phy == 0 or (i.phys & ll_phy.mask_of(phy)) == 0
+        return -1
+    i.aux_followed = i.aux_followed + 1
+    at
+
+// The legacy shape of the AUX_ADV_IND `rx` (`n` octets in all, the first `EXT_READ_OCTETS` of them in
+// `rx`), written to `v`: an ADV_IND with the AdvA, or an ADV_DIRECT_IND with the AdvA and TargetA when
+// the PDU is directed, TxAdd and RxAdd as sent, and ChSel clear: the ChSel bit of an AUX_CONNECT_REQ is
+// reserved ([Vol 6] Part B, Section 2.3.3.1), and a connection made from one uses channel selection
+// algorithm #2 whatever the header says.  The judgement of the advertiser
+// (`init_decide`, the filter list, the resolving list) reads this shape.  False when the PDU is not a
+// connectable AUX_ADV_IND with an AdvA.
+@satisfies("REQ-BLE-CTL-080")
+@tier(embedded)
+fn ext_view(var rx: Pdu, n: Int, var v: Pdu) -> Bool
+    if n < 4 or ((rx.b[0] as Int) & 0x0F) != EXT_ADV or (rx.b[1] as Int) + 2 != n
+        return false
+    rx.n = n
+    if ext_mode(var rx) != 1
+        return false
+    let a = ext_field(var rx, 0)
+    if a < 0
+        return false
+    let t = ext_field(var rx, 1)
+    let hdr = rx.b[0] as Int
+    var ty = ll_pdu.ADV_IND
+    var len = 6
+    var addr_bits = hdr & ll_pdu.TXADD
+    if t >= 0
+        ty = ll_pdu.ADV_DIRECT_IND
+        len = 12
+        addr_bits = addr_bits | (hdr & ll_pdu.RXADD)
+    v.b[0] = (ty | addr_bits) as u8
+    v.b[1] = len as u8
+    for k in 0..6
+        v.b[2 + k] = rx.b[a + k]
+    if t >= 0
+        for k in 0..6
+            v.b[8 + k] = rx.b[t + k]
+    v.n = len + 2
+    true
+
+// Whether `rx` (`n` octets, the first `EXT_READ_OCTETS` read) is the AUX_CONNECT_RSP of the advertiser the
+// AUX_CONNECT_REQ in `req` went to: the type, and the AdvA.
+@satisfies("REQ-BLE-CTL-080")
+@tier(embedded)
+fn is_connect_rsp(var i: Init, var rx: Pdu, n: Int) -> Bool
+    if n < 4 or ((rx.b[0] as Int) & 0x0F) != AUX_CONNECT_RSP or (rx.b[1] as Int) + 2 != n
+        return false
+    rx.n = n
+    let a = ext_field(var rx, 0)
+    if a < 0
+        return false
+    for k in 0..6
+        if rx.b[a + k] != i.req.b[8 + k]
+            return false
+    true
+
+// Use the connection parameters of `phy` (`ll_phy.PHY_2M` the set of LE 2M, any other the set of LE 1M) in
+// the state and in the CONNECT_IND: the interval is the maximum of the range, as in `prepare`.
+@satisfies("REQ-BLE-CTL-080")
+@tier(embedded)
+fn init_use_phy(var i: Init, phy: Int)
+    if phy == ll_phy.PHY_2M
+        i.c_min = i.x_min
+        i.c_max = i.x_max
+        i.latency = i.x_latency
+        i.timeout = i.x_timeout
+    else if phy == ll_phy.PHY_CODED
+        i.c_min = i.z_min
+        i.c_max = i.z_max
+        i.latency = i.z_latency
+        i.timeout = i.z_timeout
+    else
+        i.c_min = i.y_min
+        i.c_max = i.y_max
+        i.latency = i.y_latency
+        i.timeout = i.y_timeout
+    i.req.b[24] = (i.c_max & 0xFF) as u8
+    i.req.b[25] = ((i.c_max >>> 8) & 0xFF) as u8
+    i.req.b[26] = (i.latency & 0xFF) as u8
+    i.req.b[27] = ((i.latency >>> 8) & 0xFF) as u8
+    i.req.b[28] = (i.timeout & 0xFF) as u8
+    i.req.b[29] = ((i.timeout >>> 8) & 0xFF) as u8
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var x: Vec[u8; 6] = Vec.new()
+    for k in 0..6
+        let _a = x.push((first + k) as u8)
+    x
+
+// An initiator enabled at time 0 with the address 0xA0..0xA5, looking for the
+// peer 0x10..0x15 of type `peer_type` under `policy`: an interval of 100 ms, a
+// window of 30 ms, a connection interval of 24 units, no latency, a timeout of 400.
+fn t_init(policy: Int, peer_type: Int) -> Init
+    var i = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var i, 0, 160, 48, policy, peer_type, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    i
+
+// An advertisement of PDU type `ty` from the advertiser first..first+5 of address
+// type `tx_add`, with 3 octets of data; a directed one names `target`.
+fn t_adv(ty: Int, first: Int, tx_add: Int, target: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var a = t_addr(first)
+    ll_pdu.pdu_begin(var p, ty, tx_add, 0)
+    ll_pdu.pdu_put_addr(var p, var a)
+    if ty == ll_pdu.ADV_DIRECT_IND
+        var t = t_addr(target)
+        ll_pdu.pdu_put_addr(var p, var t)
+        ll_pdu.pdu_finish(var p)
+        return p
+    for k in 0..3
+        let _x = ll_pdu.pdu_put(var p, k)
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn t_has(var p: Pdu, off: Int, first: Int) -> Bool
+    var a = t_addr(first)
+    ll_pdu.pdu_addr_is(var p, off, var a)
+
+fn t_mark_sent(var i: Init)
+    i.sent = true
+
+fn t_policy_set(var i: Init, p: Int)
+    i.policy = p as u8
+
+@test
+fn test_capacities_match_the_constants()
+    let i = init_new()
+    test.assert_eq(i.peer.capacity(), 6)
+    test.assert_eq(i.addr.capacity(), 6)
+
+@test
+fn test_parameter_status_follows_the_command()
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(init_params_status(0x4000, 0x4000, 1, 1, 1, 3200, 3200, 0, 3200, 0, 0xFFFF), 0)
+    test.assert_eq(init_params_status(3, 3, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x4001, 0x10, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 3, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x4001, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x11, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 2, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 4, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 4, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 5, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 3201, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 8, 7, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 500, 3200, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 9, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 3201, 0, 0), 0x12)
+    // A timeout of 8 s is not longer than twice the 4 s interval.
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 3200, 3200, 0, 800, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 3200, 3200, 0, 801, 0, 0), 0)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 9, 10, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 100, 5, 4), 0x12)
+    // The peer types 2 and 3 (an identity the resolving list resolves) and the own types
+    // 2 and 3 are served.
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 2, 0, 6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 3, 3, 6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 4, 0, 6, 6, 0, 100, 0, 0), 0x12)
+
+@test
+fn test_windows_follow_the_interval_and_rotate_the_channel()
+    var i = t_init(0, 0)
+    test.assert(init_in_window(var i, 0))
+    test.assert(init_in_window(var i, 29999))
+    test.assert(not init_in_window(var i, 30000))
+    test.assert(not init_in_window(var i, 99999))
+    test.assert(init_in_window(var i, 100000))
+    test.assert_eq(init_channel(var i, 0), 37)
+    test.assert_eq(init_channel(var i, 100000), 38)
+    test.assert_eq(init_channel(var i, 250000), 39)
+    test.assert_eq(init_channel(var i, 300000), 37)
+    test.assert_eq(init_window_end(var i, 10000), 30000)
+    test.assert_eq(init_window_end(var i, 110000), 130000)
+    test.assert_eq(init_next_start(var i, 10000), 10000)
+    test.assert_eq(init_next_start(var i, 40000), 100000)
+    test.assert_eq(init_next_start(var i, 99999), 100000)
+    // Before the state was entered the first window is the next.
+    var j = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var j, 5000, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    test.assert_eq(init_next_start(var j, 0), 5000)
+    test.assert_eq(init_index(var j, 0), 0)
+    test.assert(not init_in_window(var j, 0))
+
+@test
+fn test_an_initiator_that_is_off_has_no_window_and_answers_nothing()
+    var i = init_new()
+    test.assert(not init_in_window(var i, 0))
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var p, 11, false), 0)
+    init_reset(var i)
+    test.assert(not i.enabled)
+
+@test
+fn test_enable_and_disable_set_the_state()
+    var i = t_init(0, 0)
+    test.assert(i.enabled)
+    test.assert(not i.sent)
+    init_disable(var i)
+    test.assert(not i.enabled)
+    init_seed(var i, 77)
+    test.assert(i.rng != 0)
+    t_mark_sent(var i)
+    init_reset(var i)
+    test.assert(not i.sent)
+
+@test
+fn test_the_connect_ind_carries_the_parameters_the_host_gave()
+    var i = t_init(0, 0)
+    var r = i.req
+    test.assert_eq(ll_pdu.pdu_type(var r), ll_pdu.CONNECT_IND)
+    test.assert_eq(ll_pdu.pdu_len(var r), ll_pdu.CONNECT_PAYLOAD)
+    test.assert_eq(r.n, 36)
+    test.assert_eq(ll_pdu.pdu_tx_add(var r), 0)
+    test.assert(ll_pdu.pdu_addr_is(var r, 0, var i.addr))
+    let aa = (r.b[14] as Int) | ((r.b[15] as Int) << 8) | ((r.b[16] as Int) << 16) | ((r.b[17] as Int) << 24)
+    test.assert(aa_valid(aa))
+    test.assert_eq(r.b[21] as Int, WIN_SIZE)
+    test.assert_eq((r.b[22] as Int) | ((r.b[23] as Int) << 8), 0)
+    test.assert_eq((r.b[24] as Int) | ((r.b[25] as Int) << 8), 24)
+    test.assert_eq((r.b[26] as Int) | ((r.b[27] as Int) << 8), 0)
+    test.assert_eq((r.b[28] as Int) | ((r.b[29] as Int) << 8), 400)
+    test.assert_eq(r.b[30] as Int, 0xFF)
+    test.assert_eq(r.b[34] as Int, 0x1F)
+    let hop = (r.b[35] as Int) & 0x1F
+    test.assert(hop >= 5 and hop <= 16)
+    test.assert_eq(((r.b[35] as Int) >>> 5), SCA_CLASS)
+    // A random own address is TxAdd 1.
+    var j = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var j, 0, 160, 48, 0, 0, var peer, var me, 1, 24, 24, 0, 400, 0x00FF00FF03, 0, 0)
+    test.assert_eq(ll_pdu.pdu_tx_add(var j.req), 1)
+    test.assert_eq(j.req.b[30] as Int, 0x03)
+    test.assert_eq(j.req.b[31] as Int, 0xFF)
+    test.assert_eq(j.req.b[32] as Int, 0x00)
+
+@test
+fn test_each_enable_makes_a_new_access_address()
+    var i = t_init(0, 0)
+    var seen: [Int] = []
+    for k in 0..20
+        var peer = t_addr(0x10)
+        var me = t_addr(0xA0)
+        init_enable(var i, k * 1000, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+        let aa = (i.req.b[14] as Int) | ((i.req.b[15] as Int) << 8) | ((i.req.b[16] as Int) << 16) | ((i.req.b[17] as Int) << 24)
+        test.assert(aa_valid(aa))
+        for old in seen
+            test.assert(old != aa)
+        list.push(seen, aa)
+
+@test
+fn test_the_access_address_avoids_the_ones_in_use()
+    var i = t_init(0, 0)
+    let first = (i.req.b[14] as Int) | ((i.req.b[15] as Int) << 8) | ((i.req.b[16] as Int) << 16) | ((i.req.b[17] as Int) << 24)
+    var j = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var j, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    // Same generator state as `i` had, so the same address, unless it is avoided.
+    let same = (j.req.b[14] as Int) | ((j.req.b[15] as Int) << 8) | ((j.req.b[16] as Int) << 16) | ((j.req.b[17] as Int) << 24)
+    test.assert_eq(same, first)
+    var k = init_new()
+    init_enable(var k, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, first, 0)
+    let other = (k.req.b[14] as Int) | ((k.req.b[15] as Int) << 8) | ((k.req.b[16] as Int) << 16) | ((k.req.b[17] as Int) << 24)
+    test.assert(other != first)
+    var m = init_new()
+    init_enable(var m, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, first)
+    let third = (m.req.b[14] as Int) | ((m.req.b[15] as Int) << 8) | ((m.req.b[16] as Int) << 16) | ((m.req.b[17] as Int) << 24)
+    test.assert(third != first)
+
+@test
+fn test_access_address_rules()
+    test.assert(aa_valid(0x50655A12))
+    // The advertising address and one bit from it.
+    test.assert(not aa_valid(0x8E89BED6))
+    test.assert(not aa_valid(0x8E89BED7))
+    // Four equal octets.
+    test.assert(not aa_valid(0x55555555))
+    // A run of ten equal bits.
+    test.assert(not aa_valid(0x5A007FA5))
+    // Twenty-five transitions.
+    test.assert(not aa_valid(0x5A6AA5A5))
+    test.assert(aa_valid(0x9A5A6A5A))
+    // No transition in the six most significant bits.
+    test.assert(not aa_valid(0xFC6A5A12))
+    test.assert_eq(bits_differ(0xF, 0x0), 4)
+
+@test
+fn test_a_connectable_advertisement_from_the_peer_is_answered()
+    var i = t_init(POLICY_PEER, 0)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var p, 11, false), ACT_CONNECT)
+    test.assert(i.sent)
+    test.assert_eq(i.connects, 1)
+    // AdvA and RxAdd are patched in.
+    test.assert(t_has(var i.req, 6, 0x10))
+    test.assert_eq(ll_pdu.pdu_rx_add(var i.req), 0)
+    // A random advertiser sets RxAdd.
+    var j = t_init(POLICY_PEER, 1)
+    var q = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(init_decide(var j, var q, 11, false), ACT_CONNECT)
+    test.assert_eq(ll_pdu.pdu_rx_add(var j.req), 1)
+    // Nothing is answered a second time.
+    test.assert_eq(init_decide(var i, var p, 11, false), 0)
+
+@test
+fn test_other_advertisers_and_other_types_are_not_answered()
+    var i = t_init(POLICY_PEER, 0)
+    var other = t_adv(ll_pdu.ADV_IND, 0x20, 0, 0)
+    test.assert_eq(init_decide(var i, var other, 11, false), 0)
+    var wrong_type = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(init_decide(var i, var wrong_type, 11, false), 0)
+    test.assert_eq(i.filtered, 2)
+    // Non-connectable and scannable PDUs are not connectable.
+    var nc = t_adv(ll_pdu.ADV_NONCONN_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var nc, 11, false), 0)
+    var sc = t_adv(ll_pdu.ADV_SCAN_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var sc, 11, false), 0)
+    // A PDU of the wrong length is not judged.
+    var good = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var good, 12, false), 0)
+    test.assert_eq(i.seen, 2)
+    test.assert(not i.sent)
+
+@test
+fn test_the_list_policy_answers_listed_devices_whoever_they_are()
+    var i = t_init(POLICY_LIST, 0)
+    var other = t_adv(ll_pdu.ADV_IND, 0x20, 0, 0)
+    test.assert_eq(init_decide(var i, var other, 11, false), 0)
+    test.assert_eq(i.filtered, 1)
+    test.assert_eq(init_decide(var i, var other, 11, true), ACT_CONNECT)
+    test.assert(t_has(var i.req, 6, 0x20))
+    var j = t_init(POLICY_PEER, 0)
+    t_policy_set(var j, POLICY_LIST)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var j, var p, 11, false), 0)
+
+@test
+fn test_a_directed_advertisement_is_answered_only_when_it_names_the_initiator()
+    var i = t_init(POLICY_PEER, 0)
+    var other = t_adv(ll_pdu.ADV_DIRECT_IND, 0x10, 0, 0x30)
+    test.assert_eq(init_decide(var i, var other, 14, false), 0)
+    test.assert_eq(i.filtered, 1)
+    var mine = t_adv(ll_pdu.ADV_DIRECT_IND, 0x10, 0, 0xA0)
+    test.assert_eq(init_decide(var i, var mine, 14, false), ACT_CONNECT)
+    // The target's address type must match as well.
+    var j = t_init(POLICY_PEER, 0)
+    var typed = t_adv(ll_pdu.ADV_DIRECT_IND, 0x10, 0, 0xA0)
+    typed.b[0] = (((typed.b[0] as Int) | ll_pdu.RXADD)) as u8
+    test.assert_eq(init_decide(var j, var typed, 14, false), 0)
+
+fn t_chsel(var p: Pdu)
+    p.b[0] = ((p.b[0] as Int) | ll_pdu.CHSEL) as u8
+
+@test
+fn test_the_connect_ind_takes_the_chsel_of_the_advertisement()
+    // An advertiser that supports algorithm #2 gets a connection that uses it.
+    var i = t_init(POLICY_PEER, 0)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    t_chsel(var p)
+    test.assert_eq(init_decide(var i, var p, 11, false), ACT_CONNECT)
+    test.assert_eq((i.req.b[0] as Int) & ll_pdu.CHSEL, ll_pdu.CHSEL)
+    test.assert_eq(ll_pdu.pdu_type(var i.req), ll_pdu.CONNECT_IND)
+    test.assert_eq(ll_pdu.pdu_rx_add(var i.req), 0)
+    test.assert_eq(ll_pdu.pdu_tx_add(var i.req), 0)
+    // One without it gets algorithm #1, and a random advertiser sets RxAdd.
+    var j = t_init(POLICY_PEER, 1)
+    var q = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(init_decide(var j, var q, 11, false), ACT_CONNECT)
+    test.assert_eq((j.req.b[0] as Int) & ll_pdu.CHSEL, 0)
+    test.assert_eq(ll_pdu.pdu_rx_add(var j.req), 1)
+
+// An extended advertising PDU of the type `ty` and AdvMode `mode` from the advertiser first..first+5
+// of the address type `tx_add`, with the fields the flags `flags` announce: the AdvA, the TargetA
+// `target` (for a directed one), an ADI of 0x1234 and an Auxiliary Pointer to channel `ch`, offset
+// `offset` units of `unit` (0: 30 microseconds, 1: 300) and PHY `phy` (0: LE 1M).
+fn t_ext(ty: Int, mode: Int, flags: Int, first: Int, tx_add: Int, target: Int, ch: Int, unit: Int, offset: Int, phy: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var rx_add = 0
+    if (flags & 2) != 0
+        rx_add = 1
+    var len = 1
+    if (flags & 1) != 0
+        len = len + 6
+    if (flags & 2) != 0
+        len = len + 6
+    if (flags & 8) != 0
+        len = len + 2
+    if (flags & 16) != 0
+        len = len + 3
+    ll_pdu.pdu_begin(var p, ty, tx_add, rx_add)
+    let _h = ll_pdu.pdu_put(var p, len | (mode << 6))
+    let _f = ll_pdu.pdu_put(var p, flags)
+    if (flags & 1) != 0
+        for k in 0..6
+            let _a = ll_pdu.pdu_put(var p, first + k)
+    if (flags & 2) != 0
+        for k in 0..6
+            let _t = ll_pdu.pdu_put(var p, target + k)
+    if (flags & 8) != 0
+        let _d0 = ll_pdu.pdu_put(var p, 0x34)
+        let _d1 = ll_pdu.pdu_put(var p, 0x12)
+    if (flags & 16) != 0
+        let _p0 = ll_pdu.pdu_put(var p, ch | (unit << 7))
+        let _p1 = ll_pdu.pdu_put(var p, offset & 0xFF)
+        let _p2 = ll_pdu.pdu_put(var p, ((offset >>> 8) & 0x1F) | (phy << 5))
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn t_set_aux(var i: Init, phy: Int)
+    i.aux_phy = phy
+
+fn t_ext_init(phys: Int) -> Init
+    var i = t_init(POLICY_PEER, 0)
+    init_ext_enable(var i, phys, 40, 60, 2, 300)
+    i
+
+@test
+fn test_the_fields_of_the_extended_header_are_found_by_their_flags()
+    var p = t_ext(EXT_ADV, 1, 0x19, 0x10, 0, 0, 12, 0, 100, 0)
+    // AdvA at 4, ADI after it at 10, the pointer after that at 12; no TargetA.
+    test.assert_eq(ext_field(var p, 0), 4)
+    test.assert_eq(ext_field(var p, 1), -1)
+    test.assert_eq(ext_field(var p, 3), 10)
+    test.assert_eq(ext_field(var p, 4), 12)
+    test.assert_eq(ext_field(var p, 5), -1)
+    test.assert_eq(ext_mode(var p), 1)
+    test.assert_eq(aux_channel(var p, 12), 12)
+    test.assert_eq(aux_offset_us(var p, 12), 3000)
+    test.assert_eq(aux_unit_us(var p, 12), 30)
+    test.assert_eq(aux_phy_of(var p, 12), ll_phy.PHY_1M)
+    // 300-microsecond units, LE 2M, the accuracy of 0 to 50 ppm.
+    var q = t_ext(EXT_ADV, 1, 0x10, 0x10, 0, 0, 36, 1, 20, 1)
+    q.b[4] = ((q.b[4] as Int) | 0x40) as u8
+    test.assert_eq(ext_field(var q, 4), 4)
+    test.assert_eq(aux_offset_us(var q, 4), 6000)
+    test.assert_eq(aux_phy_of(var q, 4), ll_phy.PHY_2M)
+    test.assert_eq(aux_ca(var q, 4), 1)
+    test.assert_eq(aux_widen_us(var q, 4), 300 + 6000 * 100 / 1000000 + 20)
+    // A field past the extended header, or past the octets read, is not there.
+    var r = t_ext(EXT_ADV, 1, 0x10, 0x10, 0, 0, 5, 0, 5, 0)
+    r.b[2] = (2 | (1 << 6)) as u8
+    test.assert_eq(ext_field(var r, 4), -1)
+    var none = t_ext(EXT_ADV, 1, 0x10, 0x10, 0, 0, 5, 0, 5, 0)
+    none.b[2] = (1 << 6) as u8
+    test.assert_eq(ext_field(var none, 4), -1)
+
+@test
+fn test_a_connectable_adv_ext_ind_with_a_pointer_is_followed()
+    var i = t_ext_init(1)
+    var p = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var p, p.n), 6)
+    test.assert_eq(i.aux_seen, 1)
+    test.assert_eq(i.aux_followed, 1)
+    // A scannable or non-connectable one is not, nor one without a pointer, one that points at an
+    // advertising channel, one on a PHY the command left out or on LE Coded, or one too far away.
+    var scan = t_ext(EXT_ADV, 2, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var scan, scan.n), -1)
+    var nonconn = t_ext(EXT_ADV, 0, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var nonconn, nonconn.n), -1)
+    var nopointer = t_ext(EXT_ADV, 1, 0x08, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var nopointer, nopointer.n), -1)
+    var adv_ch = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 37, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var adv_ch, adv_ch.n), -1)
+    var two_m = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 1)
+    test.assert_eq(aux_plan(var i, var two_m, two_m.n), -1)
+    var coded = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 2)
+    test.assert_eq(aux_plan(var i, var coded, coded.n), -1)
+    var far = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 400, 0)
+    test.assert_eq(aux_plan(var i, var far, far.n), -1)
+    // A length that does not match the octets received.
+    var odd = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var odd, odd.n + 1), -1)
+    test.assert_eq(i.aux_followed, 1)
+    // With LE 2M in the command a pointer to LE 2M is followed.
+    var j = t_ext_init(3)
+    test.assert_eq(aux_plan(var j, var two_m, two_m.n), 6)
+    // A legacy state, or an advertisement of the legacy kind, is not followed.
+    var k = t_init(POLICY_PEER, 0)
+    test.assert_eq(aux_plan(var k, var p, p.n), -1)
+    var legacy = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(aux_plan(var i, var legacy, legacy.n), -1)
+
+@test
+fn test_an_aux_adv_ind_is_judged_in_the_shape_of_a_legacy_advertisement()
+    var i = t_ext_init(1)
+    var v = ll_pdu.pdu_new()
+    var p = t_ext(EXT_ADV, 1, 0x09, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(ext_view(var p, p.n, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_IND)
+    test.assert_eq(v.n, 8)
+    test.assert(t_has(var v, 0, 0x10))
+    test.assert_eq((v.b[0] as Int) & ll_pdu.CHSEL, 0)
+    test.assert_eq(init_decide(var i, var v, v.n, false), ACT_CONNECT)
+    // The request has the advertiser's address; its ChSel bit is reserved and clear.
+    test.assert(t_has(var i.req, 6, 0x10))
+    test.assert_eq((i.req.b[0] as Int) & ll_pdu.CHSEL, 0)
+    // A random advertiser sets TxAdd, and so RxAdd of the request.
+    var rnd = t_ext(EXT_ADV, 1, 0x09, 0x10, 1, 0, 0, 0, 0, 0)
+    test.assert(ext_view(var rnd, rnd.n, var v))
+    test.assert_eq(ll_pdu.pdu_tx_add(var v), 1)
+    // A directed one has a TargetA and RxAdd.
+    var d = t_ext(EXT_ADV, 1, 0x0B, 0x10, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(ext_view(var d, d.n, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(v.n, 14)
+    test.assert(t_has(var v, 6, 0xA0))
+    test.assert_eq(ll_pdu.pdu_rx_add(var v), 1)
+    var j = t_ext_init(1)
+    test.assert_eq(init_decide(var j, var v, v.n, false), 0)
+    // A scannable one, one without AdvA, and one that is not an extended PDU are not.
+    var scan = t_ext(EXT_ADV, 2, 0x09, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(not ext_view(var scan, scan.n, var v))
+    var noaddr = t_ext(EXT_ADV, 1, 0x08, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(not ext_view(var noaddr, noaddr.n, var v))
+    var legacy = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert(not ext_view(var legacy, legacy.n, var v))
+
+@test
+fn test_the_connect_rsp_of_the_advertiser_is_told_by_its_type_and_address()
+    var i = t_ext_init(1)
+    var v = ll_pdu.pdu_new()
+    var p = t_ext(EXT_ADV, 1, 0x09, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(ext_view(var p, p.n, var v))
+    test.assert_eq(init_decide(var i, var v, v.n, false), ACT_CONNECT)
+    var rsp = t_ext(AUX_CONNECT_RSP, 0, 0x03, 0x10, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(is_connect_rsp(var i, var rsp, rsp.n))
+    var other = t_ext(AUX_CONNECT_RSP, 0, 0x03, 0x20, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(not is_connect_rsp(var i, var other, other.n))
+    var wrong = t_ext(EXT_ADV, 0, 0x03, 0x10, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(not is_connect_rsp(var i, var wrong, wrong.n))
+    test.assert(not is_connect_rsp(var i, var rsp, rsp.n + 1))
+
+@test
+fn test_the_parameters_of_the_phy_of_the_packet_go_into_the_request()
+    var i = t_ext_init(3)
+    // LE 1M: the set the state was entered with, interval 24 (the maximum), no latency, timeout 400.
+    test.assert_eq((i.req.b[24] as Int) | ((i.req.b[25] as Int) << 8), 24)
+    init_use_phy(var i, ll_phy.PHY_2M)
+    test.assert_eq(i.c_min, 40)
+    test.assert_eq(i.c_max, 60)
+    test.assert_eq(i.latency, 2)
+    test.assert_eq(i.timeout, 300)
+    test.assert_eq((i.req.b[24] as Int) | ((i.req.b[25] as Int) << 8), 60)
+    test.assert_eq((i.req.b[26] as Int) | ((i.req.b[27] as Int) << 8), 2)
+    test.assert_eq((i.req.b[28] as Int) | ((i.req.b[29] as Int) << 8), 300)
+    // A request that did not go out puts the set of LE 1M back.
+    t_mark_sent(var i)
+    t_set_aux(var i, ll_phy.PHY_2M)
+    init_unsent(var i)
+    test.assert_eq(i.aux_phy, 0)
+    test.assert_eq(i.c_max, 24)
+    test.assert_eq((i.req.b[24] as Int) | ((i.req.b[25] as Int) << 8), 24)
+    test.assert_eq((i.req.b[28] as Int) | ((i.req.b[29] as Int) << 8), 400)
+
+@test
+fn test_the_connection_parameters_of_a_phy_are_checked_alone()
+    test.assert_eq(conn_params_status(6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(conn_params_status(5, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 3201, 0, 100, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 6, 500, 100, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 6, 0, 9, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 6, 0, 100, 5, 4), 0x12)
+    var i = t_init(POLICY_PEER, 0)
+    test.assert(not i.ext)
+    init_ext_enable(var i, 1, 0, 0, 0, 0)
+    test.assert(i.ext)
+    // Entering the state again is a state of LE Create Connection.
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var i, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    test.assert(not i.ext)

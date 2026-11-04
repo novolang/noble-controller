@@ -1,0 +1,1279 @@
+// src/ll_scan.nv — the legacy Scanning state of the Link Layer:
+// the scan windows, the filter policy, the duplicate filter, the scan
+// request backoff, and the judgement of every PDU the scanner receives.
+//
+// [Vol 6] Part B, Section 4.4.3.  The scanner listens for scanWindow every
+// scanInterval, on the next advertising channel each window.  A PDU from an
+// advertiser the scanning filter policy lets through is reported to the Host;
+// a repeat is filtered when the Host asked for that.  An active scanner
+// answers a scannable PDU with a SCAN_REQ, T_IFS after it, once its backoff
+// count reaches zero, and reports the SCAN_RSP that follows.
+//
+// This module holds no radio.  A caller that owns a radio asks `scan_window`
+// where the windows are, hands every PDU it received to `scan_rx` and every
+// SCAN_RSP to `scan_rsp_rx`, and reports a SCAN_RSP that did not come with
+// `scan_rsp_missed`.
+//
+// The state is a value with inline storage; no function here allocates.
+
+use std.test
+use ll_pdu
+use ll_adv
+use ll_phy
+
+// The functions below take the state as a `var` parameter even where they only read
+// it, which passes its address.  A plain parameter is a copy, and a copy of a
+// struct of this size on every call costs time and stack.
+
+// LE_Scan_Type values.
+const SCAN_PASSIVE = 0
+const SCAN_ACTIVE = 1
+
+// The limits of LE_Scan_Interval and LE_Scan_Window in units of 0.625 ms,
+// [Vol 4] Part E, Section 7.8.10, and the defaults a Reset restores (10 ms).
+const SCAN_UNIT_MIN = 0x0004
+const SCAN_UNIT_MAX = 0x4000
+const SCAN_DEFAULT = 0x0010
+
+// Scanning_Filter_Policy values this Controller serves: all devices, and the
+// devices of the Filter Accept List.  The extended policies need the
+// resolving list.
+const POLICY_ALL = 0
+const POLICY_LIST = 1
+// Policy 2 adds to policy 0, and policy 3 to policy 1, the directed advertisements whose
+// TargetA is a Resolvable Private Address that is not this scanner's (the Host is told
+// with the LE Directed Advertising Report event).
+const POLICY_DIRECTED = 2
+const POLICY_LIST_DIRECTED = 3
+
+// What `scan_rx`, `scan_decide` and `scan_rsp_rx` found: the PDU is reported to
+// the Host, a SCAN_REQ is to be sent, or both; and, of `scan_decide`, that the
+// PDU is taken.
+const ACT_REPORT = 1
+const ACT_REQUEST = 2
+const ACT_ACCEPTED = 4
+
+// The duplicate filter remembers this many devices.  The kinds of entry: an
+// advertisement was reported, a scan response was reported, or a scan
+// response has been received so the device is not asked again.
+const DUP_ENTRIES = 16
+const KIND_ADV = 0
+const KIND_RSP = 1
+const KIND_ANSWERED = 2
+
+// The backoff's upper limit is 1 to 256.
+const BACKOFF_MAX = 256
+
+// `ty`, `interval`, `window`, `own` and `policy` are the parameters of LE Set
+// Scan Parameters, the interval and window in units of 0.625 ms.  `enabled`
+// and `filter_dup` come from LE Set Scan Enable, `start` is the time scanning
+// was enabled, the start of the first window.  `rng` feeds the backoff.
+// `addr` and `addr_type` are the scanner's address of the running state.
+//
+// The extended scan commands (LE Set Extended Scan Parameters and Enable): `fam` is the family of commands
+// the Host has used since the last Reset, 0 for none, 1 the legacy commands and 2 the extended ones, the
+// other family being Command Disallowed from then on; `ext` says the scanner follows extended advertising
+// (family 2); `phys` is the Scanning_PHYs mask and `c_ty`, `c_interval` and `c_window` the parameters
+// of its LE Coded set (`ty`, `interval` and `window` hold the set of LE 1M); `dup_mode` is the
+// Filter_Duplicates value of the command (0, 1 or 2), `dur` and `period` the Duration (10 ms) and the
+// Period (1.28 s), and `timeout_owed` says the Duration ran out with no Period and the Host is owed the LE
+// Scan Timeout event.  `d_did` holds the DID of each entry of the duplicate filter and `cur_did` the DID
+// the entry about to be looked up or added has (0 for a legacy PDU, else the DID with bit 15 set).  The
+// `x_` counters are the auxiliary PDUs seen, followed, not followed for want of room, not received, cut
+// short, and the requests and responses of the extended kind.
+//
+// The duplicate filter is `d_meta` (0 for an unused entry, else 1, the kind in
+// bits 1 and 2 and the address type in bit 3, so that one comparison tells
+// whether an entry can be the device) and `d_addr` (six octets an entry), filled
+// round robin from `d_next`.  The backoff is
+// `upper`, `count`, `succ` and `fail`.  `waiting` says a SCAN_REQ went out and
+// its response is awaited from the advertiser `w_type` and `w_addr`, `w_conn` that the advertisement it answers
+// was an ADV_IND (a response to which an extended report names connectable too); `req` is
+// the SCAN_REQ.  The last counters are for a caller that reports them.
+@value
+struct Scan
+    ty: u8
+    interval: Int
+    window: Int
+    own: u8
+    policy: u8
+    enabled: Bool
+    filter_dup: Bool
+    start: Int
+    rng: Int
+    addr: Vec[u8; 6]
+    addr_type: u8
+    sa: Vec[u8; 6]
+    sa_type: u8
+    d_meta: Vec[u8; 16]
+    d_addr: Vec[u8; 96]
+    d_next: u8
+    answered: Int
+    upper: Int
+    count: Int
+    succ: Int
+    fail: Int
+    waiting: Bool
+    w_type: u8
+    w_addr: Vec[u8; 6]
+    w_conn: Bool
+    req: Pdu
+    seen: Int
+    reports: Int
+    duplicates: Int
+    filtered: Int
+    requests: Int
+    responses: Int
+    misses: Int
+    fam: u8
+    ext: Bool
+    phys: u8
+    c_ty: u8
+    c_interval: Int
+    c_window: Int
+    cur_phy: u8
+    dup_mode: u8
+    dur: Int
+    period: Int
+    timeout_owed: Bool
+    d_did: Vec[u16; 16]
+    cur_did: Int
+    x_seen: Int
+    x_followed: Int
+    x_skipped: Int
+    x_missed: Int
+    x_truncated: Int
+    x_requests: Int
+    x_responses: Int
+
+// A scanner in its power-on state: off, with the default parameters.
+@tier(embedded)
+fn scan_new() -> Scan
+    var s = Scan {
+        ty: 0, interval: SCAN_DEFAULT, window: SCAN_DEFAULT, own: 0, policy: 0,
+        enabled: false, filter_dup: false, start: 0, rng: 0x1B873593,
+        addr: Vec.new(), addr_type: 0, sa: Vec.new(), sa_type: 0,
+        d_meta: Vec.new(), d_addr: Vec.new(), d_next: 0, answered: 0,
+        upper: 1, count: 1, succ: 0, fail: 0, waiting: false, w_type: 0, w_addr: Vec.new(), w_conn: false,
+        req: ll_pdu.pdu_new(), seen: 0, reports: 0, duplicates: 0, filtered: 0,
+        requests: 0, responses: 0, misses: 0,
+        fam: 0, ext: false, phys: 1, c_ty: 0, c_interval: SCAN_DEFAULT, c_window: SCAN_DEFAULT, cur_phy: 1, dup_mode: 0, dur: 0, period: 0,
+        timeout_owed: false, d_did: Vec.new(), cur_did: 0, x_seen: 0, x_followed: 0, x_skipped: 0, x_missed: 0,
+        x_truncated: 0, x_requests: 0, x_responses: 0 }
+    for _ in 0..6
+        let _a = s.addr.push(0)
+        let _b = s.w_addr.push(0)
+        let _s = s.sa.push(0)
+    for _ in 0..DUP_ENTRIES
+        let _c = s.d_meta.push(0)
+        let _d = s.d_did.push(0)
+    for _ in 0..(DUP_ENTRIES * 6)
+        let _f = s.d_addr.push(0)
+    s
+
+// The state a Reset restores: scanning off, the default parameters, an
+// empty duplicate filter.  The generator and the counters stay.
+@tier(embedded)
+fn scan_reset(var s: Scan)
+    s.ty = 0
+    s.interval = SCAN_DEFAULT
+    s.window = SCAN_DEFAULT
+    s.own = 0
+    s.policy = 0
+    s.enabled = false
+    s.filter_dup = false
+    s.waiting = false
+    s.fam = 0
+    s.ext = false
+    s.phys = 1
+    s.c_ty = 0
+    s.c_interval = SCAN_DEFAULT
+    s.c_window = SCAN_DEFAULT
+    s.cur_phy = 1
+    s.dup_mode = 0
+    s.dur = 0
+    s.period = 0
+    s.timeout_owed = false
+    s.cur_did = 0
+    dup_clear(var s)
+
+// Seed the backoff generator.
+@tier(embedded)
+fn scan_seed(var s: Scan, seed: Int)
+    s.rng = ll_adv.rng_step(seed ^ 0x1B873593)
+
+// The Status of LE Set Scan Parameters for the values given: Success (0),
+// Invalid HCI Command Parameters (0x12) for a value out of range or a window
+// longer than the interval, or Unsupported Feature or Parameter Value (0x11)
+// for an Own_Address_Type or a filter policy that needs a resolving list.
+@satisfies("REQ-BLE-CTL-009")
+@tier(embedded)
+fn scan_params_status(ty: Int, interval: Int, window: Int, own: Int, policy: Int) -> Int
+    if ty > SCAN_ACTIVE
+        return 0x12
+    if interval < SCAN_UNIT_MIN or interval > SCAN_UNIT_MAX
+        return 0x12
+    if window < SCAN_UNIT_MIN or window > SCAN_UNIT_MAX or window > interval
+        return 0x12
+    if own > 3
+        return 0x12
+    if policy > 3
+        return 0x12
+    0
+
+// The Scanning_PHYs bits of LE Set Extended Scan Parameters ([Vol 4] Part E, Section 7.8.64): LE 1M and LE
+// Coded.  Bit 1 (LE 2M) and the rest are reserved.
+const XPHY_1M = 1
+const XPHY_CODED = 4
+
+// The Status of LE Set Extended Scan Parameters for the Own_Address_Type, the filter policy and the
+// Scanning_PHYs given: Invalid HCI Command Parameters (0x12) for a value out of range, an empty set of PHYs
+// or a reserved bit.  The PHY a radio does not have is the caller's refusal (Unsupported Feature, 0x11).
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xscan_status(own: Int, policy: Int, phys: Int) -> Int
+    if own > 3 or policy > 3
+        return 0x12
+    if phys == 0 or (phys & 0xFA) != 0
+        return 0x12
+    0
+
+// The Status of one PHY's Scan_Type, Scan_Interval and Scan_Window.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xscan_set_status(ty: Int, interval: Int, window: Int) -> Int
+    scan_params_status(ty, interval, window, 0, 0)
+
+// Keep the parameters of LE Set Extended Scan Parameters.  The set of LE 1M is in the fields of the legacy
+// command (`ty`, `interval`, `window`), the set of LE Coded in `c_ty`, `c_interval` and `c_window`; a set the
+// Host did not give is left as it was.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xscan_set_params(var s: Scan, own: Int, policy: Int, phys: Int)
+    s.ext = true
+    s.own = own as u8
+    s.policy = policy as u8
+    s.phys = phys as u8
+
+// Enable the Scanning state as LE Set Extended Scan Enable asks: the Filter_Duplicates mode (0 off, 1 on, 2 on
+// and emptied at each period), the Duration and the Period.
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xscan_enable(var s: Scan, now: Int, dup_mode: Int, dur: Int, period: Int, var addr: Vec[u8; 6], addr_type: Int)
+    s.dup_mode = dup_mode as u8
+    s.dur = dur
+    s.period = period
+    if s.enabled
+        s.filter_dup = dup_mode != 0
+        return
+    scan_enable(var s, now, dup_mode != 0, var addr, addr_type)
+
+// Whether the Duration and Period of LE Set Extended Scan Enable are allowed: a Period is only meaningful
+// with a Duration, and the Duration must be shorter than the Period ([Vol 4] Part E, Section 7.8.65).
+@satisfies("REQ-BLE-CTL-090")
+@tier(embedded)
+fn xscan_timing_ok(dur: Int, period: Int) -> Bool
+    if period == 0
+        return true
+    dur > 0 and dur * 10000 < period * 1280000
+
+// Whether the scanner of the state follows extended advertising PDUs: one that LE Set Extended Scan
+// Parameters set up.
+@tier(embedded)
+fn follows_extended(var s: Scan) -> Bool
+    s.enabled and s.ext
+
+// Whether the scanning filter policy `policy` looks the advertiser up in the Filter Accept
+// List (policies 1 and 3).
+@tier(embedded)
+fn uses_list(policy: Int) -> Bool
+    policy == POLICY_LIST or policy == POLICY_LIST_DIRECTED
+
+// Whether the directed advertisement `rx` names another device than the scanner: its
+// TargetA is not the address the scanner scans with.
+@satisfies("REQ-BLE-CTL-066")
+@tier(embedded)
+fn directed_elsewhere(var s: Scan, var rx: Pdu) -> Bool
+    ll_pdu.pdu_type(var rx) == ll_pdu.ADV_DIRECT_IND
+        and (not ll_pdu.pdu_addr_is(var rx, 6, var s.addr) or ll_pdu.pdu_rx_add(var rx) != (s.addr_type as Int))
+
+// Whether the scanner takes a directed advertisement for another device: under policy 2
+// or 3 when its TargetA is a Resolvable Private Address (a random address whose two most
+// significant bits are 01), which the Host learns of with the LE Directed Advertising
+// Report event ([Vol 4] Part E, Section 7.7.65.11).
+@satisfies("REQ-BLE-CTL-066")
+@tier(embedded)
+fn takes_unresolved_target(var s: Scan, var rx: Pdu) -> Bool
+    (s.policy as Int) >= POLICY_DIRECTED and ll_pdu.pdu_rx_add(var rx) == 1
+        and ((rx.b[2 + 6 + 5] as Int) & 0xC0) == 0x40
+
+// Set the parameters.  The caller has checked `scan_params_status`.
+@tier(embedded)
+fn scan_set_params(var s: Scan, ty: Int, interval: Int, window: Int, own: Int, policy: Int)
+    s.ty = ty as u8
+    s.interval = interval
+    s.window = window
+    s.own = own as u8
+    s.policy = policy as u8
+
+// Enter the Scanning state at `now` with the scanner's address `addr` of
+// `addr_type`.  Scanning that is on already takes the new duplicate filter
+// setting and keeps its windows and its filter.
+@tier(embedded)
+fn scan_enable(var s: Scan, now: Int, filter_dup: Bool, var addr: Vec[u8; 6], addr_type: Int)
+    s.filter_dup = filter_dup
+    if s.enabled
+        return
+    for i in 0..6
+        s.addr[i] = addr[i]
+        s.sa[i] = addr[i]
+    s.addr_type = addr_type as u8
+    s.sa_type = addr_type as u8
+    s.enabled = true
+    s.start = now
+    s.waiting = false
+    s.upper = 1
+    s.count = 1
+    s.succ = 0
+    s.fail = 0
+    dup_clear(var s)
+    prepare_request(var s)
+
+// Leave the Scanning state.
+@tier(embedded)
+fn scan_disable(var s: Scan)
+    s.enabled = false
+    s.waiting = false
+
+// ── The windows ─────────────────────────────────────────────────────
+
+// The microseconds of the interval and of the window.
+@tier(embedded)
+fn interval_us(var s: Scan) -> Int
+    s.interval * ll_adv.UNIT_US
+
+@tier(embedded)
+fn window_us(var s: Scan) -> Int
+    s.window * ll_adv.UNIT_US
+
+// Whether the scanner of the extended commands scans on LE 1M and on LE Coded, which take turns in each interval: the LE 1M
+// window (`window`, `ty`), then the LE Coded window (`c_window`, `c_ty`), the interval being that of LE 1M.
+@tier(embedded)
+fn both_phys(var s: Scan) -> Bool
+    s.ext and (s.phys & XPHY_1M) != 0 and (s.phys & XPHY_CODED) != 0
+
+// The microseconds of the windows of one interval, the first (LE 1M) and the second (LE Coded) when the scanner takes turns,
+// and the whole time it listens in an interval.
+@tier(embedded)
+fn first_window_us(var s: Scan) -> Int
+    if both_phys(s)
+        return ll_phy.split_first(interval_us(s), window_us(var s), s.c_window * ll_adv.UNIT_US)
+    window_us(var s)
+
+@tier(embedded)
+fn listen_us(var s: Scan) -> Int
+    if both_phys(s)
+        return first_window_us(var s) + ll_phy.split_second(interval_us(s), window_us(var s), s.c_window * ll_adv.UNIT_US)
+    window_us(var s)
+
+// The PHY the window `now` is in or follows listens on: LE Coded for a scanner of LE Coded alone and in the second window
+// of one that takes turns, else LE 1M.
+@satisfies("REQ-BLE-CTL-092")
+@tier(embedded)
+fn scan_phy(var s: Scan, now: Int) -> Int
+    if not s.ext or (s.phys & XPHY_CODED) == 0
+        return ll_phy.PHY_1M
+    if (s.phys & XPHY_1M) == 0
+        return ll_phy.PHY_CODED
+    if now < s.start
+        return ll_phy.PHY_1M
+    if ((now - s.start) % interval_us(s)) < first_window_us(var s)
+        return ll_phy.PHY_1M
+    ll_phy.PHY_CODED
+
+// The Scan_Type in force for the window being run: the type of the PHY it listens on (`cur_phy`, set by the program).
+@tier(embedded)
+fn type_now(var s: Scan) -> Int
+    if both_phys(s) and (s.cur_phy as Int) == ll_phy.PHY_CODED
+        return s.c_ty as Int
+    s.ty as Int
+
+// The microseconds of the Duration and the Period of LE Set Extended Scan Enable: units of 10 ms and
+// of 1.28 s.
+@tier(embedded)
+fn duration_us(var s: Scan) -> Int
+    s.dur * 10000
+
+@tier(embedded)
+fn period_us(var s: Scan) -> Int
+    s.period * 1280000
+
+// The number of the window `now` is in or follows, counted from 0.
+@tier(embedded)
+fn scan_index(var s: Scan, now: Int) -> Int
+    if now < s.start
+        return 0
+    (now - s.start) / interval_us(s)
+
+// Whether `now` is inside a scan window.
+@satisfies("REQ-BLE-CTL-009")
+@tier(embedded)
+fn scan_in_window(var s: Scan, now: Int) -> Bool
+    if not s.enabled or now < s.start
+        return false
+    if s.dur > 0 and now >= s.start + duration_us(var s)
+        return false
+    ((now - s.start) % interval_us(s)) < listen_us(var s)
+
+// The channel of the window `now` is in or follows: each window listens on
+// the next advertising channel.
+@satisfies("REQ-BLE-CTL-009")
+@tier(embedded)
+fn scan_channel(var s: Scan, now: Int) -> Int
+    37 + (scan_index(var s, now) % 3)
+
+// The end of the window `now` is in or follows.
+@tier(embedded)
+fn scan_window_end(var s: Scan, now: Int) -> Int
+    if s.dur > 0 and now >= s.start + duration_us(var s)
+        return s.start + period_us(var s) + first_window_us(var s)
+    var len = listen_us(var s)
+    if both_phys(s) and (now - s.start) % interval_us(s) < first_window_us(var s)
+        len = first_window_us(var s)
+    s.start + scan_index(var s, now) * interval_us(s) + len
+
+// The start of the next window at or after `now`; `now` itself inside a
+// window.
+@tier(embedded)
+fn scan_next_start(var s: Scan, now: Int) -> Int
+    if now < s.start
+        return s.start
+    if scan_in_window(var s, now)
+        return now
+    let next = s.start + (scan_index(var s, now) + 1) * interval_us(s)
+    if s.dur > 0 and next >= s.start + duration_us(var s)
+        // The scan duration is over: the next period begins.  With no period the tick has ended the state.
+        if s.period > 0
+            return s.start + period_us(var s)
+        return s.start + duration_us(var s)
+    next
+
+// The periods of an extended scan.  Called with the time: the duration of the period has run out and
+// no period follows (answer 1: the state ends and the Host is owed the LE Scan Timeout event), or the
+// next period has begun (the window count starts again and a duplicate filter of mode 2 is emptied).
+@tier(embedded)
+fn scan_tick(var s: Scan, now: Int) -> Int
+    if not s.enabled or s.dur == 0 or now < s.start + duration_us(var s)
+        return 0
+    if s.period == 0
+        return 1
+    if now >= s.start + period_us(var s)
+        s.start = s.start + ((now - s.start) / period_us(var s)) * period_us(var s)
+        if (s.dup_mode as Int) == 2
+            dup_clear(var s)
+    0
+
+// ── The duplicate filter ────────────────────────────────────────────
+
+// Forget every device.
+@tier(embedded)
+fn dup_clear(var s: Scan)
+    for i in 0..DUP_ENTRIES
+        s.d_meta[i] = 0
+    s.d_next = 0
+    s.answered = 0
+
+// The entry holding the device with the address at payload offset 0 of `rx`
+// and the type bit `atype`, of `kind`; -1 for none.
+@tier(embedded)
+fn dup_find(var s: Scan, var rx: Pdu, atype: Int, kind: Int) -> Int
+    let want = (1 | (kind << 1) | (atype << 3)) as u8
+    var did = s.cur_did
+    if kind == KIND_ANSWERED
+        did = 0
+    for i in 0..DUP_ENTRIES
+        if s.d_meta[i] == want and (kind == KIND_ANSWERED or (s.d_did[i] as Int) == did)
+            var same = true
+            for k in 0..6
+                if s.d_addr[i * 6 + k] != rx.b[2 + k]
+                    same = false
+                    break
+            if same
+                return i
+    -1
+
+// Whether the device (address at payload offset 0 of `rx`, type bit `atype`)
+// has answered a SCAN_REQ.  With no answer in the filter the search is skipped,
+// which is the common case and keeps the judgement of an advertisement short.
+@tier(embedded)
+fn has_answered(var s: Scan, var rx: Pdu, atype: Int) -> Bool
+    s.answered > 0 and dup_find(var s, var rx, atype, KIND_ANSWERED) >= 0
+
+// Remember the device, replacing the oldest entry when the filter is full.
+@tier(embedded)
+fn dup_add(var s: Scan, var rx: Pdu, atype: Int, kind: Int)
+    let i = s.d_next as Int
+    if kind == KIND_ANSWERED
+        s.answered = s.answered + 1
+    s.d_meta[i] = (1 | (kind << 1) | (atype << 3)) as u8
+    s.d_did[i] = s.cur_did as u16
+    for k in 0..6
+        s.d_addr[i * 6 + k] = rx.b[2 + k]
+    s.d_next = ((i + 1) % DUP_ENTRIES) as u8
+
+// ── The backoff ─────────────────────────────────────────────────────
+
+// A new backoff count between one and the upper limit.
+@tier(embedded)
+fn backoff_draw(var s: Scan)
+    s.rng = ll_adv.rng_step(s.rng)
+    s.count = 1 + (s.rng % s.upper)
+
+// A scan response arrived: after two in a row the upper limit halves.
+@tier(embedded)
+fn backoff_success(var s: Scan)
+    s.fail = 0
+    s.succ = s.succ + 1
+    if s.succ >= 2
+        s.succ = 0
+        s.upper = s.upper / 2
+        if s.upper < 1
+            s.upper = 1
+    backoff_draw(var s)
+
+// A scan response did not arrive: after two in a row the upper limit doubles.
+@satisfies("REQ-BLE-CTL-011")
+@tier(embedded)
+fn backoff_failure(var s: Scan)
+    s.succ = 0
+    s.fail = s.fail + 1
+    if s.fail >= 2
+        s.fail = 0
+        s.upper = s.upper * 2
+        if s.upper > BACKOFF_MAX
+            s.upper = BACKOFF_MAX
+    backoff_draw(var s)
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// Whether the scanner would send a SCAN_REQ for the next scannable PDU it
+// accepts: it is active, awaits no response, and its backoff count is at one.
+// A caller whose radio can start the answer ahead of the judgement arms it
+// only then.
+@tier(embedded)
+fn scan_may_ask(var s: Scan) -> Bool
+    s.enabled and type_now(var s) == SCAN_ACTIVE and not s.waiting and s.count <= 1
+
+// The same, once the header octet is known to name a PDU the scanner answers.
+@tier(embedded)
+fn scan_arm_for(var s: Scan, header0: Int) -> Bool
+    scan_may_ask(var s) and ll_pdu.type_is_scannable(header0 & 0x0F)
+
+// Prepare the SCAN_REQ of the running state: the scanner's address as ScanA
+// and an AdvA to be filled in.  Done when scanning starts, so that answering
+// an advertisement only patches the advertiser's address in.
+@tier(embedded)
+fn prepare_request(var s: Scan)
+    ll_pdu.pdu_begin(var s.req, ll_pdu.SCAN_REQ, s.sa_type as Int, 0)
+    ll_pdu.pdu_put_addr(var s.req, var s.sa)
+    for _ in 0..6
+        let _a = ll_pdu.pdu_put(var s.req, 0)
+    ll_pdu.pdu_finish(var s.req)
+
+// Set the scanner's address for the next SCAN_REQ, ScanA: the Resolvable Private
+// Address made for the advertiser, or the scanner's own address.
+@tier(embedded)
+fn scan_set_scana(var s: Scan, var addr: Vec[u8; 6], addr_type: Int)
+    for i in 0..6
+        s.sa[i] = addr[i]
+    s.sa_type = addr_type as u8
+
+// Put the ScanA of the next SCAN_REQ into the request, and its type.
+@tier(embedded)
+fn put_scana(var s: Scan)
+    s.req.b[0] = (((s.req.b[0] as Int) & 0xBF) | ((s.sa_type as Int) << 6)) as u8
+    for k in 0..6
+        s.req.b[2 + k] = s.sa[k]
+
+// Address the SCAN_REQ to the advertiser whose address is at payload offset 0
+// of `rx`: its AdvA, and the advertiser's address type as RxAdd.
+@tier(embedded)
+fn build_request(var s: Scan, var rx: Pdu)
+    let tx_add = (rx.b[0] as Int) & ll_pdu.TXADD
+    s.req.b[0] = (((s.req.b[0] as Int) & 0x7F) | (tx_add << 1)) as u8
+    for k in 0..6
+        s.req.b[8 + k] = rx.b[2 + k]
+        s.w_addr[k] = rx.b[2 + k]
+    s.waiting = true
+    s.w_type = (tx_add >> 6) as u8
+    s.w_conn = ll_pdu.pdu_type(var rx) == ll_pdu.ADV_IND
+
+// The first part of the judgement of an advertising PDU received with a good
+// CRC: whether the scanner takes the PDU at all (an advertising PDU of a
+// well-formed length, from a device the filter policy lets through, a directed
+// one only when it names the scanner) and whether a SCAN_REQ is to go out.  A
+// radio that must start the SCAN_REQ T_IFS after the PDU makes this decision
+// first and tells the Host afterwards.  `got` is the octets received including
+// the header, of which the first 14 are read; `listed` says the advertiser is in
+// the Filter Accept List.  The answer is a mask: `ACT_ACCEPTED` when the PDU is
+// taken, and `ACT_REQUEST` when a SCAN_REQ is to go out (it is in `req`).
+@satisfies("REQ-BLE-CTL-010")
+@tier(embedded)
+fn scan_decide(var s: Scan, var rx: Pdu, got: Int, listed: Bool) -> Int
+    if not s.enabled or not ll_pdu.pdu_well_formed(var rx, got)
+        return 0
+    let ty = ll_pdu.pdu_type(var rx)
+    if not ll_pdu.type_is_advertising(ty)
+        return 0
+    s.seen = s.seen + 1
+    if uses_list(s.policy as Int) and not listed
+        s.filtered = s.filtered + 1
+        return 0
+    // A directed PDU is for this scanner only when it names its address, or, under
+    // policy 2 and 3, when its TargetA is an RPA the scanner cannot tell is not its own.
+    if directed_elsewhere(var s, var rx) and not takes_unresolved_target(var s, var rx)
+        s.filtered = s.filtered + 1
+        return 0
+    var act = ACT_ACCEPTED
+    if type_now(var s) == SCAN_ACTIVE and ll_pdu.type_is_scannable(ty) and not s.waiting
+        if not has_answered(var s, var rx, ll_pdu.pdu_tx_add(var rx))
+            s.count = s.count - 1
+            if s.count <= 0
+                build_request(var s, var rx)
+                put_scana(var s)
+                s.requests = s.requests + 1
+                act = act | ACT_REQUEST
+    act
+
+// The second part: whether the Host is to see a PDU that `scan_decide`
+// accepted.  A device already reported is not reported again when the Host
+// asked for the duplicate filter.  The answer is `ACT_REPORT` or 0.
+@satisfies("REQ-BLE-CTL-010")
+@tier(embedded)
+fn scan_note(var s: Scan, var rx: Pdu) -> Int
+    let atype = ll_pdu.pdu_tx_add(var rx)
+    if s.filter_dup
+        if dup_find(var s, var rx, atype, KIND_ADV) >= 0
+            s.duplicates = s.duplicates + 1
+            return 0
+        dup_add(var s, var rx, atype, KIND_ADV)
+    s.reports = s.reports + 1
+    ACT_REPORT
+
+// Judge an advertising PDU received with a good CRC in one call: the mask of
+// `ACT_REPORT` when the Host is to see the PDU and `ACT_REQUEST` when a
+// SCAN_REQ is to go out.
+@tier(embedded)
+fn scan_rx(var s: Scan, var rx: Pdu, got: Int, listed: Bool) -> Int
+    let act = scan_decide(var s, var rx, got, listed)
+    if (act & ACT_ACCEPTED) == 0
+        return 0
+    (act & ACT_REQUEST) | scan_note(var s, var rx)
+
+// Judge a PDU received with a good CRC as the response to the SCAN_REQ.  The
+// answer is `ACT_REPORT` when the Host is to see the scan response, 0
+// otherwise.  A SCAN_RSP from another advertiser leaves the scanner waiting.
+@satisfies("REQ-BLE-CTL-011")
+@tier(embedded)
+fn scan_rsp_rx(var s: Scan, var rx: Pdu, got: Int) -> Int
+    if not s.waiting or not ll_pdu.pdu_well_formed(var rx, got)
+        return 0
+    if ll_pdu.pdu_type(var rx) != ll_pdu.SCAN_RSP
+        return 0
+    if ll_pdu.pdu_tx_add(var rx) != (s.w_type as Int) or not ll_pdu.pdu_addr_is(var rx, 0, var s.w_addr)
+        return 0
+    s.waiting = false
+    s.responses = s.responses + 1
+    backoff_success(var s)
+    let atype = ll_pdu.pdu_tx_add(var rx)
+    if dup_find(var s, var rx, atype, KIND_ANSWERED) < 0
+        dup_add(var s, var rx, atype, KIND_ANSWERED)
+    if s.filter_dup and dup_find(var s, var rx, atype, KIND_RSP) >= 0
+        s.duplicates = s.duplicates + 1
+        return 0
+    if s.filter_dup
+        dup_add(var s, var rx, atype, KIND_RSP)
+    s.reports = s.reports + 1
+    ACT_REPORT
+
+// The SCAN_RSP did not come.
+@tier(embedded)
+fn scan_rsp_missed(var s: Scan)
+    if not s.waiting
+        return
+    s.waiting = false
+    s.misses = s.misses + 1
+    backoff_failure(var s)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var x: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _a = x.push((first + i) as u8)
+    x
+
+// A scanner enabled at time 0 with the address 0xA0..0xA5.
+fn t_scanner(ty: Int, interval: Int, window: Int, dup: Bool) -> Scan
+    var s = scan_new()
+    scan_set_params(var s, ty, interval, window, 0, 0)
+    var a = t_addr(0xA0)
+    scan_enable(var s, 0, dup, var a, 0)
+    s
+
+// An advertisement of PDU type `ty` from the advertiser first..first+5 of
+// address type `tx_add`, with `data_len` octets of data.
+fn t_adv(ty: Int, first: Int, tx_add: Int, data_len: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var a = t_addr(first)
+    ll_pdu.pdu_begin(var p, ty, tx_add, 0)
+    ll_pdu.pdu_put_addr(var p, var a)
+    for i in 0..data_len
+        let _x = ll_pdu.pdu_put(var p, i)
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn t_policy(var s: Scan, p: Int)
+    s.policy = p as u8
+
+fn t_backoff(var s: Scan, upper: Int, count: Int)
+    s.upper = upper
+    s.count = count
+
+@test
+fn test_capacities_match_the_constants()
+    var s = scan_new()
+    test.assert_eq(s.d_meta.capacity(), DUP_ENTRIES)
+    test.assert_eq(s.d_addr.capacity(), DUP_ENTRIES * 6)
+    test.assert_eq(s.addr.capacity(), 6)
+    test.assert_eq(s.w_addr.capacity(), 6)
+
+@test
+fn test_parameter_status_follows_the_command()
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 0), 0)
+    test.assert_eq(scan_params_status(1, 0x4000, 0x4000, 1, 1), 0)
+    test.assert_eq(scan_params_status(2, 0x10, 0x10, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 3, 3, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x4001, 0x10, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 3, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 0x11, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 4, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 4), 0x12)
+    // The own address types 2 and 3 are served, and the filter policies 2 and 3.
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 2, 0), 0)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 3, 1), 0)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 2), 0)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 3), 0)
+
+@test
+fn test_windows_follow_the_interval_and_rotate_the_channel()
+    // Interval 100 ms (160 units), window 30 ms (48 units).
+    var s = t_scanner(0, 160, 48, false)
+    test.assert(scan_in_window(var s, 0))
+    test.assert(scan_in_window(var s, 29999))
+    test.assert(not scan_in_window(var s, 30000))
+    test.assert(not scan_in_window(var s, 99999))
+    test.assert(scan_in_window(var s, 100000))
+    test.assert_eq(scan_channel(var s, 0), 37)
+    test.assert_eq(scan_channel(var s, 100000), 38)
+    test.assert_eq(scan_channel(var s, 250000), 39)
+    test.assert_eq(scan_channel(var s, 300000), 37)
+    test.assert_eq(scan_window_end(var s, 10000), 30000)
+    test.assert_eq(scan_window_end(var s, 110000), 130000)
+    test.assert_eq(scan_next_start(var s, 10000), 10000)
+    test.assert_eq(scan_next_start(var s, 40000), 100000)
+    test.assert_eq(scan_next_start(var s, 99999), 100000)
+
+@test
+fn test_equal_window_and_interval_scan_continuously()
+    var s = t_scanner(0, 16, 16, false)
+    for t in 0..200
+        test.assert(scan_in_window(var s, t * 1000))
+    // The channel still changes every window.
+    test.assert_eq(scan_channel(var s, 0), 37)
+    test.assert_eq(scan_channel(var s, 10000), 38)
+
+@test
+fn test_a_scanner_that_is_off_has_no_window()
+    var s = scan_new()
+    test.assert(not scan_in_window(var s, 0))
+
+@test
+fn test_a_passive_scanner_reports_and_never_requests()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 3)
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT)
+    test.assert_eq(s.requests, 0)
+    test.assert(not s.waiting)
+
+@test
+fn test_duplicate_filter_reports_a_device_once()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 3)
+    var q = t_adv(ll_pdu.ADV_NONCONN_IND, 0x20, 1, 0)
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 11, false), 0)
+    test.assert_eq(scan_rx(var s, var q, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var q, 8, false), 0)
+    test.assert_eq(scan_rx(var s, var p, 11, false), 0)
+    test.assert_eq(s.duplicates, 3)
+    test.assert_eq(s.reports, 2)
+
+@test
+fn test_the_same_address_with_the_other_type_is_another_device()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    var q = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var q, 8, false), ACT_REPORT)
+
+@test
+fn test_without_the_filter_every_pdu_is_reported()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    for _ in 0..5
+        test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(s.reports, 5)
+
+@test
+fn test_the_duplicate_filter_forgets_the_oldest_when_full()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    for i in 0..DUP_ENTRIES
+        var p = t_adv(ll_pdu.ADV_IND, 0x10 + i * 8, 0, 0)
+        test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    // One more device takes the place of the first.
+    var extra = t_adv(ll_pdu.ADV_IND, 0xF0, 0, 0)
+    test.assert_eq(scan_rx(var s, var extra, 8, false), ACT_REPORT)
+    var second = t_adv(ll_pdu.ADV_IND, 0x10 + 8, 0, 0)
+    test.assert_eq(scan_rx(var s, var second, 8, false), 0)
+    var first = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var first, 8, false), ACT_REPORT)
+
+@test
+fn test_enabling_again_keeps_the_filter_and_takes_the_new_setting()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    var a = t_addr(0xA0)
+    scan_enable(var s, 5000, false, var a, 0)
+    test.assert_eq(s.start, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+
+@test
+fn test_disable_and_enable_clear_the_filter()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    scan_disable(var s)
+    var a = t_addr(0xA0)
+    scan_enable(var s, 9000, true, var a, 0)
+    test.assert_eq(s.start, 9000)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+
+@test
+fn test_filtered_policy_ignores_devices_outside_the_list()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    t_policy(var s, 1)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), 0)
+    test.assert_eq(scan_rx(var s, var p, 8, true), ACT_REPORT)
+    test.assert_eq(s.filtered, 1)
+
+@test
+fn test_directed_pdu_is_reported_only_when_it_names_the_scanner()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var me = t_addr(0xA0)
+    var other = t_addr(0xB0)
+    var d = ll_pdu.pdu_new()
+    var adv = t_addr(0x10)
+    ll_pdu.pdu_begin(var d, ll_pdu.ADV_DIRECT_IND, 0, 0)
+    ll_pdu.pdu_put_addr(var d, var adv)
+    ll_pdu.pdu_put_addr(var d, var me)
+    ll_pdu.pdu_finish(var d)
+    test.assert_eq(scan_rx(var s, var d, 14, false), ACT_REPORT)
+    var e = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var e, ll_pdu.ADV_DIRECT_IND, 0, 0)
+    ll_pdu.pdu_put_addr(var e, var adv)
+    ll_pdu.pdu_put_addr(var e, var other)
+    ll_pdu.pdu_finish(var e)
+    test.assert_eq(scan_rx(var s, var e, 14, false), 0)
+    // The scanner's address with the other type bit is not the scanner.
+    var f = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var f, ll_pdu.ADV_DIRECT_IND, 0, 1)
+    ll_pdu.pdu_put_addr(var f, var adv)
+    ll_pdu.pdu_put_addr(var f, var me)
+    ll_pdu.pdu_finish(var f)
+    test.assert_eq(scan_rx(var s, var f, 14, false), 0)
+
+// A directed advertisement from the advertiser 0x10.. to `target` (a random address when
+// `rx_add` is 1).
+fn t_directed(var target: Vec[u8; 6], rx_add: Int) -> Pdu
+    var d = ll_pdu.pdu_new()
+    var adv = t_addr(0x10)
+    ll_pdu.pdu_begin(var d, ll_pdu.ADV_DIRECT_IND, 0, rx_add)
+    ll_pdu.pdu_put_addr(var d, var adv)
+    ll_pdu.pdu_put_addr(var d, var target)
+    ll_pdu.pdu_finish(var d)
+    d
+
+@test
+fn test_policy_2_takes_a_directed_pdu_for_an_rpa_that_is_not_the_scanners()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    // A Resolvable Private Address: random, the two top bits 01.
+    var rpa = t_addr(0x40)
+    rpa[5] = 0x5A
+    var d = t_directed(var rpa, 1)
+    test.assert(directed_elsewhere(var s, var d))
+    test.assert(not takes_unresolved_target(var s, var d))
+    test.assert_eq(scan_rx(var s, var d, 14, false), 0)
+    t_policy(var s, POLICY_DIRECTED)
+    test.assert(takes_unresolved_target(var s, var d))
+    test.assert_eq(scan_rx(var s, var d, 14, false), ACT_REPORT)
+    // A public address, or a random address that is no RPA, is still not for the scanner.
+    var other = t_addr(0xB0)
+    var p = t_directed(var other, 0)
+    test.assert_eq(scan_rx(var s, var p, 14, false), 0)
+    var st = t_addr(0xC0)
+    st[5] = 0xC1
+    var q = t_directed(var st, 1)
+    test.assert_eq(scan_rx(var s, var q, 14, false), 0)
+    // The scanner's own directed PDU is no "elsewhere".
+    var me = t_addr(0xA0)
+    var mine = t_directed(var me, 0)
+    test.assert(not directed_elsewhere(var s, var mine))
+
+@test
+fn test_policy_3_adds_the_filter_accept_list()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    t_policy(var s, POLICY_LIST_DIRECTED)
+    test.assert(uses_list(POLICY_LIST_DIRECTED))
+    test.assert(uses_list(POLICY_LIST))
+    test.assert(not uses_list(POLICY_DIRECTED))
+    var rpa = t_addr(0x40)
+    rpa[5] = 0x5A
+    var d = t_directed(var rpa, 1)
+    test.assert_eq(scan_rx(var s, var d, 14, false), 0)
+    test.assert_eq(scan_rx(var s, var d, 14, true), ACT_REPORT)
+
+@test
+fn test_malformed_and_foreign_pdus_are_ignored()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 9, false), 0)
+    var q = t_adv(ll_pdu.SCAN_REQ, 0x10, 0, 6)
+    test.assert_eq(scan_rx(var s, var q, 14, false), 0)
+    var off = scan_new()
+    test.assert_eq(scan_rx(var off, var p, 8, false), 0)
+
+@test
+fn test_active_scanner_requests_on_the_first_scannable_pdu()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 1, 3)
+    test.assert(scan_arm_for(var s, 0x40))
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT | ACT_REQUEST)
+    test.assert(s.waiting)
+    test.assert_eq(ll_pdu.pdu_type(var s.req), ll_pdu.SCAN_REQ)
+    test.assert_eq(ll_pdu.pdu_len(var s.req), 12)
+    // ScanA is the scanner's address and AdvA the advertiser's, with the
+    // advertiser's type in RxAdd and the scanner's in TxAdd.
+    test.assert_eq(ll_pdu.pdu_get(var s.req, 2), 0xA0)
+    test.assert_eq(ll_pdu.pdu_get(var s.req, 8), 0x10)
+    test.assert_eq(ll_pdu.pdu_get(var s.req, 13), 0x15)
+    test.assert_eq(ll_pdu.pdu_rx_add(var s.req), 1)
+    test.assert_eq(ll_pdu.pdu_tx_add(var s.req), 0)
+
+@test
+fn test_active_scanner_does_not_request_from_non_scannable_types()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var a = t_adv(ll_pdu.ADV_NONCONN_IND, 0x10, 0, 3)
+    test.assert_eq(scan_rx(var s, var a, 11, false), ACT_REPORT)
+    var b = t_adv(ll_pdu.ADV_SCAN_IND, 0x20, 0, 3)
+    test.assert_eq(scan_rx(var s, var b, 11, false), ACT_REPORT | ACT_REQUEST)
+    test.assert(not scan_arm_for(var s, 0x02))
+
+@test
+fn test_while_waiting_the_scanner_sends_no_second_request()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT | ACT_REQUEST)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert(not scan_arm_for(var s, 0x00))
+
+@test
+fn test_scan_response_is_reported_and_ends_the_wait()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    let _x = scan_rx(var s, var p, 8, false)
+    var r = t_adv(ll_pdu.SCAN_RSP, 0x10, 0, 4)
+    test.assert_eq(scan_rsp_rx(var s, var r, 12), ACT_REPORT)
+    test.assert(not s.waiting)
+    test.assert_eq(s.responses, 1)
+    // The device has answered: no further request goes to it.
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(s.requests, 1)
+
+@test
+fn test_scan_response_from_another_advertiser_is_not_the_answer()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    let _x = scan_rx(var s, var p, 8, false)
+    var wrong = t_adv(ll_pdu.SCAN_RSP, 0x30, 0, 4)
+    test.assert_eq(scan_rsp_rx(var s, var wrong, 12), 0)
+    test.assert(s.waiting)
+    var wrong_type = t_adv(ll_pdu.SCAN_RSP, 0x10, 1, 4)
+    test.assert_eq(scan_rsp_rx(var s, var wrong_type, 12), 0)
+    test.assert(s.waiting)
+
+@test
+fn test_scan_response_duplicates_are_filtered_apart_from_advertisements()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    // The advertisement was reported; its scan response is a separate report.
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT | ACT_REQUEST)
+    var r = t_adv(ll_pdu.SCAN_RSP, 0x10, 0, 4)
+    test.assert_eq(scan_rsp_rx(var s, var r, 12), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 8, false), 0)
+
+@test
+fn test_a_missed_response_counts_a_failure_and_allows_a_new_request()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    let _x = scan_rx(var s, var p, 8, false)
+    scan_rsp_missed(var s)
+    test.assert(not s.waiting)
+    test.assert_eq(s.misses, 1)
+    test.assert_eq(s.upper, 1)
+    // The count was drawn from 1 to the upper limit of 1: the next PDU asks.
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT | ACT_REQUEST)
+
+@test
+fn test_two_failures_double_the_limit_and_two_successes_halve_it()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    for _ in 0..4
+        backoff_failure(var s)
+    test.assert_eq(s.upper, 4)
+    for _ in 0..40
+        backoff_failure(var s)
+    test.assert_eq(s.upper, BACKOFF_MAX)
+    for _ in 0..4
+        backoff_success(var s)
+    test.assert_eq(s.upper, BACKOFF_MAX / 4)
+    for _ in 0..40
+        backoff_success(var s)
+    test.assert_eq(s.upper, 1)
+
+@test
+fn test_backoff_count_is_between_one_and_the_limit()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    t_backoff(var s, 8, 1)
+    var lo = 100
+    var hi = 0
+    for _ in 0..500
+        backoff_draw(var s)
+        test.assert(s.count >= 1 and s.count <= 8)
+        if s.count < lo
+            lo = s.count
+        if s.count > hi
+            hi = s.count
+    test.assert_eq(lo, 1)
+    test.assert_eq(hi, 8)
+
+@test
+fn test_with_a_limit_above_one_only_every_nth_pdu_is_asked_about()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    t_backoff(var s, 4, 3)
+    var a = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    var b = t_adv(ll_pdu.ADV_IND, 0x20, 0, 0)
+    var c = t_adv(ll_pdu.ADV_IND, 0x30, 0, 0)
+    test.assert(not scan_arm_for(var s, 0x00))
+    test.assert_eq(scan_rx(var s, var a, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var b, 8, false), ACT_REPORT)
+    test.assert(scan_arm_for(var s, 0x00))
+    test.assert_eq(scan_rx(var s, var c, 8, false), ACT_REPORT | ACT_REQUEST)
+
+@test
+fn test_reset_returns_to_the_defaults()
+    var s = t_scanner(SCAN_ACTIVE, 160, 48, true)
+    scan_reset(var s)
+    test.assert(not s.enabled)
+    test.assert_eq(s.interval, SCAN_DEFAULT)
+    test.assert_eq(s.window, SCAN_DEFAULT)
+    test.assert_eq(s.ty as Int, 0)
+
+@test
+fn test_the_decision_asks_before_the_host_is_told()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 3)
+    let act = scan_decide(var s, var p, 11, false)
+    test.assert_eq(act, ACT_ACCEPTED | ACT_REQUEST)
+    // Nothing is reported until the note is made, and a note reports once.
+    test.assert_eq(s.reports, 0)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    test.assert_eq(s.reports, 1)
+    let again = scan_decide(var s, var p, 11, false)
+    test.assert_eq(again & ACT_REQUEST, 0)
+    test.assert_eq(scan_note(var s, var p), 0)
+    test.assert_eq(s.duplicates, 1)
+
+@test
+fn test_a_pdu_the_policy_refuses_is_not_accepted()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    t_policy(var s, 1)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_decide(var s, var p, 8, false), 0)
+    test.assert_eq(scan_decide(var s, var p, 8, true), ACT_ACCEPTED | ACT_REQUEST)
+
+@test
+fn test_extended_scan_parameters_check_the_phys_and_the_ranges()
+    test.assert_eq(xscan_status(0, 0, XPHY_1M), 0)
+    test.assert_eq(xscan_status(3, 3, XPHY_1M | XPHY_CODED), 0)
+    test.assert_eq(xscan_status(4, 0, XPHY_1M), 0x12)
+    test.assert_eq(xscan_status(0, 4, XPHY_1M), 0x12)
+    test.assert_eq(xscan_status(0, 0, 0), 0x12)
+    // LE 2M (bit 1) and the bits above LE Coded are reserved.
+    test.assert_eq(xscan_status(0, 0, 2), 0x12)
+    test.assert_eq(xscan_status(0, 0, XPHY_1M | 8), 0x12)
+    test.assert_eq(xscan_set_status(1, 0x10, 0x10), 0)
+    test.assert_eq(xscan_set_status(2, 0x10, 0x10), 0x12)
+    test.assert_eq(xscan_set_status(0, 0x10, 0x20), 0x12)
+    test.assert(xscan_timing_ok(0, 0))
+    test.assert(xscan_timing_ok(100, 0))
+    test.assert(xscan_timing_ok(100, 1))
+    test.assert(not xscan_timing_ok(0, 1))
+    test.assert(not xscan_timing_ok(128, 1))
+
+fn t_xscanner(dur: Int, period: Int, dup_mode: Int) -> Scan
+    var s = scan_new()
+    scan_set_params(var s, 0, 16, 16, 0, 0)
+    xscan_set_params(var s, 0, 0, XPHY_1M)
+    var a = t_addr(0xA0)
+    xscan_enable(var s, 0, dup_mode, dur, period, var a, 0)
+    s
+
+@test
+fn test_a_duration_with_no_period_ends_the_state_and_stops_the_windows()
+    var s = t_xscanner(100, 0, 0)
+    test.assert(follows_extended(var s))
+    test.assert_eq(scan_tick(var s, 999999), 0)
+    test.assert(scan_in_window(var s, 999000))
+    test.assert(not scan_in_window(var s, 1000000))
+    test.assert_eq(scan_tick(var s, 1000000), 1)
+    // With no duration there is nothing to end.
+    var u = t_xscanner(0, 0, 0)
+    test.assert_eq(scan_tick(var u, 100000000), 0)
+
+@test
+fn test_a_period_starts_the_windows_again_and_empties_the_filter_in_mode_two()
+    var s = t_xscanner(100, 1, 2)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 8, false), 0)
+    // The duration is over at 1 s and the next period begins at 1.28 s.
+    test.assert_eq(scan_tick(var s, 1100000), 0)
+    test.assert(not scan_in_window(var s, 1100000))
+    test.assert_eq(scan_next_start(var s, 1100000), 1280000)
+    test.assert_eq(scan_window_end(var s, 1280000 - 1), 1280000 + 10000)
+    test.assert_eq(scan_tick(var s, 1290000), 0)
+    test.assert_eq(s.start, 1280000)
+    test.assert(scan_in_window(var s, 1290000))
+    test.assert_eq(scan_channel(var s, 1285000), 37)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    // Mode 1 keeps the filter across periods.
+    var q = t_xscanner(100, 1, 1)
+    test.assert_eq(scan_rx(var q, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_tick(var q, 1290000), 0)
+    test.assert_eq(scan_rx(var q, var p, 8, false), 0)
+
+fn t_did(var s: Scan, d: Int)
+    s.cur_did = d
+
+@test
+fn test_the_duplicate_filter_tells_advertisements_of_one_address_apart_by_their_did()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_NONCONN_IND, 0x10, 0, 0)
+    t_did(var s, 0x8100)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    test.assert_eq(scan_note(var s, var p), 0)
+    t_did(var s, 0x8200)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    t_did(var s, 0x8100)
+    test.assert_eq(scan_note(var s, var p), 0)
+    // A legacy PDU of the same device is another entry still.
+    t_did(var s, 0)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    test.assert_eq(scan_note(var s, var p), 0)
+
+fn t_coded_set(var s: Scan, ty: Int, window: Int)
+    s.c_ty = ty as u8
+    s.c_interval = s.interval
+    s.c_window = window
+
+fn t_cur(var s: Scan, phy: Int)
+    s.cur_phy = phy as u8
+
+fn t_both(interval: Int, w1: Int, wc: Int, ty: Int, cty: Int) -> Scan
+    var s = scan_new()
+    scan_set_params(var s, ty, interval, w1, 0, 0)
+    xscan_set_params(var s, 0, 0, XPHY_1M | XPHY_CODED)
+    t_coded_set(var s, cty, wc)
+    var a = t_addr(0xA0)
+    xscan_enable(var s, 0, 0, 0, 0, var a, 0)
+    s
+
+@test
+fn test_a_scanner_of_two_phys_listens_on_le_1m_and_then_on_le_coded_in_each_interval()
+    // An interval of 100 ms (160 units), 30 ms (48 units) on LE 1M and 20 ms (32 units) on LE Coded.
+    var s = t_both(160, 48, 32, SCAN_PASSIVE, SCAN_ACTIVE)
+    test.assert(both_phys(s))
+    test.assert_eq(first_window_us(var s), 30000)
+    test.assert_eq(listen_us(var s), 50000)
+    test.assert_eq(scan_phy(var s, 0), ll_phy.PHY_1M)
+    test.assert_eq(scan_phy(var s, 29999), ll_phy.PHY_1M)
+    test.assert_eq(scan_phy(var s, 30000), ll_phy.PHY_CODED)
+    test.assert_eq(scan_phy(var s, 49999), ll_phy.PHY_CODED)
+    test.assert_eq(scan_phy(var s, 100000), ll_phy.PHY_1M)
+    test.assert(scan_in_window(var s, 49999))
+    test.assert(not scan_in_window(var s, 50000))
+    test.assert(not scan_in_window(var s, 99999))
+    test.assert(scan_in_window(var s, 100000))
+    // A window ends at the change of PHY, and the Coded one at the end of the listening.
+    test.assert_eq(scan_window_end(var s, 10000), 30000)
+    test.assert_eq(scan_window_end(var s, 30000), 50000)
+    test.assert_eq(scan_window_end(var s, 130000), 150000)
+    test.assert_eq(scan_next_start(var s, 60000), 100000)
+    // Both windows of an interval are on the same channel, the next interval on the next.
+    test.assert_eq(scan_channel(var s, 10000), 37)
+    test.assert_eq(scan_channel(var s, 40000), 37)
+    test.assert_eq(scan_channel(var s, 110000), 38)
+    // The Scan_Type follows the PHY of the window.
+    t_cur(var s, ll_phy.PHY_1M)
+    test.assert_eq(type_now(var s), SCAN_PASSIVE)
+    test.assert(not scan_may_ask(var s))
+    t_cur(var s, ll_phy.PHY_CODED)
+    test.assert_eq(type_now(var s), SCAN_ACTIVE)
+    test.assert(scan_may_ask(var s))
+    // Windows that together are longer than the interval share it.
+    var t = t_both(160, 160, 160, SCAN_PASSIVE, SCAN_PASSIVE)
+    test.assert_eq(first_window_us(var t), 50000)
+    test.assert_eq(listen_us(var t), 100000)
+    test.assert_eq(scan_phy(var t, 49999), ll_phy.PHY_1M)
+    test.assert_eq(scan_phy(var t, 50000), ll_phy.PHY_CODED)
+
+@test
+fn test_a_scanner_of_one_phy_listens_on_it_for_the_whole_window()
+    var s = t_scanner(SCAN_PASSIVE, 160, 48, false)
+    test.assert(not both_phys(s))
+    test.assert_eq(scan_phy(var s, 0), ll_phy.PHY_1M)
+    // LE Coded alone: the legacy fields hold its set.
+    var c = scan_new()
+    scan_set_params(var c, 1, 160, 48, 0, 0)
+    xscan_set_params(var c, 0, 0, XPHY_CODED)
+    var a = t_addr(0xA0)
+    xscan_enable(var c, 0, 0, 0, 0, var a, 0)
+    test.assert_eq(scan_phy(var c, 0), ll_phy.PHY_CODED)
+    test.assert_eq(scan_phy(var c, 50000), ll_phy.PHY_CODED)
+    test.assert_eq(first_window_us(var c), 30000)
+    // A scanner of the legacy commands is on LE 1M whatever the fields hold.
+    test.assert_eq(scan_phy(var s, 0), ll_phy.PHY_1M)

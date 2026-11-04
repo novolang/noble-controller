@@ -1,0 +1,242 @@
+// src/ll_cmac.nv — AES-CMAC of messages up to one block, and the Group Session Key of an encrypted BIG.
+//
+// [Vol 6] Part E, Section 1.1: the Group Session Key (GSK) that encrypts the payloads of a Broadcast Isochronous
+// Group is derived from the Broadcast_Code the Host gave and the GSKD the Isochronous Broadcaster put in the BIGInfo.
+//
+//   IGLTK = h7("BIG1", Broadcast_Code)
+//   GLTK  = h6(IGLTK, "BIG2")
+//   GSK   = h8(GLTK, GSKD, "BIG3")
+//
+// h6, h7 and h8 are AES-CMAC ([Vol 3] Part H, Section 2.2, and [Vol 6] Part E, Section 1.1.1) of a message that is one block or
+// less: h7 takes the 16 octets of the code with the salt as key, h6 the 4 octets of a key identifier with the code as key, h8 the
+// 16 octets of K with S as key and then the 4 octets of the key identifier with the result as key.  The generalised algorithm of
+// RFC 4493 is therefore reduced to its one-block case, and the derivation runs 3 CMACs of 2 AES blocks each (the subkey
+// block and the message block), 6 blocks with the key expansions.
+//
+// Octet order.  The Host and the air carry every 128-bit value least significant octet first (the Broadcast_Code of the
+// command, the GSKD and GIV of the BIGInfo); AES-CMAC takes the most significant first.  The derivation reverses at its
+// edges, so a caller holds values in the order of the HCI and of the air.
+//
+// No function here allocates.
+
+use std.test
+use ll_aes
+
+// The key identifiers, [Vol 6] Part E, Section 1.1.2: ASCII "BIG1", "BIG2" and "BIG3" as 32-bit integers, most significant
+// octet first.
+const KEY_ID_BIG2 = 0x42494732
+const KEY_ID_BIG3 = 0x42494733
+const SALT_BIG1 = 0x42494731
+
+@value
+struct Cmac
+    k: AesKey
+    a: Vec[u8; 16]
+    b: Vec[u8; 16]
+    key: Vec[u8; 16]
+    msg: Vec[u8; 16]
+    out: Vec[u8; 16]
+
+@no_alloc
+@tier(embedded)
+fn cmac_new() -> Cmac
+    var c = cmac_empty()
+    cmac_fill(var c)
+    c
+
+// A Cmac with no octets in its buffers: a build that never derives a key holds one so (`cmac_fill` makes it usable).
+@no_alloc
+@tier(embedded)
+fn cmac_empty() -> Cmac
+    Cmac { k: ll_aes.aes_key_empty(), a: Vec.new(), b: Vec.new(), key: Vec.new(), msg: Vec.new(), out: Vec.new() }
+
+@no_alloc
+@tier(embedded)
+fn cmac_fill(var c: Cmac)
+    ll_aes.aes_key_fill(var c.k)
+    for _ in 0..16
+        let _a = c.a.push(0)
+        let _b = c.b.push(0)
+        let _c = c.key.push(0)
+        let _d = c.msg.push(0)
+        let _e = c.out.push(0)
+
+// The doubling of RFC 4493, Section 2.3, of the 16 octets in `a` (most significant first) into `b`.
+@no_alloc
+@tier(embedded)
+fn double(var a: Vec[u8; 16], var b: Vec[u8; 16])
+    var carry = 0
+    var k = 15
+    for _ in 0..16
+        let v = a[k] as Int
+        b[k] = (((v << 1) | carry) & 0xFF) as u8
+        carry = (v >>> 7) & 1
+        k = k - 1
+    if (a[0] as Int) >= 0x80
+        b[15] = ((b[15] as Int) ^ 0x87) as u8
+
+// AES-CMAC of the `n` octets (0 to 16) of `c.msg` under the key in `c.key` (most significant octet first): the result is in `c.out`.
+@no_alloc
+@tier(embedded)
+fn cmac_block(var c: Cmac, n: Int)
+    ll_aes.aes_set_key(var c.k, var c.key)
+    for i in 0..16
+        c.a[i] = 0
+    ll_aes.aes_encrypt(var c.k, var c.a)
+    double(var c.a, var c.b)
+    // K1 is in b.  A message that is not a whole block is padded with a one bit and zeros and takes K2, the doubling of K1.
+    if n < 16
+        double(var c.b, var c.a)
+        for i in 0..16
+            c.b[i] = c.a[i]
+    for i in 0..16
+        var v = 0
+        if i < n
+            v = c.msg[i] as Int
+        else if i == n and n < 16
+            v = 0x80
+        c.out[i] = (v ^ (c.b[i] as Int)) as u8
+    ll_aes.aes_encrypt(var c.k, var c.out)
+
+// The `n` octets of a key identifier or a salt held as the integer `v`, most significant octet first, at the start of `c.msg`.
+@no_alloc
+@tier(embedded)
+fn put_id(var c: Cmac, v: Int)
+    c.msg[0] = ((v >>> 24) & 0xFF) as u8
+    c.msg[1] = ((v >>> 16) & 0xFF) as u8
+    c.msg[2] = ((v >>> 8) & 0xFF) as u8
+    c.msg[3] = (v & 0xFF) as u8
+
+// Copy `src` (least significant octet first) into `dst` most significant first.
+@no_alloc
+@tier(embedded)
+fn reverse16(var src: Vec[u8; 16], var dst: Vec[u8; 16])
+    for i in 0..16
+        dst[i] = src[15 - i]
+
+// The Group Session Key of a BIG ([Vol 6] Part E, Section 1.1.2) from the Broadcast_Code and the GSKD, both least significant
+// octet first as the HCI and the BIGInfo carry them, left in `gsk` the same way, which is the order of `ll_cipher.EncKey.sk`.
+@satisfies("REQ-BLE-CTL-108")
+@no_alloc
+@tier(embedded)
+fn big_gsk(var c: Cmac, var code: Vec[u8; 16], var gskd: Vec[u8; 16], var gsk: Vec[u8; 16])
+    // IGLTK = h7("BIG1", code) = AES-CMAC with SALT as key of the code.
+    for i in 0..16
+        c.key[i] = 0
+    c.key[12] = ((SALT_BIG1 >>> 24) & 0xFF) as u8
+    c.key[13] = ((SALT_BIG1 >>> 16) & 0xFF) as u8
+    c.key[14] = ((SALT_BIG1 >>> 8) & 0xFF) as u8
+    c.key[15] = (SALT_BIG1 & 0xFF) as u8
+    reverse16(var code, var c.msg)
+    cmac_block(var c, 16)
+    // GLTK = h6(IGLTK, "BIG2") = AES-CMAC with IGLTK as key of the key identifier.
+    for i in 0..16
+        c.key[i] = c.out[i]
+    put_id(var c, KEY_ID_BIG2)
+    cmac_block(var c, 4)
+    // IK = AES-CMAC with GSKD as key of GLTK.
+    for i in 0..16
+        c.msg[i] = c.out[i]
+    reverse16(var gskd, var c.key)
+    cmac_block(var c, 16)
+    // GSK = h8(GLTK, GSKD, "BIG3") = AES-CMAC with IK as key of the key identifier.
+    for i in 0..16
+        c.key[i] = c.out[i]
+    put_id(var c, KEY_ID_BIG3)
+    cmac_block(var c, 4)
+    reverse16(var c.out, var gsk)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+fn t_block(a: [Int]) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+// The 16 octets whose 32-bit words, most significant word first, are `w0` to `w3`, as they stand in the sample data of
+// [Vol 6] Part C (most significant octet first).
+@tier(app)
+fn t_words(w0: Int, w1: Int, w2: Int, w3: Int) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for w in [w0, w1, w2, w3]
+        let _a = b.push(((w >>> 24) & 0xFF) as u8)
+        let _b = b.push(((w >>> 16) & 0xFF) as u8)
+        let _c = b.push(((w >>> 8) & 0xFF) as u8)
+        let _d = b.push((w & 0xFF) as u8)
+    b
+
+@tier(app)
+fn t_copy(var dst: Vec[u8; 16], var src: Vec[u8; 16])
+    for i in 0..16
+        dst[i] = src[i]
+
+@tier(app)
+fn t_rev(var a: Vec[u8; 16]) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for i in 0..16
+        let _a = b.push(a[15 - i])
+    b
+
+@tier(app)
+fn t_same(var got: Vec[u8; 16], var want: Vec[u8; 16])
+    for i in 0..16
+        test.assert_eq(got[i] as Int, want[i] as Int)
+
+@test
+fn test_rfc_4493_subkeys_and_the_empty_message()
+    // RFC 4493, Section 4: the key 2b7e1516 28aed2a6 abf71588 09cf4f3c; the subkey K2 f7ddac30 6ae266cc f90bc11e e46d513b (the
+    // empty message is padded, so K2 is the one it takes) and the CMAC of the empty message bb1d6929 e9593728 7fa37d12 9b756746.
+    var c = cmac_new()
+    var key = t_words(0x2B7E1516, 0x28AED2A6, 0xABF71588, 0x09CF4F3C)
+    t_copy(var c.key, var key)
+    cmac_block(var c, 0)
+    var want = t_words(0xBB1D6929, 0xE9593728, 0x7FA37D12, 0x9B756746)
+    t_same(c.out, want)
+    var k2 = t_words(0xF7DDAC30, 0x6AE266CC, 0xF90BC11E, 0xE46D513B)
+    t_same(c.b, k2)
+
+@test
+fn test_rfc_4493_one_whole_block()
+    // Example 2: the message 6bc1bee2 2e409f96 e93d7e11 7393172a, the CMAC 070a16b4 6b4d4144 f79bdd9d d04a287c.
+    var c = cmac_new()
+    var key = t_words(0x2B7E1516, 0x28AED2A6, 0xABF71588, 0x09CF4F3C)
+    t_copy(var c.key, var key)
+    var msg = t_words(0x6BC1BEE2, 0x2E409F96, 0xE93D7E11, 0x7393172A)
+    t_copy(var c.msg, var msg)
+    cmac_block(var c, 16)
+    var want = t_words(0x070A16B4, 0x6B4D4144, 0xF79BDD9D, 0xD04A287C)
+    t_same(c.out, want)
+
+@test
+fn test_h8_follows_the_sample_data_of_the_specification()
+    // [Vol 6] Part C, Section 6: K ec0234a3 57c8ad05 341010a6 0a397d9b, S 1536d18d e3d20df9 9b7044c1 2f9ed5ba, keyID cc030148,
+    // IK fe77ab4e fa982991 c1486a3b 281fd4bc, h8 e5e5beba ae7228e7 22a38904 ed350f6d.
+    var c = cmac_new()
+    var s = t_words(0x1536D18D, 0xE3D20DF9, 0x9B7044C1, 0x2F9ED5BA)
+    t_copy(var c.key, var s)
+    var k = t_words(0xEC0234A3, 0x57C8AD05, 0x341010A6, 0x0A397D9B)
+    t_copy(var c.msg, var k)
+    cmac_block(var c, 16)
+    var ik = t_words(0xFE77AB4E, 0xFA982991, 0xC1486A3B, 0x281FD4BC)
+    t_same(c.out, ik)
+    t_copy(var c.key, var c.out)
+    put_id(var c, 0xCC030148)
+    cmac_block(var c, 4)
+    var want = t_words(0xE5E5BEBA, 0xAE7228E7, 0x22A38904, 0xED350F6D)
+    t_same(c.out, want)
+
+@test
+fn test_the_group_session_key_follows_the_sample_data_of_the_specification()
+    // Broadcast Code "Børne House" 00000000 6573756f 4820656e 72b8c342 (most significant octet first), GSKD 55188b3d 32f6bb9a
+    // 900afcfb eed4e72a, GSK be2a16fc 7ac464e7 52301bcc c818812c.
+    var c = cmac_new()
+    var code_msb = t_words(0x00000000, 0x6573756F, 0x4820656E, 0x72B8C342)
+    var code = t_rev(var code_msb)
+    var gskd_msb = t_words(0x55188B3D, 0x32F6BB9A, 0x900AFCFB, 0xEED4E72A)
+    var gskd = t_rev(var gskd_msb)
+    var gsk = t_words(0, 0, 0, 0)
+    big_gsk(var c, var code, var gskd, var gsk)
+    var want_msb = t_words(0xBE2A16FC, 0x7AC464E7, 0x52301BCC, 0xC818812C)
+    var want = t_rev(var want_msb)
+    t_same(gsk, want)

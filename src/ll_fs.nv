@@ -1,0 +1,128 @@
+// src/ll_fs.nv — Frame Space Update of the Link Layer: the PDUs LL_FRAME_SPACE_REQ and LL_FRAME_SPACE_RSP and the rules of the
+// values they carry.
+//
+// [Vol 6] Part B, Sections 2.4.2.54, 2.4.2.55, 4.1, 4.6.46, 5.1.30 and 5.3; [Vol 4] Part E, Sections 7.7.65.48 and 7.8.151.  Either role
+// may ask the peer to change one or more of the five frame spaces (T_IFS_ACL_CP, T_IFS_ACL_PC, T_MCES, T_IFS_CIS and T_MSS_CIS) on one or more
+// PHYs; the peer answers with the value it picks between FS_Min and FS_Max, or refuses.
+//
+// The radio of this Controller turns round from a packet to its answer by itself, at the interframe space the port arms (150 microseconds on
+// every PHY), so the one value this Controller can keep is 150 microseconds.  It asks for no other value and agrees to a request only when
+// 150 microseconds lies in the range: the answer then names no PHY and no spacing type, which is the specification's way to say that
+// nothing changed.  A request whose range excludes 150 microseconds is refused with Unsupported Feature or Parameter Value.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.fs_on()`) says whether the build has the feature.
+
+use std.test
+use ll_pdu
+use ll_data
+use ll_sub
+
+// 1 in a build with Frame Space Update (feature bit 65), 0 in one without it.
+
+// The frame space every spacing type and PHY keeps, in microseconds, and the greatest value a request may name (10 ms).
+const FS_US = 150
+const FS_MAX_US = 10000
+
+// The PHYs (LE 1M, LE 2M and LE Coded) and the spacing types (T_IFS_ACL_CP, T_IFS_ACL_PC, T_MCES, T_IFS_CIS and T_MSS_CIS) as the PDUs and the
+// HCI command carry them, one bit each.
+const PHYS_MASK = 0x07
+const TYPES_MASK = 0x1F
+
+const E_INVALID_PARAMS = 0x1E
+const E_UNSUPPORTED_FEATURE = 0x11
+const E_COLLISION = 0x23
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// LL_FRAME_SPACE_REQ: the range of the frame space, in microseconds, the PHYs and the spacing types it is for.
+@tier(embedded)
+fn put_req(var p: Pdu, fmin: Int, fmax: Int, phys: Int, types: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_FRAME_SPACE_REQ)
+    ll_sub.put16(var p, fmin)
+    ll_sub.put16(var p, fmax)
+    let _a = ll_pdu.pdu_put(var p, phys)
+    ll_sub.put16(var p, types)
+    ll_data.dpdu_finish(var p)
+
+// LL_FRAME_SPACE_RSP: the value picked, and the PHYs and spacing types it applies to (0 and 0 when nothing changes).
+@tier(embedded)
+fn put_rsp(var p: Pdu, fs: Int, phys: Int, types: Int)
+    ll_data.ctrl_begin(var p, ll_data.OP_FRAME_SPACE_RSP)
+    ll_sub.put16(var p, fs)
+    let _a = ll_pdu.pdu_put(var p, phys)
+    ll_sub.put16(var p, types)
+    ll_data.dpdu_finish(var p)
+
+// ── The rules ───────────────────────────────────────────────────────
+
+// Whether the fields of a request are ones the specification allows (Section 2.4.2.54): FS_Max not below FS_Min and not above 10 ms, and a
+// PHY and a spacing type named.
+@tier(embedded)
+fn req_valid(fmin: Int, fmax: Int, phys: Int, types: Int) -> Bool
+    fmin <= fmax and fmax <= FS_MAX_US and (phys & PHYS_MASK) != 0 and (types & TYPES_MASK) != 0
+
+// The error code that refuses a request, 0 when this Controller agrees (Section 5.1.30): Invalid LL Parameters for a request that is not valid,
+// Unsupported Feature or Parameter Value when 150 microseconds lies outside the range.
+@tier(embedded)
+fn refusal(fmin: Int, fmax: Int, phys: Int, types: Int) -> Int
+    if not req_valid(fmin, fmax, phys, types)
+        return E_INVALID_PARAMS
+    if fmin > FS_US or fmax < FS_US
+        return E_UNSUPPORTED_FEATURE
+    0
+
+// Whether an answer is one the request it answers allows: the value in the range of the request this Controller sent (150 microseconds both
+// ways) and no PHY and no spacing type that the request did not name.
+@tier(embedded)
+fn rsp_valid(fs: Int, phys: Int, types: Int, req_phys: Int, req_types: Int) -> Bool
+    fs == FS_US and (phys & ~req_phys) == 0 and (types & ~req_types) == 0
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@test
+fn test_pdu_layouts()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, 100, 0x2710, 0x05, 0x0012)
+    test.assert_eq(ll_data.dpdu_len(var p), 8)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3B)
+    test.assert_eq(ll_sub.get16(var p, 1), 100)
+    test.assert_eq(ll_sub.get16(var p, 3), 0x2710)
+    test.assert_eq(ll_data.dpdu_byte(var p, 5), 0x05)
+    test.assert_eq(ll_sub.get16(var p, 6), 0x0012)
+    put_rsp(var p, 150, 0x02, 0x0001)
+    test.assert_eq(ll_data.dpdu_len(var p), 6)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3C)
+    test.assert_eq(ll_sub.get16(var p, 1), 150)
+    test.assert_eq(ll_data.dpdu_byte(var p, 3), 0x02)
+    test.assert_eq(ll_sub.get16(var p, 4), 0x0001)
+
+@test
+fn test_a_request_is_valid_with_a_range_and_a_bit_of_each()
+    test.assert(req_valid(150, 150, 1, 1))
+    test.assert(req_valid(0, 10000, 7, 0x1F))
+    test.assert(not req_valid(151, 150, 1, 1))
+    test.assert(not req_valid(0, 10001, 1, 1))
+    test.assert(not req_valid(0, 200, 0, 1))
+    test.assert(not req_valid(0, 200, 1, 0))
+    // Reserved bits alone name nothing.
+    test.assert(not req_valid(0, 200, 0x08, 1))
+    test.assert(not req_valid(0, 200, 1, 0x20))
+
+@test
+fn test_150_microseconds_in_the_range_is_agreed_and_nothing_else()
+    test.assert_eq(refusal(150, 150, 1, 1), 0)
+    test.assert_eq(refusal(100, 200, 7, 0x1F), 0)
+    test.assert_eq(refusal(0, 150, 1, 4), 0)
+    test.assert_eq(refusal(151, 300, 1, 1), 0x11)
+    test.assert_eq(refusal(0, 149, 1, 1), 0x11)
+    test.assert_eq(refusal(200, 100, 1, 1), 0x1E)
+    test.assert_eq(refusal(100, 200, 0, 1), 0x1E)
+
+@test
+fn test_an_answer_names_nothing_the_request_did_not()
+    test.assert(rsp_valid(150, 0, 0, 1, 1))
+    test.assert(rsp_valid(150, 1, 1, 3, 3))
+    test.assert(not rsp_valid(150, 4, 1, 3, 3))
+    test.assert(not rsp_valid(150, 1, 4, 3, 3))
+    test.assert(not rsp_valid(149, 0, 0, 1, 1))
+    test.assert(not rsp_valid(151, 0, 0, 1, 1))

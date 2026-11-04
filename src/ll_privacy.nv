@@ -1,0 +1,473 @@
+// src/ll_privacy.nv — the resolving list and the Resolvable Private
+// Addresses of the Link Layer.
+//
+// [Vol 6] Part B, Section 6 and [Vol 3] Part H, Section 2.2.2.  A device that keeps
+// its privacy sends a Resolvable Private Address (RPA) where it would send its
+// identity address.  An RPA is six octets: the top two bits of the last octet are
+// 0 and 1, the rest of the 24 bits above them is a random `prand`, and the low 24
+// bits are `hash = ah(IRK, prand)`, the least significant 24 bits of the AES
+// encryption of the zero-padded `prand` with the Identity Resolving Key.  A peer
+// that holds the IRK recomputes the hash from the `prand` and finds the identity.
+//
+// The resolving list holds `RL_SIZE` entries, each a peer's identity address (public
+// or random static), its IRK, the local IRK to make RPAs for it with, the privacy
+// mode, and the RPAs in use with that peer: the peer's (`peer_rpa`, learnt by
+// resolving an address, or made for directed advertising) and the local one
+// (`local_rpa`).  Resolving an address first compares it with the RPAs already
+// known, which is a compare of six octets, and computes a hash for each IRK only
+// for an address not seen before; the radio program leans on that, because the
+// decisions that fall inside T_IFS can afford the compare and not the hashes.
+//
+// Every AES block goes through a `Cipher` (`ll_cipher.nv`), so that the chip's AES
+// engine does the work where there is one.  The random `prand` comes from `ent`,
+// twelve random octets the program tops up from its generator
+// (`ctl_hci.ctl_entropy_put`).  No function here allocates.
+
+use std.test
+use ll_cipher
+
+// The entries of the list.
+const RL_SIZE = 8
+
+// The Host's privacy mode for an entry ([Vol 4] Part E, Section 7.8.77): in network
+// privacy mode the Controller accepts only RPAs from a peer that has an IRK, in
+// device privacy mode its identity address too.
+const MODE_NETWORK = 0
+const MODE_DEVICE = 1
+
+// The RPA timeout the Host has not set, in seconds ([Vol 6] Part B, Section 6.1).
+const RPA_TIMEOUT_DEFAULT = 900
+
+// Status codes of the commands.
+const STATUS_SUCCESS = 0x00
+const STATUS_UNKNOWN_CONNECTION = 0x02
+const STATUS_MEMORY_CAPACITY = 0x07
+const STATUS_INVALID_PARAMETERS = 0x12
+
+@value
+struct ResolvingList
+    used: Vec[Bool; 8]
+    kind: Vec[u8; 8]
+    addr: Vec[u8; 48]
+    peer_irk: Vec[u8; 128]
+    local_irk: Vec[u8; 128]
+    mode: Vec[u8; 8]
+    peer_rpa: Vec[u8; 48]
+    peer_ok: Vec[Bool; 8]
+    local_rpa: Vec[u8; 48]
+    local_ok: Vec[Bool; 8]
+    seen_rpa: Vec[u8; 48]
+    seen_ok: Vec[Bool; 8]
+    neg: Vec[u8; 24]
+    neg_next: Int
+    enable: Bool
+    timeout: Int
+    epoch: Int
+    ent: Vec[u8; 12]
+    ent_n: Int
+    resolved: Int
+    hashed: Int
+
+@tier(embedded)
+fn rl_new() -> ResolvingList
+    var r = ResolvingList {
+        used: Vec.new(), kind: Vec.new(), addr: Vec.new(), peer_irk: Vec.new(), local_irk: Vec.new(),
+        mode: Vec.new(), peer_rpa: Vec.new(), peer_ok: Vec.new(), local_rpa: Vec.new(),
+        local_ok: Vec.new(), seen_rpa: Vec.new(), seen_ok: Vec.new(), neg: Vec.new(), neg_next: 0,
+        enable: false, timeout: RPA_TIMEOUT_DEFAULT, epoch: 0, ent: Vec.new(),
+        ent_n: 0, resolved: 0, hashed: 0 }
+    for _ in 0..RL_SIZE
+        let _a = r.used.push(false)
+        let _b = r.kind.push(0)
+        let _c = r.mode.push(0)
+        let _d = r.peer_ok.push(false)
+        let _e = r.local_ok.push(false)
+        let _l = r.seen_ok.push(false)
+    for _ in 0..(RL_SIZE * 6)
+        let _f = r.addr.push(0)
+        let _g = r.peer_rpa.push(0)
+        let _h = r.local_rpa.push(0)
+        let _m = r.seen_rpa.push(0)
+    for _ in 0..(RL_SIZE * 16)
+        let _i = r.peer_irk.push(0)
+        let _j = r.local_irk.push(0)
+    for _ in 0..12
+        let _k = r.ent.push(0)
+    for _ in 0..24
+        let _n = r.neg.push(0)
+    r
+
+// Forget one entry.
+@tier(embedded)
+fn rl_drop(var r: ResolvingList, i: Int)
+    r.used[i] = false
+    r.kind[i] = 0
+    r.mode[i] = 0
+    r.peer_ok[i] = false
+    r.local_ok[i] = false
+    r.seen_ok[i] = false
+    for k in 0..6
+        r.addr[i * 6 + k] = 0
+        r.peer_rpa[i * 6 + k] = 0
+        r.local_rpa[i * 6 + k] = 0
+        r.seen_rpa[i * 6 + k] = 0
+    for k in 0..16
+        r.peer_irk[i * 16 + k] = 0
+        r.local_irk[i * 16 + k] = 0
+
+// The list a Reset leaves: no entry, resolution off, the default timeout.  The
+// random octets in hand stay.
+@tier(embedded)
+fn rl_reset(var r: ResolvingList)
+    for i in 0..RL_SIZE
+        rl_drop(var r, i)
+    r.enable = false
+    r.timeout = RPA_TIMEOUT_DEFAULT
+    r.epoch = 0
+    rl_forget(var r)
+
+// The entries in use.
+@tier(embedded)
+fn rl_count(var r: ResolvingList) -> Int
+    var n = 0
+    for i in 0..RL_SIZE
+        if r.used[i]
+            n = n + 1
+    n
+
+// Forget the addresses that matched no entry; a new entry may match them.
+@tier(embedded)
+fn rl_forget(var r: ResolvingList)
+    for k in 0..24
+        r.neg[k] = 0
+    r.neg_next = 0
+
+// The entry holding the identity address `kind`, `addr`, -1 for none.
+@tier(embedded)
+fn rl_find(var r: ResolvingList, kind: Int, var addr: Vec[u8; 6]) -> Int
+    for i in 0..RL_SIZE
+        if r.used[i] and (r.kind[i] as Int) == kind
+            var same = true
+            for k in 0..6
+                if r.addr[i * 6 + k] != addr[k]
+                    same = false
+            if same
+                return i
+    -1
+
+// The entry whose peer RPA is the six octets of `b` from `off` (a PDU's payload, read in
+// place: the judgement inside T_IFS makes no copy), -1 for none.
+@tier(embedded)
+fn rl_cached_at(var r: ResolvingList, var b: Vec[u8; 260], off: Int) -> Int
+    for i in 0..RL_SIZE
+        if r.used[i] and r.peer_ok[i]
+            var same = true
+            for k in 0..6
+                if r.peer_rpa[i * 6 + k] != b[off + k]
+                    same = false
+                    break
+            if same
+                return i
+    -1
+
+// The entry whose cached target address (the RPA a peer made for this device) is the six
+// octets of `b` from `off`, -1 for none.
+@tier(embedded)
+fn rl_seen_at(var r: ResolvingList, var b: Vec[u8; 260], off: Int) -> Int
+    for i in 0..RL_SIZE
+        if r.used[i] and r.seen_ok[i]
+            var same = true
+            for k in 0..6
+                if r.seen_rpa[i * 6 + k] != b[off + k]
+                    same = false
+                    break
+            if same
+                return i
+    -1
+
+// The entry holding the identity address `kind`, the six octets of `b` from `off`.
+@tier(embedded)
+fn rl_find_at(var r: ResolvingList, kind: Int, var b: Vec[u8; 260], off: Int) -> Int
+    for i in 0..RL_SIZE
+        if r.used[i] and (r.kind[i] as Int) == kind
+            var same = true
+            for k in 0..6
+                if r.addr[i * 6 + k] != b[off + k]
+                    same = false
+                    break
+            if same
+                return i
+    -1
+
+// Whether the 16 octets of `irk` at `at` are all zero.
+@tier(embedded)
+fn irk_is_zero(var irk: Vec[u8; 128], i: Int) -> Bool
+    for k in 0..16
+        if irk[i * 16 + k] != 0
+            return false
+    true
+
+// Whether the peer of entry `i` has an IRK.
+@tier(embedded)
+fn rl_peer_has_irk(var r: ResolvingList, i: Int) -> Bool
+    not irk_is_zero(var r.peer_irk, i)
+
+// Whether the local side of entry `i` has an IRK.
+@tier(embedded)
+fn rl_local_has_irk(var r: ResolvingList, i: Int) -> Bool
+    not irk_is_zero(var r.local_irk, i)
+
+// LE Add Device To Resolving List ([Vol 4] Part E, Section 7.8.38): the Status.
+// The entry is in network privacy mode.  A device that is in the list already, by
+// its identity or by a non-zero peer IRK, is refused with 0x12; a full list with 0x07.
+@tier(embedded)
+fn rl_add(var r: ResolvingList, kind: Int, var addr: Vec[u8; 6], var peer_irk: Vec[u8; 16], var local_irk: Vec[u8; 16]) -> Int
+    if kind == 1 and (addr[5] & 0xC0) != 0xC0
+        return STATUS_INVALID_PARAMETERS
+    if rl_find(var r, kind, var addr) >= 0
+        return STATUS_INVALID_PARAMETERS
+    var peer_zero = true
+    for k in 0..16
+        if peer_irk[k] != 0
+            peer_zero = false
+    if not peer_zero
+        for i in 0..RL_SIZE
+            if r.used[i] and rl_peer_has_irk(var r, i)
+                var same = true
+                for k in 0..16
+                    if r.peer_irk[i * 16 + k] != peer_irk[k]
+                        same = false
+                if same
+                    return STATUS_INVALID_PARAMETERS
+    for i in 0..RL_SIZE
+        if not r.used[i]
+            r.used[i] = true
+            r.kind[i] = kind as u8
+            r.mode[i] = MODE_NETWORK as u8
+            for k in 0..6
+                r.addr[i * 6 + k] = addr[k]
+            for k in 0..16
+                r.peer_irk[i * 16 + k] = peer_irk[k]
+                r.local_irk[i * 16 + k] = local_irk[k]
+            r.peer_ok[i] = false
+            r.local_ok[i] = false
+            r.seen_ok[i] = false
+            rl_forget(var r)
+            return STATUS_SUCCESS
+    STATUS_MEMORY_CAPACITY
+
+// LE Remove Device From Resolving List (Section 7.8.39).
+@tier(embedded)
+fn rl_remove(var r: ResolvingList, kind: Int, var addr: Vec[u8; 6]) -> Int
+    let i = rl_find(var r, kind, var addr)
+    if i < 0
+        return STATUS_UNKNOWN_CONNECTION
+    rl_drop(var r, i)
+    STATUS_SUCCESS
+
+// LE Clear Resolving List (Section 7.8.40).
+@tier(embedded)
+fn rl_clear(var r: ResolvingList)
+    for i in 0..RL_SIZE
+        rl_drop(var r, i)
+    rl_forget(var r)
+
+// Whether the six octets are a Resolvable Private Address: the top two bits of
+// the last octet are 0 and 1.
+@tier(embedded)
+fn is_rpa(var a: Vec[u8; 6]) -> Bool
+    (a[5] & 0xC0) == 0x40
+
+// The entry whose known RPA (the peer's, learnt or made) is `a`, -1 for none.
+@tier(embedded)
+fn rl_cached(var r: ResolvingList, var a: Vec[u8; 6]) -> Int
+    for i in 0..RL_SIZE
+        if r.used[i] and r.peer_ok[i]
+            var same = true
+            for k in 0..6
+                if r.peer_rpa[i * 6 + k] != a[k]
+                    same = false
+            if same
+                return i
+    -1
+
+// The entry whose cached address, the one a peer made for us, is `a`, -1 for none.
+@tier(embedded)
+fn rl_seen(var r: ResolvingList, var a: Vec[u8; 6]) -> Int
+    for i in 0..RL_SIZE
+        if r.used[i] and r.seen_ok[i]
+            var same = true
+            for k in 0..6
+                if r.seen_rpa[i * 6 + k] != a[k]
+                    same = false
+            if same
+                return i
+    -1
+
+// `ah(IRK, prand)` of entry `i`'s IRK (`local` says the local one): the
+// least significant 24 bits of AES(IRK, 0..0 || prand), the IRK and the block most
+// significant octet first ([Vol 3] Part H, Section 2.2.2).
+@tier(embedded)
+fn rl_ah<C: Cipher[e]>(var r: ResolvingList, var cc: C, i: Int, local: Bool, prand: Int) -> Int [e]
+    var key: Vec[u8; 16] = Vec.new()
+    var blk: Vec[u8; 16] = Vec.new()
+    for k in 0..16
+        if local
+            let _a = key.push(r.local_irk[i * 16 + 15 - k])
+        else
+            let _a = key.push(r.peer_irk[i * 16 + 15 - k])
+        let _b = blk.push(0)
+    blk[13] = ((prand >>> 16) & 0xFF) as u8
+    blk[14] = ((prand >>> 8) & 0xFF) as u8
+    blk[15] = (prand & 0xFF) as u8
+    r.hashed = r.hashed + 1
+    if not cc.block(var key, var blk)
+        return -1
+    ((blk[13] as Int) << 16) | ((blk[14] as Int) << 8) | (blk[15] as Int)
+
+// The `prand` of an RPA.
+@tier(embedded)
+fn rpa_prand(var a: Vec[u8; 6]) -> Int
+    (a[3] as Int) | ((a[4] as Int) << 8) | ((a[5] as Int) << 16)
+
+// The hash of an RPA.
+@tier(embedded)
+fn rpa_hash(var a: Vec[u8; 6]) -> Int
+    (a[0] as Int) | ((a[1] as Int) << 8) | ((a[2] as Int) << 16)
+
+// Whether `a` was tried against the list and matched no entry.
+@tier(embedded)
+fn rl_is_negative(var r: ResolvingList, var a: Vec[u8; 6]) -> Bool
+    for j in 0..4
+        var same = true
+        for k in 0..6
+            if r.neg[j * 6 + k] != a[k]
+                same = false
+        if same
+            return true
+    false
+
+// Resolve the RPA `a` against the peer IRKs of the list: the entry whose IRK made it,
+// -1 for none.  An address already known is found without a hash.  A new match is kept
+// as the peer's RPA of the entry, so that the next PDU from the device is a compare.
+@tier(embedded)
+fn rl_resolve<C: Cipher[e]>(var r: ResolvingList, var cc: C, var a: Vec[u8; 6]) -> Int [e]
+    if not is_rpa(var a)
+        return -1
+    let known = rl_cached(var r, var a)
+    if known >= 0
+        return known
+    let prand = rpa_prand(var a)
+    let ah = rpa_hash(var a)
+    for i in 0..RL_SIZE
+        if r.used[i] and rl_peer_has_irk(var r, i)
+            if rl_ah(var r, var cc, i, false, prand) == ah
+                for k in 0..6
+                    r.peer_rpa[i * 6 + k] = a[k]
+                r.peer_ok[i] = true
+                r.resolved = r.resolved + 1
+                return i
+    for k in 0..6
+        r.neg[r.neg_next * 6 + k] = a[k]
+    r.neg_next = (r.neg_next + 1) % 4
+    -1
+
+// Resolve the RPA `a` that a peer made for us (the TargetA of directed advertising)
+// against the local IRKs: the entry whose local IRK made it, -1 for none.  A new match
+// is kept in the cache of such addresses.
+@tier(embedded)
+fn rl_resolve_target<C: Cipher[e]>(var r: ResolvingList, var cc: C, var a: Vec[u8; 6]) -> Int [e]
+    if not is_rpa(var a)
+        return -1
+    let known = rl_seen(var r, var a)
+    if known >= 0
+        return known
+    let prand = rpa_prand(var a)
+    let ah = rpa_hash(var a)
+    for i in 0..RL_SIZE
+        if r.used[i] and rl_local_has_irk(var r, i)
+            if rl_ah(var r, var cc, i, true, prand) == ah
+                for k in 0..6
+                    r.seen_rpa[i * 6 + k] = a[k]
+                r.seen_ok[i] = true
+                return i
+    for k in 0..6
+        r.neg[r.neg_next * 6 + k] = a[k]
+    r.neg_next = (r.neg_next + 1) % 4
+    -1
+
+// The random octets in hand.
+@tier(embedded)
+fn rl_entropy(var r: ResolvingList) -> Int
+    r.ent_n
+
+// Take 3 random octets as a `prand` (24 bits: the top two forced to 0 and 1, the other 22 not
+// all zero and not all one, [Vol 6] Part B, Section 1.3.2.2 and [Vol 3] Part H, Section 2.2.2); -1 when the
+// program has not given enough octets yet.
+@tier(embedded)
+fn rl_prand(var r: ResolvingList) -> Int
+    if r.ent_n < 3
+        return -1
+    r.ent_n = r.ent_n - 3
+    var p = (r.ent[r.ent_n] as Int) | ((r.ent[r.ent_n + 1] as Int) << 8) | ((r.ent[r.ent_n + 2] as Int) << 16)
+    p = (p & 0x3FFFFF) | 0x400000
+    if (p & 0x3FFFFF) == 0
+        p = p | 1
+    if (p & 0x3FFFFF) == 0x3FFFFF
+        p = p & 0x7FFFFE
+    p
+
+// Give the list 12 random octets.
+@tier(embedded)
+fn rl_entropy_put(var r: ResolvingList, var v: Vec[u8; 12])
+    for k in 0..12
+        r.ent[k] = v[k]
+    r.ent_n = 12
+
+// Make the local RPA of entry `i` from the local IRK; false when the entry has none
+// (the identity address is used then) or no random octets are in hand.
+@tier(embedded)
+fn rl_make_local<C: Cipher[e]>(var r: ResolvingList, var cc: C, i: Int) -> Bool [e]
+    if not r.used[i] or not rl_local_has_irk(var r, i)
+        r.local_ok[i] = false
+        return false
+    let prand = rl_prand(var r)
+    if prand < 0
+        return false
+    let ah = rl_ah(var r, var cc, i, true, prand)
+    if ah < 0
+        return false
+    r.local_rpa[i * 6] = (ah & 0xFF) as u8
+    r.local_rpa[i * 6 + 1] = ((ah >>> 8) & 0xFF) as u8
+    r.local_rpa[i * 6 + 2] = ((ah >>> 16) & 0xFF) as u8
+    r.local_rpa[i * 6 + 3] = (prand & 0xFF) as u8
+    r.local_rpa[i * 6 + 4] = ((prand >>> 8) & 0xFF) as u8
+    r.local_rpa[i * 6 + 5] = ((prand >>> 16) & 0xFF) as u8
+    r.local_ok[i] = true
+    true
+
+// Make the peer's RPA for entry `i` from the peer IRK, for the TargetA of directed
+// advertising; false when the peer has no IRK or no random octets are in hand.
+@tier(embedded)
+fn rl_make_peer<C: Cipher[e]>(var r: ResolvingList, var cc: C, i: Int) -> Bool [e]
+    if not r.used[i] or not rl_peer_has_irk(var r, i)
+        return false
+    let prand = rl_prand(var r)
+    if prand < 0
+        return false
+    let ah = rl_ah(var r, var cc, i, false, prand)
+    if ah < 0
+        return false
+    r.peer_rpa[i * 6] = (ah & 0xFF) as u8
+    r.peer_rpa[i * 6 + 1] = ((ah >>> 8) & 0xFF) as u8
+    r.peer_rpa[i * 6 + 2] = ((ah >>> 16) & 0xFF) as u8
+    r.peer_rpa[i * 6 + 3] = (prand & 0xFF) as u8
+    r.peer_rpa[i * 6 + 4] = ((prand >>> 8) & 0xFF) as u8
+    r.peer_rpa[i * 6 + 5] = ((prand >>> 16) & 0xFF) as u8
+    r.peer_ok[i] = true
+    true
+
+// Whether the RPAs this Controller made have run their timeout at `now` (microseconds).
+@tier(embedded)
+fn rl_expired(var r: ResolvingList, now: Int) -> Bool
+    now - r.epoch >= r.timeout * 1000000

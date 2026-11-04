@@ -1,0 +1,1140 @@
+// src/ll_xadv.nv — the extended Advertising state of the Link Layer: the advertising sets the Host defines
+// (LE Set Extended Advertising Parameters, Data and Scan Response Data), the layout of an advertising event of a set
+// in time, the extended PDUs of the event and the bookkeeping that ends a set (a Duration, a number of events).
+//
+// [Vol 6] Part B, Section 4.4.2.  An extended advertising event starts with an ADV_EXT_IND on each used primary channel,
+// in ascending order, LE 1M or LE Coded.  Each carries the Advertising Data Info and the Auxiliary Pointer: the secondary
+// channel, the PHY and the time, from the start of that PDU, at which the AUX_ADV_IND is sent.  The AUX_ADV_IND holds the
+// AdvA (the TargetA of a directed set), the ADI, the Tx Power when asked, and the first data; a data longer than one PDU
+// goes on in AUX_CHAIN_IND PDUs, each pointing to the next, at least T_MAFS (300 microseconds) after the end of the
+// one before.  A scannable set sends no data in the AUX_ADV_IND: the AUX_SCAN_REQ that follows it T_IFS later is answered
+// with an AUX_SCAN_RSP, which carries the scan response data and chains as the data does.  A connectable set listens for
+// an AUX_CONNECT_REQ T_IFS after the AUX_ADV_IND and answers it with an AUX_CONNECT_RSP.
+//
+// Layout of an event, counted from the first bit of the first ADV_EXT_IND (`t0`): the ADV_EXT_IND of the k-th channel
+// starts `k * spacing`; the AUX_ADV_IND `aux_rel` after `t0`, and every offset an Auxiliary Pointer holds is a multiple of
+// the 30 microseconds the pointer counts in; a chain PDU starts `chain_gap` after the start of the one before plus its
+// air time.
+//
+// This module holds no radio.  The sets are values with inline storage; no function here allocates.
+
+use noble_controller_config
+use ctl_limits
+use std.test
+use ll_pdu
+use ll_phy
+use ll_adv
+use ll_init
+use ll_ext
+
+// The properties of LE Set Extended Advertising Parameters ([Vol 4] Part E, Section 7.8.53).
+const P_CONN = 0x0001
+const P_SCAN = 0x0002
+const P_DIRECT = 0x0004
+const P_HIGH = 0x0008
+const P_LEGACY = 0x0010
+const P_ANON = 0x0020
+const P_TXP = 0x0040
+const P_RESERVED = 0xFF80
+
+// The statuses this module answers with.
+const OK = 0
+const E_DISALLOWED = 0x0C
+const E_UNSUPPORTED = 0x11
+const E_INVALID = 0x12
+const E_UNKNOWN_SET = 0x42
+const E_MEMORY = 0x07
+const E_TOO_LONG = 0x45
+
+// The statuses of LE Advertising Set Terminated.
+const T_TIMEOUT = 0x3C
+const T_LIMIT = 0x43
+
+// The Operation values of LE Set Extended Advertising Data.
+const OP_MIDDLE = 0
+const OP_FIRST = 1
+const OP_LAST = 2
+const OP_COMPLETE = 3
+const OP_UNCHANGED = 4
+
+// The advertising sets the Controller holds (`ctl_adv_sets`), the most data octets one holds for its advertising data and for its scan
+// response data (`ctl_adv_data`), and whether the build has extended advertising at all (`ctl_limits.xadv_on()`: no sets, none of it).  A build
+// without it keeps one set with 8 octets of data.
+
+pub alias AdvData = Vec[u8; if noble_controller_config.CTL_ADV_SETS > 0 then noble_controller_config.CTL_ADV_DATA else 8]
+
+// A handle the Host may use ([Vol 4] Part E, Section 7.8.53: 0x00 to 0xEF).
+const HANDLE_MAX = 0xEF
+
+// The data one PDU of the chain carries, in octets: an event of the report of a scanner holds 229, and the PDUs of
+// the longest advertisement in view fit it.
+const CHUNK = 229
+const CHUNK_SYNC = 211
+
+// The pauses of the layout, in microseconds: the radio's turn from one channel to the next between two ADV_EXT_IND, the
+// time between the last ADV_EXT_IND and the AUX_ADV_IND (T_MAFS is 300), and between a PDU of the chain and the
+// next.  Each offset is rounded up to the 30 microseconds an Auxiliary Pointer counts in.
+const PRIM_GAP_US = 400
+const AUX_GAP_US = 900
+const CHAIN_GAP_US = 600
+const T_MAFS_US = 300
+const UNIT_US = 30
+
+// The first event of a set is due this long after it is enabled, and the pause kept between the end of an event and the
+// start of the next of the same set.
+const FIRST_EVENT_US = 1000
+const EVENT_GAP_US = 1500
+
+// High duty cycle directed advertising ends 1.28 s after it began.
+const HIGH_DUTY_TIMEOUT_US = 1280000
+
+// The clock accuracy class an Auxiliary Pointer names: 0 is 51 to 500 ppm, the class a pointer may always name.
+const CLOCK_ACCURACY = 0
+
+// `used` says the Host defined the set (its parameters are in the fields that follow), `on` that it is enabled.
+// `props` are the properties, `int_min` and `int_max` the interval range in units of 0.625 ms, `chmap`, `own`,
+// `peer_type`, `peer` and `policy` as the legacy command has them, `txp` the Tx Power the Controller selected (the
+// level the radio is asked for), `pphy` and `sphy` the primary and secondary PHY (`ll_phy` numbers) with `popt` and `sopt` the
+// options of LE Coded (0 no preference, 1 S=2, 2 S=8; LE Set Extended Advertising Parameters [v2]), `sid` the
+// Advertising SID and `notify` whether a scan request is told to the Host.
+//
+// `rand` is the random address the Host gave the set when `rand_set`.  The data is `data` and the scan response data
+// `rsp`, `dlen` and `rlen` their lengths, `dhave` and `rhave` whether the Host gave any, `dasm` and `rasm` that a fragmented
+// data is being assembled (a first fragment was taken and the last has not come).  `did` is the Data ID of the
+// Advertising Data Info, which changes whenever the data does.
+//
+// The running set: `dur` and `max_ev` are the Duration (10 ms) and the Max_Extended_Advertising_Events it was enabled with,
+// `entered` the time it was, `events` the events sent, `due` the start of the next event and `anchor` the start of the
+// running one; `addr` and `atype` the address it advertises with, `rng` the generator that picks the secondary channel and
+// the advDelay, and `term` the status of the LE Advertising Set Terminated event the Host is owed when `term_owed`, with the
+// connection `term_conn` it carries.  `si` is the SyncInfo the AUX_ADV_IND of the next event carries when `si_on`: the periodic
+// advertising train the set announces (`ll_per.nv`).  The Resolvable Private Address of an Own_Address_Type 2 or 3: `ent` is the resolving
+// list entry of the peer (-1 for none), `loc` says the AdvA is the local RPA of that entry, `tgt` that the TargetA of a directed set is an RPA made
+// with the peer's IRK and `tgt_ok` that it was made this timeout; `tpeer` and `ttype` are the TargetA the event sends, `peer` when `tgt` is not set.
+@value
+struct XSet
+    used: Bool
+    on: Bool
+    handle: u8
+    props: Int
+    int_min: Int
+    int_max: Int
+    chmap: u8
+    own: u8
+    peer_type: u8
+    peer: Vec[u8; 6]
+    policy: u8
+    txp: Int
+    pphy: u8
+    sphy: u8
+    popt: u8
+    sopt: u8
+    sid: u8
+    notify: Bool
+    rand: Vec[u8; 6]
+    rand_set: Bool
+    data: AdvData
+    dlen: Int
+    dhave: Bool
+    dasm: Bool
+    rsp: AdvData
+    rlen: Int
+    rhave: Bool
+    rasm: Bool
+    did: Int
+    dur: Int
+    max_ev: Int
+    entered: Int
+    events: Int
+    due: Int
+    anchor: Int
+    addr: Vec[u8; 6]
+    atype: u8
+    rng: Int
+    term: Int
+    term_conn: Int
+    term_owed: Bool
+    si: Vec[u8; 18]
+    si_on: Bool
+    ent: Int
+    loc: Bool
+    tgt: Bool
+    tgt_ok: Bool
+    tpeer: Vec[u8; 6]
+    ttype: u8
+
+@tier(embedded)
+fn xset_new() -> XSet
+    var s = XSet { used: false, on: false, handle: 0, props: 0, int_min: 0x20, int_max: 0x20, chmap: 7, own: 0, peer_type: 0,
+                   peer: Vec.new(), policy: 0, txp: 0, pphy: 1, sphy: 1, popt: 0, sopt: 0, sid: 0, notify: false, rand: Vec.new(), rand_set: false,
+                   data: Vec.new(), dlen: 0, dhave: false, dasm: false, rsp: Vec.new(), rlen: 0, rhave: false, rasm: false,
+                   did: 0, dur: 0, max_ev: 0, entered: 0, events: 0, due: 0, anchor: 0, addr: Vec.new(), atype: 0,
+                   rng: 0x2545F491, term: 0, term_conn: 0, term_owed: false, si: Vec.new(), si_on: false, ent: -1, loc: false, tgt: false,
+                   tgt_ok: false, tpeer: Vec.new(), ttype: 0 }
+    for _ in 0..18
+        let _s = s.si.push(0)
+    for _ in 0..6
+        let _t = s.tpeer.push(0)
+    for _ in 0..6
+        let _a = s.peer.push(0)
+        let _b = s.rand.push(0)
+        let _c = s.addr.push(0)
+    for _ in 0..251
+        let _d = s.data.push(0)
+        let _e = s.rsp.push(0)
+    s
+
+// The set forgotten: nothing defined, nothing running.
+@tier(embedded)
+fn xset_clear(var s: XSet)
+    s.used = false
+    s.on = false
+    s.rand_set = false
+    s.dlen = 0
+    s.dhave = false
+    s.dasm = false
+    s.rlen = 0
+    s.rhave = false
+    s.rasm = false
+    s.dur = 0
+    s.max_ev = 0
+    s.events = 0
+    s.term = 0
+    s.term_conn = 0
+    s.term_owed = false
+    s.si_on = false
+    s.ent = -1
+    s.loc = false
+    s.tgt = false
+    s.tgt_ok = false
+
+// Set octet `k` of the random address of the set.
+@tier(embedded)
+fn xset_rand_put(var s: XSet, k: Int, v: Int)
+    s.rand[k] = v as u8
+
+// Seed the generator of the secondary channel and of advDelay, and the first Data ID.
+@tier(embedded)
+fn xset_seed(var s: XSet, seed: Int)
+    s.rng = ll_adv.rng_step(seed ^ 0x2545F491)
+    s.did = s.rng & 0x0FFF
+
+// ── The properties ──────────────────────────────────────────────────
+
+@tier(embedded)
+fn is_legacy(var s: XSet) -> Bool
+    (s.props & P_LEGACY) != 0
+
+@tier(embedded)
+fn is_connectable(var s: XSet) -> Bool
+    (s.props & P_CONN) != 0
+
+@tier(embedded)
+fn is_scannable(var s: XSet) -> Bool
+    (s.props & P_SCAN) != 0
+
+@tier(embedded)
+fn is_directed(var s: XSet) -> Bool
+    (s.props & P_DIRECT) != 0
+
+@tier(embedded)
+fn is_anonymous(var s: XSet) -> Bool
+    (s.props & P_ANON) != 0
+
+// The AdvMode of the PDUs: 1 connectable, 2 scannable, 0 neither.
+@tier(embedded)
+fn adv_mode(var s: XSet) -> Int
+    if (s.props & P_CONN) != 0
+        return 1
+    if (s.props & P_SCAN) != 0
+        return 2
+    0
+
+// The legacy advertising type the set's properties name when it sends legacy PDUs, as `ll_adv` numbers it, -1 for a
+// combination of properties that no legacy PDU has ([Vol 4] Part E, Section 7.8.53, Table of legacy properties).
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn legacy_type(props: Int) -> Int
+    match props & 0x7F
+        0x13 => ll_adv.TYPE_IND
+        0x15 => ll_adv.TYPE_DIRECT_LOW
+        0x1D => ll_adv.TYPE_DIRECT_HIGH
+        0x12 => ll_adv.TYPE_SCAN
+        0x10 => ll_adv.TYPE_NONCONN
+        _ => -1
+
+// The advertising type the legacy engine runs a set of extended PDUs with, which decides what it answers: a scan request
+// for a scannable set, a connection request for a connectable one, either only if the set says so.
+@tier(embedded)
+fn engine_type(var s: XSet) -> Int
+    if (s.props & P_CONN) != 0
+        if (s.props & P_DIRECT) != 0
+            if (s.props & P_HIGH) != 0
+                return ll_adv.TYPE_DIRECT_HIGH
+            return ll_adv.TYPE_DIRECT_LOW
+        return ll_adv.TYPE_CONN_ONLY
+    if (s.props & P_SCAN) != 0
+        return ll_adv.TYPE_SCAN
+    ll_adv.TYPE_NONCONN
+
+// The Status of LE Set Extended Advertising Parameters for the values given, [Vol 4] Part E, Section 7.8.53:
+// Invalid HCI Command Parameters (0x12) for a handle past 0xEF, a reserved property bit, a combination the specification
+// forbids (legacy PDUs with a combination that has no legacy PDU, with a Tx Power or an anonymous bit; connectable and scannable
+// together; a high duty cycle bit without a directed connectable set; anonymous with a connectable or scannable one; a
+// directed set that is neither), an interval range out of order or below 20 ms, a channel map of no channel, an address or
+// policy value out of range, a primary PHY other than LE 1M and LE Coded, a secondary PHY other than the three, a legacy
+// set not on LE 1M, an SID above 15.  Unsupported Feature or Parameter Value (0x11) for what this Controller does not do:
+// LE Coded when the radio lacks it (`coded`) and a directed set that is scannable.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn xset_status(handle: Int, props: Int, int_min: Int, int_max: Int, chmap: Int, own: Int, peer_type: Int, policy: Int,
+               pphy: Int, sphy: Int, sid: Int, coded: Bool) -> Int
+    if handle > HANDLE_MAX or (props & P_RESERVED) != 0
+        return E_INVALID
+    let legacy = (props & P_LEGACY) != 0
+    if legacy
+        if legacy_type(props) < 0 or (props & (P_TXP | P_ANON)) != 0
+            return E_INVALID
+    else
+        if (props & P_CONN) != 0 and (props & P_SCAN) != 0
+            return E_INVALID
+        if (props & P_DIRECT) != 0 and (props & (P_CONN | P_SCAN)) == 0
+            return E_INVALID
+        if (props & P_ANON) != 0 and (props & (P_CONN | P_SCAN)) != 0
+            return E_INVALID
+    if (props & P_HIGH) != 0 and ((props & P_DIRECT) == 0 or (props & P_CONN) == 0)
+        return E_INVALID
+    if (props & P_HIGH) == 0
+        if int_min < 0x20 or int_max < int_min or int_max > 0xFFFFFF
+            return E_INVALID
+    if chmap == 0 or chmap > 7 or own > 3 or peer_type > 1 or policy > 3
+        return E_INVALID
+    if pphy != ll_phy.PHY_1M and pphy != ll_phy.PHY_CODED
+        return E_INVALID
+    if legacy
+        if pphy != ll_phy.PHY_1M
+            return E_INVALID
+    else
+        if sphy < ll_phy.PHY_1M or sphy > ll_phy.PHY_CODED or sid > 15
+            return E_INVALID
+        if (props & P_DIRECT) != 0 and (props & P_SCAN) != 0
+            return E_UNSUPPORTED
+        if (pphy == ll_phy.PHY_CODED or sphy == ll_phy.PHY_CODED) and not coded
+            return E_UNSUPPORTED
+    OK
+
+// Define the set `s`: the parameters of LE Set Extended Advertising Parameters, checked by `xset_status`.  The data stays
+// as it was.  `selected` is the Tx Power the Controller chose.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn xset_define(var s: XSet, handle: Int, props: Int, int_min: Int, int_max: Int, chmap: Int, own: Int, peer_type: Int,
+               var peer: Vec[u8; 6], policy: Int, selected: Int, pphy: Int, sphy: Int, popt: Int, sopt: Int, sid: Int, notify: Bool)
+    s.used = true
+    s.handle = handle as u8
+    s.props = props
+    s.int_min = int_min
+    s.int_max = int_max
+    s.chmap = chmap as u8
+    s.own = own as u8
+    s.peer_type = peer_type as u8
+    for i in 0..6
+        s.peer[i] = peer[i]
+    s.policy = policy as u8
+    s.txp = selected
+    s.pphy = pphy as u8
+    s.sphy = sphy as u8
+    s.popt = popt as u8
+    s.sopt = sopt as u8
+    s.sid = sid as u8
+    s.notify = notify
+
+// Whether the PDUs of the primary channels (the secondary ones) are sent in the coding S=8 of LE Coded: unless the Host asked for S=2.
+// The layout of an event counts every PDU at S=8, which is the longest, so S=2 only shortens the packets.
+@satisfies("REQ-BLE-CTL-092")
+@tier(embedded)
+fn prim_s8(var s: XSet) -> Bool
+    (s.popt as Int) != 1
+
+@satisfies("REQ-BLE-CTL-092")
+@tier(embedded)
+fn sec_s8(var s: XSet) -> Bool
+    (s.sopt as Int) != 1
+
+// ── The data ────────────────────────────────────────────────────────
+
+// The octets of the advertising data a connectable set sends in the one PDU the AUX_ADV_IND is: the payload is at most
+// 255 octets, of which the length and mode octet, the flags, the AdvA, the TargetA of a directed set, the ADI and the Tx
+// Power take their share.
+@tier(embedded)
+fn single_pdu_data(var s: XSet) -> Int
+    var hl = 1 + 6 + 2
+    if (s.props & P_DIRECT) != 0
+        hl = hl + 6
+    if (s.props & P_TXP) != 0
+        hl = hl + 1
+    255 - 1 - hl
+
+// The Status of LE Set Extended Advertising Data (`rsp` false) or LE Set Extended Scan Response Data for Operation `op`
+// and `len` octets, [Vol 4] Part E, Sections 7.8.54 and 7.8.55: Unknown Advertising Identifier is the caller's (no such set).
+// Command Disallowed for an Operation that is not Complete or Unchanged on a set that is enabled, a continuation
+// with nothing begun, and a scan response for a set that cannot be scanned; Invalid HCI Command Parameters for an Operation
+// out of range, Unchanged for the scan response, a legacy set whose data is not complete in one command or longer than 31
+// octets, and data of a scannable set; Memory Capacity Exceeded for more data than the set holds; Packet Too Long
+// for a connectable set whose data does not fit in one PDU.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn data_status(var s: XSet, rsp: Bool, op: Int, len: Int) -> Int
+    if op > OP_UNCHANGED
+        return E_INVALID
+    if s.on and op != OP_COMPLETE and op != OP_UNCHANGED
+        return E_DISALLOWED
+    if op == OP_UNCHANGED
+        if rsp or not s.dhave
+            return E_INVALID
+        return OK
+    var open = s.dasm
+    var have = s.dlen
+    if rsp
+        open = s.rasm
+        have = s.rlen
+    if (op == OP_MIDDLE or op == OP_LAST) and not open
+        return E_DISALLOWED
+    if (op == OP_FIRST or op == OP_COMPLETE)
+        have = 0
+    let total = have + len
+    let legacy = (s.props & P_LEGACY) != 0
+    // [Vol 4] Part E, Section 7.8.55: on a non-scannable set the command only discards the data (Operation 0x03, length
+    // zero) and anything else is Invalid HCI Command Parameters.
+    if rsp and (s.props & P_SCAN) == 0 and (op != OP_COMPLETE or len > 0)
+        return E_INVALID
+    if legacy
+        if op != OP_COMPLETE or len > ll_pdu.DATA_MAX
+            return E_INVALID
+    if not rsp
+        if (s.props & P_SCAN) != 0 and not legacy and len > 0
+            return E_INVALID
+    if total > ctl_limits.data_max()
+        return E_MEMORY
+    if not rsp and (s.props & P_CONN) != 0 and not legacy and total > single_pdu_data(var s)
+        return E_TOO_LONG
+    OK
+
+// Begin taking data of `op`: a first or complete data starts the buffer afresh, and a first or middle one leaves the
+// assembly open.  The caller checked `data_status`.  `Unchanged` and a data that ends only change the DID.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn data_begin(var s: XSet, rsp: Bool, op: Int)
+    if op == OP_FIRST or op == OP_COMPLETE
+        if rsp
+            s.rlen = 0
+        else
+            s.dlen = 0
+    if rsp
+        s.rasm = op == OP_FIRST or op == OP_MIDDLE
+    else
+        s.dasm = op == OP_FIRST or op == OP_MIDDLE
+
+// Append one octet of the fragment.
+@tier(embedded)
+fn data_put(var s: XSet, rsp: Bool, v: Int)
+    if rsp
+        s.rsp[s.rlen] = v as u8
+        s.rlen = s.rlen + 1
+    else
+        s.data[s.dlen] = v as u8
+        s.dlen = s.dlen + 1
+
+// The fragment is in.  Data that is complete (Last, Complete) or unchanged is now what the set sends from the next event
+// on; the scan response is complete likewise.  A new data takes a new DID.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn data_end(var s: XSet, rsp: Bool, op: Int)
+    if op == OP_FIRST or op == OP_MIDDLE
+        return
+    if rsp
+        s.rhave = true
+    else
+        s.dhave = true
+    s.rng = ll_adv.rng_step(s.rng)
+    s.did = (s.did + 1) & 0x0FFF
+
+// ── The enable ──────────────────────────────────────────────────────
+
+// Whether the set is ready to be enabled: Command Disallowed for a scannable set whose scan response data the Host has
+// not set.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn enable_status(var s: XSet) -> Int
+    if not s.used
+        return E_UNKNOWN_SET
+    if (s.props & P_SCAN) != 0 and not s.rhave
+        return E_DISALLOWED
+    OK
+
+// Enable the set at `now` with the advertiser's address `addr` of `atype`, a Duration of `dur` units of 10 ms and
+// at most `max_ev` events (0 for no limit).  The first event is due `FIRST_EVENT_US` later.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn xset_enable(var s: XSet, now: Int, var addr: Vec[u8; 6], atype: Int, dur: Int, max_ev: Int)
+    for i in 0..6
+        s.addr[i] = addr[i]
+    s.atype = atype as u8
+    s.on = true
+    for i in 0..6
+        s.tpeer[i] = s.peer[i]
+    s.ttype = s.peer_type
+    s.tgt_ok = false
+    s.dur = dur
+    s.max_ev = max_ev
+    s.entered = now
+    s.events = 0
+    s.due = now + FIRST_EVENT_US
+    s.anchor = now
+    s.term = 0
+    s.term_conn = 0
+    s.term_owed = false
+
+// The address of type `atype` (0 public, 1 random) the next event advertises with, and the TargetA of type `ttype` it names its peer with: the
+// Resolvable Private Addresses of the timeout.
+@satisfies("REQ-BLE-CTL-095")
+@tier(embedded)
+fn xset_use_addr(var s: XSet, var a: Vec[u8; 6], atype: Int)
+    for k in 0..6
+        s.addr[k] = a[k]
+    s.atype = atype as u8
+
+@satisfies("REQ-BLE-CTL-095")
+@tier(embedded)
+fn xset_use_target(var s: XSet, var t: Vec[u8; 6], ttype: Int)
+    for k in 0..6
+        s.tpeer[k] = t[k]
+    s.ttype = ttype as u8
+
+// Disable the set.
+@tier(embedded)
+fn xset_disable(var s: XSet)
+    s.on = false
+
+// The advertising interval of the set in microseconds: the minimum of the range, as the legacy advertiser has it.
+@tier(embedded)
+fn interval_us(var s: XSet) -> Int
+    s.int_min * ll_adv.UNIT_US
+
+// ── The layout of an event ─────────────────────────────────────────
+
+// Round `us` up to a whole number of the 30 microseconds an Auxiliary Pointer counts in.
+@tier(embedded)
+fn round_up(us: Int) -> Int
+    ((us + UNIT_US - 1) / UNIT_US) * UNIT_US
+
+// The primary channels the set uses, and the channel of the k-th of them.
+@tier(embedded)
+fn prim_count(var s: XSet) -> Int
+    ll_adv.chan_count(s.chmap as Int)
+
+@tier(embedded)
+fn prim_channel(var s: XSet, k: Int) -> Int
+    ll_adv.chan_of_slot(s.chmap as Int, k)
+
+// The octets of an ADV_EXT_IND with the header: the length and mode octet, the flags, the ADI, the Auxiliary Pointer and,
+// when the set asks, the Tx Power.
+@tier(embedded)
+fn prim_octets(var s: XSet) -> Int
+    var n = 2 + 1 + 1 + 2 + 3
+    if (s.props & P_TXP) != 0
+        n = n + 1
+    n
+
+// The microseconds an ADV_EXT_IND takes on the primary PHY, and the spacing of the starts of two of them.
+@tier(embedded)
+fn prim_us(var s: XSet) -> Int
+    ll_phy.air_us(s.pphy as Int, true, prim_octets(var s))
+
+@tier(embedded)
+fn spacing_us(var s: XSet) -> Int
+    round_up(prim_us(var s) + PRIM_GAP_US)
+
+// The time from the first bit of the first ADV_EXT_IND to that of the AUX_ADV_IND.
+@tier(embedded)
+fn aux_rel_us(var s: XSet) -> Int
+    (prim_count(var s) - 1) * spacing_us(var s) + round_up(prim_us(var s) + AUX_GAP_US)
+
+// The data the PDU `k` of a chain (0 the AUX_ADV_IND or the AUX_SCAN_RSP) carries of `len` octets, and the PDUs the chain has,
+// when a PDU carries `ch` octets at most (`CHUNK`, or `CHUNK_SYNC` for the AUX_ADV_IND that announces a train).
+@tier(embedded)
+fn chain_pdus_c(len: Int, ch: Int) -> Int
+    if len <= ch
+        return 1
+    (len + ch - 1) / ch
+
+@tier(embedded)
+fn chunk_len_c(len: Int, k: Int, ch: Int) -> Int
+    let left = len - k * ch
+    if left > ch
+        return ch
+    if left < 0
+        return 0
+    left
+
+@tier(embedded)
+fn chain_pdus(len: Int) -> Int
+    chain_pdus_c(len, CHUNK)
+
+@tier(embedded)
+fn chunk_len(len: Int, k: Int) -> Int
+    chunk_len_c(len, k, CHUNK)
+
+// The data one PDU of the advertising data of the set carries: the AUX_ADV_IND that holds a SyncInfo has 18 octets less room.
+@tier(embedded)
+fn data_chunk(var s: XSet) -> Int
+    if s.si_on
+        return CHUNK_SYNC
+    CHUNK
+
+// The octets of an AUX_ADV_IND carrying `n` octets of data with the header: the length and mode octet, the flags, the
+// AdvA (not when anonymous), the TargetA (directed), the ADI, the Auxiliary Pointer when `more`, the SyncInfo of a set that
+// announces a periodic advertising train, the Tx Power, the `acad_n` octets of ACAD (0 for none), and the data.
+@tier(embedded)
+fn aux_octets(var s: XSet, n: Int, more: Bool, acad_n: Int) -> Int
+    var hl = 1 + 2
+    if (s.props & P_ANON) == 0
+        hl = hl + 6
+    if (s.props & P_DIRECT) != 0
+        hl = hl + 6
+    if more
+        hl = hl + 3
+    if s.si_on
+        hl = hl + 18
+    if (s.props & P_TXP) != 0
+        hl = hl + 1
+    hl = hl + acad_n
+    2 + 1 + hl + n
+
+// The octets of an AUX_CHAIN_IND (of the advertising data `adi`, else of a scan response) carrying `n` octets.
+@tier(embedded)
+fn chain_octets(n: Int, adi: Bool, more: Bool) -> Int
+    var hl = 1
+    if adi
+        hl = hl + 2
+    if more
+        hl = hl + 3
+    2 + 1 + hl + n
+
+// The octets of an AUX_SCAN_RSP carrying `n` octets of the scan response data.
+@tier(embedded)
+fn rsp_octets(n: Int, more: Bool) -> Int
+    var hl = 1 + 6
+    if more
+        hl = hl + 3
+    2 + 1 + hl + n
+
+// The time from the start of a PDU of `octets` octets on `phy` to the start of the PDU of the chain after it.
+@tier(embedded)
+fn next_rel_us(phy: Int, octets: Int) -> Int
+    round_up(ll_phy.air_us(phy, true, octets) + CHAIN_GAP_US)
+
+// The Auxiliary Pointer's PHY field for a PHY as `ll_phy` numbers it: 0 LE 1M, 1 LE 2M, 2 LE Coded.
+@tier(embedded)
+fn aux_phy_code(phy: Int) -> Int
+    if phy == ll_phy.PHY_2M
+        return 1
+    if phy == ll_phy.PHY_CODED
+        return 2
+    0
+
+// The secondary channel of the next event, 0 to 36.
+@tier(embedded)
+fn pick_aux_channel(var s: XSet) -> Int
+    s.rng = ll_adv.rng_step(s.rng)
+    s.rng % 37
+
+// The delay the next event is given beyond the interval, 0 to 10 ms.
+@tier(embedded)
+fn adv_delay(var s: XSet) -> Int
+    s.rng = ll_adv.rng_step(s.rng)
+    s.rng % (ll_adv.ADV_DELAY_MAX_US + 1)
+
+// The event that started at `start` ended at `end`: the number of events, the end of the set (the Duration ran out, or the
+// events were sent: the status of the LE Advertising Set Terminated event the Host is owed), and the start of the next.
+// Answers true when the set goes on.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn xset_event_end(var s: XSet, end: Int) -> Bool
+    s.events = s.events + 1
+    if s.max_ev > 0 and s.events >= s.max_ev
+        s.on = false
+        s.term = T_LIMIT
+        s.term_owed = true
+        return false
+    var next = end + EVENT_GAP_US
+    if (s.props & P_HIGH) != 0
+        if end - s.entered >= HIGH_DUTY_TIMEOUT_US
+            s.on = false
+            s.term = T_TIMEOUT
+            s.term_owed = true
+            return false
+        next = end + ll_adv.PDU_GAP_US
+    else
+        let wanted = s.anchor + interval_us(s) + adv_delay(s)
+        if wanted > next
+            next = wanted
+    s.due = next
+    if s.dur > 0 and next - s.entered >= s.dur * 10000
+        s.on = false
+        s.term = T_TIMEOUT
+        s.term_owed = true
+        return false
+    true
+
+// The most time an event of the set takes from the start of its first PDU, in microseconds, which the arbiter books and the
+// program checks against the next booking: the primary PDUs, the AUX_ADV_IND and the chain after it, and for a set that a
+// request can follow the request, the response and its chain, with a margin.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn event_us(var s: XSet) -> Int
+    let sphy = s.sphy as Int
+    let longest = next_rel_us(sphy, 257)
+    var t = aux_rel_us(var s) + chain_pdus_c(s.dlen, data_chunk(var s)) * longest
+    if (s.props & (P_CONN | P_SCAN)) != 0
+        t = t + 3 * ll_pdu.airtime_us(40) + chain_pdus(s.rlen) * longest
+    t + 500
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// Write the Auxiliary Pointer to channel `ch`, `off` microseconds on, on the PHY `phy`.
+@tier(embedded)
+fn put_aux_ptr(var p: Pdu, ch: Int, off: Int, phy: Int)
+    var unit = 30
+    var units_300 = 0
+    if off / 30 > 8191
+        unit = 300
+        units_300 = 1
+    let n = off / unit
+    let _a = ll_pdu.pdu_put_data(var p, ch | (CLOCK_ACCURACY << 6) | (units_300 << 7))
+    let _b = ll_pdu.pdu_put_data(var p, n & 0xFF)
+    let _c = ll_pdu.pdu_put_data(var p, ((n >>> 8) & 0x1F) | (aux_phy_code(phy) << 5))
+
+// Build an extended advertising PDU of the type `ty` in `p`: the header with TxAdd `tx_add` and RxAdd `rx_add`, the
+// AdvMode, then the fields the arguments name, in the order of the flags — the AdvA `addr` when `adva`, the TargetA
+// `target` when `targ`, the ADI of `did` and `sid` when `adi`, an Auxiliary Pointer to channel `aux_ch`, `aux_off`
+// microseconds on and PHY `aux_phy` when `aux`, the SyncInfo `si` when `sync`, a Tx Power `txp` when `txp_on` — and `n` octets of
+// `src` from `at`.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn ext_build(var p: Pdu, ty: Int, tx_add: Int, rx_add: Int, mode: Int,
+             adva: Bool, var addr: Vec[u8; 6], targ: Bool, var target: Vec[u8; 6], adi: Bool, did: Int, sid: Int,
+             aux: Bool, aux_ch: Int, aux_off: Int, aux_phy: Int, txp_on: Bool, txp: Int,
+             sync: Bool, var si: Vec[u8; 18], var src: AdvData, at: Int, n: Int)
+    var none: Vec[u8; 64] = Vec.new()
+    ext_build_acad(var p, ty, tx_add, rx_add, mode, adva, var addr, targ, var target, adi, did, sid, aux, aux_ch, aux_off, aux_phy, txp_on, txp,
+                   sync, var si, var src, at, n, var none, 0)
+
+// The same with the ACAD, `acad_n` octets of `acad`, after the fields of the Extended Header ([Vol 6] Part B, Section 2.3.4.8): the
+// header length counts them, and they come before the advertising data.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn ext_build_acad(var p: Pdu, ty: Int, tx_add: Int, rx_add: Int, mode: Int,
+                  adva: Bool, var addr: Vec[u8; 6], targ: Bool, var target: Vec[u8; 6], adi: Bool, did: Int, sid: Int,
+                  aux: Bool, aux_ch: Int, aux_off: Int, aux_phy: Int, txp_on: Bool, txp: Int,
+                  sync: Bool, var si: Vec[u8; 18], var src: AdvData, at: Int, n: Int, var acad: Vec[u8; 64], acad_n: Int)
+    ll_pdu.pdu_begin(var p, ty, tx_add, rx_add)
+    let _hl = ll_pdu.pdu_put_data(var p, 0)
+    var flags = 0
+    let _fl = ll_pdu.pdu_put_data(var p, 0)
+    if adva
+        flags = flags | 1
+        for k in 0..6
+            let _a = ll_pdu.pdu_put_data(var p, addr[k] as Int)
+    if targ
+        flags = flags | 2
+        for k in 0..6
+            let _t = ll_pdu.pdu_put_data(var p, target[k] as Int)
+    if adi
+        flags = flags | 8
+        let _d0 = ll_pdu.pdu_put_data(var p, did & 0xFF)
+        let _d1 = ll_pdu.pdu_put_data(var p, ((did >>> 8) & 0x0F) | (sid << 4))
+    if aux
+        flags = flags | 0x10
+        put_aux_ptr(var p, aux_ch, aux_off, aux_phy)
+    if sync
+        flags = flags | 0x20
+        for k in 0..18
+            let _y = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    if txp_on
+        flags = flags | 0x40
+        let _x = ll_pdu.pdu_put_data(var p, txp & 0xFF)
+    for k in 0..acad_n
+        let _ac = ll_pdu.pdu_put_data(var p, acad[k] as Int)
+    p.b[3] = flags as u8
+    p.b[2] = ((p.n - 3) | (mode << 6)) as u8
+    for k in 0..n
+        let _s = ll_pdu.pdu_put_data(var p, src[at + k] as Int)
+    ll_pdu.pdu_finish(var p)
+
+// The ADV_EXT_IND of the set that points to the AUX_ADV_IND `off` microseconds on, on channel `ch`.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn build_ext_ind(var s: XSet, var p: Pdu, ch: Int, off: Int)
+    ext_build(var p, ll_init.EXT_ADV, 0, 0, adv_mode(var s), false, var s.addr, false, var s.peer, true, s.did, s.sid as Int,
+              true, ch, off, s.sphy as Int, (s.props & P_TXP) != 0, s.txp, false, var s.si, var s.data, 0, 0)
+
+// The AUX_ADV_IND of the set: AdvA (the TargetA of a directed set), ADI, a pointer `off` microseconds on to the next PDU of the chain when
+// `more`, and `n` octets of the advertising data from `at`.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn build_aux_adv(var s: XSet, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int)
+    ext_build(var p, ll_init.EXT_ADV, (s.atype as Int) & 1, (s.ttype as Int) & 1, adv_mode(var s),
+              (s.props & P_ANON) == 0, var s.addr, (s.props & P_DIRECT) != 0, var s.tpeer, true, s.did, s.sid as Int,
+              more, ch, off, s.sphy as Int, (s.props & P_TXP) != 0, s.txp, s.si_on, var s.si, var s.data, at, n)
+
+// The AUX_ADV_IND of a set that announces a periodic train with responses: the same with the `acad_n` octets of `acad` (the Periodic Advertising
+// Response Timing Information), which `aux_octets` counts as its `acad_n`.
+@satisfies("REQ-BLE-CTL-110")
+@tier(embedded)
+fn build_aux_adv_acad(var s: XSet, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int, var acad: Vec[u8; 64], acad_n: Int)
+    ext_build_acad(var p, ll_init.EXT_ADV, (s.atype as Int) & 1, (s.ttype as Int) & 1, adv_mode(var s),
+                   (s.props & P_ANON) == 0, var s.addr, (s.props & P_DIRECT) != 0, var s.tpeer, true, s.did, s.sid as Int,
+                   more, ch, off, s.sphy as Int, (s.props & P_TXP) != 0, s.txp, s.si_on, var s.si, var s.data, at, n, var acad, acad_n)
+
+// A PDU of the chain after the AUX_ADV_IND: the ADI, a pointer when `more`, `n` octets of the advertising data.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn build_chain(var s: XSet, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int)
+    ext_build(var p, ll_init.EXT_ADV, 0, 0, 0, false, var s.addr, false, var s.peer, true, s.did, s.sid as Int,
+              more, ch, off, s.sphy as Int, false, 0, false, var s.si, var s.data, at, n)
+
+// The AUX_SCAN_RSP of the set: the AdvA, a pointer when `more`, `n` octets of the scan response data from `at`.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn build_scan_rsp(var s: XSet, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int)
+    ext_build(var p, ll_init.EXT_ADV, (s.atype as Int) & 1, 0, 0, true, var s.addr, false, var s.peer, false, 0, 0,
+              more, ch, off, s.sphy as Int, false, 0, false, var s.si, var s.rsp, at, n)
+
+// A PDU of the chain after the AUX_SCAN_RSP: no ADI, a pointer when `more`, `n` octets of the scan response data.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn build_rsp_chain(var s: XSet, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int)
+    ext_build(var p, ll_init.EXT_ADV, 0, 0, 0, false, var s.addr, false, var s.peer, false, 0, 0,
+              more, ch, off, s.sphy as Int, false, 0, false, var s.si, var s.rsp, at, n)
+
+// The AUX_CONNECT_RSP to the initiator `init` of type `init_type`: the AdvA and the TargetA.
+@satisfies("REQ-BLE-CTL-091")
+@tier(embedded)
+fn build_connect_rsp(var s: XSet, var p: Pdu, var init: Vec[u8; 6], init_type: Int)
+    ext_build(var p, ll_init.AUX_CONNECT_RSP, (s.atype as Int) & 1, init_type & 1, 0, true, var s.addr, true, var init, false, 0, 0,
+              false, 0, 0, s.sphy as Int, false, 0, false, var s.si, var s.data, 0, 0)
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@tier(app)
+fn t_set(props: Int) -> XSet
+    var s = xset_new()
+    var peer: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _p = peer.push(0x60 + i)
+    xset_define(var s, 3, props, 0x30, 0x30, 7, 1, 0, var peer, 0, 0, 1, 1, 0, 0, 5, false)
+    var a: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _a = a.push(0x30 + i)
+    xset_enable(var s, 1000, var a, 1, 0, 0)
+    xset_seed(var s, 7)
+    s
+
+@tier(app)
+fn t_engine(props: Int) -> Int
+    var s = t_set(props)
+    engine_type(var s)
+
+@tier(app)
+fn t_on(var s: XSet, on: Bool)
+    s.on = on
+
+@tier(app)
+fn t_max(var s: XSet, n: Int)
+    s.max_ev = n
+
+@tier(app)
+fn t_dur(var s: XSet, n: Int)
+    s.dur = n
+
+@tier(app)
+fn t_anchor(var s: XSet, t: Int)
+    s.anchor = t
+
+@test
+fn test_capacities_match_the_constants()
+    var s = xset_new()
+    test.assert_eq(s.data.capacity(), ctl_limits.data_max())
+    test.assert_eq(s.rsp.capacity(), ctl_limits.data_max())
+    test.assert(CHUNK <= ctl_limits.data_max())
+
+@test
+fn test_the_properties_say_what_a_set_is()
+    test.assert_eq(legacy_type(0x13), ll_adv.TYPE_IND)
+    test.assert_eq(legacy_type(0x15), ll_adv.TYPE_DIRECT_LOW)
+    test.assert_eq(legacy_type(0x1D), ll_adv.TYPE_DIRECT_HIGH)
+    test.assert_eq(legacy_type(0x12), ll_adv.TYPE_SCAN)
+    test.assert_eq(legacy_type(0x10), ll_adv.TYPE_NONCONN)
+    test.assert_eq(legacy_type(0x11), -1)
+    test.assert_eq(legacy_type(0x03), -1)
+    test.assert_eq(t_engine(P_CONN), ll_adv.TYPE_CONN_ONLY)
+    test.assert_eq(t_engine(P_SCAN), ll_adv.TYPE_SCAN)
+    test.assert_eq(t_engine(0), ll_adv.TYPE_NONCONN)
+    test.assert_eq(t_engine(P_CONN | P_DIRECT), ll_adv.TYPE_DIRECT_LOW)
+    test.assert_eq(t_engine(P_CONN | P_DIRECT | P_HIGH), ll_adv.TYPE_DIRECT_HIGH)
+
+@test
+fn test_the_parameters_are_checked_against_the_specification()
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), OK)
+    test.assert_eq(xset_status(0xEF, P_CONN | P_TXP, 0x20, 0x40, 3, 1, 1, 3, 1, 2, 15, false), OK)
+    test.assert_eq(xset_status(0xF0, 0, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    // Reserved bits, connectable with scannable, a directed set that is neither, anonymous with a request.
+    test.assert_eq(xset_status(0, 0x0080, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, P_CONN | P_SCAN, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, P_DIRECT, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, P_ANON | P_CONN, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, P_HIGH | P_CONN, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    // The interval: under 20 ms, a range out of order.
+    test.assert_eq(xset_status(0, 0, 0x1F, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x40, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    // The map, the address types, the policy, the PHYs, the SID.
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 0, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 8, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 4, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 2, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 4, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 2, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 1, 0, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 16, false), E_INVALID)
+    // What this Controller does not do: LE Coded without the radio (as the primary or the secondary PHY), a directed scannable set.  A
+    // Resolvable Private Address (Own_Address_Type 2 and 3) is taken.
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 3, 1, 0, false), E_UNSUPPORTED)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 1, 3, 0, false), E_UNSUPPORTED)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 0, 0, 0, 3, 3, 0, true), OK)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 2, 0, 0, 1, 1, 0, false), OK)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 3, 0, 0, 1, 1, 0, false), OK)
+    test.assert_eq(xset_status(0, 0, 0x20, 0x20, 7, 4, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, P_DIRECT | P_SCAN, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_UNSUPPORTED)
+    // Legacy PDUs: a combination of the table, on LE 1M, and an RPA is for the legacy engine.
+    test.assert_eq(xset_status(0, 0x13, 0x20, 0x20, 7, 2, 0, 0, 1, 1, 0, false), OK)
+    test.assert_eq(xset_status(0, 0x11, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0x13 | P_TXP, 0x20, 0x20, 7, 0, 0, 0, 1, 1, 0, false), E_INVALID)
+    test.assert_eq(xset_status(0, 0x13, 0x20, 0x20, 7, 0, 0, 0, 3, 1, 0, true), E_INVALID)
+    // High duty cycle directed advertising has no interval.
+    test.assert_eq(xset_status(0, P_CONN | P_DIRECT | P_HIGH, 0, 0, 7, 0, 0, 0, 1, 1, 0, false), OK)
+
+@test
+fn test_the_data_commands_follow_the_operations()
+    var s = t_set(0)
+    t_on(s, false)
+    test.assert_eq(data_status(var s, false, OP_COMPLETE, 10), OK)
+    test.assert_eq(data_status(var s, false, OP_FIRST, 100), OK)
+    test.assert_eq(data_status(var s, false, OP_MIDDLE, 10), E_DISALLOWED)
+    test.assert_eq(data_status(var s, false, 5, 10), E_INVALID)
+    test.assert_eq(data_status(var s, false, OP_UNCHANGED, 0), E_INVALID)
+    // A scan response is for a scannable set: data on another is refused, and an empty Complete one discards and succeeds (7.8.55).
+    test.assert_eq(data_status(var s, true, OP_COMPLETE, 10), E_INVALID)
+    test.assert_eq(data_status(var s, true, OP_COMPLETE, 0), OK)
+    data_begin(var s, false, OP_FIRST)
+    for i in 0..100
+        data_put(var s, false, i)
+    data_end(var s, false, OP_FIRST)
+    test.assert(s.dasm)
+    test.assert(not s.dhave)
+    test.assert_eq(data_status(var s, false, OP_MIDDLE, 100), OK)
+    test.assert_eq(data_status(var s, false, OP_LAST, 152), E_MEMORY)
+    test.assert_eq(data_status(var s, false, OP_LAST, 151), OK)
+    let did = s.did
+    data_begin(var s, false, OP_LAST)
+    for i in 0..50
+        data_put(var s, false, i)
+    data_end(var s, false, OP_LAST)
+    test.assert(s.dhave)
+    test.assert(not s.dasm)
+    test.assert_eq(s.dlen, 150)
+    test.assert_eq(s.did, (did + 1) & 0x0FFF)
+    // Enabled, only a complete or an unchanged data may be given.
+    t_on(s, true)
+    test.assert_eq(data_status(var s, false, OP_FIRST, 10), E_DISALLOWED)
+    test.assert_eq(data_status(var s, false, OP_COMPLETE, 10), OK)
+    test.assert_eq(data_status(var s, false, OP_UNCHANGED, 0), OK)
+    // A scannable set has no advertising data but a scan response; a connectable set's data fits one PDU.
+    var sc = t_set(P_SCAN)
+    t_on(sc, false)
+    test.assert_eq(data_status(var sc, false, OP_COMPLETE, 1), E_INVALID)
+    test.assert_eq(data_status(var sc, false, OP_COMPLETE, 0), OK)
+    test.assert_eq(data_status(var sc, true, OP_COMPLETE, 251), OK)
+    test.assert_eq(data_status(var sc, true, OP_UNCHANGED, 0), E_INVALID)
+    var cn = t_set(P_CONN)
+    t_on(cn, false)
+    test.assert_eq(single_pdu_data(var cn), 255 - 1 - 9)
+    test.assert_eq(data_status(var cn, false, OP_COMPLETE, 245), OK)
+    test.assert_eq(data_status(var cn, false, OP_COMPLETE, 246), E_TOO_LONG)
+    // A legacy set: one command, 31 octets.
+    var lg = t_set(0x13)
+    t_on(lg, false)
+    test.assert_eq(data_status(var lg, false, OP_COMPLETE, 31), OK)
+    test.assert_eq(data_status(var lg, false, OP_COMPLETE, 32), E_INVALID)
+    test.assert_eq(data_status(var lg, false, OP_FIRST, 10), E_INVALID)
+    test.assert_eq(data_status(var lg, true, OP_COMPLETE, 31), OK)
+
+@test
+fn test_a_scannable_set_is_enabled_only_with_its_scan_response()
+    var s = t_set(P_SCAN)
+    test.assert_eq(enable_status(var s), E_DISALLOWED)
+    data_begin(var s, true, OP_COMPLETE)
+    data_end(var s, true, OP_COMPLETE)
+    test.assert_eq(enable_status(var s), OK)
+    var u = xset_new()
+    test.assert_eq(enable_status(var u), E_UNKNOWN_SET)
+
+@test
+fn test_the_layout_keeps_every_offset_a_multiple_of_the_pointer_unit_and_the_pdus_t_mafs_apart()
+    var s = t_set(P_TXP)
+    // Three channels: the ADV_EXT_IND is 10 octets, 144 microseconds on LE 1M.
+    test.assert_eq(prim_count(var s), 3)
+    test.assert_eq(prim_octets(var s), 10)
+    test.assert_eq(prim_us(var s), 144)
+    test.assert_eq(spacing_us(var s) % 30, 0)
+    test.assert_eq(spacing_us(var s), 570)
+    test.assert_eq(aux_rel_us(var s) % 30, 0)
+    for k in 0..3
+        let off = aux_rel_us(var s) - k * spacing_us(var s)
+        test.assert_eq(off % 30, 0)
+        // The AUX_ADV_IND starts at least T_MAFS after the end of the PDU that points to it.
+        test.assert(off - prim_us(var s) >= T_MAFS_US)
+    // The chain: a PDU starts a multiple of 30 microseconds after the one before, and 300 or more after its end.
+    let n = aux_octets(var s, 229, true, 0)
+    test.assert_eq(n, 2 + 1 + (1 + 2 + 6 + 3 + 1) + 229)
+    let rel = next_rel_us(ll_phy.PHY_1M, n)
+    test.assert_eq(rel % 30, 0)
+    test.assert(rel - ll_phy.air_us(ll_phy.PHY_1M, true, n) >= T_MAFS_US)
+    test.assert_eq(chain_pdus(0), 1)
+    test.assert_eq(chain_pdus(229), 1)
+    test.assert_eq(chain_pdus(230), 2)
+    test.assert_eq(chunk_len(251, 0), 229)
+    test.assert_eq(chunk_len(251, 1), 22)
+    test.assert_eq(chunk_len(251, 2), 0)
+
+@test
+fn test_the_pdus_of_an_event_carry_their_fields()
+    var s = t_set(P_TXP)
+    data_begin(var s, false, OP_COMPLETE)
+    for i in 0..300
+        if i < 251
+            data_put(var s, false, i)
+    data_end(var s, false, OP_COMPLETE)
+    var p = ll_pdu.pdu_new()
+    build_ext_ind(var s, var p, 12, 2700)
+    let x = ll_ext.ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(p.n, prim_octets(var s))
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(ll_ext.adi_did(var p, x.adi), s.did)
+    test.assert_eq(ll_ext.adi_sid(var p, x.adi), 5)
+    test.assert_eq(ll_init.aux_channel(var p, x.aux), 12)
+    test.assert_eq(ll_init.aux_offset_us(var p, x.aux), 2700)
+    test.assert_eq(ll_init.aux_phy_of(var p, x.aux), ll_phy.PHY_1M)
+    test.assert_eq(ll_ext.tx_power(var p, x), 0)
+    test.assert_eq(x.data_len, 0)
+    var q = ll_pdu.pdu_new()
+    build_aux_adv(var s, var q, 0, 229, true, 13, 3000)
+    let y = ll_ext.ext_parse(var q)
+    test.assert(y.ok)
+    test.assert_eq(q.n, aux_octets(var s, 229, true, 0))
+    test.assert_eq(y.adva, 4)
+    test.assert_eq(q.b[4] as Int, 0x30)
+    test.assert_eq(ll_pdu.pdu_tx_add(var q), 1)
+    test.assert_eq(y.data_len, 229)
+    test.assert_eq(q.b[y.data_at + 228] as Int, 228)
+    test.assert_eq(ll_init.aux_channel(var q, y.aux), 13)
+    test.assert_eq(ll_init.aux_offset_us(var q, y.aux), 3000)
+    var r = ll_pdu.pdu_new()
+    build_chain(var s, var r, 229, 22, false, 0, 0)
+    let z = ll_ext.ext_parse(var r)
+    test.assert(z.ok)
+    test.assert_eq(z.adva, -1)
+    test.assert_eq(z.aux, -1)
+    test.assert_eq(z.data_len, 22)
+    test.assert_eq(r.n, chain_octets(22, true, false))
+    test.assert_eq(r.b[z.data_at] as Int, 229)
+    // An offset past 245 ms counts in units of 300 microseconds.
+    var w = ll_pdu.pdu_new()
+    build_ext_ind(var s, var w, 5, 400000)
+    let v = ll_ext.ext_parse(var w)
+    test.assert_eq(ll_init.aux_unit_us(var w, v.aux), 300)
+    test.assert_eq(ll_init.aux_offset_us(var w, v.aux), 399900)
+
+@test
+fn test_the_scan_response_and_the_connect_response_have_the_addresses_a_scanner_needs()
+    var s = t_set(P_SCAN)
+    data_begin(var s, true, OP_COMPLETE)
+    for i in 0..40
+        data_put(var s, true, 100 + i)
+    data_end(var s, true, OP_COMPLETE)
+    var p = ll_pdu.pdu_new()
+    build_scan_rsp(var s, var p, 0, 40, false, 0, 0)
+    let x = ll_ext.ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.adva, 4)
+    test.assert_eq(x.adi, -1)
+    test.assert_eq(x.data_len, 40)
+    test.assert_eq(p.b[x.data_at] as Int, 100)
+    test.assert_eq(p.n, rsp_octets(40, false))
+    var init: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _i = init.push(0x80 + i)
+    var q = ll_pdu.pdu_new()
+    build_connect_rsp(var s, var q, var init, 1)
+    test.assert_eq(ll_pdu.pdu_type(var q), ll_init.AUX_CONNECT_RSP)
+    let y = ll_ext.ext_parse(var q)
+    test.assert(y.ok)
+    test.assert_eq(y.adva, 4)
+    test.assert_eq(y.targeta, 10)
+    test.assert_eq(q.b[10] as Int, 0x80)
+    test.assert_eq(ll_pdu.pdu_rx_add(var q), 1)
+    // An anonymous set names no address in the AUX_ADV_IND.
+    var a = t_set(P_ANON)
+    var r = ll_pdu.pdu_new()
+    build_aux_adv(var a, var r, 0, 0, false, 0, 0)
+    test.assert_eq(ll_ext.ext_parse(var r).adva, -1)
+
+@test
+fn test_events_end_a_set_by_its_count_its_duration_and_the_high_duty_time()
+    var s = t_set(0)
+    t_max(var s, 3)
+    test.assert(xset_event_end(var s, 5000))
+    test.assert(xset_event_end(var s, 25000))
+    test.assert(not xset_event_end(var s, 45000))
+    test.assert_eq(s.term, T_LIMIT)
+    test.assert(not s.on)
+    // The interval is the minimum of the range: 0x30 units is 30 ms from the anchor of the event.
+    var u = t_set(0)
+    t_anchor(var u, 100000)
+    test.assert(xset_event_end(var u, 105000))
+    test.assert(u.due >= 130000)
+    test.assert(u.due <= 140000)
+    // A Duration of 100 ms from the time it was enabled (1000).
+    var d = t_set(0)
+    t_dur(var d, 10)
+    t_anchor(var d, 90000)
+    test.assert(not xset_event_end(var d, 95000))
+    test.assert_eq(d.term, T_TIMEOUT)
+    // High duty cycle directed advertising stops 1.28 s after it began, with the status of a timeout.
+    var h = t_set(P_CONN | P_DIRECT | P_HIGH)
+    test.assert(xset_event_end(var h, 2000))
+    test.assert(not xset_event_end(var h, 1000 + HIGH_DUTY_TIMEOUT_US))
+    test.assert_eq(h.term, T_TIMEOUT)
+
+@test
+fn test_the_secondary_channel_is_a_data_channel_and_changes()
+    var s = t_set(0)
+    var seen = 0
+    var last = -1
+    for _ in 0..40
+        let ch = pick_aux_channel(var s)
+        test.assert(ch >= 0 and ch <= 36)
+        if ch != last
+            seen = seen + 1
+        last = ch
+    test.assert(seen > 20)

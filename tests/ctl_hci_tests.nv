@@ -1,0 +1,939 @@
+// tests/ctl_hci_tests.nv — the Controller's HCI layer driven the way a Host's
+// UART drives it: Commands go in octet by octet, the events come out octet by
+// octet.
+
+use noble_controller_config
+use std.test
+use hci_frame
+use hci_commands
+use ctl_hci
+use ctl_pool
+use h4_rx
+
+// Feed one Command to the ctl_hci.Controller as the Host's UART would.
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+// Every octet the Controller has to send.
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+// A Command, its answer.
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+fn zeros(n: Int) -> [Int]
+    var v: [Int] = []
+    for _ in 0..n
+        list.push(v, 0)
+    v
+
+fn bytes_of(opcode: Int, status: Int) -> [Int]
+    [0x04, 0x0E, 0x04, 0x01, opcode & 0xFF, (opcode >>> 8) & 0xFF, status]
+
+fn fresh() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_ECB | ctl_hci.CAP_RNG)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    c
+
+fn test_address(n: Int) -> [Int]
+    [n, 0x22, 0x33, 0x44, 0x55, 0x66]
+
+@test
+fn test_capacities_match_the_constants()
+    let c = ctl_hci.controller_new(0)
+    test.assert_eq(c.fal_used.capacity(), ctl_hci.FILTER_ACCEPT_LIST_SIZE)
+    test.assert_eq(c.fal_type.capacity(), ctl_hci.FILTER_ACCEPT_LIST_SIZE)
+    test.assert_eq(c.fal_addr.capacity(), ctl_hci.FILTER_ACCEPT_LIST_SIZE * 6)
+    test.assert_eq(c.public.capacity(), 6)
+    test.assert_eq(c.random.capacity(), 6)
+    test.assert_eq(c.block.capacity(), 16)
+    test.assert_eq(c.key.capacity(), 16)
+    test.assert_eq(c.result.capacity(), 16)
+    test.assert_eq(c.links.capacity(), noble_controller_config.CTL_LINKS)
+    test.assert_eq(c.links.len(), noble_controller_config.CTL_LINKS)
+
+@test
+fn test_opcodes_match_the_hosts()
+    test.assert_eq(ctl_hci.OP_RESET, hci_commands.opcode_hci_reset())
+    test.assert_eq(ctl_hci.OP_SET_CONTROLLER_TO_HOST_FLOW_CONTROL, hci_commands.opcode_set_controller_to_host_flow_control())
+    test.assert_eq(ctl_hci.OP_HOST_BUFFER_SIZE, hci_commands.opcode_host_buffer_size())
+    test.assert_eq(ctl_hci.OP_HOST_NUMBER_OF_COMPLETED_PACKETS, hci_commands.opcode_host_number_of_completed_packets())
+    test.assert_eq(ctl_hci.OP_SET_EVENT_MASK, hci_commands.opcode_hci_set_event_mask())
+    test.assert_eq(ctl_hci.OP_READ_LOCAL_VERSION, hci_commands.opcode_read_local_version_information())
+    test.assert_eq(ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, hci_commands.opcode_read_local_supported_commands())
+    test.assert_eq(ctl_hci.OP_READ_LOCAL_SUPPORTED_FEATURES, hci_commands.opcode_read_local_supported_features())
+    test.assert_eq(ctl_hci.OP_READ_BD_ADDR, hci_commands.opcode_read_bd_addr())
+    test.assert_eq(ctl_hci.OP_LE_SET_EVENT_MASK, hci_commands.opcode_le_set_event_mask())
+    test.assert_eq(ctl_hci.OP_LE_READ_BUFFER_SIZE, hci_commands.opcode_le_read_buffer_size())
+    test.assert_eq(ctl_hci.OP_LE_READ_LOCAL_SUPPORTED_FEATURES, hci_commands.opcode_le_read_local_supported_features())
+    test.assert_eq(ctl_hci.OP_LE_SET_RANDOM_ADDRESS, hci_commands.opcode_le_set_random_address())
+    test.assert_eq(ctl_hci.OP_LE_READ_FILTER_ACCEPT_LIST_SIZE, hci_commands.opcode_le_read_white_list_size())
+    test.assert_eq(ctl_hci.OP_LE_CLEAR_FILTER_ACCEPT_LIST, hci_commands.opcode_le_clear_filter_accept_list())
+    test.assert_eq(ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, hci_commands.opcode_le_add_device_to_filter_accept_list())
+    test.assert_eq(ctl_hci.OP_LE_ENCRYPT, hci_commands.opcode_le_encrypt())
+    test.assert_eq(ctl_hci.OP_LE_RAND, hci_commands.opcode_le_rand())
+    test.assert_eq(ctl_hci.OP_LE_READ_SUPPORTED_STATES, hci_commands.opcode_le_read_supported_states())
+
+@test
+fn test_reset_is_answered_with_success()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_RESET, []), bytes_of(ctl_hci.OP_RESET, 0))
+
+@test
+fn test_read_local_version_reports_the_specification_and_no_vendor()
+    var c = fresh()
+    let want = [0x04, 0x0E, 0x0C, 0x01, 0x01, 0x10, 0x00, 0x11, 0x01, 0x00, 0x11, 0xFF, 0xFF, 0x01, 0x00]
+    test.assert_eq(run(c, ctl_hci.OP_READ_LOCAL_VERSION, []), want)
+
+@test
+fn test_read_bd_addr_returns_the_public_address_least_significant_first()
+    var c = fresh()
+    let want = [0x04, 0x0E, 0x0A, 0x01, 0x09, 0x10, 0x00, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15]
+    test.assert_eq(run(c, ctl_hci.OP_READ_BD_ADDR, []), want)
+
+@test
+fn test_read_local_supported_features_claims_le_only()
+    var c = fresh()
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_FEATURES, [])
+    test.assert_eq(list.len(got), 15)
+    test.assert_eq(got[2], 12)
+    test.assert_eq(got[6], 0)
+    for i in 0..8
+        test.assert_eq(got[7 + i], if i == 4 then 0x60 else 0)
+
+@test
+fn test_le_read_buffer_size_reports_the_acl_path()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_LE_READ_BUFFER_SIZE, []), [0x04, 0x0E, 0x07, 0x01, 0x02, 0x20, 0x00, 251, 0x00, ctl_hci.ACL_BUFFERS])
+
+// Read Buffer Size and Read Local Name belong to BR/EDR; an LE Controller answers them
+// with Unknown HCI Command and leaves their bits clear (HCI.TS HCI/GEV/BV-01-C).
+@test
+fn test_the_br_edr_only_commands_are_unknown()
+    var c = fresh()
+    test.assert_eq(run(c, 0x1005, []), bytes_of(0x1005, 0x01))
+    test.assert_eq(run(c, 0x0C14, []), bytes_of(0x0C14, 0x01))
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    // Octet 14 bit 7 was Read Buffer Size, octet 7 bit 1 Read Local Name.
+    test.assert_eq(got[7 + 14] & 0x80, 0)
+    test.assert_eq(got[7 + 7] & 0x02, 0)
+
+// Read Transmit Power Level (octet 10 bit 2) and Read RSSI (octet 15 bit 5) are listed
+// when the build has a Link Layer.
+// The test commands are listed (octet 28 bits 4 to 6, octet 35 bit 7, octet 36 bit 0, octet 39
+// bits 3 and 4, octet 45 bit 0) when the build has a Link Layer.
+@test
+fn test_the_direct_test_mode_commands_are_listed()
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    test.assert_eq(got[7 + 28] & 0x70, 0x70)
+    test.assert_eq(got[7 + 35] & 0x80, 0x80)
+    test.assert_eq(got[7 + 36] & 0x01, 0x01)
+    test.assert_eq(got[7 + 39] & 0x18, 0x18)
+    test.assert_eq(got[7 + 45] & 0x01, 0x01)
+    // Without a Link Layer there is no radio to test.
+    var d = fresh()
+    let none = run(d, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    test.assert_eq(none[7 + 28] & 0x70, 0)
+    test.assert_eq(none[7 + 45] & 0x01, 0)
+
+@test
+fn test_read_transmit_power_level_and_read_rssi_are_listed()
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    test.assert_eq(got[7 + 10] & 0x04, 0x04)
+    test.assert_eq(got[7 + 15] & 0x20, 0x20)
+    var d = fresh()
+    let none = run(d, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    test.assert_eq(none[7 + 10] & 0x04, 0)
+    test.assert_eq(none[7 + 15] & 0x20, 0)
+
+@test
+fn test_le_features_and_states_claim_nothing()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_LE_READ_LOCAL_SUPPORTED_FEATURES, []), list.concat([0x04, 0x0E, 0x0C, 0x01, 0x03, 0x20, 0x00], zeros(8)))
+    test.assert_eq(run(c, ctl_hci.OP_LE_READ_SUPPORTED_STATES, []), list.concat([0x04, 0x0E, 0x0C, 0x01, 0x1C, 0x20, 0x00], zeros(8)))
+
+@test
+fn test_default_masks_let_the_events_through()
+    var c = fresh()
+    test.assert(ctl_hci.event_enabled(var c, hci_frame.EVT_DISCONNECTION_COMPLETE))
+    test.assert(ctl_hci.event_enabled(var c, hci_frame.EVT_HARDWARE_ERROR))
+    test.assert(ctl_hci.event_enabled(var c, 45))
+    test.assert(not ctl_hci.event_enabled(var c, 46))
+    test.assert(not ctl_hci.event_enabled(var c, 0))
+    test.assert(not ctl_hci.event_enabled(var c, 65))
+    // The LE Meta event is off until the Host turns it on, and with it every
+    // LE subevent.
+    test.assert(not ctl_hci.event_enabled(var c, hci_frame.EVT_LE_META_EVENT))
+    test.assert(not ctl_hci.le_event_enabled(var c, 1))
+    let _a = run(c, ctl_hci.OP_SET_EVENT_MASK, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x20])
+    test.assert(ctl_hci.event_enabled(var c, hci_frame.EVT_LE_META_EVENT))
+    test.assert(ctl_hci.le_event_enabled(var c, 1))
+    test.assert(ctl_hci.le_event_enabled(var c, 5))
+    test.assert(not ctl_hci.le_event_enabled(var c, 6))
+
+@test
+fn test_set_event_mask_replaces_the_mask()
+    var c = fresh()
+    let got = run(c, ctl_hci.OP_SET_EVENT_MASK, [0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80])
+    test.assert_eq(got, bytes_of(ctl_hci.OP_SET_EVENT_MASK, 0))
+    test.assert(ctl_hci.event_enabled(var c, 5))
+    test.assert(not ctl_hci.event_enabled(var c, hci_frame.EVT_HARDWARE_ERROR))
+    test.assert(not ctl_hci.event_enabled(var c, hci_frame.EVT_LE_META_EVENT))
+    test.assert(ctl_hci.event_enabled(var c, 64))
+
+@test
+fn test_le_set_event_mask_replaces_the_le_mask()
+    var c = fresh()
+    let _m = run(c, ctl_hci.OP_SET_EVENT_MASK, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x20])
+    let got = run(c, ctl_hci.OP_LE_SET_EVENT_MASK, [0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
+    test.assert_eq(got, bytes_of(ctl_hci.OP_LE_SET_EVENT_MASK, 0))
+    test.assert(not ctl_hci.le_event_enabled(var c, 1))
+    test.assert(ctl_hci.le_event_enabled(var c, 2))
+    test.assert(ctl_hci.le_event_enabled(var c, 33))
+
+@test
+fn test_the_le_mask_applies_only_while_the_le_meta_event_is_enabled()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_SET_EVENT_MASK, zeros(8))
+    test.assert(not ctl_hci.le_event_enabled(var c, 1))
+
+@test
+fn test_reset_restores_the_defaults()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_SET_EVENT_MASK, zeros(8))
+    let _b = run(c, ctl_hci.OP_LE_SET_EVENT_MASK, zeros(8))
+    let _c = run(c, ctl_hci.OP_LE_SET_RANDOM_ADDRESS, test_address(0xC1))
+    let _d = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(1)))
+    test.assert(c.random_set)
+    test.assert_eq(ctl_hci.fal_count(var c), 1)
+    let got = run(c, ctl_hci.OP_RESET, [])
+    test.assert_eq(got, bytes_of(ctl_hci.OP_RESET, 0))
+    test.assert(ctl_hci.event_enabled(var c, hci_frame.EVT_HARDWARE_ERROR))
+    test.assert_eq(c.le_low, ctl_hci.LE_MASK_DEFAULT)
+    test.assert_eq(c.le_high, 0)
+    test.assert(not c.random_set)
+    test.assert_eq(c.random[0] as Int, 0)
+    test.assert_eq(ctl_hci.fal_count(var c), 0)
+    test.assert_eq(c.resets, 1)
+
+@test
+fn test_reset_keeps_the_public_address()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_RESET, [])
+    test.assert_eq(c.public[5] as Int, 0x15)
+
+@test
+fn test_reset_drops_events_not_begun()
+    var c = fresh()
+    // Two answers wait: nothing reads them out before the Reset.
+    send(c, ctl_hci.OP_READ_BD_ADDR, [])
+    let _a = ctl_hci.ctl_step(var c)
+    send(c, ctl_hci.OP_READ_LOCAL_VERSION, [])
+    let _b = ctl_hci.ctl_step(var c)
+    send(c, ctl_hci.OP_RESET, [])
+    let _c = ctl_hci.ctl_step(var c)
+    test.assert_eq(drain(var c), bytes_of(ctl_hci.OP_RESET, 0))
+
+@test
+fn test_set_random_address_stores_the_address()
+    var c = fresh()
+    let got = run(c, ctl_hci.OP_LE_SET_RANDOM_ADDRESS, test_address(0xC1))
+    test.assert_eq(got, bytes_of(ctl_hci.OP_LE_SET_RANDOM_ADDRESS, 0))
+    test.assert(c.random_set)
+    test.assert_eq(c.random[0] as Int, 0xC1)
+    test.assert_eq(c.random[5] as Int, 0x66)
+
+@test
+fn test_supported_commands_lists_what_is_answered()
+    var c = ctl_hci.controller_new(0)
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    test.assert_eq(list.len(got), 7 + 64)
+    test.assert_eq(got[2], 68)
+    test.assert_eq(got[6], 0)
+    // Octet 5: Set Event Mask and Reset.
+    test.assert_eq(got[7 + 5], 0xC0)
+    // Octet 7: nothing (Read Local Name is BR/EDR).
+    test.assert_eq(got[7 + 7], 0x00)
+    // Octet 14: Read Local Version, Supported Features (Read Buffer Size is BR/EDR).
+    test.assert_eq(got[7 + 14], 0x28)
+    // Octet 15: Read BD_ADDR.
+    test.assert_eq(got[7 + 15], 0x02)
+    // Octet 25: LE Set Event Mask, Read Buffer Size, Local Supported
+    // Features, Set Random Address.
+    test.assert_eq(got[7 + 25], 0x17)
+    // Octet 26: Filter Accept List size and clear.
+    test.assert_eq(got[7 + 26], 0xC0)
+    // Octet 27: add and remove, and neither LE Encrypt nor LE Rand without
+    // hardware for them.
+    test.assert_eq(got[7 + 27], 0x03)
+    // Octet 28: LE Read Supported States.
+    test.assert_eq(got[7 + 28], 0x08)
+
+@test
+fn test_supported_commands_adds_the_commands_the_hardware_allows()
+    var c = fresh()
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    test.assert_eq(got[7 + 27], 0xC3)
+
+@test
+fn test_every_opcode_is_answered_exactly_when_the_bit_field_lists_it()
+    var c = fresh()
+    let field = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    var answered = 0
+    for opcode in 0..0x10000
+        var out = run(c, opcode, [])
+        // A command that waits for the hardware is finished with a fixed answer.
+        if ctl_hci.ctl_async_kind(var c) != ctl_hci.PEND_NONE
+            ctl_hci.ctl_async_fail(var c)
+            out = drain(var c)
+        let bit = ctl_hci.command_bit(opcode)
+        let listed = bit >= 0 and ((field[7 + bit / 8] >>> (bit % 8)) & 1) == 1
+        if opcode == ctl_hci.OP_HOST_NUMBER_OF_COMPLETED_PACKETS
+            // Listed, and answered with no event at all ([Vol 4] Part E, Section 7.3.40).
+            test.assert(listed)
+            test.assert_eq(list.len(out), 0)
+            answered = answered + 1
+            continue
+        let status = out[6]
+        if opcode == ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS
+            test.assert_eq(status, 0)
+        else if listed
+            test.assert(status != ctl_hci.STATUS_UNKNOWN_COMMAND)
+            answered = answered + 1
+        else
+            test.assert_eq(status, ctl_hci.STATUS_UNKNOWN_COMMAND)
+    // The 17 commands of the table that need no capability, and the three of
+    // flow control toward the Host.
+    test.assert_eq(answered, 20)
+
+@test
+fn test_every_listed_opcode_lies_in_the_group_scan()
+    // The bit field is built by scanning OCF 0 to 0xFF of five groups.
+    for opcode in 0..0x10000
+        if ctl_hci.command_bit(opcode) >= 0
+            let ogf = hci_frame.opcode_ogf(opcode)
+            test.assert(ogf == 0x01 or ogf == 0x03 or ogf == 0x04 or ogf == 0x05 or ogf == 0x08)
+            test.assert(hci_frame.opcode_ocf(opcode) < 0x100)
+
+@test
+fn test_every_answered_command_has_its_parameter_length()
+    for opcode in 0..0x10000
+        let known = ctl_hci.command_bit(opcode) >= 0 or opcode == ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS
+        let want = ctl_hci.command_params(opcode)
+        test.assert_eq(want >= 0 or want == -2, known)
+
+@test
+fn test_an_unknown_command_is_answered_with_unknown_hci_command()
+    var c = fresh()
+    // LE Set Advertising Parameters: a Link Layer command.
+    let got = run(c, 0x2006, zeros(15))
+    test.assert_eq(got, bytes_of(0x2006, ctl_hci.STATUS_UNKNOWN_COMMAND))
+    test.assert_eq(c.unknown, 1)
+    // The stream is intact: the next command is read.
+    test.assert_eq(run(c, ctl_hci.OP_RESET, []), bytes_of(ctl_hci.OP_RESET, 0))
+
+@test
+fn test_a_vendor_command_is_unknown()
+    var c = fresh()
+    test.assert_eq(run(c, 0xFC01, []), bytes_of(0xFC01, ctl_hci.STATUS_UNKNOWN_COMMAND))
+
+@test
+fn test_a_command_with_the_wrong_parameter_length_is_refused()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_SET_EVENT_MASK, zeros(7)), bytes_of(ctl_hci.OP_SET_EVENT_MASK, ctl_hci.STATUS_INVALID_PARAMETERS))
+    test.assert_eq(run(c, ctl_hci.OP_RESET, [0]), bytes_of(ctl_hci.OP_RESET, ctl_hci.STATUS_INVALID_PARAMETERS))
+    test.assert_eq(run(c, ctl_hci.OP_LE_SET_RANDOM_ADDRESS, zeros(7)), bytes_of(ctl_hci.OP_LE_SET_RANDOM_ADDRESS, ctl_hci.STATUS_INVALID_PARAMETERS))
+    // A refused command changes nothing.
+    test.assert(ctl_hci.event_enabled(var c, hci_frame.EVT_HARDWARE_ERROR))
+    test.assert_eq(c.resets, 0)
+
+@test
+fn test_the_filter_accept_list_reports_its_size()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_LE_READ_FILTER_ACCEPT_LIST_SIZE, []), [0x04, 0x0E, 0x05, 0x01, 0x0F, 0x20, 0x00, ctl_hci.FILTER_ACCEPT_LIST_SIZE])
+
+@test
+fn test_the_filter_accept_list_takes_its_size_in_devices_and_no_more()
+    var c = fresh()
+    for n in 0..FILTER_ACCEPT_LIST_SIZE
+        test.assert_eq(run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(n))), bytes_of(ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, 0))
+    test.assert_eq(ctl_hci.fal_count(var c), ctl_hci.FILTER_ACCEPT_LIST_SIZE)
+    test.assert_eq(run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(99))), bytes_of(ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, ctl_hci.STATUS_MEMORY_CAPACITY_EXCEEDED))
+    test.assert_eq(ctl_hci.fal_count(var c), ctl_hci.FILTER_ACCEPT_LIST_SIZE)
+
+@test
+fn test_the_filter_accept_list_does_not_add_a_device_twice()
+    var c = fresh()
+    let add = list.concat([1], test_address(7))
+    let _a = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, add)
+    test.assert_eq(run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, add), bytes_of(ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, 0))
+    test.assert_eq(ctl_hci.fal_count(var c), 1)
+
+@test
+fn test_the_filter_accept_list_tells_a_public_from_a_random_address()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(7)))
+    let _b = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([1], test_address(7)))
+    test.assert_eq(ctl_hci.fal_count(var c), 2)
+
+@test
+fn test_the_filter_accept_list_removes_a_device_and_frees_its_entry()
+    var c = fresh()
+    for n in 0..FILTER_ACCEPT_LIST_SIZE
+        let _a = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(n)))
+    let remove = list.concat([0], test_address(3))
+    test.assert_eq(run(c, ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, remove), bytes_of(ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, 0))
+    test.assert_eq(ctl_hci.fal_count(var c), ctl_hci.FILTER_ACCEPT_LIST_SIZE - 1)
+    test.assert_eq(run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(99))), bytes_of(ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, 0))
+    test.assert_eq(ctl_hci.fal_count(var c), ctl_hci.FILTER_ACCEPT_LIST_SIZE)
+
+@test
+fn test_removing_a_device_that_is_not_listed_succeeds()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(1)))
+    test.assert_eq(run(c, ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, list.concat([0], test_address(2))), bytes_of(ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, 0))
+    test.assert_eq(ctl_hci.fal_count(var c), 1)
+
+@test
+fn test_the_filter_accept_list_refuses_an_address_type_it_does_not_know()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([2], test_address(1))), bytes_of(ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, ctl_hci.STATUS_INVALID_PARAMETERS))
+    test.assert_eq(run(c, ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, list.concat([2], test_address(1))), bytes_of(ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, ctl_hci.STATUS_INVALID_PARAMETERS))
+    test.assert_eq(ctl_hci.fal_count(var c), 0)
+
+@test
+fn test_the_anonymous_type_ignores_the_address()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0xFF], test_address(1)))
+    let _b = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0xFF], test_address(2)))
+    test.assert_eq(ctl_hci.fal_count(var c), 1)
+    let _c = run(c, ctl_hci.OP_LE_REMOVE_DEVICE_FROM_FILTER_ACCEPT_LIST, list.concat([0xFF], test_address(3)))
+    test.assert_eq(ctl_hci.fal_count(var c), 0)
+
+@test
+fn test_clear_empties_the_filter_accept_list()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(1)))
+    let _b = run(c, ctl_hci.OP_LE_ADD_DEVICE_TO_FILTER_ACCEPT_LIST, list.concat([0], test_address(2)))
+    test.assert_eq(run(c, ctl_hci.OP_LE_CLEAR_FILTER_ACCEPT_LIST, []), bytes_of(ctl_hci.OP_LE_CLEAR_FILTER_ACCEPT_LIST, 0))
+    test.assert_eq(ctl_hci.fal_count(var c), 0)
+
+@test
+fn test_commands_follow_the_host_bring_up_in_order()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_RESET, []), bytes_of(ctl_hci.OP_RESET, 0))
+    test.assert_eq(list.len(run(c, ctl_hci.OP_READ_LOCAL_VERSION, [])), 15)
+    test.assert_eq(run(c, ctl_hci.OP_SET_EVENT_MASK, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), bytes_of(ctl_hci.OP_SET_EVENT_MASK, 0))
+    test.assert_eq(run(c, ctl_hci.OP_LE_SET_EVENT_MASK, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]), bytes_of(ctl_hci.OP_LE_SET_EVENT_MASK, 0))
+    test.assert_eq(run(c, ctl_hci.OP_LE_SET_RANDOM_ADDRESS, test_address(0xC1)), bytes_of(ctl_hci.OP_LE_SET_RANDOM_ADDRESS, 0))
+    test.assert_eq(c.answered, 5)
+
+@test
+fn test_a_command_split_across_calls_is_answered_when_complete()
+    var c = fresh()
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, 0x09)
+    test.assert(not ctl_hci.ctl_step(var c))
+    ctl_hci.ctl_rx(var c, 0x10)
+    test.assert(not ctl_hci.ctl_step(var c))
+    ctl_hci.ctl_rx(var c, 0x00)
+    test.assert(not ctl_hci.ctl_accepts(var c))
+    test.assert(ctl_hci.ctl_step(var c))
+    test.assert(ctl_hci.ctl_accepts(var c))
+    test.assert_eq(list.len(drain(var c)), 13)
+
+@test
+fn test_a_complete_command_holds_back_the_next_octets()
+    var c = fresh()
+    send(c, ctl_hci.OP_RESET, [])
+    test.assert(not ctl_hci.ctl_accepts(var c))
+    let _a = ctl_hci.ctl_step(var c)
+    test.assert(ctl_hci.ctl_accepts(var c))
+
+@test
+fn test_a_command_waits_for_a_free_slot()
+    var c = fresh()
+    for _ in 0..ctl_pool.SLOTS
+        let _a = ctl_pool.pool_take(var c.pool)
+    send(c, ctl_hci.OP_RESET, [])
+    test.assert(not ctl_hci.ctl_step(var c))
+    test.assert(not ctl_hci.ctl_accepts(var c))
+    ctl_pool.pool_give(var c.pool, 0)
+    test.assert(ctl_hci.ctl_step(var c))
+    test.assert_eq(drain(var c), bytes_of(ctl_hci.OP_RESET, 0))
+
+@test
+fn test_acl_data_for_a_handle_that_is_not_on_is_dropped_and_the_next_command_answered()
+    var c = fresh()
+    for b in [0x02, 0x40, 0x00, 0x02, 0x00, 0xAA, 0xBB]
+        ctl_hci.ctl_rx(var c, b)
+    test.assert(not ctl_hci.ctl_tx_pending(var c))
+    test.assert_eq(c.dropped_acl, 1)
+    test.assert_eq(run(c, ctl_hci.OP_RESET, []), bytes_of(ctl_hci.OP_RESET, 0))
+
+@test
+fn test_a_lost_stream_sends_a_hardware_error()
+    var c = fresh()
+    ctl_hci.ctl_rx(var c, 0x04)
+    test.assert_eq(drain(var c), [0x04, 0x10, 0x01, ctl_hci.HW_ERROR_STREAM_LOST])
+    test.assert_eq(c.hw_errors, 1)
+    test.assert(h4_rx.h4_is_lost(var c.rx))
+
+@test
+fn test_the_hardware_error_is_sent_whatever_the_event_mask_says()
+    var c = fresh()
+    let _a = run(c, ctl_hci.OP_SET_EVENT_MASK, zeros(8))
+    ctl_hci.ctl_rx(var c, 0x09)
+    test.assert_eq(drain(var c), [0x04, 0x10, 0x01, ctl_hci.HW_ERROR_STREAM_LOST])
+
+@test
+fn test_a_lost_stream_is_silent_until_reset_and_reset_is_answered()
+    var c = fresh()
+    ctl_hci.ctl_rx(var c, 0x00)
+    let _a = drain(var c)
+    // A command in the lost stream is not run.
+    for b in [0x01, 0x09, 0x10, 0x00, 0x55, 0x66]
+        ctl_hci.ctl_rx(var c, b)
+    test.assert(not ctl_hci.ctl_step(var c))
+    test.assert(not ctl_hci.ctl_tx_pending(var c))
+    // The Reset command is.
+    for b in [0x01, 0x03, 0x0C, 0x00]
+        ctl_hci.ctl_rx(var c, b)
+    test.assert(ctl_hci.ctl_step(var c))
+    test.assert_eq(drain(var c), bytes_of(ctl_hci.OP_RESET, 0))
+    test.assert(not h4_rx.h4_is_lost(var c.rx))
+    test.assert_eq(run(c, ctl_hci.OP_READ_BD_ADDR, [])[2], 10)
+
+@test
+fn test_an_acl_length_out_of_range_loses_the_stream()
+    var c = fresh()
+    for b in [0x02, 0x40, 0x00, 0xFC, 0x00]
+        ctl_hci.ctl_rx(var c, b)
+    test.assert_eq(drain(var c), [0x04, 0x10, 0x01, ctl_hci.HW_ERROR_STREAM_LOST])
+
+@test
+fn test_a_hardware_error_waits_for_a_free_slot()
+    var c = fresh()
+    for _ in 0..ctl_pool.SLOTS
+        let _a = ctl_pool.pool_take(var c.pool)
+    ctl_hci.ctl_rx(var c, 0x03)
+    test.assert(c.hw_owed)
+    test.assert_eq(c.hw_errors, 0)
+    ctl_pool.pool_give(var c.pool, 2)
+    let _b = ctl_hci.ctl_step(var c)
+    test.assert(not c.hw_owed)
+    test.assert_eq(drain(var c), [0x04, 0x10, 0x01, ctl_hci.HW_ERROR_STREAM_LOST])
+
+@test
+fn test_le_rand_without_hardware_is_unknown()
+    var c = ctl_hci.controller_new(0)
+    test.assert_eq(run(c, ctl_hci.OP_LE_RAND, []), bytes_of(ctl_hci.OP_LE_RAND, ctl_hci.STATUS_UNKNOWN_COMMAND))
+    test.assert_eq(run(c, ctl_hci.OP_LE_ENCRYPT, zeros(32)), bytes_of(ctl_hci.OP_LE_ENCRYPT, ctl_hci.STATUS_UNKNOWN_COMMAND))
+
+@test
+fn test_le_rand_is_answered_when_the_hardware_has_run()
+    var c = fresh()
+    send(c, ctl_hci.OP_LE_RAND, [])
+    test.assert(ctl_hci.ctl_step(var c))
+    test.assert_eq(ctl_hci.ctl_async_kind(var c), ctl_hci.PEND_RAND)
+    test.assert(not ctl_hci.ctl_accepts(var c))
+    test.assert(not ctl_hci.ctl_tx_pending(var c))
+    for i in 0..8
+        ctl_hci.ctl_async_put(var c, i, 0xA0 + i)
+    ctl_hci.ctl_async_complete(var c)
+    test.assert_eq(ctl_hci.ctl_async_kind(var c), ctl_hci.PEND_NONE)
+    test.assert(ctl_hci.ctl_accepts(var c))
+    test.assert_eq(drain(var c), [0x04, 0x0E, 0x0C, 0x01, 0x18, 0x20, 0x00, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7])
+
+@test
+fn test_le_encrypt_hands_the_cipher_its_operands_most_significant_octet_first()
+    var c = fresh()
+    var key: [Int] = []
+    var plain: [Int] = []
+    for i in 0..16
+        list.push(key, 0x10 + i)
+        list.push(plain, 0x20 + i)
+    send(c, ctl_hci.OP_LE_ENCRYPT, list.concat(key, plain))
+    test.assert(ctl_hci.ctl_step(var c))
+    test.assert_eq(ctl_hci.ctl_async_kind(var c), ctl_hci.PEND_ENCRYPT)
+    test.assert(not ctl_hci.ctl_accepts(var c))
+    // The parameter holds the least significant octet first.
+    test.assert_eq(ctl_hci.ctl_async_key(var c, 0), 0x1F)
+    test.assert_eq(ctl_hci.ctl_async_key(var c, 15), 0x10)
+    test.assert_eq(ctl_hci.ctl_async_plain(var c, 0), 0x2F)
+    test.assert_eq(ctl_hci.ctl_async_plain(var c, 15), 0x20)
+    // A cipher that copies its plaintext shows the order the answer takes.
+    for i in 0..16
+        ctl_hci.ctl_async_put(var c, i, ctl_hci.ctl_async_plain(var c, i))
+    ctl_hci.ctl_async_complete(var c)
+    let got = drain(var c)
+    test.assert_eq(list.len(got), 7 + 16)
+    test.assert_eq(got[2], 20)
+    for i in 0..16
+        test.assert_eq(got[7 + i], 0x20 + i)
+
+@test
+fn test_le_encrypt_reports_a_hardware_failure()
+    var c = fresh()
+    send(c, ctl_hci.OP_LE_ENCRYPT, zeros(32))
+    let _a = ctl_hci.ctl_step(var c)
+    ctl_hci.ctl_async_fail(var c)
+    test.assert_eq(drain(var c), bytes_of(ctl_hci.OP_LE_ENCRYPT, ctl_hci.STATUS_HARDWARE_FAILURE))
+    test.assert(ctl_hci.ctl_accepts(var c))
+
+@test
+fn test_le_encrypt_with_short_parameters_is_refused()
+    var c = fresh()
+    test.assert_eq(run(c, ctl_hci.OP_LE_ENCRYPT, zeros(16)), bytes_of(ctl_hci.OP_LE_ENCRYPT, ctl_hci.STATUS_INVALID_PARAMETERS))
+    test.assert_eq(ctl_hci.ctl_async_kind(var c), ctl_hci.PEND_NONE)
+
+@test
+fn test_a_command_that_waits_for_the_hardware_blocks_the_next_one()
+    var c = fresh()
+    send(c, ctl_hci.OP_LE_RAND, [])
+    let _a = ctl_hci.ctl_step(var c)
+    test.assert(not ctl_hci.ctl_accepts(var c))
+    test.assert(not ctl_hci.ctl_step(var c))
+    ctl_hci.ctl_async_complete(var c)
+    test.assert_eq(run(c, ctl_hci.OP_RESET, []), bytes_of(ctl_hci.OP_RESET, 0))
+
+// ── The Host's port holds an octet ──────────────────────────────────
+
+// A port that takes `room` more octets and then holds, as a UART does while the Host's flow control stops it.
+@value
+struct HeldPort
+    room: Int
+    asked: Int
+    got: Vec[Int; 64]
+
+fn held_port(room: Int) -> HeldPort
+    HeldPort { room: room, asked: 0, got: Vec.new() }
+
+impl HeldPort
+    // The Host reads again: the port takes `n` more octets.
+    fn open_for(var self, n: Int)
+        self.room = n
+
+impl ctl_hci.HostTx[] for HeldPort
+    fn ready(var self) -> Bool
+        self.asked = self.asked + 1
+        self.room > 0
+
+    fn send(var self, b: Int)
+        self.room = self.room - 1
+        let _p = self.got.push(b)
+
+fn heard(p: HeldPort) -> [Int]
+    var got: [Int] = []
+    for i in 0..p.got.len()
+        list.push(got, p.got[i])
+    got
+
+@test
+fn test_a_port_that_holds_gets_no_octet_and_the_event_waits()
+    var c = fresh()
+    send(c, ctl_hci.OP_RESET, [])
+    let _a = ctl_hci.ctl_step(var c)
+    var port = held_port(0)
+    test.assert_eq(ctl_hci.ctl_tx_drain(var c, var port, 64), 0)
+    test.assert_eq(port.got.len(), 0)
+    // The event is still whole in the queue, for the turn the Host reads again.
+    test.assert(ctl_hci.ctl_tx_pending(var c))
+    port.open_for(64)
+    test.assert_eq(ctl_hci.ctl_tx_drain(var c, var port, 64), 7)
+    test.assert_eq(heard(port), bytes_of(ctl_hci.OP_RESET, 0))
+    test.assert(not ctl_hci.ctl_tx_pending(var c))
+
+@test
+fn test_a_port_that_takes_part_of_an_event_gets_the_rest_later_in_order()
+    var c = fresh()
+    send(c, ctl_hci.OP_RESET, [])
+    let _a = ctl_hci.ctl_step(var c)
+    var port = held_port(3)
+    test.assert_eq(ctl_hci.ctl_tx_drain(var c, var port, 64), 3)
+    // The port was asked once for each octet and once for the one it held: not again and again.
+    test.assert_eq(port.asked, 4)
+    port.open_for(64)
+    test.assert_eq(ctl_hci.ctl_tx_drain(var c, var port, 64), 4)
+    test.assert_eq(heard(port), bytes_of(ctl_hci.OP_RESET, 0))
+
+@test
+fn test_the_drain_stops_at_its_bound_and_an_empty_queue_asks_the_port_nothing()
+    var c = fresh()
+    var idle = held_port(64)
+    test.assert_eq(ctl_hci.ctl_tx_drain(var c, var idle, 64), 0)
+    test.assert_eq(idle.asked, 0)
+    send(c, ctl_hci.OP_RESET, [])
+    let _a = ctl_hci.ctl_step(var c)
+    var port = held_port(64)
+    test.assert_eq(ctl_hci.ctl_tx_drain(var c, var port, 2), 2)
+    test.assert(ctl_hci.ctl_tx_pending(var c))
+
+// ── Flow control toward the Host ────────────────────────────────────
+//
+// The mock Hosts here are the commands a Host would send: Host Buffer Size,
+// Set Controller To Host Flow Control and Host Number Of Completed Packets.
+// The ACL Data packets the Link Layer would hand over are put in the pool
+// the way `forward_acl` does.
+
+// Host Buffer Size with `length` octets of ACL data and `total` packets.
+fn host_buffer_size(var c: ctl_hci.Controller, length: Int, total: Int) -> [Int]
+    run(c, 0x0C33, [length & 0xFF, (length >>> 8) & 0xFF, 0, total & 0xFF, (total >>> 8) & 0xFF, 0, 0])
+
+// An HCI ACL Data packet of `n` octets for handle 0x0040, the first piece
+// of a PDU (flag 2) when `start`, in the pool of `c`.
+fn queue_acl(var c: ctl_hci.Controller, start: Bool, n: Int) -> Bool
+    let slot = ctl_pool.acl_begin(var c.pool, 0x0040, if start then 2 else 1)
+    if slot == ctl_pool.NO_SLOT
+        return false
+    for i in 0..n
+        let _ = ctl_pool.pool_put(var c.pool, slot, i & 0x7F)
+    ctl_pool.acl_send(var c.pool, slot)
+
+// The packets of a stream of octets the Controller sent, each as a list.
+fn packets_of(out: [Int]) -> [[Int]]
+    var all: [[Int]] = []
+    var at = 0
+    for _ in 0..64
+        if at < list.len(out)
+            let n = if out[at] == 0x02 then 5 + out[at + 3] + (out[at + 4] << 8) else 3 + out[at + 2]
+            var one: [Int] = []
+            for i in 0..n
+                list.push(one, out[at + i])
+            list.push(all, one)
+            at = at + n
+    all
+
+// The Packet_Boundary_Flag of an ACL packet.
+fn pb_of(pkt: [Int]) -> Int
+    (pkt[2] >>> 4) & 3
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_supported_commands_lists_the_three_commands_of_flow_control_toward_the_host()
+    var c = fresh()
+    let got = run(c, ctl_hci.OP_READ_LOCAL_SUPPORTED_COMMANDS, [])
+    // Octet 10 bits 5, 6 and 7.
+    test.assert_eq(got[7 + 10] & 0xE0, 0xE0)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_host_buffer_size_is_answered_and_a_zero_is_refused()
+    var c = fresh()
+    test.assert_eq(host_buffer_size(var c, 27, 2), bytes_of(0x0C33, 0))
+    test.assert_eq(host_buffer_size(var c, 0, 2), bytes_of(0x0C33, 0x12))
+    test.assert_eq(host_buffer_size(var c, 27, 0), bytes_of(0x0C33, 0x12))
+    // A command of the wrong length is refused like any other.
+    test.assert_eq(run(c, 0x0C33, [27, 0, 0]), bytes_of(0x0C33, 0x12))
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_flow_control_is_accepted_before_the_host_buffer_size()
+    var c = fresh()
+    // Section 7.3.38 sets no order: the enable is accepted, a bad value is not.
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0x00))
+    test.assert_eq(run(c, 0x0C31, [4]), bytes_of(0x0C31, 0x12))
+    test.assert_eq(run(c, 0x0C31, [0]), bytes_of(0x0C31, 0x00))
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0x00))
+    test.assert_eq(host_buffer_size(var c, 251, 3), bytes_of(0x0C33, 0))
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_flow_control_on_without_a_buffer_size_counts_nothing_until_the_size_arrives()
+    var c = fresh()
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0x00))
+    for _ in 0..3
+        test.assert(queue_acl(var c, true, 10))
+    test.assert_eq(list.len(packets_of(drain(var c))), 3)
+    for _ in 0..3
+        test.assert(queue_acl(var c, true, 10))
+    test.assert_eq(list.len(packets_of(drain(var c))), 3)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 0)
+    // The size arrives: the count starts with every buffer free.
+    test.assert_eq(host_buffer_size(var c, 251, 2), bytes_of(0x0C33, 0))
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 2)
+    test.assert(queue_acl(var c, true, 10))
+    test.assert(queue_acl(var c, true, 10))
+    test.assert(queue_acl(var c, true, 10))
+    test.assert_eq(list.len(packets_of(drain(var c))), 2)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 0)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_flow_control_cannot_change_while_a_connection_exists()
+    var c = fresh()
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0x00))
+    c.links[0].live = true
+    // A change is Command Disallowed, the same value is accepted.
+    test.assert_eq(run(c, 0x0C31, [0]), bytes_of(0x0C31, 0x0C))
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0x00))
+    c.links[0].live = false
+    test.assert_eq(run(c, 0x0C31, [0]), bytes_of(0x0C31, 0x00))
+    c.links[0].live = true
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0x0C))
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_host_number_of_completed_packets_is_ignored_with_flow_control_off_or_no_size_or_no_connection()
+    var c = fresh()
+    // Flow control off: nothing happens, no event.
+    test.assert_eq(host_buffer_size(var c, 251, 2), bytes_of(0x0C33, 0))
+    test.assert_eq(run(c, 0x0C35, [1, 0x40, 0x00, 0x01, 0x00]), [])
+    // Flow control on, no connection: ignored, the count of sent packets stays.
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0))
+    test.assert(queue_acl(var c, true, 10))
+    let _sent = drain(var c)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 1)
+    test.assert_eq(run(c, 0x0C35, [1, 0x40, 0x00, 0x01, 0x00]), [])
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 1)
+    // No Host Buffer Size seen: ignored.
+    var d = fresh()
+    test.assert_eq(run(d, 0x0C31, [1]), bytes_of(0x0C31, 0))
+    d.links[0].live = true
+    test.assert_eq(run(d, 0x0C35, [1, 0x40, 0x00, 0x01, 0x00]), [])
+    test.assert_eq(ctl_pool.pool_host_free(var d.pool), 0)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_a_host_that_sends_no_size_is_sent_the_packet_whole()
+    var c = fresh()
+    test.assert(queue_acl(var c, true, 251))
+    let pkts = packets_of(drain(var c))
+    test.assert_eq(list.len(pkts), 1)
+    test.assert_eq(list.len(pkts[0]), 5 + 251)
+    test.assert_eq(pb_of(pkts[0]), 2)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_a_mock_host_with_27_octet_buffers_is_sent_pieces_of_27()
+    var c = fresh()
+    test.assert_eq(host_buffer_size(var c, 27, 2), bytes_of(0x0C33, 0))
+    test.assert(queue_acl(var c, true, 100))
+    let pkts = packets_of(drain(var c))
+    // 27 + 27 + 27 + 19 octets: the first starts the PDU, the rest continue it.
+    test.assert_eq(list.len(pkts), 4)
+    test.assert_eq(list.len(pkts[0]), 5 + 27)
+    test.assert_eq(list.len(pkts[1]), 5 + 27)
+    test.assert_eq(list.len(pkts[2]), 5 + 27)
+    test.assert_eq(list.len(pkts[3]), 5 + 19)
+    test.assert_eq(pb_of(pkts[0]), 2)
+    test.assert_eq(pb_of(pkts[1]), 1)
+    test.assert_eq(pb_of(pkts[3]), 1)
+    // The handle stays, the length field says what each piece holds, and the
+    // data runs on without a gap.
+    var at = 0
+    for pkt in pkts
+        test.assert_eq(pkt[1], 0x40)
+        test.assert_eq(pkt[2] & 0x0F, 0)
+        test.assert_eq(pkt[3] + (pkt[4] << 8), list.len(pkt) - 5)
+        for i in 5..list.len(pkt)
+            test.assert_eq(pkt[i], at & 0x7F)
+            at = at + 1
+    test.assert_eq(at, 100)
+    // A packet that fits goes whole.
+    test.assert(queue_acl(var c, true, 27))
+    test.assert_eq(list.len(packets_of(drain(var c))), 1)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_a_mock_host_with_a_buffer_longer_than_the_data_gets_the_packet_whole()
+    var c = fresh()
+    test.assert_eq(host_buffer_size(var c, 0xFFFF, 1), bytes_of(0x0C33, 0))
+    test.assert(queue_acl(var c, true, 251))
+    let pkts = packets_of(drain(var c))
+    test.assert_eq(list.len(pkts), 1)
+    test.assert_eq(list.len(pkts[0]), 5 + 251)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_a_mock_host_with_two_buffers_is_sent_two_packets_until_it_returns_one()
+    var c = fresh()
+    test.assert_eq(host_buffer_size(var c, 251, 2), bytes_of(0x0C33, 0))
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0))
+    test.assert(queue_acl(var c, true, 10))
+    test.assert(queue_acl(var c, true, 11))
+    test.assert(queue_acl(var c, true, 12))
+    // An event queued behind the three passes the one that waits.
+    send(c, ctl_hci.OP_READ_BD_ADDR, [])
+    let _ran = ctl_hci.ctl_step(var c)
+    let first = packets_of(drain(var c))
+    test.assert_eq(list.len(first), 3)
+    test.assert_eq(list.len(first[0]), 5 + 10)
+    test.assert_eq(list.len(first[1]), 5 + 11)
+    test.assert_eq(first[2][0], 0x04)
+    test.assert(not ctl_hci.ctl_tx_pending(var c))
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 0)
+    // Host Number Of Completed Packets has no event in answer, and a buffer
+    // back sends the packet that waited.
+    c.links[0].live = true
+    send(c, 0x0C35, [1, 0x40, 0x00, 0x01, 0x00])
+    let _ret = ctl_hci.ctl_step(var c)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 1)
+    let second = packets_of(drain(var c))
+    test.assert_eq(list.len(second), 1)
+    test.assert_eq(list.len(second[0]), 5 + 12)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 0)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_host_number_of_completed_packets_is_ignored_when_malformed_and_not_believed_when_too_big()
+    var c = fresh()
+    test.assert_eq(host_buffer_size(var c, 251, 2), bytes_of(0x0C33, 0))
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0))
+    c.links[0].live = true
+    test.assert(queue_acl(var c, true, 10))
+    let _sent = drain(var c)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 1)
+    // No handle count, a count that disagrees with the length: nothing returned, no event.
+    test.assert_eq(run(c, 0x0C35, []), [])
+    test.assert_eq(run(c, 0x0C35, [2, 0x40, 0x00, 0x01, 0x00]), [])
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 1)
+    // A Host that returns more than it holds frees what was sent, no more.
+    test.assert_eq(run(c, 0x0C35, [1, 0x40, 0x00, 0x09, 0x00]), [])
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 2)
+    // Two handles in one command add up.
+    test.assert(queue_acl(var c, true, 10))
+    test.assert(queue_acl(var c, true, 10))
+    let _more = drain(var c)
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 0)
+    test.assert_eq(run(c, 0x0C35, [2, 0x40, 0x00, 0x01, 0x00, 0x41, 0x00, 0x01, 0x00]), [])
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 2)
+
+@test
+@satisfies("REQ-BLE-HCI-059")
+fn test_flow_control_off_stops_counting_and_reset_forgets_the_hosts_sizes()
+    var c = fresh()
+    test.assert_eq(host_buffer_size(var c, 27, 1), bytes_of(0x0C33, 0))
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0))
+    test.assert(queue_acl(var c, true, 40))
+    test.assert_eq(list.len(packets_of(drain(var c))), 1)
+    // Off: the second piece, which waited for a buffer, goes out beside the answer,
+    // and further packets are not held back by the count.
+    let released = packets_of(run(c, 0x0C31, [0]))
+    test.assert_eq(list.len(released), 2)
+    test.assert_eq(list.len(released[0]), 5 + 13)
+    test.assert_eq(pb_of(released[0]), 1)
+    test.assert_eq(released[1], bytes_of(0x0C31, 0))
+    test.assert(queue_acl(var c, true, 40))
+    test.assert_eq(list.len(packets_of(drain(var c))), 2)
+    // Reset: the Host's size is forgotten and the packet goes whole.
+    test.assert_eq(run(c, 0x0C03, []), bytes_of(0x0C03, 0))
+    test.assert(queue_acl(var c, true, 100))
+    test.assert_eq(list.len(packets_of(drain(var c))), 1)
+    // Reset cleared the flow control too: it can be turned on again, and counts nothing without a size.
+    test.assert_eq(run(c, 0x0C31, [1]), bytes_of(0x0C31, 0))
+    test.assert_eq(ctl_pool.pool_host_free(var c.pool), 0)

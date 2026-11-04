@@ -1,0 +1,39 @@
+// src/ll_sca.nv — the Sleep Clock Accuracy request of the Link Layer: the rules by which the Controller asks the peer for its accuracy class.
+//
+// [Vol 6] Part B, Sections 2.4.2.28, 4.6.25 and 5.1.14; [Vol 4] Part E, Sections 7.7.65.31 and 7.8.108.  Either role sends LL_CLOCK_ACCURACY_REQ
+// with its own accuracy class and the peer answers LL_CLOCK_ACCURACY_RSP with its; the answering of the request is part of the isochronous
+// channels (`ll_link.ctrl_clock_accuracy`).  A build with this feature lets the Host start the procedure, with LE Request Peer SCA, and
+// reports the class the peer sent.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.sca_on()`) says whether the build has the feature.
+
+use std.test
+
+// 1 in a build with the LE Request Peer SCA command, 0 in one without it.
+
+// The Controller error codes of the Complete event.
+const E_UNSUPPORTED = 0x11
+
+// The accuracy class (Table 2.1 of Section 2.3.3.1) is 0 to 7.
+@tier(embedded)
+fn class_ok(class: Int) -> Bool
+    class >= 0 and class <= 7
+
+// Whether the octet 3 of a peer's feature set lacks Sleep Clock Accuracy Updates (feature 26, bit 2).
+@tier(embedded)
+fn peer_lacks(octet3: Int) -> Bool
+    (octet3 & 0x04) == 0
+
+@test
+fn test_classes_are_zero_to_seven()
+    test.assert(class_ok(0))
+    test.assert(class_ok(7))
+    test.assert(not class_ok(8))
+    test.assert(not class_ok(-1))
+
+@test
+fn test_feature_26_is_bit_2_of_octet_3()
+    test.assert(peer_lacks(0))
+    test.assert(peer_lacks(0xFB))
+    test.assert(not peer_lacks(0x04))
+    test.assert(not peer_lacks(0xF4))

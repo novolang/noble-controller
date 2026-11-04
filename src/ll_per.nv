@@ -1,0 +1,1359 @@
+// src/ll_per.nv — periodic advertising and periodic advertising synchronization of the Link Layer: the
+// train of an advertising set (LE Set Periodic Advertising Parameters, Data and Enable), the SyncInfo that announces it,
+// the AUX_SYNC_IND and AUX_CHAIN_IND PDUs of an event, and the trains this device synchronizes to (LE Periodic Advertising
+// Create Sync, the Periodic Advertiser List).
+//
+// [Vol 6] Part B, Sections 2.3.4.6, 4.4.2.1, 4.4.2.2.3, 4.4.3.4 and 4.4.5.1.  A periodic advertising train is a
+// sequence of periodic advertising events at a fixed interval (7.5 ms to 81.91875 s, in units of 1.25 ms).  An event
+// is an AUX_SYNC_IND PDU on the secondary PHY of the advertising set, on a data channel that channel selection
+// algorithm #2 picks from the train's access address and the 16-bit paEventCounter, and the AUX_CHAIN_IND PDUs
+// behind it when the data is longer than one PDU.  The counter grows by one for each interval whether or not the
+// event is sent.  The AUX_ADV_IND of the advertising set announces the train in its SyncInfo field: the time from the
+// start of that PDU to the AUX_SYNC_IND (a 13-bit count of 30 microseconds, or of 300 for an offset of 245.7 ms or
+// more), the interval, the channel map, the sleep clock accuracy, the access address, the CRC seed and the counter of
+// that event.  A scanner that finds a SyncInfo it wants listens for the AUX_SYNC_IND at that time, a window of one
+// offset unit widened by the clock accuracies of both ends, and from then on once an interval, from the start of the
+// last PDU it heard.
+//
+// This module holds no radio.  The trains and the synchronizations are values with inline storage; no function here
+// allocates.  The slots under "The profile" follow the keys of the package configuration (`ctl_limits.padv_n()`, `psync_n()`, `pal_n()`).
+
+use noble_controller_config
+use ctl_limits
+use std.test
+use ll_pdu
+use ll_phy
+use ll_adv
+use ll_init
+use ll_ext
+use ll_link
+use ll_xadv
+
+// A table of an absent feature keeps one record: a `Vec` holds at least one element.
+const fn max1(n: Int) -> Int
+    if n > 1 then n else 1
+
+// ── The profile ─────────────────────────────────────────────────────
+
+// The trains this Controller advertises (at most one for each advertising set), the trains it synchronizes to at
+// once, the entries of the Periodic Advertiser List, whether the build has periodic advertising at all (0 when the
+// profile has no train or no synchronization), whether it has Periodic Advertising Sync Transfer (1 when the profile
+// asks and the build has periodic advertising), and the octets of periodic advertising data one train holds.
+// Periodic Advertising with Responses as the advertiser and as the synchronizer (1 when the profile asks and the build has the train).
+pub alias PerData = Vec[u8; if noble_controller_config.CTL_ADV_SETS > 0 then noble_controller_config.CTL_ADV_DATA else 8]
+
+// ── Statuses, limits and times ──────────────────────────────────────
+
+const OK = 0
+const E_MEMORY = 0x07
+const E_EXISTS = 0x0B
+const E_DISALLOWED = 0x0C
+const E_UNSUPPORTED = 0x11
+const E_INVALID = 0x12
+const E_UNKNOWN = 0x42
+const E_CANCELLED = 0x44
+const E_TOO_LONG = 0x45
+const E_SYNC_TIMEOUT = 0x3E
+
+// The Periodic_Advertising_Interval a Host may ask for: 7.5 ms to 81.91875 s in units of 1.25 ms.
+const INTERVAL_MIN = 6
+const INTERVAL_MAX = 0xFFFF
+const INTERVAL_UNIT_US = 1250
+
+// The Operation values of LE Set Periodic Advertising Data are those of the extended advertising data.
+const OP_COMPLETE = 3
+const OP_UNCHANGED = 4
+
+// The octets of data one LE Periodic Advertising Report event holds: the event is 255 octets of parameters, 8 of them its own.
+const REPORT_DATA_MAX = 247
+
+// The longest Periodic Advertising Data one command carries, and the PDU that carries all of a data: the
+// AUX_SYNC_IND holds the length octet, the flags and the Tx Power before the data, so 251 octets fit one.
+const CMD_DATA_MAX = 252
+
+// The pause kept between the end of an event of a train and the start of the next one, and between the
+// extended advertising event that announces a train and the first AUX_SYNC_IND it names.
+const TRAIN_GAP_US = 400
+const FIRST_GAP_US = 1500
+
+// The units a SyncInfo counts its offset in, the offset above which the second unit is used, and the longest offset a
+// SyncInfo holds (13 bits of 300 microseconds; the Offset Adjust bit is for LL_PERIODIC_SYNC_IND alone).
+const UNIT_FINE_US = 30
+const UNIT_COARSE_US = 300
+const FINE_LIMIT_US = 245700
+const OFFSET_MAX_US = 2457300
+
+// The microseconds past a multiple of the offset unit at which the AUX_SYNC_IND is planned from the AUX_ADV_IND that
+// announces it: the offset the SyncInfo gives is rounded down, so the planned time sits inside the unit the receiver
+// listens for, whatever the start error of the AUX_ADV_IND.
+const SYNC_PHASE_US = 12
+
+// The Sleep Clock Accuracy class this Controller names in a SyncInfo: that of `ll_link.OWN_PPM`.
+const OWN_SCA = 5
+
+// A synchronization that finds no AUX_SYNC_IND in this many periodic events from the first it listens for ends
+// with Connection Failed to be Established / Synchronization Timeout ([Vol 6] Part B, Section 4.4.5.1).
+const SYNC_TRIES = 6
+
+// The time an event of a synchronization is booked for beyond the start of its window, in microseconds.
+const SYNC_BOOK_US = 3000
+
+// ── The train of an advertising set ────────────────────────────────
+
+// `used` says LE Set Periodic Advertising Parameters was given for the set `handle`; `on` that the Host enabled the train; `run`
+// that its events are sent (the advertising set was enabled while `on`).  `props` are the Periodic_Advertising_Properties (bit 6: Tx
+// Power) and `int_min` and `int_max` the interval range in units of 1.25 ms; `interval` the interval in effect while `on`.
+//
+// The running train: `aa`, `crc` and `chmap` (37 bits, `n_used` of them used) are the physical channel the SyncInfo
+// describes, `counter` the paEventCounter of the event at `due` (microseconds), `events` the events sent and `late` the
+// events given up because the program came to them too late.  `rng` feeds the access address, the CRC seed, the first
+// counter and the channels of the chain.  The data is `data`, `dlen` octets, `dhave` whether the Host gave any and `dasm`
+// that a fragmented data is being assembled.  `none` is six octets of zero for the builders of PDUs that name no address.
+// `big` is the slot of the broadcast isochronous group that rides the train (-1 for none), `acad` the ACAD of the next AUX_SYNC_IND,
+// the BIGInfo of that group as an AD structure, `acad_n` its octets (0 when the group is not announced).  `last_ctr` and `last_at` are
+// the paEventCounter and the start (microseconds) of the last event sent, the one LL_PERIODIC_SYNC_IND names as sent; `sent` says
+// one was sent since the train started.
+//
+// A train with responses (`pawr`, [Vol 6] Part B, Section 4.4.2.2.4) has `n_sub` subevents, `si_us` microseconds apart, in each event instead of
+// one AUX_SYNC_IND: `due` is the start of the next subevent, `sub` its number, `counter` the paEventCounter of its event and `ev_start` the start
+// of that event.
+@value
+struct PerAdv
+    used: Bool
+    handle: Int
+    on: Bool
+    run: Bool
+    props: Int
+    int_min: Int
+    int_max: Int
+    interval: Int
+    aa: Int
+    crc: Int
+    chmap: Int
+    n_used: Int
+    counter: Int
+    due: Int
+    events: Int
+    late: Int
+    rng: Int
+    data: PerData
+    dlen: Int
+    dhave: Bool
+    dasm: Bool
+    none: Vec[u8; 6]
+    si: Vec[u8; 18]
+    big: Int
+    acad: Vec[u8; 64]
+    acad_n: Int
+    last_ctr: Int
+    last_at: Int
+    sent: Bool
+    pawr: Bool
+    sub: Int
+    ev_start: Int
+    n_sub: Int
+    si_us: Int
+
+@tier(embedded)
+fn padv_new() -> PerAdv
+    var t = PerAdv { used: false, handle: 0, on: false, run: false, props: 0, int_min: INTERVAL_MIN, int_max: INTERVAL_MIN,
+                     interval: INTERVAL_MIN, aa: 0, crc: 0, chmap: ll_init.CHMAP_ALL, n_used: 37, counter: 0, due: 0,
+                     events: 0, late: 0, rng: 0x1B873593, data: Vec.new(), dlen: 0, dhave: false, dasm: false,
+                     none: Vec.new(), si: Vec.new(), big: -1, acad: Vec.new(), acad_n: 0,
+                     last_ctr: 0, last_at: 0, sent: false, pawr: false, sub: 0, ev_start: 0, n_sub: 0, si_us: 0 }
+    for _ in 0..6
+        let _a = t.none.push(0)
+    for _ in 0..18
+        let _b = t.si.push(0)
+    for _ in 0..251
+        let _c = t.data.push(0)
+    for _ in 0..64
+        let _d = t.acad.push(0)
+    t
+
+// The train forgotten: nothing defined, nothing running.
+@tier(embedded)
+fn padv_clear(var t: PerAdv)
+    t.used = false
+    t.on = false
+    t.run = false
+    t.dlen = 0
+    t.dhave = false
+    t.dasm = false
+    t.events = 0
+    t.late = 0
+    t.big = -1
+    t.acad_n = 0
+    t.sent = false
+    if ctl_limits.pawr_adv_on()
+        t.pawr = false
+
+// Seed the generator of the access address, the CRC seed, the first counter and the chain channels.
+@tier(embedded)
+fn padv_seed(var t: PerAdv, seed: Int)
+    t.rng = ll_adv.rng_step(seed ^ 0x1B873593)
+
+// The parameters of LE Set Periodic Advertising Parameters, [Vol 4] Part E, Section 7.8.61, for the set whose properties
+// are `set_props`: Invalid HCI Command Parameters for an interval range out of order or below 7.5 ms and for a set
+// that is scannable, connectable, legacy or anonymous (the specification lists the second as an error the Controller
+// may detect here or when it enables the train).
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn padv_params_status(set_props: Int, int_min: Int, int_max: Int) -> Int
+    if int_min < INTERVAL_MIN or int_max < int_min or int_max > INTERVAL_MAX
+        return E_INVALID
+    if (set_props & (ll_xadv.P_CONN | ll_xadv.P_SCAN | ll_xadv.P_LEGACY | ll_xadv.P_ANON)) != 0
+        return E_INVALID
+    OK
+
+// Define the train of the set `handle`.  The data stays as it was.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn padv_define(var t: PerAdv, handle: Int, props: Int, int_min: Int, int_max: Int)
+    t.used = true
+    t.handle = handle
+    t.props = props
+    t.int_min = int_min
+    t.int_max = int_max
+    if ctl_limits.pawr_adv_on()
+        t.pawr = false
+
+// The train of the set is one with responses: `n_sub` subevents of an event, `si_us` microseconds apart.
+@tier(embedded)
+fn padv_define_pawr(var t: PerAdv, n_sub: Int, si_us: Int)
+    t.pawr = true
+    t.n_sub = n_sub
+    t.si_us = si_us
+
+// ── The data ────────────────────────────────────────────────────────
+
+// The Status of LE Set Periodic Advertising Data for the Operation `op` and `len` octets ([Vol 4] Part E, Section
+// 7.8.62; Unknown Advertising Identifier is the caller's): Invalid HCI Command Parameters for an Operation out of range,
+// for no octets in a fragment, and for Unchanged data of a train that is not enabled or has no data; Command Disallowed
+// for a fragment while the train is enabled and for a continuation that nothing began; Memory Capacity Exceeded for
+// more octets than the train holds.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn pdata_status(var t: PerAdv, op: Int, len: Int) -> Int
+    if op > OP_UNCHANGED or len > CMD_DATA_MAX
+        return E_INVALID
+    if op == OP_UNCHANGED
+        if not t.on or not t.dhave or len != 0
+            return E_INVALID
+        return OK
+    if op != OP_COMPLETE
+        if len == 0
+            return E_INVALID
+        if t.on
+            return E_DISALLOWED
+    if (op == ll_xadv.OP_MIDDLE or op == ll_xadv.OP_LAST) and not t.dasm
+        return E_DISALLOWED
+    var have = t.dlen
+    if op == ll_xadv.OP_FIRST or op == OP_COMPLETE
+        have = 0
+    if have + len > ctl_limits.data_max()
+        return E_MEMORY
+    OK
+
+// Begin taking the Operation `op`: a first or complete data starts the buffer afresh.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn pdata_begin(var t: PerAdv, op: Int)
+    if op == ll_xadv.OP_FIRST or op == OP_COMPLETE
+        t.dlen = 0
+    t.dasm = op == ll_xadv.OP_FIRST or op == ll_xadv.OP_MIDDLE
+
+// Append one octet of the fragment.
+@tier(embedded)
+fn pdata_put(var t: PerAdv, v: Int)
+    t.data[t.dlen] = v as u8
+    t.dlen = t.dlen + 1
+
+// The fragment is in.  Data that is complete or unchanged is what the train sends from the next event on.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn pdata_end(var t: PerAdv, op: Int)
+    if op == ll_xadv.OP_FIRST or op == ll_xadv.OP_MIDDLE
+        return
+    t.dhave = true
+
+// ── The layout of an event ──────────────────────────────────────────
+
+// The octets of an AUX_SYNC_IND with `n` octets of data and the Tx Power when the train asks, and of an AUX_CHAIN_IND, with the pointer to the next PDU when `more`.
+@tier(embedded)
+fn sync_octets(var t: PerAdv, n: Int, more: Bool) -> Int
+    var hl = 1 + t.acad_n
+    if (t.props & ll_xadv.P_TXP) != 0
+        hl = hl + 1
+    if more
+        hl = hl + 3
+    2 + 1 + hl + n
+
+@tier(embedded)
+fn chain_octets(n: Int, more: Bool) -> Int
+    var hl = 1
+    if more
+        hl = hl + 3
+    2 + 1 + hl + n
+
+// The PDUs of an event for `len` octets of data: the AUX_SYNC_IND and the AUX_CHAIN_IND PDUs behind it.
+@tier(embedded)
+fn event_pdus(var t: PerAdv) -> Int
+    ll_xadv.chain_pdus(t.dlen)
+
+// The most time an event for `len` octets of data takes from the start of its AUX_SYNC_IND on the PHY `phy`, in microseconds:
+// every PDU with the pause that follows it.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn event_us_len(var t: PerAdv, len: Int, phy: Int) -> Int
+    let total = ll_xadv.chain_pdus(len)
+    var us = 0
+    for k in 0..total
+        let more = k + 1 < total
+        let n = ll_xadv.chunk_len(len, k)
+        if k == 0
+            us = us + ll_xadv.next_rel_us(phy, sync_octets(var t, n, more))
+        else
+            us = us + ll_xadv.next_rel_us(phy, chain_octets(n, more))
+    us
+
+@tier(embedded)
+fn event_us(var t: PerAdv, phy: Int) -> Int
+    event_us_len(var t, t.dlen, phy)
+
+// The interval of the train in units of 1.25 ms for `len` octets of data: the shortest one of the Host's range that holds an event and a
+// pause.  -1 when not even the longest does (Packet Too Long).
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn pick_interval_len(var t: PerAdv, len: Int, phy: Int) -> Int
+    if ctl_limits.pawr_adv_on() and t.pawr
+        // The interval of a train with responses is the shortest the Host allows: the subevents fit it by the parameters' check.
+        return t.int_min
+    let need = (event_us_len(var t, len, phy) + TRAIN_GAP_US + INTERVAL_UNIT_US - 1) / INTERVAL_UNIT_US
+    var v = t.int_min
+    if need > v
+        v = need
+    if v > t.int_max
+        return -1
+    v
+
+@tier(embedded)
+fn pick_interval(var t: PerAdv, phy: Int) -> Int
+    pick_interval_len(var t, t.dlen, phy)
+
+@tier(embedded)
+fn interval_us(var t: PerAdv) -> Int
+    t.interval * INTERVAL_UNIT_US
+
+// ── The physical channel ────────────────────────────────────────────
+
+// The channelIdentifier of channel selection algorithm #2 for an access address.
+@tier(embedded)
+fn channel_id(aa: Int) -> Int
+    ((aa >>> 16) ^ (aa & 0xFFFF)) & 0xFFFF
+
+// An access address a periodic physical channel may use: valid as a connection's is ([Vol 6] Part B, Section 2.1.2),
+// drawn from the generator of the train; the 64 draws are a bound a working generator never reaches.
+@tier(embedded)
+fn make_aa(var t: PerAdv) -> Int
+    var aa = 0
+    for _ in 0..64
+        t.rng = ll_adv.rng_step(t.rng)
+        aa = t.rng
+        t.rng = ll_adv.rng_step(t.rng)
+        aa = (aa ^ (t.rng << 16)) & 0xFFFFFFFF
+        if ll_init.aa_valid(aa)
+            break
+    aa
+
+// Start the train: a new access address and CRC seed, the Host's channel classification `chmap`, a counter that starts anywhere,
+// the first event at `due`.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn padv_start(var t: PerAdv, chmap: Int, due: Int)
+    t.aa = make_aa(t)
+    t.rng = ll_adv.rng_step(t.rng)
+    t.crc = t.rng & 0xFFFFFF
+    t.rng = ll_adv.rng_step(t.rng)
+    t.counter = t.rng & 0xFFFF
+    t.chmap = chmap
+    t.n_used = ll_link.popcount(chmap)
+    t.due = due
+    t.run = true
+    t.events = 0
+    t.late = 0
+    t.sent = false
+    if ctl_limits.pawr_adv_on()
+        t.sub = 0
+        t.ev_start = due
+
+// The data channel of the event with the counter `counter`.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn padv_channel(var t: PerAdv, counter: Int) -> Int
+    ll_link.csa2_channel(channel_id(t.aa), counter & 0xFFFF, t.chmap, t.n_used)
+
+// A data channel for the next PDU of a chain, one of the used channels.
+@tier(embedded)
+fn chain_channel(var t: PerAdv) -> Int
+    t.rng = ll_adv.rng_step(t.rng)
+    ll_link.nth_used(t.chmap, t.rng % t.n_used)
+
+// The event at `due` was sent: LL_PERIODIC_SYNC_IND can name it as the last one this device transmitted.
+@tier(embedded)
+fn padv_note_sent(var t: PerAdv)
+    t.last_ctr = t.counter
+    t.last_at = t.due
+    t.sent = true
+
+// The event at `due` is over, sent or given up: the next one is an interval on, its counter one more.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn padv_advance(var t: PerAdv)
+    if ctl_limits.pawr_adv_on() and t.pawr
+        // The next subevent, or the first of the next event.
+        t.sub = t.sub + 1
+        if t.sub >= t.n_sub
+            t.sub = 0
+            t.ev_start = t.ev_start + interval_us(t)
+            t.counter = (t.counter + 1) & 0xFFFF
+        t.due = t.ev_start + t.sub * t.si_us
+        return
+    t.due = t.due + interval_us(t)
+    t.counter = (t.counter + 1) & 0xFFFF
+
+// The start and the counter of the next event a SyncInfo can name: the one `due` and `counter` belong to, or, for a train with responses that
+// is inside an event, the one after it.
+@tier(embedded)
+fn ev_due(var t: PerAdv) -> Int
+    if not ctl_limits.pawr_adv_on()
+        return t.due
+    if t.pawr and t.sub > 0
+        return t.ev_start + interval_us(t)
+    if t.pawr
+        return t.ev_start
+    t.due
+
+@tier(embedded)
+fn ev_ctr(var t: PerAdv) -> Int
+    if ctl_limits.pawr_adv_on() and t.pawr and t.sub > 0
+        return (t.counter + 1) & 0xFFFF
+    t.counter
+
+// The number of intervals from the next event to the first event that starts at `min_time` or later.
+@tier(embedded)
+fn intervals_to(var t: PerAdv, min_time: Int) -> Int
+    let at = ev_due(var t)
+    if at >= min_time
+        return 0
+    (min_time - at + interval_us(t) - 1) / interval_us(t)
+
+// ── SyncInfo ────────────────────────────────────────────────────────
+
+// The units and the count a SyncInfo holds an offset of `offset_us` in: 0 for an offset that is none or does not fit (a
+// SyncInfo with a zero offset says the time to the next AUX_SYNC_IND is greater than can be represented).
+@tier(embedded)
+fn offset_base(offset_us: Int) -> Int
+    if offset_us <= 0 or offset_us > OFFSET_MAX_US
+        return 0
+    if offset_us < FINE_LIMIT_US
+        return offset_us / UNIT_FINE_US
+    offset_us / UNIT_COARSE_US
+
+@tier(embedded)
+fn offset_unit(offset_us: Int) -> Int
+    if offset_us < FINE_LIMIT_US
+        return UNIT_FINE_US
+    UNIT_COARSE_US
+
+// Write the SyncInfo of 18 octets: the offset (13 bits, the unit in bit 13), the interval, the 37-bit channel map with the
+// sleep clock accuracy class above it, the access address, the CRC seed and the paEventCounter.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn syncinfo_put(var si: Vec[u8; 18], offset_us: Int, interval: Int, chmap: Int, sca: Int, aa: Int, crc: Int, counter: Int)
+    let base = offset_base(offset_us)
+    var unit = 0
+    if offset_us >= FINE_LIMIT_US
+        unit = 1
+    si[0] = (base & 0xFF) as u8
+    si[1] = (((base >>> 8) & 0x1F) | (unit << 5)) as u8
+    si[2] = (interval & 0xFF) as u8
+    si[3] = ((interval >>> 8) & 0xFF) as u8
+    for k in 0..4
+        si[4 + k] = ((chmap >>> (8 * k)) & 0xFF) as u8
+    si[8] = (((chmap >>> 32) & 0x1F) | (sca << 5)) as u8
+    for k in 0..4
+        si[9 + k] = ((aa >>> (8 * k)) & 0xFF) as u8
+    for k in 0..3
+        si[13 + k] = ((crc >>> (8 * k)) & 0xFF) as u8
+    si[16] = (counter & 0xFF) as u8
+    si[17] = ((counter >>> 8) & 0xFF) as u8
+
+// The SyncInfo of the train for the extended set whose AUX_ADV_IND starts at `aux_at`: the next event of the train
+// that starts `min_gap` or more after it (the whole extended event is over by then).  The AUX_ADV_IND is planned
+// later by at most one unit, so that the offset the SyncInfo holds is `SYNC_PHASE_US` short of the event's start.  Answers that
+// shift, in microseconds; `si` is the SyncInfo.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn plan_syncinfo(var t: PerAdv, var si: Vec[u8; 18], aux_at: Int, min_gap: Int) -> Int
+    let n = intervals_to(var t, aux_at + min_gap)
+    let at = ev_due(var t) + n * interval_us(t)
+    let counter = (ev_ctr(var t) + n) & 0xFFFF
+    var off = at - aux_at
+    var shift = 0
+    if off > 0 and off <= OFFSET_MAX_US
+        let unit = offset_unit(off)
+        shift = ((off % unit) - SYNC_PHASE_US + unit) % unit
+        off = off - shift
+        if off <= 0
+            off = 0
+    else
+        off = 0
+    syncinfo_put(var si, off, t.interval, t.chmap, OWN_SCA, t.aa, t.crc, counter)
+    shift
+
+// ── The PDUs ────────────────────────────────────────────────────────
+
+// The ACAD of the next AUX_SYNC_IND: the `n` octets of `info`, the BIGInfo of the train's group as an AD structure; 0 for none.
+@tier(embedded)
+fn acad_put(var t: PerAdv, var info: Vec[u8; 64], n: Int)
+    for j in 0..n
+        t.acad[j] = info[j]
+    t.acad_n = n
+
+// The AUX_SYNC_IND of the train: AdvMode 0, the Auxiliary Pointer to the chain when `more`, the Tx Power `txp` when the
+// train asks, and `n` octets of the data from `at`.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn build_sync_ind(var t: PerAdv, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int, phy: Int, txp: Int)
+    var no_target = t.none     // a second name for the six zero octets: one place is not given to two var parameters
+    ll_xadv.ext_build_acad(var p, ll_init.EXT_ADV, 0, 0, 0, false, var t.none, false, var no_target, false, 0, 0,
+                           more, ch, off, phy, (t.props & ll_xadv.P_TXP) != 0, txp, false, var t.si, var t.data, at, n, var t.acad, t.acad_n)
+
+// A PDU of the chain behind it: only the pointer to the next, when `more`.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn build_sync_chain(var t: PerAdv, var p: Pdu, at: Int, n: Int, more: Bool, ch: Int, off: Int, phy: Int)
+    var no_target = t.none     // a second name for the six zero octets: one place is not given to two var parameters
+    ll_xadv.ext_build(var p, ll_init.EXT_ADV, 0, 0, 0, false, var t.none, false, var no_target, false, 0, 0,
+                      more, ch, off, phy, false, 0, false, var t.si, var t.data, at, n)
+
+// ── The Periodic Advertiser List ────────────────────────────────────
+
+// The entries of the list: the address type, the address and the SID of each.
+@value
+struct PerList
+    used: Vec[Bool; if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1]
+    kind: Vec[u8; if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1]
+    sid: Vec[u8; if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1]
+    addr: Vec[u8; (if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1) * 6]
+
+@tier(embedded)
+fn pal_new() -> PerList
+    var l = PerList { used: Vec.new(), kind: Vec.new(), sid: Vec.new(), addr: Vec.new() }
+    for _ in 0..ctl_limits.pal_n()
+        let _a = l.used.push(false)
+        let _b = l.kind.push(0)
+        let _c = l.sid.push(0)
+    for _ in 0..(ctl_limits.pal_n() * 6)
+        let _d = l.addr.push(0)
+    l
+
+@tier(embedded)
+fn pal_clear(var l: PerList)
+    for i in 0..ctl_limits.pal_n()
+        l.used[i] = false
+
+@tier(embedded)
+fn pal_count(var l: PerList) -> Int
+    var n = 0
+    for i in 0..ctl_limits.pal_n()
+        if l.used[i]
+            n = n + 1
+    n
+
+// The entry of the type `kind` (the low bit: 0 public, 1 random), the address and the SID, -1 for none.
+@tier(embedded)
+fn pal_find(var l: PerList, kind: Int, var a: Vec[u8; 6], sid: Int) -> Int
+    for i in 0..ctl_limits.pal_n()
+        if l.used[i] and ((l.kind[i] as Int) & 1) == (kind & 1) and (l.sid[i] as Int) == sid
+            var same = true
+            for k in 0..6
+                if l.addr[i * 6 + k] != a[k]
+                    same = false
+            if same
+                return i
+    -1
+
+// Add the entry; Invalid HCI Command Parameters for one that is on the list, Memory Capacity Exceeded when the list is full.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn pal_add(var l: PerList, kind: Int, var a: Vec[u8; 6], sid: Int) -> Int
+    if kind > 1 or sid > 15
+        return E_INVALID
+    if pal_find(var l, kind, var a, sid) >= 0
+        return E_INVALID
+    for i in 0..ctl_limits.pal_n()
+        if not l.used[i]
+            l.used[i] = true
+            l.kind[i] = kind as u8
+            l.sid[i] = sid as u8
+            for k in 0..6
+                l.addr[i * 6 + k] = a[k]
+            return OK
+    E_MEMORY
+
+// Remove the entry; Unknown Advertising Identifier for one that is not on the list.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn pal_remove(var l: PerList, kind: Int, var a: Vec[u8; 6], sid: Int) -> Int
+    if kind > 1 or sid > 15
+        return E_INVALID
+    let i = pal_find(var l, kind, var a, sid)
+    if i < 0
+        return E_UNKNOWN
+    l.used[i] = false
+    OK
+
+// ── The Create Sync request ─────────────────────────────────────────
+
+// LE Periodic Advertising Create Sync waits for a train (`pending`) described by the Options, the SID, the address type
+// and address, or by the Periodic Advertiser List; `skip` is the number of events it may skip (the Controller listens to
+// all), `timeout` the Sync_Timeout in units of 10 ms, `reports` whether the reports are initially enabled, `cancel_owed` that
+// the Host is owed the LE Periodic Advertising Sync Established event with status 0x44 after the Cancel.  The request stays
+// pending while the train it found is being synchronized to, in `slot` (-1 until a SyncInfo is taken).
+@value
+struct PerReq
+    pending: Bool
+    use_list: Bool
+    reports: Bool
+    sid: Int
+    kind: Int
+    addr: Vec[u8; 6]
+    skip: Int
+    timeout: Int
+    cancel_owed: Bool
+    slot: Int
+
+@tier(embedded)
+fn preq_new() -> PerReq
+    var q = PerReq { pending: false, use_list: false, reports: true, sid: 0, kind: 0, addr: Vec.new(), skip: 0, timeout: 0x0A,
+                     cancel_owed: false, slot: -1 }
+    for _ in 0..6
+        let _a = q.addr.push(0)
+    q
+
+@tier(embedded)
+fn preq_clear(var q: PerReq)
+    q.pending = false
+    q.cancel_owed = false
+    q.slot = -1
+
+// Whether the advertiser with the type `kind` (the low bit), the address `a` and the SID `sid` is the train the request waits for.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn preq_accepts(var q: PerReq, var l: PerList, kind: Int, var a: Vec[u8; 6], sid: Int) -> Bool
+    if not q.pending
+        return false
+    if q.use_list
+        return pal_find(var l, kind, var a, sid) >= 0
+    if sid != q.sid or (kind & 1) != (q.kind & 1)
+        return false
+    for k in 0..6
+        if q.addr[k] != a[k]
+            return false
+    true
+
+// ── The trains this device synchronizes to ──────────────────────────
+
+// The slot of a synchronization: `PS_FREE`, synchronizing (the SyncInfo is known and no AUX_SYNC_IND has been heard)
+// or synchronized.
+const PS_FREE = 0
+const PS_SYNCING = 1
+const PS_SYNCED = 2
+
+// The events a slot owes the Host: LE Periodic Advertising Sync Established and LE Periodic Advertising Sync Lost.
+const EV_NONE = 0
+const EV_ESTABLISHED = 1
+const EV_LOST = 2
+
+// A train this device listens to.  `handle` is the Sync_Handle the Host uses (the slot's number); `sid`, `kind` and
+// `addr` name the advertiser, `phy` the PHY of the train and `interval` its interval in units of 1.25 ms.  The physical channel
+// is `aa`, `crc` and `chmap` (`n_used` channels); `sca_ppm` the advertiser's clock accuracy and `sca` its class (the Advertiser_Clock_Accuracy
+// of the event).  `counter` is the paEventCounter of the event the window at `due` (microseconds) is for, `win` the width
+// of that window beyond `due` (an offset unit while the SyncInfo's window is awaited, 0 after), `t_ref` the time of the
+// last packet heard (the start of the AUX_ADV_IND until then), `tries` the events listened without a packet while
+// synchronizing, `timeout` the Sync_Timeout in microseconds, `last_ok` the start of the last packet heard.
+// `reports` says the Host takes the reports; `owed` and `status` the event the Host is owed and the status it carries.
+// A train a connected device transferred (`past`, [Vol 6] Part B, Section 5.1.13) is reported with LE Periodic Advertising Sync Transfer
+// Received instead of LE Periodic Advertising Sync Established: `conn` is the connection handle of the sender and `sdata` the Service_Data
+// it gave.  `pre` is the widening, in microseconds, that the three clocks of a transfer add to the first window beyond what the advertiser's
+// accuracy over the time since `t_ref` gives (0 once a packet was heard).
+@value
+struct PerSync
+    state: Int
+    handle: Int
+    sid: Int
+    kind: Int
+    addr: Vec[u8; 6]
+    phy: Int
+    interval: Int
+    aa: Int
+    crc: Int
+    chmap: Int
+    n_used: Int
+    sca: Int
+    sca_ppm: Int
+    counter: Int
+    due: Int
+    win: Int
+    t_ref: Int
+    tries: Int
+    timeout: Int
+    last_ok: Int
+    reports: Bool
+    owed: Int
+    status: Int
+    heard: Int
+    missed: Int
+    cx_live: Bool
+    cx_txp: Int
+    cx_counter: Int
+    past: Bool
+    conn: Int
+    sdata: Int
+    pre: Int
+
+@tier(embedded)
+fn psync_new() -> PerSync
+    var s = PerSync { state: PS_FREE, handle: 0, sid: 0, kind: 0, addr: Vec.new(), phy: 1, interval: INTERVAL_MIN, aa: 0, crc: 0,
+                      chmap: ll_init.CHMAP_ALL, n_used: 37, sca: 0, sca_ppm: 500, counter: 0, due: 0, win: 0, t_ref: 0, tries: 0,
+                      timeout: 0, last_ok: 0, reports: true, owed: EV_NONE, status: 0, heard: 0, missed: 0, cx_live: false,
+                      cx_txp: 0x7F, cx_counter: 0, past: false, conn: 0, sdata: 0, pre: 0 }
+    for _ in 0..6
+        let _a = s.addr.push(0)
+    s
+
+// The slot forgotten, with the event it owed.
+@tier(embedded)
+fn psync_clear(var s: PerSync)
+    s.state = PS_FREE
+    s.owed = EV_NONE
+    s.cx_live = false
+
+// Whether the slot holds a train or owes an event, which keeps it from being given to another.
+@tier(embedded)
+fn psync_busy(var s: PerSync) -> Bool
+    s.state != PS_FREE or s.owed != EV_NONE
+
+// The parts of a SyncInfo at the octet `at` of the PDU `rx`: the offset in microseconds (0 when the SyncInfo holds none), the interval,
+// the channel map, the sleep clock accuracy class, the access address, the CRC seed and the paEventCounter.
+@tier(embedded)
+fn si_offset_us(var rx: Pdu, at: Int) -> Int
+    let base = (rx.b[at] as Int) | (((rx.b[at + 1] as Int) & 0x1F) << 8)
+    var unit = UNIT_FINE_US
+    if (((rx.b[at + 1] as Int) >>> 5) & 1) == 1
+        unit = UNIT_COARSE_US
+    var off = base * unit
+    if base != 0 and (((rx.b[at + 1] as Int) >>> 6) & 1) == 1
+        off = off + 2457600
+    off
+
+@tier(embedded)
+fn si_unit_us(var rx: Pdu, at: Int) -> Int
+    if (((rx.b[at + 1] as Int) >>> 5) & 1) == 1
+        return UNIT_COARSE_US
+    UNIT_FINE_US
+
+@tier(embedded)
+fn si_interval(var rx: Pdu, at: Int) -> Int
+    (rx.b[at + 2] as Int) | ((rx.b[at + 3] as Int) << 8)
+
+@tier(embedded)
+fn si_chmap(var rx: Pdu, at: Int) -> Int
+    var m = 0
+    for k in 0..4
+        m = m | ((rx.b[at + 4 + k] as Int) << (8 * k))
+    m | (((rx.b[at + 8] as Int) & 0x1F) << 32)
+
+@tier(embedded)
+fn si_sca(var rx: Pdu, at: Int) -> Int
+    ((rx.b[at + 8] as Int) >>> 5) & 7
+
+@tier(embedded)
+fn si_aa(var rx: Pdu, at: Int) -> Int
+    (rx.b[at + 9] as Int) | ((rx.b[at + 10] as Int) << 8) | ((rx.b[at + 11] as Int) << 16) | ((rx.b[at + 12] as Int) << 24)
+
+@tier(embedded)
+fn si_crc(var rx: Pdu, at: Int) -> Int
+    (rx.b[at + 13] as Int) | ((rx.b[at + 14] as Int) << 8) | ((rx.b[at + 15] as Int) << 16)
+
+@tier(embedded)
+fn si_counter(var rx: Pdu, at: Int) -> Int
+    (rx.b[at + 16] as Int) | ((rx.b[at + 17] as Int) << 8)
+
+// Whether a SyncInfo can be listened to: an interval of at least 7.5 ms, a channel map with at least two used channels and an offset the SyncInfo holds.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn si_usable(var rx: Pdu, at: Int) -> Bool
+    si_offset_us(var rx, at) > 0 and si_interval(var rx, at) >= INTERVAL_MIN and ll_link.popcount(si_chmap(var rx, at)) >= 2 and ll_init.aa_valid(si_aa(var rx, at))
+
+// The slot `s` takes the train the SyncInfo at the octet `at` of `rx` describes, for the advertiser `kind` and `a` with the SID `sid`,
+// on the PHY `phy`; the AUX_ADV_IND started at `t_first`, so that the first AUX_SYNC_IND is awaited at the offset from it, in a window
+// of one offset unit.  `timeout` is the Sync_Timeout in units of 10 ms.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn psync_begin(var s: PerSync, handle: Int, var rx: Pdu, at: Int, kind: Int, var a: Vec[u8; 6], sid: Int, phy: Int, t_first: Int, timeout: Int, reports: Bool)
+    s.state = PS_SYNCING
+    s.handle = handle
+    s.sid = sid
+    s.kind = kind
+    for k in 0..6
+        s.addr[k] = a[k]
+    s.phy = phy
+    s.interval = si_interval(var rx, at)
+    s.aa = si_aa(var rx, at)
+    s.crc = si_crc(var rx, at)
+    s.chmap = si_chmap(var rx, at)
+    s.n_used = ll_link.popcount(s.chmap)
+    s.sca = si_sca(var rx, at)
+    s.sca_ppm = ll_link.sca_ppm(s.sca)
+    s.counter = si_counter(var rx, at)
+    s.due = t_first + si_offset_us(var rx, at)
+    s.win = si_unit_us(var rx, at)
+    s.t_ref = t_first
+    s.tries = 0
+    s.timeout = timeout * 10000
+    s.last_ok = t_first
+    s.reports = reports
+    s.owed = EV_NONE
+    s.heard = 0
+    s.missed = 0
+    s.cx_live = false
+    s.past = false
+    s.pre = 0
+
+@tier(embedded)
+fn psync_interval_us(var s: PerSync) -> Int
+    s.interval * INTERVAL_UNIT_US
+
+// The window widening of the event at `due` ([Vol 6] Part B, Section 4.5.7): the clock accuracies of both ends over the time since the last packet
+// heard, and the jitter.  It never exceeds half the interval less T_IFS, so the windows of two events cannot meet.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn psync_widen(var s: PerSync) -> Int
+    let elapsed = s.due - s.t_ref
+    var w = ((s.sca_ppm + ll_link.OWN_PPM) * elapsed) / 1000000 + ll_link.JITTER_US
+    if ctl_limits.past_on()
+        w = w + s.pre
+    let cap = psync_interval_us(var s) / 2 - 150
+    if w > cap
+        w = cap
+    w
+
+// Whether the window of the event at `due` can no longer be made narrow enough: the widening has reached half the interval less T_IFS.
+@tier(embedded)
+fn psync_exhausted(var s: PerSync) -> Bool
+    let elapsed = s.due - s.t_ref
+    var w = ((s.sca_ppm + ll_link.OWN_PPM) * elapsed) / 1000000 + ll_link.JITTER_US
+    if ctl_limits.past_on()
+        w = w + s.pre
+    w >= psync_interval_us(var s) / 2 - 150
+
+// The data channel of the event at `due`.
+@tier(embedded)
+fn psync_channel(var s: PerSync) -> Int
+    ll_link.csa2_channel(channel_id(s.aa), s.counter & 0xFFFF, s.chmap, s.n_used)
+
+// A packet of the train started at `start`: the next event is expected an interval on, its counter one more, and the clock is
+// what this packet set.  The first packet of a synchronizing slot makes it synchronized, and the Host is owed LE Periodic
+// Advertising Sync Established.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn psync_heard(var s: PerSync, start: Int)
+    s.heard = s.heard + 1
+    s.cx_counter = s.counter
+    s.t_ref = start
+    s.last_ok = start
+    s.tries = 0
+    s.win = 0
+    s.pre = 0
+    s.due = start + psync_interval_us(var s)
+    s.counter = (s.counter + 1) & 0xFFFF
+    if s.state == PS_SYNCING
+        s.state = PS_SYNCED
+        s.owed = EV_ESTABLISHED
+        s.status = OK
+
+// The event at `due` brought no packet.  A synchronizing slot that has listened `SYNC_TRIES` events ends, owing LE Periodic Advertising Sync
+// Established with status 0x3E; a synchronized one whose Sync_Timeout ran out since the last packet, or whose window can no longer be made narrow enough, ends owing LE
+// Periodic Advertising Sync Lost.  True when the slot goes on.
+@satisfies("REQ-BLE-CTL-094")
+@tier(embedded)
+fn psync_missed(var s: PerSync) -> Bool
+    s.missed = s.missed + 1
+    s.due = s.due + psync_interval_us(var s)
+    s.counter = (s.counter + 1) & 0xFFFF
+    s.win = 0
+    if s.state == PS_SYNCING
+        s.tries = s.tries + 1
+        if s.tries >= SYNC_TRIES
+            s.state = PS_FREE
+            s.owed = EV_ESTABLISHED
+            s.status = E_SYNC_TIMEOUT
+            return false
+        return true
+    if s.due - s.last_ok >= s.timeout or psync_exhausted(var s)
+        s.state = PS_FREE
+        s.owed = EV_LOST
+        return false
+    true
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@tier(app)
+fn t_train(props: Int, dlen: Int) -> PerAdv
+    var t = padv_new()
+    padv_define(var t, 4, props, 16, 40)
+    padv_seed(var t, 11)
+    for i in 0..dlen
+        pdata_put(var t, i)
+    pdata_end(var t, OP_COMPLETE)
+    t
+
+@tier(app)
+fn t_ext_parse(var p: Pdu) -> ll_ext.ExtView
+    ll_ext.ext_parse(var p)
+
+@tier(app)
+fn t_dhave(var t: PerAdv, v: Bool)
+    t.dhave = v
+
+@tier(app)
+fn t_on(var t: PerAdv, v: Bool)
+    t.on = v
+
+@tier(app)
+fn t_range(var t: PerAdv, lo: Int, hi: Int)
+    t.int_min = lo
+    t.int_max = hi
+
+@tier(app)
+fn t_interval(var t: PerAdv, v: Int)
+    t.interval = v
+
+@tier(app)
+fn t_counter(var t: PerAdv, v: Int)
+    t.counter = v
+
+@tier(app)
+fn t_req(var q: PerReq, sid: Int, kind: Int, use_list: Bool, var a: Vec[u8; 6])
+    q.pending = true
+    q.sid = sid
+    q.kind = kind
+    q.use_list = use_list
+    for k in 0..6
+        q.addr[k] = a[k]
+
+@tier(app)
+fn t_req_list(var q: PerReq, use_list: Bool)
+    q.use_list = use_list
+
+@tier(app)
+fn t_owed(var s: PerSync, v: Int)
+    s.owed = v
+
+@test
+fn test_capacities_match_the_constants()
+    let t = padv_new()
+    test.assert_eq(t.data.capacity(), ctl_limits.data_max())
+    let l = pal_new()
+    test.assert_eq(l.used.capacity(), ctl_limits.pal_n())
+    test.assert_eq(l.kind.capacity(), ctl_limits.pal_n())
+    test.assert_eq(l.sid.capacity(), ctl_limits.pal_n())
+    test.assert_eq(l.addr.capacity(), ctl_limits.pal_n() * 6)
+
+@test
+fn test_the_parameters_are_checked_against_the_set_and_the_interval()
+    test.assert_eq(padv_params_status(0, 6, 6), OK)
+    test.assert_eq(padv_params_status(ll_xadv.P_TXP, 16, 40), OK)
+    test.assert_eq(padv_params_status(0, 5, 20), E_INVALID)
+    test.assert_eq(padv_params_status(0, 30, 20), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_CONN, 16, 40), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_SCAN, 16, 40), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_LEGACY, 16, 40), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_ANON, 16, 40), E_INVALID)
+
+@test
+fn test_the_data_commands_follow_the_operations()
+    var t = t_train(0, 0)
+    t_dhave(var t, false)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 0), OK)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 252), E_MEMORY)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 253), E_INVALID)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 0), E_INVALID)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 100), OK)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_MIDDLE, 10), E_DISALLOWED)
+    test.assert_eq(pdata_status(var t, 5, 10), E_INVALID)
+    // Unchanged data needs an enabled train that has data and no octets.
+    test.assert_eq(pdata_status(var t, OP_UNCHANGED, 0), E_INVALID)
+    pdata_begin(var t, ll_xadv.OP_FIRST)
+    for i in 0..100
+        pdata_put(var t, i)
+    pdata_end(var t, ll_xadv.OP_FIRST)
+    test.assert(t.dasm)
+    test.assert(not t.dhave)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 152), E_MEMORY)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 151), OK)
+    pdata_begin(var t, ll_xadv.OP_LAST)
+    for i in 0..50
+        pdata_put(var t, i)
+    pdata_end(var t, ll_xadv.OP_LAST)
+    test.assert(t.dhave)
+    test.assert(not t.dasm)
+    test.assert_eq(t.dlen, 150)
+    // Enabled, only a complete data or an unchanged one may be given.
+    t_on(t, true)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 10), E_DISALLOWED)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 10), OK)
+    test.assert_eq(pdata_status(var t, OP_UNCHANGED, 0), OK)
+    test.assert_eq(pdata_status(var t, OP_UNCHANGED, 1), E_INVALID)
+
+@test
+fn test_the_interval_is_the_shortest_that_holds_an_event()
+    var t = t_train(0, 20)
+    test.assert_eq(event_pdus(var t), 1)
+    test.assert_eq(sync_octets(var t, 20, false), 2 + 1 + 1 + 20)
+    test.assert(event_us(t, ll_phy.PHY_1M) > 200)
+    test.assert_eq(pick_interval(t, ll_phy.PHY_1M), 16)
+    // A range that ends before an event fits is refused.
+    var big = t_train(0, 251)
+    t_range(var big, 6, 6)
+    test.assert_eq(event_pdus(var big), 2)
+    test.assert_eq(pick_interval(big, ll_phy.PHY_1M), 6)
+    test.assert_eq(pick_interval(big, ll_phy.PHY_CODED), -1)
+    t_range(var big, 6, 0xFFFF)
+    test.assert(pick_interval(big, ll_phy.PHY_CODED) > 6)
+
+@test
+fn test_syncinfo_holds_the_fields_of_the_train()
+    var si: Vec[u8; 18] = Vec.new()
+    for _ in 0..18
+        let _a = si.push(0)
+    syncinfo_put(var si, 9990, 0x0140, 0x1FFFFFFFFF, 5, 0x8E89BED7, 0xA1B2C3, 0xBEEF)
+    var p = ll_pdu.pdu_new()
+    for k in 0..18
+        let _x = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    test.assert_eq(si_offset_us(var p, 0), 9990)
+    test.assert_eq(si_unit_us(var p, 0), 30)
+    test.assert_eq(si_interval(var p, 0), 0x0140)
+    test.assert_eq(si_chmap(var p, 0), 0x1FFFFFFFFF)
+    test.assert_eq(si_sca(var p, 0), 5)
+    test.assert_eq(si_aa(var p, 0), 0x8E89BED7)
+    test.assert_eq(si_crc(var p, 0), 0xA1B2C3)
+    test.assert_eq(si_counter(var p, 0), 0xBEEF)
+    // An offset of 245.7 ms or more counts in units of 300 microseconds, and one that does not fit is zero.
+    syncinfo_put(var si, 300000, 100, 0x1FFFFFFFFF, 5, 1, 2, 3)
+    var q = ll_pdu.pdu_new()
+    for k in 0..18
+        let _y = ll_pdu.pdu_put_data(var q, si[k] as Int)
+    test.assert_eq(si_unit_us(var q, 0), 300)
+    test.assert_eq(si_offset_us(var q, 0), 300000)
+    syncinfo_put(var si, 3000000, 100, 0x1FFFFFFFFF, 5, 1, 2, 3)
+    var r = ll_pdu.pdu_new()
+    for k in 0..18
+        let _z = ll_pdu.pdu_put_data(var r, si[k] as Int)
+    test.assert_eq(si_offset_us(var r, 0), 0)
+
+@test
+fn test_the_next_event_and_the_shift_put_the_offset_in_its_unit()
+    var t = t_train(0, 10)
+    t_interval(var t, 16)
+    padv_start(var t, ll_init.CHMAP_ALL, 100000)
+    var si: Vec[u8; 18] = Vec.new()
+    for _ in 0..18
+        let _a = si.push(0)
+    // The AUX_ADV_IND is at 101000; the first event of the train 20 ms apart that starts 3000 or more after it.
+    let shift = plan_syncinfo(var t, var si, 101000, 3000)
+    test.assert(shift >= 0 and shift < 30)
+    var p = ll_pdu.pdu_new()
+    for k in 0..18
+        let _x = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    let planned = si_offset_us(var p, 0)
+    // 100000 is 1000 before the AUX_ADV_IND: the event at 100000 is too early, the next is at 120000.
+    test.assert_eq(si_counter(var p, 0), (t.counter + 1) & 0xFFFF)
+    test.assert_eq(120000 - (101000 + shift), planned + SYNC_PHASE_US)
+    test.assert_eq(planned % 30, 0)
+
+@test
+fn test_the_channels_follow_the_counter_and_the_map()
+    var t = t_train(0, 0)
+    padv_start(var t, 0x1FFFFFFFFF, 0)
+    var seen = 0
+    var last = -1
+    for k in 0..40
+        let ch = padv_channel(var t, k)
+        test.assert(ch >= 0 and ch <= 36)
+        if ch != last
+            seen = seen + 1
+        last = ch
+    test.assert(seen > 20)
+    // Only the used channels: the map names channels 3 and 20.
+    var u = t_train(0, 0)
+    padv_start(var u, (1 << 3) | (1 << 20), 0)
+    for k in 0..30
+        let ch = padv_channel(var u, k)
+        test.assert(ch == 3 or ch == 20)
+        let ch2 = chain_channel(var u)
+        test.assert(ch2 == 3 or ch2 == 20)
+    test.assert(ll_init.aa_valid(u.aa))
+
+@test
+fn test_an_event_advances_the_due_time_and_the_counter()
+    var t = t_train(0, 0)
+    t_interval(var t, 100)
+    padv_start(var t, ll_init.CHMAP_ALL, 5000)
+    t_counter(var t, 0xFFFF)
+    padv_advance(var t)
+    test.assert_eq(t.due, 5000 + 125000)
+    test.assert_eq(t.counter, 0)
+    test.assert_eq(intervals_to(var t, 5000), 0)
+    test.assert_eq(intervals_to(var t, 130000), 0)
+    test.assert_eq(intervals_to(var t, 130001), 1)
+    test.assert_eq(intervals_to(var t, 255001), 2)
+
+@test
+fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
+    var t = t_train(ll_xadv.P_TXP, 251)
+    t_interval(var t, 100)
+    padv_start(var t, ll_init.CHMAP_ALL, 0)
+    test.assert_eq(event_pdus(var t), 2)
+    var p = ll_pdu.pdu_new()
+    build_sync_ind(var t, var p, 0, 229, true, 13, 3000, ll_phy.PHY_1M, -4)
+    let x = ll_ext.ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.mode, 0)
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(x.adi, -1)
+    test.assert_eq(x.sync, -1)
+    test.assert_eq(p.n, sync_octets(var t, 229, true))
+    test.assert_eq(ll_ext.tx_power(var p, x), 0xFC)
+    test.assert_eq(ll_init.aux_channel(var p, x.aux), 13)
+    test.assert_eq(ll_init.aux_offset_us(var p, x.aux), 3000)
+    test.assert_eq(x.data_len, 229)
+    var q = ll_pdu.pdu_new()
+    build_sync_chain(var t, var q, 229, 22, false, 0, 0, ll_phy.PHY_1M)
+    let y = ll_ext.ext_parse(var q)
+    test.assert(y.ok)
+    test.assert_eq(y.aux, -1)
+    test.assert_eq(y.data_len, 22)
+    test.assert_eq(q.n, chain_octets(22, false))
+    test.assert_eq(q.b[y.data_at] as Int, 229)
+    // No data at all is a PDU of the header alone.
+    var e = t_train(0, 0)
+    var r = ll_pdu.pdu_new()
+    build_sync_ind(var e, var r, 0, 0, false, 0, 0, ll_phy.PHY_1M, 0)
+    test.assert_eq(r.n, sync_octets(var e, 0, false))
+    test.assert_eq(ll_ext.ext_parse(var r).data_len, 0)
+
+@test
+fn test_the_periodic_advertiser_list_adds_finds_and_removes()
+    var l = pal_new()
+    var a = ll_pdu.test_addr(0x10)
+    var b = ll_pdu.test_addr(0x20)
+    test.assert_eq(pal_add(var l, 1, var a, 3), OK)
+    test.assert_eq(pal_add(var l, 1, var a, 3), E_INVALID)
+    test.assert_eq(pal_add(var l, 1, var a, 4), OK)
+    test.assert_eq(pal_add(var l, 0, var b, 3), OK)
+    test.assert_eq(pal_add(var l, 0, var b, 16), E_INVALID)
+    test.assert_eq(pal_add(var l, 2, var b, 3), E_INVALID)
+    test.assert_eq(pal_count(var l), 3)
+    test.assert(pal_find(var l, 1, var a, 3) >= 0)
+    // The type is the low bit: an identity address of the type 3 is a random one.
+    test.assert(pal_find(var l, 3, var a, 3) >= 0)
+    test.assert(pal_find(var l, 0, var a, 3) < 0)
+    test.assert_eq(pal_add(var l, 1, var b, 7), OK)
+    test.assert_eq(pal_add(var l, 1, var b, 8), E_MEMORY)
+    test.assert_eq(pal_remove(var l, 1, var b, 8), E_UNKNOWN)
+    test.assert_eq(pal_remove(var l, 1, var a, 3), OK)
+    test.assert(pal_find(var l, 1, var a, 3) < 0)
+    pal_clear(var l)
+    test.assert_eq(pal_count(var l), 0)
+
+@test
+fn test_a_request_accepts_the_train_it_names_or_the_list()
+    var q = preq_new()
+    var a = ll_pdu.test_addr(0x30)
+    var other = ll_pdu.test_addr(0x40)
+    var l = pal_new()
+    test.assert(not preq_accepts(var q, var l, 1, var a, 2))
+    t_req(var q, 2, 1, false, var a)
+    test.assert(preq_accepts(var q, var l, 1, var a, 2))
+    test.assert(preq_accepts(var q, var l, 3, var a, 2))
+    test.assert(not preq_accepts(var q, var l, 0, var a, 2))
+    test.assert(not preq_accepts(var q, var l, 1, var a, 3))
+    test.assert(not preq_accepts(var q, var l, 1, var other, 2))
+    t_req_list(var q, true)
+    test.assert(not preq_accepts(var q, var l, 1, var a, 2))
+    test.assert_eq(pal_add(var l, 1, var other, 5), OK)
+    test.assert(preq_accepts(var q, var l, 1, var other, 5))
+    test.assert(not preq_accepts(var q, var l, 1, var a, 2))
+
+@tier(app)
+fn t_syncinfo_pdu(offset: Int, interval: Int) -> Pdu
+    var si: Vec[u8; 18] = Vec.new()
+    for _ in 0..18
+        let _a = si.push(0)
+    var t = t_train(0, 0)
+    padv_start(var t, ll_init.CHMAP_ALL, 0)
+    syncinfo_put(var si, offset, interval, 0x1FFFFFFFFF, 3, t.aa, 0x123456, 0x0102)
+    var p = ll_pdu.pdu_new()
+    for k in 0..18
+        let _x = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    p
+
+@tier(app)
+fn t_psync(var rx: Pdu, t_first: Int) -> PerSync
+    var s = psync_new()
+    var a = ll_pdu.test_addr(0x50)
+    psync_begin(s, 1, rx, 0, 1, a, 6, ll_phy.PHY_1M, t_first, 100, true)
+    s
+
+@test
+fn test_a_synchronization_takes_the_train_of_a_syncinfo()
+    var p = t_syncinfo_pdu(9990, 80)
+    test.assert(si_usable(var p, 0))
+    let s = t_psync(var p, 50000)
+    test.assert_eq(s.state, PS_SYNCING)
+    test.assert_eq(s.due, 50000 + 9990)
+    test.assert_eq(s.win, 30)
+    test.assert_eq(s.counter, 0x0102)
+    test.assert_eq(s.interval, 80)
+    test.assert_eq(s.sca, 3)
+    test.assert_eq(s.sca_ppm, 100)
+    test.assert_eq(s.timeout, 1000000)
+    test.assert_eq(s.n_used, 37)
+    // An incomplete SyncInfo (no offset), an interval under 7.5 ms and a map of one channel are not used.
+    var none = t_syncinfo_pdu(0, 80)
+    test.assert(not si_usable(var none, 0))
+    var fast = t_syncinfo_pdu(9990, 5)
+    test.assert(not si_usable(var fast, 0))
+
+@test
+fn test_the_first_packet_establishes_and_the_clock_follows_the_last_packet()
+    var p = t_syncinfo_pdu(9990, 80)
+    var s = t_psync(var p, 50000)
+    psync_heard(var s, 60005)
+    test.assert_eq(s.state, PS_SYNCED)
+    test.assert_eq(s.owed, EV_ESTABLISHED)
+    test.assert_eq(s.status, OK)
+    test.assert_eq(s.due, 60005 + 100000)
+    test.assert_eq(s.counter, 0x0103)
+    test.assert_eq(s.cx_counter, 0x0102)
+    test.assert_eq(s.win, 0)
+    test.assert_eq(s.t_ref, 60005)
+    // The window of the next event is the widening alone: the clocks over an interval, and the jitter.
+    test.assert_eq(psync_widen(var s), (100 + 50) * 100000 / 1000000 + 32)
+    // The channel follows the counter of the event it is for.
+    let ch = psync_channel(var s)
+    test.assert(ch >= 0 and ch <= 36)
+    t_owed(var s, EV_NONE)
+    // Eight events without a packet leave it synchronized, the ninth is the Sync_Timeout (1 s since the last packet).
+    for _ in 0..8
+        test.assert(psync_missed(var s))
+    test.assert_eq(s.state, PS_SYNCED)
+    test.assert_eq(psync_widen(var s), (100 + 50) * 900000 / 1000000 + 32)
+    test.assert(not psync_missed(var s))
+    test.assert_eq(s.state, PS_FREE)
+    test.assert_eq(s.owed, EV_LOST)
+
+@test
+fn test_missed_events_end_a_synchronization_by_the_count_or_the_timeout()
+    var p = t_syncinfo_pdu(9990, 80)
+    var s = t_psync(var p, 50000)
+    // Five events pass without a packet, the sixth ends it with Synchronization Timeout.
+    for _ in 0..5
+        test.assert(psync_missed(var s))
+    test.assert(not psync_missed(var s))
+    test.assert_eq(s.state, PS_FREE)
+    test.assert_eq(s.owed, EV_ESTABLISHED)
+    test.assert_eq(s.status, E_SYNC_TIMEOUT)
+    test.assert(psync_busy(var s))
+    psync_clear(var s)
+    test.assert(not psync_busy(var s))
+
+@tier(app)
+fn t_past(var s: PerSync, pre: Int)
+    s.past = true
+    s.pre = pre
+
+@test
+fn test_a_slot_of_a_transfer_widens_its_first_window_by_the_drift_it_came_with_until_a_packet_comes()
+    var p = t_syncinfo_pdu(9990, 80)
+    var s = t_psync(var p, 50000)
+    test.assert(not s.past)
+    test.assert_eq(s.pre, 0)
+    let plain = psync_widen(var s)
+    t_past(var s, 40)
+    // The widening is the advertiser's accuracy and this device's over the time since the reference packet, the jitter, and (in a build with the
+    // transfer) the drift the three clocks of the transfer brought.
+    if ctl_limits.past_on()
+        test.assert_eq(psync_widen(var s), plain + 40)
+    else
+        test.assert_eq(psync_widen(var s), plain)
+    // The first packet heard makes the slot an ordinary one.
+    psync_heard(var s, 60005)
+    test.assert_eq(s.pre, 0)
+    test.assert_eq(psync_widen(var s), (100 + 50) * 100000 / 1000000 + 32)
+
+@test
+fn test_the_train_keeps_the_counter_and_the_start_of_the_last_event_it_sent()
+    var t = t_train(0, 3)
+    t_interval(var t, 16)
+    padv_start(var t, ll_init.CHMAP_ALL, 5000)
+    t_counter(var t, 0xFFFF)
+    test.assert(not t.sent)
+    padv_note_sent(var t)
+    test.assert(t.sent)
+    test.assert_eq(t.last_ctr, 0xFFFF)
+    test.assert_eq(t.last_at, 5000)
+    padv_advance(var t)
+    // The next event is another; the last one sent stays until it is sent.
+    test.assert_eq(t.counter, 0)
+    test.assert_eq(t.last_ctr, 0xFFFF)
+    // A train that starts again has sent nothing.
+    padv_start(var t, ll_init.CHMAP_ALL, 9000)
+    test.assert(not t.sent)
+
+@test
+fn test_a_train_with_responses_advances_a_subevent_at_a_time_and_a_syncinfo_names_the_next_event()
+    if not ctl_limits.pawr_adv_on()
+        return
+    var t = t_train(0, 0)
+    padv_define_pawr(var t, 3, 15000)
+    t_interval(var t, 100)
+    padv_start(var t, ll_init.CHMAP_ALL, 1000000)
+    t_counter(var t, 50)
+    test.assert_eq(t.sub, 0)
+    test.assert_eq(t.due, 1000000)
+    test.assert_eq(ev_due(var t), 1000000)
+    test.assert_eq(ev_ctr(var t), 50)
+    // The second subevent is 15 ms on in the same event; the next event to name is the one after.
+    padv_advance(var t)
+    test.assert_eq(t.sub, 1)
+    test.assert_eq(t.due, 1015000)
+    test.assert_eq(t.counter, 50)
+    test.assert_eq(ev_due(var t), 1125000)
+    test.assert_eq(ev_ctr(var t), 51)
+    padv_advance(var t)
+    test.assert_eq(t.due, 1030000)
+    padv_advance(var t)
+    test.assert_eq(t.sub, 0)
+    test.assert_eq(t.due, 1125000)
+    test.assert_eq(t.counter, 51)
+    // The interval of such a train is the shortest the Host allows.
+    t_range(var t, 100, 200)
+    test.assert_eq(pick_interval(t, ll_phy.PHY_1M), 100)
+    // padv_define forgets the subevents.
+    padv_define(var t, 4, 0, 16, 40)
+    test.assert(not t.pawr)
