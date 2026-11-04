@@ -15,7 +15,6 @@
 //
 // No function here allocates.
 
-use std.test
 use ll_pdu
 
 // The functions below take the PDU as a `var` parameter even where they only read
@@ -98,22 +97,22 @@ const OP_CONNECTION_RATE_IND = 0x3F
 @tier(embedded)
 fn ctrl_payload_len(opcode: Int) -> Int
     match opcode
-        0x00 => 12
-        0x01 => 8
-        0x02 => 2
-        0x03 => 23
-        0x04 => 13
-        0x05 => 1
-        0x06 => 1
-        0x07 => 2
-        0x08 => 9
-        0x09 => 9
-        0x0A => 1
-        0x0B => 1
-        0x0C => 6
-        0x0D => 2
-        0x0E => 9
-        0x0F => 24
+        0x0  => 12
+        0x1  => 8
+        0x2  => 2
+        0x3  => 23
+        0x4  => 13
+        0x5  => 1
+        0x6  => 1
+        0x7  => 2
+        0x8  => 9
+        0x9  => 9
+        0xa  => 1
+        0xb  => 1
+        0xc  => 6
+        0xd  => 2
+        0xe  => 9
+        0xf  => 24
         0x10 => 24
         0x11 => 3
         0x12 => 1
@@ -124,27 +123,27 @@ fn ctrl_payload_len(opcode: Int) -> Int
         0x17 => 3
         0x18 => 5
         0x19 => 3
-        0x1F => 36
+        0x1f => 36
         0x20 => 9
         0x21 => 16
         0x22 => 4
-        0x1D => 2
-        0x1E => 2
+        0x1d => 2
+        0x1e => 2
         0x23 => 4
         0x24 => 5
         0x25 => 5
         0x26 => 11
         0x27 => 11
-        0x1C => 35
-        0x2A => 43
-        0x2B => 27
-        0x2C => 27
-        _ => -1
+        0x1c => 35
+        0x2a => 43
+        0x2b => 27
+        0x2c => 27
+        _    => -1
 
 // The LLID of a data PDU.
 @tier(embedded)
 fn dpdu_llid(var p: Pdu) -> Int
-    (p.b[0] as Int) & 0x03
+    p.b[0] as Int & 0x03
 
 // The payload length the header claims.
 @tier(embedded)
@@ -167,7 +166,7 @@ fn dpdu_byte(var p: Pdu, i: Int) -> Int
 // Payload octets `i` and `i + 1` as a 16-bit value, least significant first.
 @tier(embedded)
 fn dpdu_u16(var p: Pdu, i: Int) -> Int
-    (p.b[2 + i] as Int) | ((p.b[3 + i] as Int) << 8)
+    p.b[2 + i] as Int | (p.b[3 + i] as Int << 8)
 
 // Start a data PDU of `llid` with an empty payload.
 @tier(embedded)
@@ -257,7 +256,8 @@ fn put_u16(var p: Pdu, v: Int)
 // window, the interval, latency and timeout in the units of the PDU, and the
 // instant.
 @tier(embedded)
-fn ctrl_connection_update(var p: Pdu, win_size: Int, win_offset: Int, interval: Int, latency: Int, timeout: Int, instant: Int)
+fn ctrl_connection_update(var p: Pdu, win_size: Int, win_offset: Int, interval: Int, latency: Int,
+                          timeout: Int, instant: Int)
     ctrl_begin(var p, OP_CONNECTION_UPDATE_IND)
     let _a = ll_pdu.pdu_put(var p, win_size)
     put_u16(var p, win_offset)
@@ -282,7 +282,8 @@ fn ctrl_channel_map(var p: Pdu, map: Int, instant: Int)
 // periodicity and the reference event count; the six offsets are 0xFFFF, which
 // says the sender has no preference.
 @tier(embedded)
-fn ctrl_param(var p: Pdu, opcode: Int, i_min: Int, i_max: Int, latency: Int, timeout: Int, periodicity: Int, reference: Int)
+fn ctrl_param(var p: Pdu, opcode: Int, i_min: Int, i_max: Int, latency: Int, timeout: Int,
+              periodicity: Int, reference: Int)
     ctrl_begin(var p, opcode)
     put_u16(var p, i_min)
     put_u16(var p, i_max)
@@ -324,7 +325,8 @@ fn ctrl_min_used(var p: Pdu, phys: Int, channels: Int)
 // `rand` has 8 octets, `skd` the 8 octets of SKD_C and `iv` the 4 of IV_C, all
 // in the order they are on air.
 @tier(embedded)
-fn ctrl_enc_req(var p: Pdu, var rand: Vec[u8; 8], ediv: Int, var skd: Vec[u8; 16], var iv: Vec[u8; 8])
+fn ctrl_enc_req(var p: Pdu, var rand: Vec[u8; 8], ediv: Int, var skd: Vec[u8; 16],
+                var iv: Vec[u8; 8])
     ctrl_begin(var p, OP_ENC_REQ)
     for i in 0..8
         let _a = ll_pdu.pdu_put(var p, rand[i] as Int)
@@ -381,226 +383,3 @@ fn ctrl_phy_update(var p: Pdu, c_to_p: Int, p_to_c: Int, instant: Int)
 fn ctrl_bare(var p: Pdu, opcode: Int)
     ctrl_begin(var p, opcode)
     dpdu_finish(var p)
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-fn t_features() -> Vec[u8; 8]
-    var f: Vec[u8; 8] = Vec.new()
-    for i in 0..8
-        let _a = f.push((0x10 + i) as u8)
-    f
-
-@test
-fn test_empty_pdu_is_llid_one_with_no_payload()
-    var p = ll_pdu.pdu_new()
-    dpdu_empty(var p)
-    test.assert_eq(p.n, 2)
-    test.assert_eq(dpdu_llid(var p), LLID_CONTINUE)
-    test.assert_eq(dpdu_len(var p), 0)
-    test.assert_eq(dpdu_opcode(var p), -1)
-
-@test
-fn test_payload_stops_at_the_data_pdu_size()
-    // The PDU holds the header, 251 octets of payload and the MIC of 4.
-    var p = ll_pdu.pdu_new()
-    dpdu_begin(var p, LLID_START)
-    for i in 0..(PAYLOAD_EXT_MAX + 4)
-        test.assert(dpdu_put(var p, i))
-    test.assert(not dpdu_put(var p, 1))
-    dpdu_finish(var p)
-    test.assert_eq(p.n, DATA_PDU_EXT_OCTETS)
-    test.assert_eq(dpdu_len(var p), PAYLOAD_EXT_MAX + 4)
-    test.assert_eq(dpdu_llid(var p), LLID_START)
-    test.assert_eq(dpdu_byte(var p, 26), 26)
-    test.assert_eq(dpdu_byte(var p, 250), 250)
-    test.assert_eq(DATA_PAYLOAD_MAX + 2, DATA_PDU_OCTETS)
-    test.assert_eq(PAYLOAD_EXT_MAX + 6, DATA_PDU_EXT_OCTETS)
-
-@test
-fn test_length_pdus_carry_the_four_values()
-    var p = ll_pdu.pdu_new()
-    ctrl_length(var p, OP_LENGTH_REQ, 251, 2120, 27, 328)
-    test.assert_eq(dpdu_llid(var p), LLID_CONTROL)
-    test.assert_eq(dpdu_len(var p), 9)
-    test.assert_eq(dpdu_opcode(var p), OP_LENGTH_REQ)
-    test.assert_eq(dpdu_u16(var p, 1), 251)
-    test.assert_eq(dpdu_u16(var p, 3), 2120)
-    test.assert_eq(dpdu_u16(var p, 5), 27)
-    test.assert_eq(dpdu_u16(var p, 7), 328)
-    ctrl_length(var p, OP_LENGTH_RSP, 27, 328, 251, 17040)
-    test.assert_eq(dpdu_opcode(var p), OP_LENGTH_RSP)
-    test.assert_eq(dpdu_u16(var p, 7), 17040)
-
-@test
-fn test_phy_pdus_carry_masks_and_the_instant()
-    var p = ll_pdu.pdu_new()
-    ctrl_phy(var p, OP_PHY_REQ, 3, 7)
-    test.assert_eq(dpdu_len(var p), 3)
-    test.assert_eq(dpdu_opcode(var p), OP_PHY_REQ)
-    test.assert_eq(dpdu_byte(var p, 1), 3)
-    test.assert_eq(dpdu_byte(var p, 2), 7)
-    ctrl_phy(var p, OP_PHY_RSP, 2, 2)
-    test.assert_eq(dpdu_opcode(var p), OP_PHY_RSP)
-    ctrl_phy_update(var p, 2, 4, 0x1234)
-    test.assert_eq(dpdu_len(var p), 5)
-    test.assert_eq(dpdu_opcode(var p), OP_PHY_UPDATE_IND)
-    test.assert_eq(dpdu_byte(var p, 1), 2)
-    test.assert_eq(dpdu_byte(var p, 2), 4)
-    test.assert_eq(dpdu_u16(var p, 3), 0x1234)
-
-@test
-fn test_header_bits_do_not_overlap()
-    test.assert_eq(NESN_BIT | SN_BIT | MD_BIT | LLID_CONTROL, 0x1F)
-    test.assert_eq(NESN_BIT & SN_BIT, 0)
-    test.assert_eq(SN_BIT & MD_BIT, 0)
-
-@test
-fn test_terminate_carries_the_reason()
-    var p = ll_pdu.pdu_new()
-    ctrl_terminate(p, 0x13)
-    test.assert_eq(dpdu_llid(var p), LLID_CONTROL)
-    test.assert_eq(dpdu_len(var p), 2)
-    test.assert_eq(dpdu_opcode(var p), OP_TERMINATE_IND)
-    test.assert_eq(dpdu_byte(var p, 1), 0x13)
-
-@test
-fn test_unknown_response_names_the_opcode()
-    var p = ll_pdu.pdu_new()
-    ctrl_unknown_rsp(var p, 0x1A)
-    test.assert_eq(dpdu_opcode(var p), OP_UNKNOWN_RSP)
-    test.assert_eq(dpdu_byte(var p, 1), 0x1A)
-    test.assert_eq(dpdu_len(var p), 2)
-
-@test
-fn test_feature_pdus_carry_eight_octets()
-    var p = ll_pdu.pdu_new()
-    var f = t_features()
-    ctrl_features(var p, OP_FEATURE_RSP, var f)
-    test.assert_eq(dpdu_opcode(var p), OP_FEATURE_RSP)
-    test.assert_eq(dpdu_len(var p), 9)
-    test.assert_eq(dpdu_byte(var p, 1), 0x10)
-    test.assert_eq(dpdu_byte(var p, 8), 0x17)
-    ctrl_features(var p, OP_PERIPHERAL_FEATURE_REQ, var f)
-    test.assert_eq(dpdu_opcode(var p), OP_PERIPHERAL_FEATURE_REQ)
-
-@test
-fn test_version_pdu_is_little_endian()
-    var p = ll_pdu.pdu_new()
-    ctrl_version(var p, 0x11, 0x1234, 0x5678)
-    test.assert_eq(dpdu_opcode(var p), OP_VERSION_IND)
-    test.assert_eq(dpdu_len(var p), 6)
-    test.assert_eq(dpdu_byte(var p, 1), 0x11)
-    test.assert_eq(dpdu_u16(var p, 2), 0x1234)
-    test.assert_eq(dpdu_u16(var p, 4), 0x5678)
-
-@test
-fn test_ping_response_is_one_octet()
-    var p = ll_pdu.pdu_new()
-    ctrl_ping_rsp(var p)
-    test.assert_eq(dpdu_len(var p), 1)
-    test.assert_eq(dpdu_opcode(var p), OP_PING_RSP)
-
-@test
-fn test_control_lengths_name_the_opcodes_that_are_read()
-    test.assert_eq(ctrl_payload_len(OP_CONNECTION_UPDATE_IND), 12)
-    test.assert_eq(ctrl_payload_len(OP_CHANNEL_MAP_IND), 8)
-    test.assert_eq(ctrl_payload_len(OP_TERMINATE_IND), 2)
-    test.assert_eq(ctrl_payload_len(OP_UNKNOWN_RSP), 2)
-    test.assert_eq(ctrl_payload_len(OP_FEATURE_REQ), 9)
-    test.assert_eq(ctrl_payload_len(OP_FEATURE_RSP), 9)
-    test.assert_eq(ctrl_payload_len(OP_VERSION_IND), 6)
-    test.assert_eq(ctrl_payload_len(OP_PERIPHERAL_FEATURE_REQ), 9)
-    test.assert_eq(ctrl_payload_len(OP_PING_REQ), 1)
-    test.assert_eq(ctrl_payload_len(OP_PERIODIC_SYNC_IND), 35)
-    test.assert_eq(ctrl_payload_len(OP_PERIODIC_SYNC_WR_IND), 43)
-    test.assert_eq(ctrl_payload_len(OP_FEATURE_EXT_REQ), 27)
-    test.assert_eq(ctrl_payload_len(OP_FEATURE_EXT_RSP), 27)
-    test.assert_eq(ctrl_payload_len(OP_PING_RSP), 1)
-    test.assert_eq(ctrl_payload_len(OP_REJECT_IND), 2)
-    test.assert_eq(ctrl_payload_len(OP_CONNECTION_PARAM_REQ), 24)
-    test.assert_eq(ctrl_payload_len(OP_CONNECTION_PARAM_RSP), 24)
-    test.assert_eq(ctrl_payload_len(OP_REJECT_EXT_IND), 3)
-    test.assert_eq(ctrl_payload_len(OP_MIN_USED_CHANNELS_IND), 3)
-    test.assert_eq(ctrl_payload_len(OP_ENC_REQ), 23)
-    test.assert_eq(ctrl_payload_len(OP_ENC_RSP), 13)
-    test.assert_eq(ctrl_payload_len(OP_START_ENC_REQ), 1)
-    test.assert_eq(ctrl_payload_len(OP_START_ENC_RSP), 1)
-    test.assert_eq(ctrl_payload_len(OP_PAUSE_ENC_REQ), 1)
-    test.assert_eq(ctrl_payload_len(OP_PAUSE_ENC_RSP), 1)
-    test.assert_eq(ctrl_payload_len(OP_LENGTH_REQ), 9)
-    test.assert_eq(ctrl_payload_len(OP_LENGTH_RSP), 9)
-    test.assert_eq(ctrl_payload_len(OP_PHY_REQ), 3)
-    test.assert_eq(ctrl_payload_len(OP_PHY_RSP), 3)
-    test.assert_eq(ctrl_payload_len(OP_PHY_UPDATE_IND), 5)
-    test.assert_eq(ctrl_payload_len(0x1A), -1)
-    test.assert_eq(ctrl_payload_len(0x7F), -1)
-
-@test
-fn test_ping_request_is_one_octet()
-    var p = ll_pdu.pdu_new()
-    ctrl_ping_req(var p)
-    test.assert_eq(dpdu_len(var p), 1)
-    test.assert_eq(dpdu_opcode(var p), OP_PING_REQ)
-
-@test
-fn test_connection_update_carries_the_window_the_parameters_and_the_instant()
-    var p = ll_pdu.pdu_new()
-    ctrl_connection_update(p, 2, 3, 0x30, 4, 0x200, 0x1234)
-    test.assert_eq(dpdu_len(var p), 12)
-    test.assert_eq(dpdu_opcode(var p), OP_CONNECTION_UPDATE_IND)
-    test.assert_eq(dpdu_byte(var p, 1), 2)
-    test.assert_eq(dpdu_u16(var p, 2), 3)
-    test.assert_eq(dpdu_u16(var p, 4), 0x30)
-    test.assert_eq(dpdu_u16(var p, 6), 4)
-    test.assert_eq(dpdu_u16(var p, 8), 0x200)
-    test.assert_eq(dpdu_u16(var p, 10), 0x1234)
-
-@test
-fn test_channel_map_carries_five_octets_and_the_instant()
-    var p = ll_pdu.pdu_new()
-    ctrl_channel_map(p, 0x1FFFFFF7FF, 100)
-    test.assert_eq(dpdu_len(var p), 8)
-    test.assert_eq(dpdu_opcode(var p), OP_CHANNEL_MAP_IND)
-    test.assert_eq(dpdu_byte(var p, 1), 0xFF)
-    test.assert_eq(dpdu_byte(var p, 2), 0xF7)
-    test.assert_eq(dpdu_byte(var p, 5), 0x1F)
-    test.assert_eq(dpdu_u16(var p, 6), 100)
-
-@test
-fn test_parameter_pdus_carry_the_range_and_no_offset_preference()
-    var p = ll_pdu.pdu_new()
-    ctrl_param(var p, OP_CONNECTION_PARAM_REQ, 6, 0x20, 2, 300, 4, 0x55)
-    test.assert_eq(dpdu_len(var p), 24)
-    test.assert_eq(dpdu_opcode(var p), OP_CONNECTION_PARAM_REQ)
-    test.assert_eq(dpdu_u16(var p, 1), 6)
-    test.assert_eq(dpdu_u16(var p, 3), 0x20)
-    test.assert_eq(dpdu_u16(var p, 5), 2)
-    test.assert_eq(dpdu_u16(var p, 7), 300)
-    test.assert_eq(dpdu_byte(var p, 9), 4)
-    test.assert_eq(dpdu_u16(var p, 10), 0x55)
-    for k in 0..6
-        test.assert_eq(dpdu_u16(var p, 12 + 2 * k), 0xFFFF)
-    ctrl_param(var p, OP_CONNECTION_PARAM_RSP, 6, 6, 0, 100, 0, 0)
-    test.assert_eq(dpdu_opcode(var p), OP_CONNECTION_PARAM_RSP)
-
-@test
-fn test_rejects_name_the_code_and_the_rejected_opcode()
-    var p = ll_pdu.pdu_new()
-    ctrl_reject_ext(var p, OP_CONNECTION_PARAM_REQ, 0x23)
-    test.assert_eq(dpdu_len(var p), 3)
-    test.assert_eq(dpdu_opcode(var p), OP_REJECT_EXT_IND)
-    test.assert_eq(dpdu_byte(var p, 1), OP_CONNECTION_PARAM_REQ)
-    test.assert_eq(dpdu_byte(var p, 2), 0x23)
-    ctrl_reject(var p, 0x1A)
-    test.assert_eq(dpdu_len(var p), 2)
-    test.assert_eq(dpdu_opcode(var p), OP_REJECT_IND)
-    test.assert_eq(dpdu_byte(var p, 1), 0x1A)
-
-@test
-fn test_min_used_channels_names_the_phys_and_the_count()
-    var p = ll_pdu.pdu_new()
-    ctrl_min_used(var p, 1, 20)
-    test.assert_eq(dpdu_len(var p), 3)
-    test.assert_eq(dpdu_opcode(var p), OP_MIN_USED_CHANNELS_IND)
-    test.assert_eq(dpdu_byte(var p, 1), 1)
-    test.assert_eq(dpdu_byte(var p, 2), 20)

@@ -1,0 +1,459 @@
+// tests/ll_per_tests.nv — the unit tests of src/ll_per.nv.
+//
+//   novo test tests/ll_per_tests.nv
+
+use std.test
+use ctl_limits
+use ll_pdu
+use ll_phy
+use ll_init
+use ll_ext
+use ll_xadv
+use ll_per.{ EV_ESTABLISHED, EV_LOST, EV_NONE, E_DISALLOWED, E_INVALID, E_MEMORY, E_SYNC_TIMEOUT, E_UNKNOWN, OK, OP_COMPLETE, OP_UNCHANGED, PS_FREE, PS_SYNCED, PS_SYNCING, PerAdv, PerReq, PerSync, SYNC_PHASE_US, build_sync_chain, build_sync_ind, chain_channel, chain_octets, ev_ctr, ev_due, event_pdus, event_us, intervals_to, padv_advance, padv_channel, padv_define, padv_define_pawr, padv_new, padv_note_sent, padv_params_status, padv_seed, padv_start, pal_add, pal_clear, pal_count, pal_find, pal_new, pal_remove, pdata_begin, pdata_end, pdata_put, pdata_status, pick_interval, plan_syncinfo, preq_accepts, preq_new, psync_begin, psync_busy, psync_channel, psync_clear, psync_heard, psync_missed, psync_new, psync_widen, si_aa, si_chmap, si_counter, si_crc, si_interval, si_offset_us, si_sca, si_unit_us, si_usable, sync_octets, syncinfo_put }
+
+@tier(app)
+fn t_train(props: Int, dlen: Int) -> PerAdv
+    var t = padv_new()
+    padv_define(var t, 4, props, 16, 40)
+    padv_seed(var t, 11)
+    for i in 0..dlen
+        pdata_put(var t, i)
+    pdata_end(var t, OP_COMPLETE)
+    t
+
+@tier(app)
+fn t_ext_parse(var p: Pdu) -> ll_ext.ExtView
+    ll_ext.ext_parse(var p)
+
+@tier(app)
+fn t_dhave(var t: PerAdv, v: Bool)
+    t.dhave = v
+
+@tier(app)
+fn t_on(var t: PerAdv, v: Bool)
+    t.on = v
+
+@tier(app)
+fn t_range(var t: PerAdv, lo: Int, hi: Int)
+    t.int_min = lo
+    t.int_max = hi
+
+@tier(app)
+fn t_interval(var t: PerAdv, v: Int)
+    t.interval = v
+
+@tier(app)
+fn t_counter(var t: PerAdv, v: Int)
+    t.counter = v
+
+@tier(app)
+fn t_req(var q: PerReq, sid: Int, kind: Int, use_list: Bool, var a: Vec[u8; 6])
+    q.pending = true
+    q.sid = sid
+    q.kind = kind
+    q.use_list = use_list
+    for k in 0..6
+        q.addr[k] = a[k]
+
+@tier(app)
+fn t_req_list(var q: PerReq, use_list: Bool)
+    q.use_list = use_list
+
+@tier(app)
+fn t_owed(var s: PerSync, v: Int)
+    s.owed = v
+
+@test
+fn test_capacities_match_the_constants()
+    let t = padv_new()
+    test.assert_eq(t.data.capacity(), ctl_limits.data_max())
+    let l = pal_new()
+    test.assert_eq(l.used.capacity(), ctl_limits.pal_n())
+    test.assert_eq(l.kind.capacity(), ctl_limits.pal_n())
+    test.assert_eq(l.sid.capacity(), ctl_limits.pal_n())
+    test.assert_eq(l.addr.capacity(), ctl_limits.pal_n() * 6)
+
+@test
+fn test_the_parameters_are_checked_against_the_set_and_the_interval()
+    test.assert_eq(padv_params_status(0, 6, 6), OK)
+    test.assert_eq(padv_params_status(ll_xadv.P_TXP, 16, 40), OK)
+    test.assert_eq(padv_params_status(0, 5, 20), E_INVALID)
+    test.assert_eq(padv_params_status(0, 30, 20), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_CONN, 16, 40), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_SCAN, 16, 40), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_LEGACY, 16, 40), E_INVALID)
+    test.assert_eq(padv_params_status(ll_xadv.P_ANON, 16, 40), E_INVALID)
+
+@test
+fn test_the_data_commands_follow_the_operations()
+    var t = t_train(0, 0)
+    t_dhave(var t, false)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 0), OK)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 252), E_MEMORY)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 253), E_INVALID)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 0), E_INVALID)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 100), OK)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_MIDDLE, 10), E_DISALLOWED)
+    test.assert_eq(pdata_status(var t, 5, 10), E_INVALID)
+    // Unchanged data needs an enabled train that has data and no octets.
+    test.assert_eq(pdata_status(var t, OP_UNCHANGED, 0), E_INVALID)
+    pdata_begin(var t, ll_xadv.OP_FIRST)
+    for i in 0..100
+        pdata_put(var t, i)
+    pdata_end(var t, ll_xadv.OP_FIRST)
+    test.assert(t.dasm)
+    test.assert(not t.dhave)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 152), E_MEMORY)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 151), OK)
+    pdata_begin(var t, ll_xadv.OP_LAST)
+    for i in 0..50
+        pdata_put(var t, i)
+    pdata_end(var t, ll_xadv.OP_LAST)
+    test.assert(t.dhave)
+    test.assert(not t.dasm)
+    test.assert_eq(t.dlen, 150)
+    // Enabled, only a complete data or an unchanged one may be given.
+    t_on(var t, true)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 10), E_DISALLOWED)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 10), OK)
+    test.assert_eq(pdata_status(var t, OP_UNCHANGED, 0), OK)
+    test.assert_eq(pdata_status(var t, OP_UNCHANGED, 1), E_INVALID)
+
+@test
+fn test_the_interval_is_the_shortest_that_holds_an_event()
+    var t = t_train(0, 20)
+    test.assert_eq(event_pdus(var t), 1)
+    test.assert_eq(sync_octets(var t, 20, false), 2 + 1 + 1 + 20)
+    test.assert(event_us(var t, ll_phy.PHY_1M) > 200)
+    test.assert_eq(pick_interval(var t, ll_phy.PHY_1M), 16)
+    // A range that ends before an event fits is refused.
+    var big = t_train(0, 251)
+    t_range(var big, 6, 6)
+    test.assert_eq(event_pdus(var big), 2)
+    test.assert_eq(pick_interval(var big, ll_phy.PHY_1M), 6)
+    test.assert_eq(pick_interval(var big, ll_phy.PHY_CODED), -1)
+    t_range(var big, 6, 0xFFFF)
+    test.assert(pick_interval(var big, ll_phy.PHY_CODED) > 6)
+
+@test
+fn test_syncinfo_holds_the_fields_of_the_train()
+    var si: Vec[u8; 18] = Vec.new()
+    for _ in 0..18
+        let _a = si.push(0)
+    syncinfo_put(var si, 9990, 0x0140, 0x1FFFFFFFFF, 5, 0x8E89BED7, 0xA1B2C3, 0xBEEF)
+    var p = ll_pdu.pdu_new()
+    for k in 0..18
+        let _x = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    test.assert_eq(si_offset_us(var p, 0), 9990)
+    test.assert_eq(si_unit_us(var p, 0), 30)
+    test.assert_eq(si_interval(var p, 0), 0x0140)
+    test.assert_eq(si_chmap(var p, 0), 0x1FFFFFFFFF)
+    test.assert_eq(si_sca(var p, 0), 5)
+    test.assert_eq(si_aa(var p, 0), 0x8E89BED7)
+    test.assert_eq(si_crc(var p, 0), 0xA1B2C3)
+    test.assert_eq(si_counter(var p, 0), 0xBEEF)
+    // An offset of 245.7 ms or more counts in units of 300 microseconds, and one that does not fit is zero.
+    syncinfo_put(var si, 300000, 100, 0x1FFFFFFFFF, 5, 1, 2, 3)
+    var q = ll_pdu.pdu_new()
+    for k in 0..18
+        let _y = ll_pdu.pdu_put_data(var q, si[k] as Int)
+    test.assert_eq(si_unit_us(var q, 0), 300)
+    test.assert_eq(si_offset_us(var q, 0), 300000)
+    syncinfo_put(var si, 3000000, 100, 0x1FFFFFFFFF, 5, 1, 2, 3)
+    var r = ll_pdu.pdu_new()
+    for k in 0..18
+        let _z = ll_pdu.pdu_put_data(var r, si[k] as Int)
+    test.assert_eq(si_offset_us(var r, 0), 0)
+
+@test
+fn test_the_next_event_and_the_shift_put_the_offset_in_its_unit()
+    var t = t_train(0, 10)
+    t_interval(var t, 16)
+    padv_start(var t, ll_init.CHMAP_ALL, 100000)
+    var si: Vec[u8; 18] = Vec.new()
+    for _ in 0..18
+        let _a = si.push(0)
+    // The AUX_ADV_IND is at 101000; the first event of the train 20 ms apart that starts 3000 or more after it.
+    let shift = plan_syncinfo(var t, var si, 101000, 3000)
+    test.assert(shift >= 0 and shift < 30)
+    var p = ll_pdu.pdu_new()
+    for k in 0..18
+        let _x = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    let planned = si_offset_us(var p, 0)
+    // 100000 is 1000 before the AUX_ADV_IND: the event at 100000 is too early, the next is at 120000.
+    test.assert_eq(si_counter(var p, 0), (t.counter + 1) & 0xFFFF)
+    test.assert_eq(120000 - (101000 + shift), planned + SYNC_PHASE_US)
+    test.assert_eq(planned % 30, 0)
+
+@test
+fn test_the_channels_follow_the_counter_and_the_map()
+    var t = t_train(0, 0)
+    padv_start(var t, 0x1FFFFFFFFF, 0)
+    var seen = 0
+    var last = -1
+    for k in 0..40
+        let ch = padv_channel(var t, k)
+        test.assert(ch >= 0 and ch <= 36)
+        if ch != last
+            seen = seen + 1
+        last = ch
+    test.assert(seen > 20)
+    // Only the used channels: the map names channels 3 and 20.
+    var u = t_train(0, 0)
+    padv_start(var u, (1 << 3) | (1 << 20), 0)
+    for k in 0..30
+        let ch = padv_channel(var u, k)
+        test.assert(ch == 3 or ch == 20)
+        let ch2 = chain_channel(var u)
+        test.assert(ch2 == 3 or ch2 == 20)
+    test.assert(ll_init.aa_valid(u.aa))
+
+@test
+fn test_an_event_advances_the_due_time_and_the_counter()
+    var t = t_train(0, 0)
+    t_interval(var t, 100)
+    padv_start(var t, ll_init.CHMAP_ALL, 5000)
+    t_counter(var t, 0xFFFF)
+    padv_advance(var t)
+    test.assert_eq(t.due, 5000 + 125000)
+    test.assert_eq(t.counter, 0)
+    test.assert_eq(intervals_to(var t, 5000), 0)
+    test.assert_eq(intervals_to(var t, 130000), 0)
+    test.assert_eq(intervals_to(var t, 130001), 1)
+    test.assert_eq(intervals_to(var t, 255001), 2)
+
+@test
+fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
+    var t = t_train(ll_xadv.P_TXP, 251)
+    t_interval(var t, 100)
+    padv_start(var t, ll_init.CHMAP_ALL, 0)
+    test.assert_eq(event_pdus(var t), 2)
+    var p = ll_pdu.pdu_new()
+    build_sync_ind(var t, var p, 0, 229, true, 13, 3000, ll_phy.PHY_1M, -4)
+    let x = ll_ext.ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.mode, 0)
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(x.adi, -1)
+    test.assert_eq(x.sync, -1)
+    test.assert_eq(p.n, sync_octets(var t, 229, true))
+    test.assert_eq(ll_ext.tx_power(var p, x), 0xFC)
+    test.assert_eq(ll_init.aux_channel(var p, x.aux), 13)
+    test.assert_eq(ll_init.aux_offset_us(var p, x.aux), 3000)
+    test.assert_eq(x.data_len, 229)
+    var q = ll_pdu.pdu_new()
+    build_sync_chain(var t, var q, 229, 22, false, 0, 0, ll_phy.PHY_1M)
+    let y = ll_ext.ext_parse(var q)
+    test.assert(y.ok)
+    test.assert_eq(y.aux, -1)
+    test.assert_eq(y.data_len, 22)
+    test.assert_eq(q.n, chain_octets(22, false))
+    test.assert_eq(q.b[y.data_at] as Int, 229)
+    // No data at all is a PDU of the header alone.
+    var e = t_train(0, 0)
+    var r = ll_pdu.pdu_new()
+    build_sync_ind(var e, var r, 0, 0, false, 0, 0, ll_phy.PHY_1M, 0)
+    test.assert_eq(r.n, sync_octets(var e, 0, false))
+    test.assert_eq(ll_ext.ext_parse(var r).data_len, 0)
+
+@test
+fn test_the_periodic_advertiser_list_adds_finds_and_removes()
+    var l = pal_new()
+    var a = ll_pdu.test_addr(0x10)
+    var b = ll_pdu.test_addr(0x20)
+    test.assert_eq(pal_add(var l, 1, var a, 3), OK)
+    test.assert_eq(pal_add(var l, 1, var a, 3), E_INVALID)
+    test.assert_eq(pal_add(var l, 1, var a, 4), OK)
+    test.assert_eq(pal_add(var l, 0, var b, 3), OK)
+    test.assert_eq(pal_add(var l, 0, var b, 16), E_INVALID)
+    test.assert_eq(pal_add(var l, 2, var b, 3), E_INVALID)
+    test.assert_eq(pal_count(var l), 3)
+    test.assert(pal_find(var l, 1, var a, 3) >= 0)
+    // The type is the low bit: an identity address of the type 3 is a random one.
+    test.assert(pal_find(var l, 3, var a, 3) >= 0)
+    test.assert(pal_find(var l, 0, var a, 3) < 0)
+    test.assert_eq(pal_add(var l, 1, var b, 7), OK)
+    test.assert_eq(pal_add(var l, 1, var b, 8), E_MEMORY)
+    test.assert_eq(pal_remove(var l, 1, var b, 8), E_UNKNOWN)
+    test.assert_eq(pal_remove(var l, 1, var a, 3), OK)
+    test.assert(pal_find(var l, 1, var a, 3) < 0)
+    pal_clear(var l)
+    test.assert_eq(pal_count(var l), 0)
+
+@test
+fn test_a_request_accepts_the_train_it_names_or_the_list()
+    var q = preq_new()
+    var a = ll_pdu.test_addr(0x30)
+    var other = ll_pdu.test_addr(0x40)
+    var l = pal_new()
+    test.assert(not preq_accepts(var q, var l, 1, var a, 2))
+    t_req(var q, 2, 1, false, var a)
+    test.assert(preq_accepts(var q, var l, 1, var a, 2))
+    test.assert(preq_accepts(var q, var l, 3, var a, 2))
+    test.assert(not preq_accepts(var q, var l, 0, var a, 2))
+    test.assert(not preq_accepts(var q, var l, 1, var a, 3))
+    test.assert(not preq_accepts(var q, var l, 1, var other, 2))
+    t_req_list(var q, true)
+    test.assert(not preq_accepts(var q, var l, 1, var a, 2))
+    test.assert_eq(pal_add(var l, 1, var other, 5), OK)
+    test.assert(preq_accepts(var q, var l, 1, var other, 5))
+    test.assert(not preq_accepts(var q, var l, 1, var a, 2))
+
+@tier(app)
+fn t_syncinfo_pdu(offset: Int, interval: Int) -> Pdu
+    var si: Vec[u8; 18] = Vec.new()
+    for _ in 0..18
+        let _a = si.push(0)
+    var t = t_train(0, 0)
+    padv_start(var t, ll_init.CHMAP_ALL, 0)
+    syncinfo_put(var si, offset, interval, 0x1FFFFFFFFF, 3, t.aa, 0x123456, 0x0102)
+    var p = ll_pdu.pdu_new()
+    for k in 0..18
+        let _x = ll_pdu.pdu_put_data(var p, si[k] as Int)
+    p
+
+@tier(app)
+fn t_psync(var rx: Pdu, t_first: Int) -> PerSync
+    var s = psync_new()
+    var a = ll_pdu.test_addr(0x50)
+    psync_begin(var s, 1, var rx, 0, 1, var a, 6, ll_phy.PHY_1M, t_first, 100, true)
+    s
+
+@test
+fn test_a_synchronization_takes_the_train_of_a_syncinfo()
+    var p = t_syncinfo_pdu(9990, 80)
+    test.assert(si_usable(var p, 0))
+    let s = t_psync(var p, 50000)
+    test.assert_eq(s.state, PS_SYNCING)
+    test.assert_eq(s.due, 50000 + 9990)
+    test.assert_eq(s.win, 30)
+    test.assert_eq(s.counter, 0x0102)
+    test.assert_eq(s.interval, 80)
+    test.assert_eq(s.sca, 3)
+    test.assert_eq(s.sca_ppm, 100)
+    test.assert_eq(s.timeout, 1000000)
+    test.assert_eq(s.n_used, 37)
+    // An incomplete SyncInfo (no offset), an interval under 7.5 ms and a map of one channel are not used.
+    var none = t_syncinfo_pdu(0, 80)
+    test.assert(not si_usable(var none, 0))
+    var fast = t_syncinfo_pdu(9990, 5)
+    test.assert(not si_usable(var fast, 0))
+
+@test
+fn test_the_first_packet_establishes_and_the_clock_follows_the_last_packet()
+    var p = t_syncinfo_pdu(9990, 80)
+    var s = t_psync(var p, 50000)
+    psync_heard(var s, 60005)
+    test.assert_eq(s.state, PS_SYNCED)
+    test.assert_eq(s.owed, EV_ESTABLISHED)
+    test.assert_eq(s.status, OK)
+    test.assert_eq(s.due, 60005 + 100000)
+    test.assert_eq(s.counter, 0x0103)
+    test.assert_eq(s.cx_counter, 0x0102)
+    test.assert_eq(s.win, 0)
+    test.assert_eq(s.t_ref, 60005)
+    // The window of the next event is the widening alone: the clocks over an interval, and the jitter.
+    test.assert_eq(psync_widen(var s), (100 + 50) * 100000 / 1000000 + 32)
+    // The channel follows the counter of the event it is for.
+    let ch = psync_channel(var s)
+    test.assert(ch >= 0 and ch <= 36)
+    t_owed(var s, EV_NONE)
+    // Eight events without a packet leave it synchronized, the ninth is the Sync_Timeout (1 s since the last packet).
+    for _ in 0..8
+        test.assert(psync_missed(var s))
+    test.assert_eq(s.state, PS_SYNCED)
+    test.assert_eq(psync_widen(var s), (100 + 50) * 900000 / 1000000 + 32)
+    test.assert(not psync_missed(var s))
+    test.assert_eq(s.state, PS_FREE)
+    test.assert_eq(s.owed, EV_LOST)
+
+@test
+fn test_missed_events_end_a_synchronization_by_the_count_or_the_timeout()
+    var p = t_syncinfo_pdu(9990, 80)
+    var s = t_psync(var p, 50000)
+    // Five events pass without a packet, the sixth ends it with Synchronization Timeout.
+    for _ in 0..5
+        test.assert(psync_missed(var s))
+    test.assert(not psync_missed(var s))
+    test.assert_eq(s.state, PS_FREE)
+    test.assert_eq(s.owed, EV_ESTABLISHED)
+    test.assert_eq(s.status, E_SYNC_TIMEOUT)
+    test.assert(psync_busy(var s))
+    psync_clear(var s)
+    test.assert(not psync_busy(var s))
+
+@tier(app)
+fn t_past(var s: PerSync, pre: Int)
+    s.past = true
+    s.pre = pre
+
+@test
+fn test_a_slot_of_a_transfer_widens_its_first_window_by_the_drift_it_came_with_until_a_packet_comes()
+    var p = t_syncinfo_pdu(9990, 80)
+    var s = t_psync(var p, 50000)
+    test.assert(not s.past)
+    test.assert_eq(s.pre, 0)
+    let plain = psync_widen(var s)
+    t_past(var s, 40)
+    // The widening is the advertiser's accuracy and this device's over the time since the reference packet, the jitter, and (in a build with the
+    // transfer) the drift the three clocks of the transfer brought.
+    if ctl_limits.past_on()
+        test.assert_eq(psync_widen(var s), plain + 40)
+    else
+        test.assert_eq(psync_widen(var s), plain)
+    // The first packet heard makes the slot an ordinary one.
+    psync_heard(var s, 60005)
+    test.assert_eq(s.pre, 0)
+    test.assert_eq(psync_widen(var s), (100 + 50) * 100000 / 1000000 + 32)
+
+@test
+fn test_the_train_keeps_the_counter_and_the_start_of_the_last_event_it_sent()
+    var t = t_train(0, 3)
+    t_interval(var t, 16)
+    padv_start(var t, ll_init.CHMAP_ALL, 5000)
+    t_counter(var t, 0xFFFF)
+    test.assert(not t.sent)
+    padv_note_sent(var t)
+    test.assert(t.sent)
+    test.assert_eq(t.last_ctr, 0xFFFF)
+    test.assert_eq(t.last_at, 5000)
+    padv_advance(var t)
+    // The next event is another; the last one sent stays until it is sent.
+    test.assert_eq(t.counter, 0)
+    test.assert_eq(t.last_ctr, 0xFFFF)
+    // A train that starts again has sent nothing.
+    padv_start(var t, ll_init.CHMAP_ALL, 9000)
+    test.assert(not t.sent)
+
+@test
+fn test_a_train_with_responses_advances_a_subevent_at_a_time_and_a_syncinfo_names_the_next_event()
+    if not ctl_limits.pawr_adv_on()
+        return
+    var t = t_train(0, 0)
+    padv_define_pawr(var t, 3, 15000)
+    t_interval(var t, 100)
+    padv_start(var t, ll_init.CHMAP_ALL, 1000000)
+    t_counter(var t, 50)
+    test.assert_eq(t.sub, 0)
+    test.assert_eq(t.due, 1000000)
+    test.assert_eq(ev_due(var t), 1000000)
+    test.assert_eq(ev_ctr(var t), 50)
+    // The second subevent is 15 ms on in the same event; the next event to name is the one after.
+    padv_advance(var t)
+    test.assert_eq(t.sub, 1)
+    test.assert_eq(t.due, 1015000)
+    test.assert_eq(t.counter, 50)
+    test.assert_eq(ev_due(var t), 1125000)
+    test.assert_eq(ev_ctr(var t), 51)
+    padv_advance(var t)
+    test.assert_eq(t.due, 1030000)
+    padv_advance(var t)
+    test.assert_eq(t.sub, 0)
+    test.assert_eq(t.due, 1125000)
+    test.assert_eq(t.counter, 51)
+    // The interval of such a train is the shortest the Host allows.
+    t_range(var t, 100, 200)
+    test.assert_eq(pick_interval(var t, ll_phy.PHY_1M), 100)
+    // padv_define forgets the subevents.
+    padv_define(var t, 4, 0, 16, 40)
+    test.assert(not t.pawr)

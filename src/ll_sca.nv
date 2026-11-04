@@ -7,8 +7,6 @@
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.sca_on()`) says whether the build has the feature.
 
-use std.test
-
 // 1 in a build with the LE Request Peer SCA command, 0 in one without it.
 
 // The Controller error codes of the Complete event.
@@ -23,17 +21,3 @@ fn class_ok(class: Int) -> Bool
 @tier(embedded)
 fn peer_lacks(octet3: Int) -> Bool
     (octet3 & 0x04) == 0
-
-@test
-fn test_classes_are_zero_to_seven()
-    test.assert(class_ok(0))
-    test.assert(class_ok(7))
-    test.assert(not class_ok(8))
-    test.assert(not class_ok(-1))
-
-@test
-fn test_feature_26_is_bit_2_of_octet_3()
-    test.assert(peer_lacks(0))
-    test.assert(peer_lacks(0xFB))
-    test.assert(not peer_lacks(0x04))
-    test.assert(not peer_lacks(0xF4))

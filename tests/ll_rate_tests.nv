@@ -1,0 +1,105 @@
+// tests/ll_rate_tests.nv — the unit tests of src/ll_rate.nv.
+//
+//   novo test tests/ll_rate_tests.nv
+
+use std.test
+use ll_pdu
+use ll_data
+use ll_sub
+use ll_rate.{ accept_interval, first_offset, floor_units, offsets_ok, pack, pack_hi, pack_lo, pick_interval, put_ind, put_req, rcv, req_valid, required_us }
+
+@test
+fn test_pdu_layouts()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, 12, 40, 2, 8, 1, 3, 0x0100, 10, 0x1234, 20)
+    test.assert_eq(ll_data.dpdu_len(var p), 27)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3E)
+    test.assert_eq(ll_sub.get16(var p, 1), 12)
+    test.assert_eq(ll_sub.get16(var p, 3), 40)
+    test.assert_eq(ll_sub.get16(var p, 5), 2)
+    test.assert_eq(ll_sub.get16(var p, 7), 8)
+    test.assert_eq(ll_sub.get16(var p, 9), 1)
+    test.assert_eq(ll_sub.get16(var p, 11), 3)
+    test.assert_eq(ll_sub.get16(var p, 13), 0x0100)
+    test.assert_eq(ll_sub.get16(var p, 15), 10)
+    test.assert_eq(ll_sub.get16(var p, 17), 0x1234)
+    test.assert_eq(ll_sub.get16(var p, 19), 20)
+    test.assert_eq(ll_sub.get16(var p, 21), 0xFFFF)
+    test.assert_eq(ll_sub.get16(var p, 25), 0xFFFF)
+    put_ind(var p, 30, 60, 0x0102, 4, 1, 3, 0x0C80)
+    test.assert_eq(ll_data.dpdu_len(var p), 15)
+    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3F)
+    test.assert_eq(ll_sub.get16(var p, 1), 30)
+    test.assert_eq(ll_sub.get16(var p, 3), 60)
+    test.assert_eq(ll_sub.get16(var p, 5), 0x0102)
+    test.assert_eq(ll_sub.get16(var p, 7), 4)
+    test.assert_eq(ll_sub.get16(var p, 13), 0x0C80)
+
+@test
+fn test_offsets()
+    var p = ll_pdu.pdu_new()
+    put_req(var p, 12, 40, 1, 1, 0, 0, 100, 0, 0, 20)
+    test.assert(offsets_ok(var p, 40))
+    test.assert(not offsets_ok(var p, 20))
+    test.assert_eq(first_offset(var p), 2)
+    put_req(var p, 12, 40, 1, 1, 0, 0, 100, 0, 0, 25)
+    test.assert(offsets_ok(var p, 40))
+    test.assert_eq(first_offset(var p), -1)
+    put_req(var p, 12, 40, 1, 1, 0, 0, 100, 0, 0, 0xFFFF)
+    test.assert(offsets_ok(var p, 40))
+    test.assert_eq(first_offset(var p), -1)
+
+@test
+fn test_interval_rules()
+    test.assert(rcv(10))
+    test.assert(rcv(0x7D00))
+    test.assert(not rcv(9))
+    test.assert(not rcv(15))
+    test.assert(not rcv(0x7D0A))
+    test.assert_eq(pick_interval(6, 40, 0, 0), 40)
+    test.assert_eq(pick_interval(6, 47, 0, 0), 40)
+    test.assert_eq(pick_interval(11, 19, 0, 0), -1)
+    test.assert_eq(pick_interval(11, 20, 0, 0), 20)
+    // The preferred periodicity 30 and the step 10 meet at 30.
+    test.assert_eq(pick_interval(10, 100, 30, 0), 90)
+    test.assert_eq(pick_interval(10, 80, 25, 0), 50)
+    test.assert_eq(pick_interval(10, 40, 25, 0), 40)
+    test.assert_eq(pick_interval(10, 100, 0, 70), 100)
+    test.assert_eq(pick_interval(10, 60, 0, 70), -1)
+    test.assert_eq(pick_interval(3, 4, 0, 0), -1)
+
+@test
+fn test_required_interval()
+    // 27 octets at 328 us: 150 + 150 + 328.
+    test.assert_eq(required_us(328, 27), 628)
+    test.assert_eq(required_us(2120, 251), 150 + 150 + 2120)
+    test.assert_eq(required_us(17040, 27), 150 + 150 + 2704)
+    test.assert_eq(floor_units(628, false), 8)
+    test.assert_eq(floor_units(628, true), 27)
+
+@test
+fn test_request_ranges()
+    test.assert(req_valid(12, 40, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(2, 40, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 0x7D01, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(41, 40, 1, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 40, 0, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 40, 5, 4, 1, 3, 100, 0))
+    test.assert(not req_valid(12, 40, 1, 501, 0, 0, 100, 0))
+    test.assert(not req_valid(12, 40, 100, 100, 5, 0, 100, 0))
+    test.assert(req_valid(12, 40, 100, 100, 4, 0, 100, 0))
+    test.assert(not req_valid(12, 40, 1, 4, 1, 3, 9, 0))
+    test.assert(not req_valid(12, 40, 1, 4, 1, 3, 100, 41))
+
+@test
+fn test_accept_interval_follows_the_hosts_range()
+    var v: Vec[Sub; 1] = Vec.new()
+    let _a = v.push(ll_sub.sub_new())
+    v[0].aiv = pack(20, 80)
+    test.assert_eq(pack_lo(v[0].aiv), 20)
+    test.assert_eq(pack_hi(v[0].aiv), 80)
+    test.assert_eq(accept_interval(var v[0], 10, 100, 0, 0), 80)
+    test.assert_eq(accept_interval(var v[0], 10, 50, 0, 0), 50)
+    test.assert_eq(accept_interval(var v[0], 81, 100, 0, 0), -1)
+    test.assert_eq(accept_interval(var v[0], 10, 25, 0, 0), 20)
+    test.assert_eq(ll_sub.ALLOW_IV, pack(0x3C, 0x7D00))

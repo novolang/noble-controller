@@ -1,0 +1,99 @@
+// tests/ll_cmac_tests.nv — the unit tests of src/ll_cmac.nv.
+//
+//   novo test tests/ll_cmac_tests.nv
+
+use std.test
+use ll_cmac.{ big_gsk, cmac_block, cmac_new, put_id }
+
+fn t_block(a: [Int]) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+// The 16 octets whose 32-bit words, most significant word first, are `w0` to `w3`, as they stand in the sample data of
+// [Vol 6] Part C (most significant octet first).
+@tier(app)
+fn t_words(w0: Int, w1: Int, w2: Int, w3: Int) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for w in [w0, w1, w2, w3]
+        let _a = b.push(((w >>> 24) & 0xFF) as u8)
+        let _b = b.push(((w >>> 16) & 0xFF) as u8)
+        let _c = b.push(((w >>> 8) & 0xFF) as u8)
+        let _d = b.push((w & 0xFF) as u8)
+    b
+
+@tier(app)
+fn t_copy(var dst: Vec[u8; 16], var src: Vec[u8; 16])
+    for i in 0..16
+        dst[i] = src[i]
+
+@tier(app)
+fn t_rev(var a: Vec[u8; 16]) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for i in 0..16
+        let _a = b.push(a[15 - i])
+    b
+
+@tier(app)
+fn t_same(var got: Vec[u8; 16], var want: Vec[u8; 16])
+    for i in 0..16
+        test.assert_eq(got[i] as Int, want[i] as Int)
+
+@test
+fn test_rfc_4493_subkeys_and_the_empty_message()
+    // RFC 4493, Section 4: the key 2b7e1516 28aed2a6 abf71588 09cf4f3c; the subkey K2 f7ddac30 6ae266cc f90bc11e e46d513b (the
+    // empty message is padded, so K2 is the one it takes) and the CMAC of the empty message bb1d6929 e9593728 7fa37d12 9b756746.
+    var c = cmac_new()
+    var key = t_words(0x2B7E1516, 0x28AED2A6, 0xABF71588, 0x09CF4F3C)
+    t_copy(var c.key, var key)
+    cmac_block(var c, 0)
+    var want = t_words(0xBB1D6929, 0xE9593728, 0x7FA37D12, 0x9B756746)
+    t_same(var c.out, var want)
+    var k2 = t_words(0xF7DDAC30, 0x6AE266CC, 0xF90BC11E, 0xE46D513B)
+    t_same(var c.b, var k2)
+
+@test
+fn test_rfc_4493_one_whole_block()
+    // Example 2: the message 6bc1bee2 2e409f96 e93d7e11 7393172a, the CMAC 070a16b4 6b4d4144 f79bdd9d d04a287c.
+    var c = cmac_new()
+    var key = t_words(0x2B7E1516, 0x28AED2A6, 0xABF71588, 0x09CF4F3C)
+    t_copy(var c.key, var key)
+    var msg = t_words(0x6BC1BEE2, 0x2E409F96, 0xE93D7E11, 0x7393172A)
+    t_copy(var c.msg, var msg)
+    cmac_block(var c, 16)
+    var want = t_words(0x070A16B4, 0x6B4D4144, 0xF79BDD9D, 0xD04A287C)
+    t_same(var c.out, var want)
+
+@test
+fn test_h8_follows_the_sample_data_of_the_specification()
+    // [Vol 6] Part C, Section 6: K ec0234a3 57c8ad05 341010a6 0a397d9b, S 1536d18d e3d20df9 9b7044c1 2f9ed5ba, keyID cc030148,
+    // IK fe77ab4e fa982991 c1486a3b 281fd4bc, h8 e5e5beba ae7228e7 22a38904 ed350f6d.
+    var c = cmac_new()
+    var s = t_words(0x1536D18D, 0xE3D20DF9, 0x9B7044C1, 0x2F9ED5BA)
+    t_copy(var c.key, var s)
+    var k = t_words(0xEC0234A3, 0x57C8AD05, 0x341010A6, 0x0A397D9B)
+    t_copy(var c.msg, var k)
+    cmac_block(var c, 16)
+    var ik = t_words(0xFE77AB4E, 0xFA982991, 0xC1486A3B, 0x281FD4BC)
+    t_same(var c.out, var ik)
+    t_copy(var c.key, var c.out)
+    put_id(var c, 0xCC030148)
+    cmac_block(var c, 4)
+    var want = t_words(0xE5E5BEBA, 0xAE7228E7, 0x22A38904, 0xED350F6D)
+    t_same(var c.out, var want)
+
+@test
+fn test_the_group_session_key_follows_the_sample_data_of_the_specification()
+    // Broadcast Code "Børne House" 00000000 6573756f 4820656e 72b8c342 (most significant octet first), GSKD 55188b3d 32f6bb9a
+    // 900afcfb eed4e72a, GSK be2a16fc 7ac464e7 52301bcc c818812c.
+    var c = cmac_new()
+    var code_msb = t_words(0x00000000, 0x6573756F, 0x4820656E, 0x72B8C342)
+    var code = t_rev(var code_msb)
+    var gskd_msb = t_words(0x55188B3D, 0x32F6BB9A, 0x900AFCFB, 0xEED4E72A)
+    var gskd = t_rev(var gskd_msb)
+    var gsk = t_words(0, 0, 0, 0)
+    big_gsk(var c, var code, var gskd, var gsk)
+    var want_msb = t_words(0xBE2A16FC, 0x7AC464E7, 0x52301BCC, 0xC818812C)
+    var want = t_rev(var want_msb)
+    t_same(var gsk, var want)

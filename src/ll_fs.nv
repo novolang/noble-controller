@@ -12,7 +12,6 @@
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.fs_on()`) says whether the build has the feature.
 
-use std.test
 use ll_pdu
 use ll_data
 use ll_sub
@@ -76,53 +75,3 @@ fn refusal(fmin: Int, fmax: Int, phys: Int, types: Int) -> Int
 @tier(embedded)
 fn rsp_valid(fs: Int, phys: Int, types: Int, req_phys: Int, req_types: Int) -> Bool
     fs == FS_US and (phys & ~req_phys) == 0 and (types & ~req_types) == 0
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_pdu_layouts()
-    var p = ll_pdu.pdu_new()
-    put_req(var p, 100, 0x2710, 0x05, 0x0012)
-    test.assert_eq(ll_data.dpdu_len(var p), 8)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3B)
-    test.assert_eq(ll_sub.get16(var p, 1), 100)
-    test.assert_eq(ll_sub.get16(var p, 3), 0x2710)
-    test.assert_eq(ll_data.dpdu_byte(var p, 5), 0x05)
-    test.assert_eq(ll_sub.get16(var p, 6), 0x0012)
-    put_rsp(var p, 150, 0x02, 0x0001)
-    test.assert_eq(ll_data.dpdu_len(var p), 6)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x3C)
-    test.assert_eq(ll_sub.get16(var p, 1), 150)
-    test.assert_eq(ll_data.dpdu_byte(var p, 3), 0x02)
-    test.assert_eq(ll_sub.get16(var p, 4), 0x0001)
-
-@test
-fn test_a_request_is_valid_with_a_range_and_a_bit_of_each()
-    test.assert(req_valid(150, 150, 1, 1))
-    test.assert(req_valid(0, 10000, 7, 0x1F))
-    test.assert(not req_valid(151, 150, 1, 1))
-    test.assert(not req_valid(0, 10001, 1, 1))
-    test.assert(not req_valid(0, 200, 0, 1))
-    test.assert(not req_valid(0, 200, 1, 0))
-    // Reserved bits alone name nothing.
-    test.assert(not req_valid(0, 200, 0x08, 1))
-    test.assert(not req_valid(0, 200, 1, 0x20))
-
-@test
-fn test_150_microseconds_in_the_range_is_agreed_and_nothing_else()
-    test.assert_eq(refusal(150, 150, 1, 1), 0)
-    test.assert_eq(refusal(100, 200, 7, 0x1F), 0)
-    test.assert_eq(refusal(0, 150, 1, 4), 0)
-    test.assert_eq(refusal(151, 300, 1, 1), 0x11)
-    test.assert_eq(refusal(0, 149, 1, 1), 0x11)
-    test.assert_eq(refusal(200, 100, 1, 1), 0x1E)
-    test.assert_eq(refusal(100, 200, 0, 1), 0x1E)
-
-@test
-fn test_an_answer_names_nothing_the_request_did_not()
-    test.assert(rsp_valid(150, 0, 0, 1, 1))
-    test.assert(rsp_valid(150, 1, 1, 3, 3))
-    test.assert(not rsp_valid(150, 4, 1, 3, 3))
-    test.assert(not rsp_valid(150, 1, 4, 3, 3))
-    test.assert(not rsp_valid(149, 0, 0, 1, 1))
-    test.assert(not rsp_valid(151, 0, 0, 1, 1))

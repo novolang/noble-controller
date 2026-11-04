@@ -17,8 +17,6 @@
 //
 // Satisfies: REQ-BLE-CTL-013.
 
-use std.test
-
 // What a CONNECT_IND asks: the initiator's address, its type (0 public, 1
 // random), and the parameters of LLData in the units of the PDU (the interval
 // and the transmit window in 1.25 ms, the timeout in 10 ms).
@@ -45,17 +43,18 @@ fn conn_request_new() -> ConnRequest
     r
 
 // The decisions the specification leaves to the implementation.
-trait LinkPolicy
+pub trait LinkPolicy
     // Whether to take a connection request that passed the checks of the
     // Link Layer.  False ignores the request.
     fn accept_connection(var self, req: ConnRequest) -> Bool
 
 // The policy that takes every request.
-@value
+pub @value
 struct DefaultLinkPolicy
     asked: Int
 
-@tier(embedded)
+// A `DefaultLinkPolicy` that has been asked nothing yet.
+pub @tier(embedded)
 fn default_link_policy() -> DefaultLinkPolicy
     DefaultLinkPolicy { asked: 0 }
 
@@ -63,20 +62,3 @@ impl LinkPolicy for DefaultLinkPolicy
     fn accept_connection(var self, req: ConnRequest) -> Bool
         self.asked = self.asked + 1
         true
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_default_policy_takes_every_request()
-    var p = default_link_policy()
-    var r = conn_request_new()
-    test.assert(p.accept_connection(r))
-    test.assert(p.accept_connection(r))
-    test.assert_eq(p.asked, 2)
-
-@test
-fn test_a_request_starts_with_an_empty_address()
-    let r = conn_request_new()
-    test.assert_eq(r.peer.len(), 6)
-    test.assert_eq(r.peer[5] as Int, 0)
-    test.assert_eq(r.peer_type, 0)

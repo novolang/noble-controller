@@ -1,0 +1,339 @@
+// tests/ctl_surface_tests.nv — the functions the Host package calls on the Controller (the public surface of
+// `ctl_hci` and `ll_air`) that the other suites reach only through a larger call: the questions the main loop
+// asks (is advertising on, is the Host's stream inside a packet, how many packet slots are free, how much room
+// has the stream before the radio), the P-256 work of the two key commands over an engine that is a stand-in,
+// the resolving list commands, the two parts of the judgement of a received PDU in the initiating state, and the
+// window of the radio measurements.
+//
+//   novo test tests/ctl_surface_tests.nv
+
+use std.test
+use ll_ecdh
+use ll_pdu
+use ll_air
+use ctl_hci
+use ctl_limits
+
+// ── The Host's side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+// A Command, its answer.
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(var c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+// Split the octets of the events the Controller sent into events.
+fn events_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i + 3 <= list.len(bytes)
+        let n = bytes[i + 2]
+        list.push(out, bytes[i:i + 3 + n])
+        i = i + 3 + n
+    out
+
+// The events with this code among them.
+fn events_coded(bytes: [Int], code: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in events_of(bytes)
+        if e[1] == code
+            list.push(out, e[:])
+    out
+
+// The status a command was answered with, in a Command Complete or a Command Status.
+fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(var c, opcode, params)
+    var status = -1
+    for e in events_coded(r, 0x0E)
+        status = e[6]
+    for e in events_coded(r, 0x0F)
+        status = e[3]
+    status
+
+// A Controller with the Link Layer and the capabilities `caps`, every event enabled.
+fn controller(caps: Int) -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL | caps)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    test.assert_eq(status_of(var c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0x0F, 0, 0, 0, 0, 0]), 0)
+    c
+
+fn zeros(n: Int) -> [Int]
+    var v: [Int] = []
+    for _ in 0..n
+        list.push(v, 0)
+    v
+
+// ── A stand-in for the P-256 engine ─────────────────────────────────
+
+// Its public key is the private key twice over, its DHKey is 0xAA in every octet, and it counts what it was asked.
+struct StubEcdh
+    var asked: Int
+    fail: Bool
+
+fn stub_ecdh(fail: Bool) -> StubEcdh
+    StubEcdh { asked: 0, fail: fail }
+
+impl Ecdh[] for StubEcdh
+    fn public_key(var self, var secret: Vec[u8; 32], var out: Vec[u8; 64]) -> Bool
+        self.asked = self.asked + 1
+        for k in 0..32
+            out[k] = secret[k]
+            out[32 + k] = secret[k]
+        true
+
+    fn dhkey(var self, var secret: Vec[u8; 32], var peer: Vec[u8; 64], var out: Vec[u8; 32]) -> Bool
+        self.asked = self.asked + 1
+        for k in 0..32
+            out[k] = 0xAA
+        not self.fail
+
+    fn faults(var self) -> Int
+        0
+
+fn secret_of(first: Int) -> Vec[u8; 32]
+    var v: Vec[u8; 32] = Vec.new()
+    for k in 0..32
+        let _p = v.push((first + k) as u8)
+    v
+
+// ── Advertising ─────────────────────────────────────────────────────
+
+@test
+fn test_adv_active_follows_the_advertising_enable()
+    var c = controller(0)
+    test.assert(not ctl_hci.adv_active(var c))
+    var params = [0x20, 0x00, 0x20, 0x00, 0x03, 0x00, 0x00]
+    for i in 0..6
+        list.push(params, 0x70 + i)
+    list.push(params, 7)
+    list.push(params, 0)
+    test.assert_eq(status_of(var c, 0x2006, params), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
+    test.assert(ctl_hci.adv_active(var c))
+    test.assert_eq(status_of(var c, 0x200A, [0]), 0)
+    test.assert(not ctl_hci.adv_active(var c))
+
+// ── The Host's stream ───────────────────────────────────────────────
+
+@test
+fn test_ctl_in_packet_is_true_between_the_first_octet_and_the_last()
+    var c = controller(0)
+    test.assert(not ctl_hci.ctl_in_packet(var c))
+    ctl_hci.ctl_rx(var c, 0x01)
+    test.assert(ctl_hci.ctl_in_packet(var c))
+    ctl_hci.ctl_rx(var c, 0x03)
+    ctl_hci.ctl_rx(var c, 0x0C)
+    test.assert(ctl_hci.ctl_in_packet(var c))
+    ctl_hci.ctl_rx(var c, 0x00)
+    test.assert(not ctl_hci.ctl_in_packet(var c))
+    let _ran = ctl_hci.ctl_step(var c)
+    let _bytes = drain(var c)
+    test.assert(not ctl_hci.ctl_in_packet(var c))
+
+@test
+fn test_ctl_pool_free_counts_the_slots_the_events_have_not_taken()
+    var c = controller(0)
+    let before = ctl_hci.ctl_pool_free(var c)
+    test.assert(before > 0)
+    send(var c, 0x0C03, [])
+    let _ran = ctl_hci.ctl_step(var c)
+    test.assert(ctl_hci.ctl_pool_free(var c) < before)
+    let _bytes = drain(var c)
+    test.assert_eq(ctl_hci.ctl_pool_free(var c), before)
+
+@test
+fn test_ctl_ll_room_is_the_time_until_the_next_booking()
+    var c = controller(0)
+    ctl_hci.ctl_set_time(var c, 1000)
+    // Idle: the Link Layer wants the radio for nothing, so the stream has the most room there is.
+    let idle = ctl_hci.ctl_ll_room(var c, 1000)
+    test.assert(idle > 0)
+    var params = [0x20, 0x00, 0x20, 0x00, 0x03, 0x00, 0x00]
+    for i in 0..6
+        list.push(params, 0x70 + i)
+    list.push(params, 7)
+    list.push(params, 0)
+    test.assert_eq(status_of(var c, 0x2006, params), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
+    ctl_hci.ctl_ll_book(var c)
+    let room = ctl_hci.ctl_ll_room(var c, 1000)
+    test.assert(room >= 0)
+    test.assert(room < idle)
+
+// ── LE Read Local P-256 Public Key and LE Generate DHKey ────────────
+
+@test
+fn test_the_public_key_work_waits_for_random_octets_and_then_reports_the_key()
+    var c = controller(ctl_hci.CAP_ECDH)
+    var ecdh = stub_ecdh(false)
+    var rnd = secret_of(1)
+    test.assert(not ctl_hci.ctl_ecdh_wanted(var c))
+    test.assert_eq(status_of(var c, 0x2025, []), 0)
+    test.assert(ctl_hci.ctl_ecdh_wanted(var c))
+    test.assert(ctl_hci.ctl_ecdh_wants_random(var c))
+    // No random octets: the work waits and the engine is not asked.
+    test.assert(not ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, false))
+    test.assert_eq(ecdh.asked, 0)
+    test.assert(ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, true))
+    test.assert(not ctl_hci.ctl_ecdh_wanted(var c))
+    let ev = events_coded(drain(var c), 0x3E)
+    test.assert_eq(list.len(ev), 1)
+    // LE Read Local P-256 Public Key Complete: subevent 8, status, X and Y.
+    test.assert_eq(ev[0][3], 0x08)
+    test.assert_eq(ev[0][4], 0)
+    test.assert_eq(ev[0][5], 1)
+    test.assert_eq(ev[0][36], 32)
+    test.assert_eq(ev[0][37], 1)
+
+@test
+fn test_the_dhkey_work_needs_no_random_octets()
+    var c = controller(ctl_hci.CAP_ECDH)
+    var ecdh = stub_ecdh(false)
+    var rnd = secret_of(1)
+    test.assert_eq(status_of(var c, 0x2025, []), 0)
+    test.assert(ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, true))
+    let _key = drain(var c)
+    test.assert_eq(status_of(var c, 0x2026, zeros(64)), 0)
+    test.assert(ctl_hci.ctl_ecdh_wanted(var c))
+    test.assert(not ctl_hci.ctl_ecdh_wants_random(var c))
+    test.assert(ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, false))
+    let ev = events_coded(drain(var c), 0x3E)
+    test.assert_eq(list.len(ev), 1)
+    // LE Generate DHKey Complete: subevent 9, status, 32 octets.
+    test.assert_eq(ev[0][3], 0x09)
+    test.assert_eq(ev[0][4], 0)
+    test.assert_eq(ev[0][5], 0xAA)
+
+@test
+fn test_an_engine_that_refuses_the_peer_key_ends_the_command_with_invalid_parameters()
+    var c = controller(ctl_hci.CAP_ECDH)
+    var ecdh = stub_ecdh(true)
+    var rnd = secret_of(1)
+    test.assert_eq(status_of(var c, 0x2025, []), 0)
+    test.assert(ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, true))
+    let _key = drain(var c)
+    test.assert_eq(status_of(var c, 0x2026, zeros(64)), 0)
+    test.assert(ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, false))
+    let ev = events_coded(drain(var c), 0x3E)
+    test.assert_eq(ev[0][4], 0x12)
+
+// ── The resolving list ──────────────────────────────────────────────
+
+@test
+fn test_cmd_le_read_resolving_list_size_answers_the_size_of_the_list()
+    var c = controller(0)
+    send(var c, 0x202A, [])
+    ctl_hci.cmd_le_read_resolving_list_size(var c)
+    let done = events_coded(drain(var c), 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), 0x202A)
+    test.assert_eq(done[0][6], 0)
+    test.assert(done[0][7] > 0)
+
+@test
+fn test_cmd_le_read_resolvable_address_refuses_a_device_the_list_does_not_have()
+    var c = controller(0)
+    var params: [Int] = [0]
+    for i in 0..6
+        list.push(params, 0x40 + i)
+    send(var c, 0x202B, params)
+    ctl_hci.cmd_le_read_resolvable_address(var c, 0x202B, false)
+    let done = events_coded(drain(var c), 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), 0x202B)
+    // Unknown Connection Identifier.
+    test.assert_eq(done[0][6], 0x02)
+
+@test
+fn test_ctl_privacy_wanted_is_false_while_nothing_waits_for_the_program()
+    var c = controller(0)
+    test.assert(not ctl_hci.ctl_privacy_wanted(var c))
+
+// ── Initiating on an auxiliary channel ──────────────────────────────
+
+@test
+fn test_ctl_init_aux_decide_takes_no_pdu_while_the_initiator_is_off()
+    var c = controller(0)
+    var rx = ll_pdu.pdu_new()
+    test.assert(not ctl_hci.ctl_init_aux_decide(var c, var rx, 0, 1))
+
+@test
+fn test_ctl_init_aux_lost_counts_the_answer_that_did_not_come()
+    var c = controller(0)
+    test.assert_eq(c.init.aux_rsp_missed, 0)
+    ctl_hci.ctl_init_aux_lost(var c)
+    ctl_hci.ctl_init_aux_lost(var c)
+    test.assert_eq(c.init.aux_rsp_missed, 2)
+
+// ── Broadcast isochronous groups ────────────────────────────────────
+
+@test
+fn test_ctl_big_wants_random_follows_the_build_and_the_octets_given()
+    var c = controller(0)
+    // A build with groups asks for the 24 octets of an encrypted group until it has them; one without asks for none.
+    test.assert_eq(ctl_hci.ctl_big_wants_random(var c), ctl_limits.big_on())
+    if ctl_limits.big_on()
+        var v: Vec[u8; 12] = Vec.new()
+        for k in 0..12
+            let _p = v.push(k as u8)
+        ctl_hci.ctl_big_random_put(var c, var v)
+        test.assert(ctl_hci.ctl_big_wants_random(var c))
+        ctl_hci.ctl_big_random_put(var c, var v)
+        test.assert(not ctl_hci.ctl_big_wants_random(var c))
+
+// ── The measurements of the radio program ───────────────────────────
+
+// Every minimum, maximum and counter of the window moved off its starting value.
+fn t_dirty(var rf: ll_air.Rf)
+    rf.tifs_min_ns = 5
+    rf.tifs_max_ns = 9
+    rf.err_min_us = -3
+    rf.err_max_us = 4
+    rf.ev_gap_min_us = 7
+    rf.ev_gap_max_us = 8
+    rf.judge_max_us = 11
+    rf.cy_get = 3
+    rf.cy_scan = 4
+    rf.cy_put = 5
+    rf.cy_adv = 6
+    rf.pdu_gap_min_us = 2
+    rf.pdu_gap_max_us = 3
+    rf.an_min_us = 1
+    rf.an_max_us = 2
+    rf.ev_n = 42
+
+@test
+fn test_reset_window_starts_the_minima_and_maxima_again()
+    var rf = ll_air.rf_new()
+    t_dirty(var rf)
+    ll_air.reset_window(var rf)
+    test.assert_eq(rf.tifs_min_ns, 1000000000)
+    test.assert_eq(rf.tifs_max_ns, 0)
+    test.assert_eq(rf.err_min_us, 1000000)
+    test.assert_eq(rf.err_max_us, -1000000)
+    test.assert_eq(rf.ev_gap_min_us, 1000000000)
+    test.assert_eq(rf.ev_gap_max_us, 0)
+    test.assert_eq(rf.judge_max_us, 0)
+    test.assert_eq(rf.cy_get + rf.cy_scan + rf.cy_put + rf.cy_adv, 0)
+    test.assert_eq(rf.pdu_gap_min_us, 1000000000)
+    test.assert_eq(rf.pdu_gap_max_us, 0)
+    test.assert_eq(rf.an_min_us, 1000000)
+    test.assert_eq(rf.an_max_us, -1000000)
+    // The counts go on.
+    test.assert_eq(rf.ev_n, 42)

@@ -1,0 +1,579 @@
+// tests/ll_scan_tests.nv — the unit tests of src/ll_scan.nv.
+//
+//   novo test tests/ll_scan_tests.nv
+
+use std.test
+use ll_pdu
+use ll_phy
+use ll_scan.{ ACT_ACCEPTED, ACT_REPORT, ACT_REQUEST, BACKOFF_MAX, DUP_ENTRIES, POLICY_DIRECTED, POLICY_LIST, POLICY_LIST_DIRECTED, SCAN_ACTIVE, SCAN_DEFAULT, SCAN_PASSIVE, Scan, XPHY_1M, XPHY_CODED, backoff_draw, backoff_failure, backoff_success, both_phys, directed_elsewhere, first_window_us, follows_extended, listen_us, scan_arm_for, scan_channel, scan_decide, scan_disable, scan_enable, scan_in_window, scan_may_ask, scan_new, scan_next_start, scan_note, scan_params_status, scan_phy, scan_reset, scan_rsp_missed, scan_rsp_rx, scan_rx, scan_set_params, scan_tick, scan_window_end, takes_unresolved_target, type_now, uses_list, xscan_enable, xscan_set_params, xscan_set_status, xscan_status, xscan_timing_ok }
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var x: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _a = x.push((first + i) as u8)
+    x
+
+// A scanner enabled at time 0 with the address 0xA0..0xA5.
+fn t_scanner(ty: Int, interval: Int, window: Int, dup: Bool) -> Scan
+    var s = scan_new()
+    scan_set_params(var s, ty, interval, window, 0, 0)
+    var a = t_addr(0xA0)
+    scan_enable(var s, 0, dup, var a, 0)
+    s
+
+// An advertisement of PDU type `ty` from the advertiser first..first+5 of
+// address type `tx_add`, with `data_len` octets of data.
+fn t_adv(ty: Int, first: Int, tx_add: Int, data_len: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var a = t_addr(first)
+    ll_pdu.pdu_begin(var p, ty, tx_add, 0)
+    ll_pdu.pdu_put_addr(var p, var a)
+    for i in 0..data_len
+        let _x = ll_pdu.pdu_put(var p, i)
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn t_policy(var s: Scan, p: Int)
+    s.policy = p as u8
+
+fn t_backoff(var s: Scan, upper: Int, count: Int)
+    s.upper = upper
+    s.count = count
+
+@test
+fn test_capacities_match_the_constants()
+    var s = scan_new()
+    test.assert_eq(s.d_meta.capacity(), DUP_ENTRIES)
+    test.assert_eq(s.d_addr.capacity(), DUP_ENTRIES * 6)
+    test.assert_eq(s.addr.capacity(), 6)
+    test.assert_eq(s.w_addr.capacity(), 6)
+
+@test
+fn test_parameter_status_follows_the_command()
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 0), 0)
+    test.assert_eq(scan_params_status(1, 0x4000, 0x4000, 1, 1), 0)
+    test.assert_eq(scan_params_status(2, 0x10, 0x10, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 3, 3, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x4001, 0x10, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 3, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 0x11, 0, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 4, 0), 0x12)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 4), 0x12)
+    // The own address types 2 and 3 are served, and the filter policies 2 and 3.
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 2, 0), 0)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 3, 1), 0)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 2), 0)
+    test.assert_eq(scan_params_status(0, 0x10, 0x10, 0, 3), 0)
+
+@test
+fn test_windows_follow_the_interval_and_rotate_the_channel()
+    // Interval 100 ms (160 units), window 30 ms (48 units).
+    var s = t_scanner(0, 160, 48, false)
+    test.assert(scan_in_window(var s, 0))
+    test.assert(scan_in_window(var s, 29999))
+    test.assert(not scan_in_window(var s, 30000))
+    test.assert(not scan_in_window(var s, 99999))
+    test.assert(scan_in_window(var s, 100000))
+    test.assert_eq(scan_channel(var s, 0), 37)
+    test.assert_eq(scan_channel(var s, 100000), 38)
+    test.assert_eq(scan_channel(var s, 250000), 39)
+    test.assert_eq(scan_channel(var s, 300000), 37)
+    test.assert_eq(scan_window_end(var s, 10000), 30000)
+    test.assert_eq(scan_window_end(var s, 110000), 130000)
+    test.assert_eq(scan_next_start(var s, 10000), 10000)
+    test.assert_eq(scan_next_start(var s, 40000), 100000)
+    test.assert_eq(scan_next_start(var s, 99999), 100000)
+
+@test
+fn test_equal_window_and_interval_scan_continuously()
+    var s = t_scanner(0, 16, 16, false)
+    for t in 0..200
+        test.assert(scan_in_window(var s, t * 1000))
+    // The channel still changes every window.
+    test.assert_eq(scan_channel(var s, 0), 37)
+    test.assert_eq(scan_channel(var s, 10000), 38)
+
+@test
+fn test_a_scanner_that_is_off_has_no_window()
+    var s = scan_new()
+    test.assert(not scan_in_window(var s, 0))
+
+@test
+fn test_a_passive_scanner_reports_and_never_requests()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 3)
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT)
+    test.assert_eq(s.requests, 0)
+    test.assert(not s.waiting)
+
+@test
+fn test_duplicate_filter_reports_a_device_once()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 3)
+    var q = t_adv(ll_pdu.ADV_NONCONN_IND, 0x20, 1, 0)
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 11, false), 0)
+    test.assert_eq(scan_rx(var s, var q, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var q, 8, false), 0)
+    test.assert_eq(scan_rx(var s, var p, 11, false), 0)
+    test.assert_eq(s.duplicates, 3)
+    test.assert_eq(s.reports, 2)
+
+@test
+fn test_the_same_address_with_the_other_type_is_another_device()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    var q = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var q, 8, false), ACT_REPORT)
+
+@test
+fn test_without_the_filter_every_pdu_is_reported()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    for _ in 0..5
+        test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(s.reports, 5)
+
+@test
+fn test_the_duplicate_filter_forgets_the_oldest_when_full()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    for i in 0..DUP_ENTRIES
+        var p = t_adv(ll_pdu.ADV_IND, 0x10 + i * 8, 0, 0)
+        test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    // One more device takes the place of the first.
+    var extra = t_adv(ll_pdu.ADV_IND, 0xF0, 0, 0)
+    test.assert_eq(scan_rx(var s, var extra, 8, false), ACT_REPORT)
+    var second = t_adv(ll_pdu.ADV_IND, 0x10 + 8, 0, 0)
+    test.assert_eq(scan_rx(var s, var second, 8, false), 0)
+    var first = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var first, 8, false), ACT_REPORT)
+
+@test
+fn test_enabling_again_keeps_the_filter_and_takes_the_new_setting()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    var a = t_addr(0xA0)
+    scan_enable(var s, 5000, false, var a, 0)
+    test.assert_eq(s.start, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+
+@test
+fn test_disable_and_enable_clear_the_filter()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    scan_disable(var s)
+    var a = t_addr(0xA0)
+    scan_enable(var s, 9000, true, var a, 0)
+    test.assert_eq(s.start, 9000)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+
+@test
+fn test_filtered_policy_ignores_devices_outside_the_list()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    t_policy(var s, 1)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), 0)
+    test.assert_eq(scan_rx(var s, var p, 8, true), ACT_REPORT)
+    test.assert_eq(s.filtered, 1)
+
+@test
+fn test_directed_pdu_is_reported_only_when_it_names_the_scanner()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var me = t_addr(0xA0)
+    var other = t_addr(0xB0)
+    var d = ll_pdu.pdu_new()
+    var adv = t_addr(0x10)
+    ll_pdu.pdu_begin(var d, ll_pdu.ADV_DIRECT_IND, 0, 0)
+    ll_pdu.pdu_put_addr(var d, var adv)
+    ll_pdu.pdu_put_addr(var d, var me)
+    ll_pdu.pdu_finish(var d)
+    test.assert_eq(scan_rx(var s, var d, 14, false), ACT_REPORT)
+    var e = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var e, ll_pdu.ADV_DIRECT_IND, 0, 0)
+    ll_pdu.pdu_put_addr(var e, var adv)
+    ll_pdu.pdu_put_addr(var e, var other)
+    ll_pdu.pdu_finish(var e)
+    test.assert_eq(scan_rx(var s, var e, 14, false), 0)
+    // The scanner's address with the other type bit is not the scanner.
+    var f = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var f, ll_pdu.ADV_DIRECT_IND, 0, 1)
+    ll_pdu.pdu_put_addr(var f, var adv)
+    ll_pdu.pdu_put_addr(var f, var me)
+    ll_pdu.pdu_finish(var f)
+    test.assert_eq(scan_rx(var s, var f, 14, false), 0)
+
+// A directed advertisement from the advertiser 0x10.. to `target` (a random address when
+// `rx_add` is 1).
+fn t_directed(var target: Vec[u8; 6], rx_add: Int) -> Pdu
+    var d = ll_pdu.pdu_new()
+    var adv = t_addr(0x10)
+    ll_pdu.pdu_begin(var d, ll_pdu.ADV_DIRECT_IND, 0, rx_add)
+    ll_pdu.pdu_put_addr(var d, var adv)
+    ll_pdu.pdu_put_addr(var d, var target)
+    ll_pdu.pdu_finish(var d)
+    d
+
+@test
+fn test_policy_2_takes_a_directed_pdu_for_an_rpa_that_is_not_the_scanners()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    // A Resolvable Private Address: random, the two top bits 01.
+    var rpa = t_addr(0x40)
+    rpa[5] = 0x5A
+    var d = t_directed(var rpa, 1)
+    test.assert(directed_elsewhere(var s, var d))
+    test.assert(not takes_unresolved_target(var s, var d))
+    test.assert_eq(scan_rx(var s, var d, 14, false), 0)
+    t_policy(var s, POLICY_DIRECTED)
+    test.assert(takes_unresolved_target(var s, var d))
+    test.assert_eq(scan_rx(var s, var d, 14, false), ACT_REPORT)
+    // A public address, or a random address that is no RPA, is still not for the scanner.
+    var other = t_addr(0xB0)
+    var p = t_directed(var other, 0)
+    test.assert_eq(scan_rx(var s, var p, 14, false), 0)
+    var st = t_addr(0xC0)
+    st[5] = 0xC1
+    var q = t_directed(var st, 1)
+    test.assert_eq(scan_rx(var s, var q, 14, false), 0)
+    // The scanner's own directed PDU is no "elsewhere".
+    var me = t_addr(0xA0)
+    var mine = t_directed(var me, 0)
+    test.assert(not directed_elsewhere(var s, var mine))
+
+@test
+fn test_policy_3_adds_the_filter_accept_list()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    t_policy(var s, POLICY_LIST_DIRECTED)
+    test.assert(uses_list(POLICY_LIST_DIRECTED))
+    test.assert(uses_list(POLICY_LIST))
+    test.assert(not uses_list(POLICY_DIRECTED))
+    var rpa = t_addr(0x40)
+    rpa[5] = 0x5A
+    var d = t_directed(var rpa, 1)
+    test.assert_eq(scan_rx(var s, var d, 14, false), 0)
+    test.assert_eq(scan_rx(var s, var d, 14, true), ACT_REPORT)
+
+@test
+fn test_malformed_and_foreign_pdus_are_ignored()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 9, false), 0)
+    var q = t_adv(ll_pdu.SCAN_REQ, 0x10, 0, 6)
+    test.assert_eq(scan_rx(var s, var q, 14, false), 0)
+    var off = scan_new()
+    test.assert_eq(scan_rx(var off, var p, 8, false), 0)
+
+@test
+fn test_active_scanner_requests_on_the_first_scannable_pdu()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 1, 3)
+    test.assert(scan_arm_for(var s, 0x40))
+    test.assert_eq(scan_rx(var s, var p, 11, false), ACT_REPORT | ACT_REQUEST)
+    test.assert(s.waiting)
+    test.assert_eq(ll_pdu.pdu_type(var s.req), ll_pdu.SCAN_REQ)
+    test.assert_eq(ll_pdu.pdu_len(var s.req), 12)
+    // ScanA is the scanner's address and AdvA the advertiser's, with the
+    // advertiser's type in RxAdd and the scanner's in TxAdd.
+    test.assert_eq(ll_pdu.pdu_get(var s.req, 2), 0xA0)
+    test.assert_eq(ll_pdu.pdu_get(var s.req, 8), 0x10)
+    test.assert_eq(ll_pdu.pdu_get(var s.req, 13), 0x15)
+    test.assert_eq(ll_pdu.pdu_rx_add(var s.req), 1)
+    test.assert_eq(ll_pdu.pdu_tx_add(var s.req), 0)
+
+@test
+fn test_active_scanner_does_not_request_from_non_scannable_types()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var a = t_adv(ll_pdu.ADV_NONCONN_IND, 0x10, 0, 3)
+    test.assert_eq(scan_rx(var s, var a, 11, false), ACT_REPORT)
+    var b = t_adv(ll_pdu.ADV_SCAN_IND, 0x20, 0, 3)
+    test.assert_eq(scan_rx(var s, var b, 11, false), ACT_REPORT | ACT_REQUEST)
+    test.assert(not scan_arm_for(var s, 0x02))
+
+@test
+fn test_while_waiting_the_scanner_sends_no_second_request()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT | ACT_REQUEST)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert(not scan_arm_for(var s, 0x00))
+
+@test
+fn test_scan_response_is_reported_and_ends_the_wait()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    let _x = scan_rx(var s, var p, 8, false)
+    var r = t_adv(ll_pdu.SCAN_RSP, 0x10, 0, 4)
+    test.assert_eq(scan_rsp_rx(var s, var r, 12), ACT_REPORT)
+    test.assert(not s.waiting)
+    test.assert_eq(s.responses, 1)
+    // The device has answered: no further request goes to it.
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(s.requests, 1)
+
+@test
+fn test_scan_response_from_another_advertiser_is_not_the_answer()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    let _x = scan_rx(var s, var p, 8, false)
+    var wrong = t_adv(ll_pdu.SCAN_RSP, 0x30, 0, 4)
+    test.assert_eq(scan_rsp_rx(var s, var wrong, 12), 0)
+    test.assert(s.waiting)
+    var wrong_type = t_adv(ll_pdu.SCAN_RSP, 0x10, 1, 4)
+    test.assert_eq(scan_rsp_rx(var s, var wrong_type, 12), 0)
+    test.assert(s.waiting)
+
+@test
+fn test_scan_response_duplicates_are_filtered_apart_from_advertisements()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    // The advertisement was reported; its scan response is a separate report.
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT | ACT_REQUEST)
+    var r = t_adv(ll_pdu.SCAN_RSP, 0x10, 0, 4)
+    test.assert_eq(scan_rsp_rx(var s, var r, 12), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 8, false), 0)
+
+@test
+fn test_a_missed_response_counts_a_failure_and_allows_a_new_request()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    let _x = scan_rx(var s, var p, 8, false)
+    scan_rsp_missed(var s)
+    test.assert(not s.waiting)
+    test.assert_eq(s.misses, 1)
+    test.assert_eq(s.upper, 1)
+    // The count was drawn from 1 to the upper limit of 1: the next PDU asks.
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT | ACT_REQUEST)
+
+@test
+fn test_two_failures_double_the_limit_and_two_successes_halve_it()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    for _ in 0..4
+        backoff_failure(var s)
+    test.assert_eq(s.upper, 4)
+    for _ in 0..40
+        backoff_failure(var s)
+    test.assert_eq(s.upper, BACKOFF_MAX)
+    for _ in 0..4
+        backoff_success(var s)
+    test.assert_eq(s.upper, BACKOFF_MAX / 4)
+    for _ in 0..40
+        backoff_success(var s)
+    test.assert_eq(s.upper, 1)
+
+@test
+fn test_backoff_count_is_between_one_and_the_limit()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    t_backoff(var s, 8, 1)
+    var lo = 100
+    var hi = 0
+    for _ in 0..500
+        backoff_draw(var s)
+        test.assert(s.count >= 1 and s.count <= 8)
+        if s.count < lo
+            lo = s.count
+        if s.count > hi
+            hi = s.count
+    test.assert_eq(lo, 1)
+    test.assert_eq(hi, 8)
+
+@test
+fn test_with_a_limit_above_one_only_every_nth_pdu_is_asked_about()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    t_backoff(var s, 4, 3)
+    var a = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    var b = t_adv(ll_pdu.ADV_IND, 0x20, 0, 0)
+    var c = t_adv(ll_pdu.ADV_IND, 0x30, 0, 0)
+    test.assert(not scan_arm_for(var s, 0x00))
+    test.assert_eq(scan_rx(var s, var a, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var b, 8, false), ACT_REPORT)
+    test.assert(scan_arm_for(var s, 0x00))
+    test.assert_eq(scan_rx(var s, var c, 8, false), ACT_REPORT | ACT_REQUEST)
+
+@test
+fn test_reset_returns_to_the_defaults()
+    var s = t_scanner(SCAN_ACTIVE, 160, 48, true)
+    scan_reset(var s)
+    test.assert(not s.enabled)
+    test.assert_eq(s.interval, SCAN_DEFAULT)
+    test.assert_eq(s.window, SCAN_DEFAULT)
+    test.assert_eq(s.ty as Int, 0)
+
+@test
+fn test_the_decision_asks_before_the_host_is_told()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 3)
+    let act = scan_decide(var s, var p, 11, false)
+    test.assert_eq(act, ACT_ACCEPTED | ACT_REQUEST)
+    // Nothing is reported until the note is made, and a note reports once.
+    test.assert_eq(s.reports, 0)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    test.assert_eq(s.reports, 1)
+    let again = scan_decide(var s, var p, 11, false)
+    test.assert_eq(again & ACT_REQUEST, 0)
+    test.assert_eq(scan_note(var s, var p), 0)
+    test.assert_eq(s.duplicates, 1)
+
+@test
+fn test_a_pdu_the_policy_refuses_is_not_accepted()
+    var s = t_scanner(SCAN_ACTIVE, 16, 16, false)
+    t_policy(var s, 1)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_decide(var s, var p, 8, false), 0)
+    test.assert_eq(scan_decide(var s, var p, 8, true), ACT_ACCEPTED | ACT_REQUEST)
+
+@test
+fn test_extended_scan_parameters_check_the_phys_and_the_ranges()
+    test.assert_eq(xscan_status(0, 0, XPHY_1M), 0)
+    test.assert_eq(xscan_status(3, 3, XPHY_1M | XPHY_CODED), 0)
+    test.assert_eq(xscan_status(4, 0, XPHY_1M), 0x12)
+    test.assert_eq(xscan_status(0, 4, XPHY_1M), 0x12)
+    test.assert_eq(xscan_status(0, 0, 0), 0x12)
+    // LE 2M (bit 1) and the bits above LE Coded are reserved.
+    test.assert_eq(xscan_status(0, 0, 2), 0x12)
+    test.assert_eq(xscan_status(0, 0, XPHY_1M | 8), 0x12)
+    test.assert_eq(xscan_set_status(1, 0x10, 0x10), 0)
+    test.assert_eq(xscan_set_status(2, 0x10, 0x10), 0x12)
+    test.assert_eq(xscan_set_status(0, 0x10, 0x20), 0x12)
+    test.assert(xscan_timing_ok(0, 0))
+    test.assert(xscan_timing_ok(100, 0))
+    test.assert(xscan_timing_ok(100, 1))
+    test.assert(not xscan_timing_ok(0, 1))
+    test.assert(not xscan_timing_ok(128, 1))
+
+fn t_xscanner(dur: Int, period: Int, dup_mode: Int) -> Scan
+    var s = scan_new()
+    scan_set_params(var s, 0, 16, 16, 0, 0)
+    xscan_set_params(var s, 0, 0, XPHY_1M)
+    var a = t_addr(0xA0)
+    xscan_enable(var s, 0, dup_mode, dur, period, var a, 0)
+    s
+
+@test
+fn test_a_duration_with_no_period_ends_the_state_and_stops_the_windows()
+    var s = t_xscanner(100, 0, 0)
+    test.assert(follows_extended(var s))
+    test.assert_eq(scan_tick(var s, 999999), 0)
+    test.assert(scan_in_window(var s, 999000))
+    test.assert(not scan_in_window(var s, 1000000))
+    test.assert_eq(scan_tick(var s, 1000000), 1)
+    // With no duration there is nothing to end.
+    var u = t_xscanner(0, 0, 0)
+    test.assert_eq(scan_tick(var u, 100000000), 0)
+
+@test
+fn test_a_period_starts_the_windows_again_and_empties_the_filter_in_mode_two()
+    var s = t_xscanner(100, 1, 2)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_rx(var s, var p, 8, false), 0)
+    // The duration is over at 1 s and the next period begins at 1.28 s.
+    test.assert_eq(scan_tick(var s, 1100000), 0)
+    test.assert(not scan_in_window(var s, 1100000))
+    test.assert_eq(scan_next_start(var s, 1100000), 1280000)
+    test.assert_eq(scan_window_end(var s, 1280000 - 1), 1280000 + 10000)
+    test.assert_eq(scan_tick(var s, 1290000), 0)
+    test.assert_eq(s.start, 1280000)
+    test.assert(scan_in_window(var s, 1290000))
+    test.assert_eq(scan_channel(var s, 1285000), 37)
+    test.assert_eq(scan_rx(var s, var p, 8, false), ACT_REPORT)
+    // Mode 1 keeps the filter across periods.
+    var q = t_xscanner(100, 1, 1)
+    test.assert_eq(scan_rx(var q, var p, 8, false), ACT_REPORT)
+    test.assert_eq(scan_tick(var q, 1290000), 0)
+    test.assert_eq(scan_rx(var q, var p, 8, false), 0)
+
+fn t_did(var s: Scan, d: Int)
+    s.cur_did = d
+
+@test
+fn test_the_duplicate_filter_tells_advertisements_of_one_address_apart_by_their_did()
+    var s = t_scanner(SCAN_PASSIVE, 16, 16, true)
+    var p = t_adv(ll_pdu.ADV_NONCONN_IND, 0x10, 0, 0)
+    t_did(var s, 0x8100)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    test.assert_eq(scan_note(var s, var p), 0)
+    t_did(var s, 0x8200)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    t_did(var s, 0x8100)
+    test.assert_eq(scan_note(var s, var p), 0)
+    // A legacy PDU of the same device is another entry still.
+    t_did(var s, 0)
+    test.assert_eq(scan_note(var s, var p), ACT_REPORT)
+    test.assert_eq(scan_note(var s, var p), 0)
+
+fn t_coded_set(var s: Scan, ty: Int, window: Int)
+    s.c_ty = ty as u8
+    s.c_interval = s.interval
+    s.c_window = window
+
+fn t_cur(var s: Scan, phy: Int)
+    s.cur_phy = phy as u8
+
+fn t_both(interval: Int, w1: Int, wc: Int, ty: Int, cty: Int) -> Scan
+    var s = scan_new()
+    scan_set_params(var s, ty, interval, w1, 0, 0)
+    xscan_set_params(var s, 0, 0, XPHY_1M | XPHY_CODED)
+    t_coded_set(var s, cty, wc)
+    var a = t_addr(0xA0)
+    xscan_enable(var s, 0, 0, 0, 0, var a, 0)
+    s
+
+@test
+fn test_a_scanner_of_two_phys_listens_on_le_1m_and_then_on_le_coded_in_each_interval()
+    // An interval of 100 ms (160 units), 30 ms (48 units) on LE 1M and 20 ms (32 units) on LE Coded.
+    var s = t_both(160, 48, 32, SCAN_PASSIVE, SCAN_ACTIVE)
+    test.assert(both_phys(var s))
+    test.assert_eq(first_window_us(var s), 30000)
+    test.assert_eq(listen_us(var s), 50000)
+    test.assert_eq(scan_phy(var s, 0), ll_phy.PHY_1M)
+    test.assert_eq(scan_phy(var s, 29999), ll_phy.PHY_1M)
+    test.assert_eq(scan_phy(var s, 30000), ll_phy.PHY_CODED)
+    test.assert_eq(scan_phy(var s, 49999), ll_phy.PHY_CODED)
+    test.assert_eq(scan_phy(var s, 100000), ll_phy.PHY_1M)
+    test.assert(scan_in_window(var s, 49999))
+    test.assert(not scan_in_window(var s, 50000))
+    test.assert(not scan_in_window(var s, 99999))
+    test.assert(scan_in_window(var s, 100000))
+    // A window ends at the change of PHY, and the Coded one at the end of the listening.
+    test.assert_eq(scan_window_end(var s, 10000), 30000)
+    test.assert_eq(scan_window_end(var s, 30000), 50000)
+    test.assert_eq(scan_window_end(var s, 130000), 150000)
+    test.assert_eq(scan_next_start(var s, 60000), 100000)
+    // Both windows of an interval are on the same channel, the next interval on the next.
+    test.assert_eq(scan_channel(var s, 10000), 37)
+    test.assert_eq(scan_channel(var s, 40000), 37)
+    test.assert_eq(scan_channel(var s, 110000), 38)
+    // The Scan_Type follows the PHY of the window.
+    t_cur(var s, ll_phy.PHY_1M)
+    test.assert_eq(type_now(var s), SCAN_PASSIVE)
+    test.assert(not scan_may_ask(var s))
+    t_cur(var s, ll_phy.PHY_CODED)
+    test.assert_eq(type_now(var s), SCAN_ACTIVE)
+    test.assert(scan_may_ask(var s))
+    // Windows that together are longer than the interval share it.
+    var t = t_both(160, 160, 160, SCAN_PASSIVE, SCAN_PASSIVE)
+    test.assert_eq(first_window_us(var t), 50000)
+    test.assert_eq(listen_us(var t), 100000)
+    test.assert_eq(scan_phy(var t, 49999), ll_phy.PHY_1M)
+    test.assert_eq(scan_phy(var t, 50000), ll_phy.PHY_CODED)
+
+@test
+fn test_a_scanner_of_one_phy_listens_on_it_for_the_whole_window()
+    var s = t_scanner(SCAN_PASSIVE, 160, 48, false)
+    test.assert(not both_phys(var s))
+    test.assert_eq(scan_phy(var s, 0), ll_phy.PHY_1M)
+    // LE Coded alone: the legacy fields hold its set.
+    var c = scan_new()
+    scan_set_params(var c, 1, 160, 48, 0, 0)
+    xscan_set_params(var c, 0, 0, XPHY_CODED)
+    var a = t_addr(0xA0)
+    xscan_enable(var c, 0, 0, 0, 0, var a, 0)
+    test.assert_eq(scan_phy(var c, 0), ll_phy.PHY_CODED)
+    test.assert_eq(scan_phy(var c, 50000), ll_phy.PHY_CODED)
+    test.assert_eq(first_window_us(var c), 30000)
+    // A scanner of the legacy commands is on LE 1M whatever the fields hold.
+    test.assert_eq(scan_phy(var s, 0), ll_phy.PHY_1M)

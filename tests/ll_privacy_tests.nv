@@ -57,10 +57,20 @@ fn t_entropy(var r: ll_privacy.ResolvingList, v: Int)
     ll_privacy.rl_entropy_put(var r, var e)
 
 fn t_local(var r: ll_privacy.ResolvingList, i: Int) -> Vec[u8; 6]
-    t6([r.local_rpa[i * 6] as Int, r.local_rpa[i * 6 + 1] as Int, r.local_rpa[i * 6 + 2] as Int, r.local_rpa[i * 6 + 3] as Int, r.local_rpa[i * 6 + 4] as Int, r.local_rpa[i * 6 + 5] as Int])
+    t6([r.local_rpa[i * 6] as Int,
+        r.local_rpa[i * 6 + 1] as Int,
+        r.local_rpa[i * 6 + 2] as Int,
+        r.local_rpa[i * 6 + 3] as Int,
+        r.local_rpa[i * 6 + 4] as Int,
+        r.local_rpa[i * 6 + 5] as Int])
 
 fn t_peer(var r: ll_privacy.ResolvingList, i: Int) -> Vec[u8; 6]
-    t6([r.peer_rpa[i * 6] as Int, r.peer_rpa[i * 6 + 1] as Int, r.peer_rpa[i * 6 + 2] as Int, r.peer_rpa[i * 6 + 3] as Int, r.peer_rpa[i * 6 + 4] as Int, r.peer_rpa[i * 6 + 5] as Int])
+    t6([r.peer_rpa[i * 6] as Int,
+        r.peer_rpa[i * 6 + 1] as Int,
+        r.peer_rpa[i * 6 + 2] as Int,
+        r.peer_rpa[i * 6 + 3] as Int,
+        r.peer_rpa[i * 6 + 4] as Int,
+        r.peer_rpa[i * 6 + 5] as Int])
 
 @test
 fn test_ah_matches_the_sample_data_of_the_specification()
@@ -133,14 +143,14 @@ fn test_prand_has_its_top_bits_and_never_all_zero_or_all_one()
     ll_privacy.rl_entropy_put(var r, var e)
     let p0 = ll_privacy.rl_prand(var r)
     test.assert_eq(p0 & 0xC00000, 0x400000)
-    test.assert(p0 & 0x3FFFFF != 0)
+    test.assert((p0 & 0x3FFFFF) != 0)
     var f: Vec[u8; 12] = Vec.new()
     for k in 0..12
         let _b = f.push(0xFF)
     ll_privacy.rl_entropy_put(var r, var f)
     let p1 = ll_privacy.rl_prand(var r)
     test.assert_eq(p1 & 0xC00000, 0x400000)
-    test.assert(p1 & 0x3FFFFF != 0x3FFFFF)
+    test.assert((p1 & 0x3FFFFF) != 0x3FFFFF)
     // Twelve octets make four of them.
     test.assert(ll_privacy.rl_prand(var r) >= 0)
     test.assert(ll_privacy.rl_prand(var r) >= 0)
@@ -197,7 +207,7 @@ fn test_add_remove_and_clear_follow_the_statuses_of_the_command()
 @test
 fn test_reset_restores_the_defaults()
     var r = t_list()
-    t_set(r, true, 77, 5)
+    t_set(var r, true, 77, 5)
     ll_privacy.rl_reset(var r)
     test.assert_eq(ll_privacy.rl_count(var r), 0)
     test.assert(not r.enable)
@@ -208,7 +218,7 @@ fn test_reset_restores_the_defaults()
 @test
 fn test_the_rpa_timeout_runs_from_the_epoch()
     var r = ll_privacy.rl_new()
-    t_set(r, false, 2, 1000000)
+    t_set(var r, false, 2, 1000000)
     test.assert(not ll_privacy.rl_expired(var r, 2999999))
     test.assert(ll_privacy.rl_expired(var r, 3000000))
 

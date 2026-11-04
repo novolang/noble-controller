@@ -1,0 +1,3339 @@
+// tests/ll_link_tests.nv — the unit tests of src/ll_link.nv.
+//
+//   novo test tests/ll_link_tests.nv
+
+use std.test
+use ctl_limits
+use ll_pdu
+use ll_data
+use ll_policy
+use ll_phy
+use ll_sub
+use ll_rate
+use ll_fs
+use ll_feat
+use ll_link.{ AUTO_PHY_EVENTS, CATCH_UP_MAX, CODE_BUSY, CODE_COLLISION, CODE_DIFFERENT_COLLISION, CODE_INVALID_LL_PARAMETERS, CTRL_SLOTS, ENC_C_PAUSE_WAIT_RSP, ENC_IDLE, ENC_NEED_RANDOM, ENC_P_WAIT_LTK, ENC_P_WAIT_START_RSP, EV_APTO, EV_COMPLETED, EV_CONNECTED, EV_DATA_LENGTH, EV_DISCONNECTED, EV_FEATEXT, EV_FEATURES, EV_PARAM_REQUEST, EV_PHY, EV_SUBRATE, EV_UPDATED, EV_VERSION, FEAT1_2M, FEAT1_CODED, FEAT3_PAST, FEATURES_OCTET0, FEATURES_OCTET2, FX_HAVE, FX_LOCAL, FX_PEER, FX_RATE, FX_RATEEV, INSTANT_LEAD, INSTANT_SLACK, K_ACL, K_ACL_PART, K_CTRL, K_EMPTY, LL_COMPANY, LL_SUBVERSION, LL_VERSION, Link, PHYS_SUPPORTED, PHY_DEFERRED, PHY_IDLE, PHY_RESPONDED, PHY_WAIT_IND, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, PROC_PARAM, PROC_PING, PROC_VERSION, REASON_FAILED_TO_ESTABLISH, REASON_INSTANT_PASSED, REASON_LOCAL_HOST, REASON_RESPONSE_TIMEOUT, REASON_TIMEOUT, REASON_UNSUPPORTED_PARAMETER, RX_NOTHING, RX_TO_HOST, STATUS_COMMAND_DISALLOWED, STATUS_INVALID_PARAMETERS, STATUS_SUCCESS, STATUS_UNKNOWN_CONNECTION, STATUS_UNSUPPORTED_FEATURE, STATUS_UNSUPPORTED_REMOTE, anchor_offset, auto_tasks, chan_next, connect_request, connect_valid, csa2_channel, csa2_permute, csa2_prn, ctrl_queue, ctrl_rx, dle_refresh, dle_start, dle_wire_time, eff_rx_octets, eff_rx_time, eff_tx_octets, eff_tx_time, enc_begin, features_request_opcode, first_offset, fs_peer_lacks, fx_get, fx_put, interval_us, link_answers_bad, link_auth_rx, link_book_us, link_catch_up, link_close, link_connection_update, link_disconnect, link_ended, link_event_begin, link_event_done, link_event_late, link_first_header, link_host_range, link_is_central, link_listen_end, link_listen_start, link_live, link_new, link_note_rx, link_open, link_open_central, link_owes, link_param_negative, link_param_reply, link_prepare, link_queue_acl, link_read_features, link_read_version, link_released, link_request_min_used, link_reset, link_rx_bad, link_rx_fast, link_rx_slow, link_sent, link_set_apto, link_set_auth, link_set_data_length, link_set_defaults, link_set_host_map, link_set_host_rate, link_set_indicate, link_set_phy, link_set_room, link_start_encryption, link_take_completed, nth_used, pad_map, params_valid, peer_has_phy, phy_begin, phy_best, phy_wanted, pick_interval, popcount, rate_central_start, rate_fetch, rate_fetch_over, rate_host, rate_peer_ok, reverse_octet, sca_ppm, slot_get_cq, sub_can_start, sub_set, tx_limit, wanted_map, widening }
+
+// An LL Control PDU from the peer: the opcode and the payload octets after it.
+fn t_ctrl(op: Int, rest: [Int]) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var p, op)
+    for b in rest
+        let _a = ll_pdu.pdu_put(var p, b)
+    ll_data.dpdu_finish(var p)
+    p
+
+// Run the Central's PDU `rx`, with the header bits `sn`, `nesn`, `md`, through
+// the two steps a packet takes; the answer is the verdict of the slow step.
+fn t_packet(var l: Link, var rx: Pdu, sn: Int, nesn: Int, md: Int) -> Int
+    let _h = link_rx_fast(var l, rx.b[0] as Int | (nesn << 2) | (sn << 3) | (md << 4))
+    link_rx_slow(var l, var rx)
+
+// The peer told its feature octet `i` is `v` (a test sets what LL_FEATURE_RSP would).
+fn t_peer_features(var l: Link, i: Int, v: Int)
+    l.have_feat = true
+    l.peer_feat[i] = v as u8
+
+// Two octets of a test PDU, least significant first.
+fn t_put16(var p: Pdu, v: Int)
+    let _a = ll_pdu.pdu_put(var p, v & 0xFF)
+    let _b = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+
+// A CONNECT_IND from the random address 0x40..0x45 to the public address
+// 0x10..0x15: the access address 0x50655A12, CRC seed 0x332211, an interval
+// of `interval` units, a latency, a timeout, a transmit window of `win_size`
+// at `win_offset`, the channel map `map`, hop `hop` and SCA class `sca`.
+fn t_connect(interval: Int, latency: Int, timeout: Int, win_size: Int, win_offset: Int, map: Int,
+             hop: Int, sca: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0x10 + i)
+    t_put16(var p, 0x5A12)
+    t_put16(var p, 0x5065)
+    t_put16(var p, 0x2211)
+    let _c = ll_pdu.pdu_put(var p, 0x33)
+    let _d = ll_pdu.pdu_put(var p, win_size)
+    t_put16(var p, win_offset)
+    t_put16(var p, interval)
+    t_put16(var p, latency)
+    t_put16(var p, timeout)
+    for k in 0..5
+        let _g = ll_pdu.pdu_put(var p, (map >>> (8 * k)) & 0xFF)
+    let _h = ll_pdu.pdu_put(var p, hop | (sca << 5))
+    ll_pdu.pdu_finish(var p)
+    p
+
+// The usual request: 7.5 ms interval, no latency, 2 s timeout, a transmit
+// window of 2.5 ms at offset 0, all 37 channels, hop 7, SCA class 0.
+fn t_usual() -> Pdu
+    t_connect(6, 0, 200, 2, 0, 0x1FFFFFFFFF, 7, 0)
+
+// A link opened on the usual request, which ended at time 1000.
+fn t_link() -> Link
+    var l = link_new()
+    var p = t_usual()
+    link_open(var l, 1, var p, 1000)
+    l
+
+// A data PDU from the peer.
+fn t_data(llid: Int, n: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var p, llid)
+    for i in 0..n
+        let _a = ll_pdu.pdu_put(var p, 0xA0 + i)
+    ll_data.dpdu_finish(var p)
+    p
+
+// The header octet of a Central's packet.
+fn t_hdr(sn: Int, nesn: Int, md: Int) -> Int
+    1 | (nesn << 2) | (sn << 3) | (md << 4)
+
+// Set a field of the link for a test: the link is the callee's `var`.
+fn t_due(var l: Link, v: Int)
+    l.due = v
+
+fn t_ev_count(var l: Link, v: Int)
+    l.ev_count = v
+
+fn t_now(var l: Link, v: Int)
+    l.now = v
+
+fn t_proc(var l: Link, v: Int)
+    l.proc = v
+
+fn t_alive(var l: Link, timeout: Int, last_rx: Int)
+    l.timeout = timeout
+    l.synced = true
+    l.last_rx = last_rx
+
+// The slow step on a data PDU the Central sent: LLID `llid`, `n` octets.
+fn t_slow(var l: Link, llid: Int, n: Int) -> Int
+    var rx = t_data(llid, n)
+    link_rx_slow(var l, var rx)
+
+// An ACL fragment of `n` octets queued for the Peripheral.
+fn t_queue(var l: Link, start: Bool, n: Int) -> Bool
+    var d: Vec[u8; 260] = Vec.new()
+    for i in 0..260
+        // The payload is from octet 2, as the H4 reader leaves it; octet 0x60 first.
+        let _a = d.push((0x60 + ((i + 30) & 0x1F)) as u8)
+    link_queue_acl(var l, start, var d, n)
+
+@test
+fn test_connect_ind_checks_each_field()
+    var ok = t_usual()
+    test.assert(connect_valid(var ok))
+    var a = t_connect(5, 0, 200, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var a))
+    var b = t_connect(3201, 0, 3200, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var b))
+    var c = t_connect(6, 0, 200, 0, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var c))
+    var d = t_connect(40, 0, 200, 9, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var d))
+    var e = t_connect(6, 0, 200, 6, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var e))
+    var f = t_connect(6, 0, 200, 2, 7, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var f))
+    var g = t_connect(6, 500, 3200, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var g))
+    var h = t_connect(6, 0, 9, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var h))
+    var i = t_connect(6, 0, 3201, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var i))
+    // A timeout of 100 ms is not longer than twice the 7.5 ms interval of 11 events.
+    var j = t_connect(6, 10, 10, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    test.assert(not connect_valid(var j))
+    var k = t_connect(6, 0, 200, 2, 0, 0x0000000001, 7, 0)
+    test.assert(not connect_valid(var k))
+    var m = t_connect(6, 0, 200, 2, 0, 0x2000000003, 7, 0)
+    test.assert(not connect_valid(var m))
+    var n = t_connect(6, 0, 200, 2, 0, 0x1FFFFFFFFF, 4, 0)
+    test.assert(not connect_valid(var n))
+    var o = t_connect(6, 0, 200, 2, 0, 0x1FFFFFFFFF, 17, 0)
+    test.assert(not connect_valid(var o))
+    var p = t_usual()
+    p.b[2 + 12] = 0xD6
+    p.b[2 + 13] = 0xBE
+    p.b[2 + 14] = 0x89
+    p.b[2 + 15] = 0x8E
+    test.assert(not connect_valid(var p))
+    // The limits themselves are valid.
+    var q = t_connect(3200, 0, 3200, 8, 3200, 0x0000000003, 16, 7)
+    test.assert(connect_valid(var q))
+    var r = t_connect(9, 499, 1200, 1, 0, 0x0000000003, 5, 0)
+    test.assert(connect_valid(var r))
+
+@test
+fn test_request_reads_the_connect_ind()
+    var p = t_connect(24, 3, 400, 2, 5, 0x1F00FF00FF, 9, 5)
+    var r = ll_policy.conn_request_new()
+    connect_request(var p, var r)
+    test.assert_eq(r.peer_type, 1)
+    test.assert_eq(r.peer[0] as Int, 0x40)
+    test.assert_eq(r.peer[5] as Int, 0x45)
+    test.assert_eq(r.interval, 24)
+    test.assert_eq(r.latency, 3)
+    test.assert_eq(r.timeout, 400)
+    test.assert_eq(r.win_size, 2)
+    test.assert_eq(r.win_offset, 5)
+    test.assert_eq(r.hop, 9)
+    test.assert_eq(r.sca, 5)
+    test.assert_eq(r.chmap, 0x1F00FF00FF)
+
+@test
+fn test_open_takes_the_parameters_and_expects_the_first_anchor()
+    var l = t_link()
+    test.assert(link_live(var l))
+    test.assert_eq(l.handle, 1)
+    test.assert_eq(l.aa, 0x50655A12)
+    test.assert_eq(l.crc_init, 0x332211)
+    test.assert_eq(l.interval, 6)
+    test.assert_eq(l.timeout, 200)
+    test.assert_eq(l.n_used, 37)
+    test.assert_eq(l.hop, 7)
+    test.assert_eq(l.sca, 0)
+    test.assert_eq(l.peer_type, 1)
+    test.assert_eq(l.own_type, 0)
+    test.assert_eq(l.peer[0] as Int, 0x40)
+    test.assert_eq(l.own[5] as Int, 0x15)
+    // The transmit window starts 1.25 ms after the end of the CONNECT_IND, plus
+    // WinOffset, and is WinSize long.
+    test.assert_eq(l.due, 1000 + 1250)
+    test.assert_eq(l.win_len, 2500)
+    test.assert_eq(l.first_due, l.due)
+    test.assert_eq(l.owed, EV_CONNECTED)
+    test.assert_eq(interval_us(var l), 7500)
+    var p = t_connect(24, 0, 400, 2, 3, 0x1FFFFFFFFF, 7, 0)
+    link_open(var l, 2, var p, 5000)
+    test.assert_eq(l.due, 5000 + 1250 + 3 * 1250)
+    test.assert_eq(l.handle, 2)
+
+@test
+fn test_clock_accuracy_classes_follow_the_table()
+    test.assert_eq(sca_ppm(0), 500)
+    test.assert_eq(sca_ppm(1), 250)
+    test.assert_eq(sca_ppm(2), 150)
+    test.assert_eq(sca_ppm(3), 100)
+    test.assert_eq(sca_ppm(4), 75)
+    test.assert_eq(sca_ppm(5), 50)
+    test.assert_eq(sca_ppm(6), 30)
+    test.assert_eq(sca_ppm(7), 20)
+
+@test
+fn test_channel_map_helpers()
+    test.assert_eq(popcount(0x1FFFFFFFFF), 37)
+    test.assert_eq(popcount(0), 0)
+    test.assert_eq(popcount(0b1010), 2)
+    test.assert_eq(nth_used(0b1010, 0), 1)
+    test.assert_eq(nth_used(0b1010, 1), 3)
+    test.assert_eq(nth_used(0b1010, 5), 0)
+
+@test
+fn test_channel_selection_hops_by_the_increment()
+    var l = t_link()
+    test.assert_eq(chan_next(var l), 7)
+    test.assert_eq(chan_next(var l), 14)
+    test.assert_eq(chan_next(var l), 21)
+    test.assert_eq(chan_next(var l), 28)
+    test.assert_eq(chan_next(var l), 35)
+    // 35 + 7 = 42, modulo 37 is 5.
+    test.assert_eq(chan_next(var l), 5)
+
+@test
+fn test_channel_selection_remaps_an_unused_channel()
+    // Channels 0 to 9 and 20 to 36 are used: 27 channels.
+    var l = link_new()
+    var p = t_connect(6, 0, 200, 2, 0, 0x1FFFF003FF, 7, 0)
+    link_open(var l, 1, var p, 0)
+    test.assert_eq(l.n_used, 27)
+    test.assert_eq(chan_next(var l), 7)
+    // 14 is unused: remapped to usedChannels[14 % 27], the 15th used channel,
+    // which is channel 24 (0 to 9, then 20 is the 11th, so 24 is the 15th).
+    test.assert_eq(chan_next(var l), 24)
+
+@test
+fn test_widening_grows_with_the_time_since_the_anchor()
+    var l = t_link()
+    // First window: 1250 us since the end of the CONNECT_IND, the Central
+    // 500 ppm and this end 50: 550 * 1250 / 1e6 = 0, plus 32 us of jitter.
+    test.assert_eq(widening(var l), 32)
+    test.assert_eq(link_listen_start(var l), 1000 + 1250 - 32)
+    test.assert_eq(link_listen_end(var l), 1000 + 1250 + 2500 + 32)
+    t_due(var l, l.t_ref + 1000000)
+    test.assert_eq(widening(var l), 550 + 32)
+    // Over 20 s the accuracy alone is 11 ms; the cap is half the interval less T_IFS.
+    t_due(var l, l.t_ref + 20000000)
+    test.assert_eq(widening(var l), 3750 - 150)
+
+@test
+fn test_an_event_with_an_anchor_moves_the_schedule_on_from_it()
+    var l = t_link()
+    test.assert_eq(link_event_begin(var l), 7)
+    test.assert(l.ev_open)
+    link_note_rx(var l, 3100, true)
+    link_note_rx(var l, 3500, true)
+    test.assert_eq(l.anchor, 3100)
+    test.assert(l.synced)
+    test.assert_eq(l.last_rx, 3500)
+    link_event_done(var l, 4000)
+    test.assert(not l.ev_open)
+    test.assert_eq(l.ev_count, 1)
+    test.assert_eq(l.due, 3100 + 7500)
+    test.assert_eq(l.t_ref, 3100)
+    test.assert_eq(l.win_len, 0)
+    test.assert(not l.closing)
+
+@test
+fn test_a_missed_event_keeps_the_window_and_the_last_anchor()
+    var l = t_link()
+    let _c = link_event_begin(var l)
+    link_event_done(var l, 5000)
+    test.assert_eq(l.ev_count, 1)
+    test.assert_eq(l.due, 2250 + 7500)
+    test.assert_eq(l.t_ref, 1000)
+    // The transmit window is still asked for.
+    test.assert_eq(l.win_len, 2500)
+    // The widening reckons from the end of the CONNECT_IND.
+    test.assert_eq(widening(var l), 550 * (2250 + 7500 - 1000) / 1000000 + 32)
+
+@test
+fn test_a_packet_with_a_bad_crc_still_fixes_the_anchor()
+    var l = t_link()
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, 3200, false)
+    test.assert(l.ev_anchor)
+    test.assert(l.synced)
+    // The supervision timer is not reset by it.
+    test.assert_eq(l.last_rx, 1000)
+    test.assert_eq(l.bad_run, 1)
+    test.assert(link_answers_bad(var l))
+    link_note_rx(var l, 3300, false)
+    test.assert(not link_answers_bad(var l))
+    link_note_rx(var l, 3400, true)
+    test.assert(link_answers_bad(var l))
+    test.assert_eq(l.last_rx, 3400)
+    test.assert_eq(l.anchor, 3200)
+
+@test
+fn test_the_event_counter_wraps_at_65536()
+    var l = t_link()
+    t_ev_count(var l, 0xFFFF)
+    let _c = link_event_begin(var l)
+    link_event_done(var l, 3000)
+    test.assert_eq(l.ev_count, 0)
+
+@test
+fn test_a_connection_that_never_hears_the_central_fails_to_establish()
+    var l = t_link()
+    var t = 1000
+    var n = 0
+    while not l.closing and n < 40
+        let _c = link_event_begin(var l)
+        t = l.due + 7500
+        link_event_done(var l, t)
+        n = n + 1
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_FAILED_TO_ESTABLISH)
+    test.assert(n >= 6)
+    test.assert(n <= 9)
+    test.assert(link_ended(var l))
+
+@test
+fn test_supervision_timeout_ends_the_connection()
+    var l = t_link()
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, 3000, true)
+    link_event_done(var l, 4000)
+    test.assert(not l.closing)
+    let _d = link_event_begin(var l)
+    // 200 units of 10 ms is 2 s after the last good packet.
+    link_event_done(var l, 3000 + 2000000)
+    test.assert(not l.closing)
+    let _e = link_event_begin(var l)
+    link_event_done(var l, 3000 + 2000001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_TIMEOUT)
+    // The first reason stands.
+    link_close(var l, 0x13)
+    test.assert_eq(l.reason, REASON_TIMEOUT)
+
+@test
+fn test_supervision_timeout_after_a_disconnect_is_local_termination()
+    var l = t_link()
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, 3000, true)
+    link_event_done(var l, 3500)
+    test.assert_eq(link_disconnect(var l, 0x13), 0)
+    let _d = link_event_begin(var l)
+    link_event_done(var l, 3000 + 2000001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_LOCAL_HOST)
+
+@test
+fn test_termination_timer_runs_without_the_supervision_timer()
+    var l = t_link()
+    t_now(var l, 100)
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, 3000, true)
+    link_event_done(var l, 3500)
+    test.assert_eq(link_disconnect(var l, 0x13), 0)
+    // The packets keep coming, the PDU is never acknowledged.
+    let _d = link_event_begin(var l)
+    link_note_rx(var l, 2200000, true)
+    link_event_done(var l, 2200001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_LOCAL_HOST)
+
+@test
+fn test_a_procedure_that_gets_no_answer_in_forty_seconds_ends_the_connection()
+    var l = t_link()
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, 3000, true)
+    link_event_done(var l, 3500)
+    test.assert_eq(link_read_version(var l), 0)
+    let _d = link_event_begin(var l)
+    link_note_rx(var l, 30000000, true)
+    link_event_done(var l, 30000001)
+    test.assert(not l.closing)
+    let _e = link_event_begin(var l)
+    link_note_rx(var l, 41000000, true)
+    link_event_done(var l, 41000001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_RESPONSE_TIMEOUT)
+
+@test
+fn test_the_first_packet_is_new_data_and_is_acknowledged()
+    var l = t_link()
+    // The Central's first packet: SN 0, NESN 0, no MD.  Nothing of ours is
+    // acknowledged; its data is new, so NESN becomes 1; this end sends the PDU
+    // in flight, SN 0, an empty one.
+    let h = link_rx_fast(var l, t_hdr(0, 0, 0))
+    test.assert_eq(h, 1 | (1 << 2))
+    test.assert(not l.acked)
+    test.assert(l.rx_new)
+    test.assert(not l.use_nxt)
+    test.assert(not l.cont)
+    test.assert_eq(l.nesn, 1)
+
+@test
+fn test_a_resent_packet_is_not_taken_again()
+    var l = t_link()
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    // The Central sends SN 0 again, since it did not hear this end: old data.
+    let h = link_rx_fast(var l, t_hdr(0, 0, 0))
+    test.assert(not l.rx_new)
+    test.assert_eq(l.nesn, 1)
+    test.assert_eq(h, 1 | (1 << 2))
+    // SN 1 is the next new one.
+    let _b = link_rx_fast(var l, t_hdr(1, 0, 0))
+    test.assert(l.rx_new)
+    test.assert_eq(l.nesn, 0)
+
+@test
+fn test_the_central_acknowledging_selects_the_next_pdu()
+    var l = t_link()
+    test.assert(t_queue(var l, true, 5))
+    // The PDU in flight is still the empty one; the data waits in `nxt`.
+    test.assert_eq(l.nxt_kind, K_ACL)
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 0, 0)
+    // NESN 1: the empty PDU is acknowledged and the data goes, with SN 1.
+    var rx = t_data(1, 0)
+    let h = link_rx_fast(var l, t_hdr(1, 1, 0))
+    test.assert(l.acked)
+    test.assert(l.use_nxt)
+    test.assert_eq(h & 3, ll_data.LLID_START)
+    test.assert_eq((h >>> 3) & 1, 1)
+    test.assert_eq((h >>> 2) & 1, 0)
+    let r = link_rx_slow(var l, var rx)
+    test.assert_eq(r, RX_NOTHING)
+    test.assert_eq(l.sn, 1)
+    test.assert_eq(l.cur_kind, K_ACL)
+    test.assert_eq(ll_data.dpdu_len(var l.cur), 5)
+    test.assert_eq(ll_data.dpdu_byte(var l.cur, 0), 0x60)
+    test.assert_eq(l.nxt_kind, K_EMPTY)
+    test.assert(l.dirty)
+
+@test
+fn test_a_packet_that_does_not_acknowledge_sends_the_pdu_again()
+    var l = t_link()
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 0, 0)
+    let h = link_rx_fast(var l, t_hdr(1, 0, 0))
+    test.assert(not l.acked)
+    test.assert(not l.use_nxt)
+    test.assert_eq((h >>> 3) & 1, 0)
+
+@test
+fn test_md_on_either_side_keeps_the_event_open()
+    var l = t_link()
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 1))
+    test.assert(l.cont)
+    let _b = t_slow(var l, 0, 0)
+    let _c = link_rx_fast(var l, t_hdr(1, 0, 0))
+    test.assert(not l.cont)
+    // Two PDUs queued: the first sent carries MD.
+    test.assert(t_queue(var l, true, 3))
+    test.assert(t_queue(var l, false, 3))
+    test.assert_eq(l.nxt_md, 1)
+    let _d = link_rx_fast(var l, t_hdr(0, 1, 0))
+    test.assert(l.acked)
+    test.assert(l.cont)
+
+@test
+fn test_a_packet_without_room_is_not_acknowledged()
+    var l = t_link()
+    link_set_room(var l, 1)
+    test.assert(not l.room)
+    let h = link_rx_fast(var l, t_hdr(0, 0, 0))
+    test.assert(not l.rx_new)
+    test.assert_eq(l.nesn, 0)
+    test.assert_eq((h >>> 2) & 1, 0)
+    link_set_room(var l, 2)
+    test.assert(l.room)
+    let _x = link_rx_fast(var l, t_hdr(0, 0, 0))
+    test.assert(l.rx_new)
+    // A full queue of LL Control PDUs also holds the Central back.
+    for _ in 0..3
+        var p = t_ctrl(ll_data.OP_PING_RSP, [])
+        test.assert(ctrl_queue(var l, var p))
+    link_set_room(var l, 4)
+    test.assert(not l.room)
+
+@test
+fn test_a_bad_packet_is_answered_with_the_pdu_in_flight_and_nothing_acknowledged()
+    var l = t_link()
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 0, 0)
+    let h = link_rx_bad(var l)
+    test.assert_eq(h, 1 | (1 << 2))
+    test.assert(not l.acked)
+    test.assert(not l.rx_new)
+    test.assert(l.cont)
+    test.assert(not l.use_nxt)
+
+@test
+fn test_acknowledged_acl_data_frees_a_host_buffer()
+    var l = t_link()
+    test.assert(t_queue(var l, true, 4))
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 0, 0)
+    let _c = link_rx_fast(var l, t_hdr(1, 1, 0))
+    let _d = t_slow(var l, 1, 0)
+    test.assert_eq(l.completed, 0)
+    // The data PDU is acknowledged by the next packet.
+    let _e = link_rx_fast(var l, t_hdr(0, 0, 0))
+    test.assert(l.acked)
+    let _f = t_slow(var l, 1, 0)
+    test.assert_eq(l.completed, 1)
+    test.assert(link_owes(var l, EV_COMPLETED))
+    test.assert_eq(link_take_completed(var l), 1)
+    test.assert(not link_owes(var l, EV_COMPLETED))
+    test.assert_eq(link_take_completed(var l), 0)
+
+@test
+fn test_received_data_goes_to_the_host_and_empty_pdus_do_not()
+    var l = t_link()
+    var d = t_data(2, 6)
+    test.assert_eq(t_packet(var l, var d, 0, 0, 0), RX_TO_HOST)
+    var c = t_data(1, 3)
+    test.assert_eq(t_packet(var l, var c, 1, 0, 0), RX_TO_HOST)
+    var e = t_data(1, 0)
+    test.assert_eq(t_packet(var l, var e, 0, 0, 0), RX_NOTHING)
+    var z = t_data(0, 4)
+    test.assert_eq(t_packet(var l, var z, 1, 0, 0), RX_NOTHING)
+    // A resent PDU is not delivered twice.
+    var again = t_data(2, 6)
+    test.assert_eq(t_packet(var l, var again, 1, 0, 0), RX_NOTHING)
+
+@test
+fn test_acl_queue_takes_three_fragments_behind_the_next_pdu_and_checks_them()
+    var l = t_link()
+    // The first goes straight to `nxt`; three more fit the Host's buffers.
+    test.assert(t_queue(var l, true, 27))
+    test.assert(t_queue(var l, false, 1))
+    test.assert(t_queue(var l, true, 2))
+    test.assert(t_queue(var l, true, 2))
+    test.assert(not t_queue(var l, true, 2))
+    var m = t_link()
+    test.assert(t_queue(var m, true, 28))
+    var big = t_link()
+    test.assert(t_queue(var big, true, 251))
+    test.assert(not t_queue(var big, true, 252))
+    test.assert(t_queue(var m, false, 0))
+    // Not on a link that is not live, nor on one that is ending.
+    var n = link_new()
+    test.assert(not t_queue(var n, true, 2))
+    link_close(var m, 0x08)
+    test.assert(not t_queue(var m, true, 2))
+
+@test
+fn test_queued_data_reaches_the_flight_in_order_with_its_llid()
+    var l = t_link()
+    test.assert(t_queue(var l, true, 2))
+    test.assert(t_queue(var l, false, 3))
+    test.assert_eq(l.nxt_kind, K_ACL)
+    test.assert_eq(ll_data.dpdu_llid(var l.nxt), ll_data.LLID_START)
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 0, 0)
+    let _c = link_rx_fast(var l, t_hdr(1, 1, 0))
+    let _d = t_slow(var l, 1, 0)
+    test.assert_eq(ll_data.dpdu_len(var l.cur), 2)
+    test.assert_eq(l.nxt_kind, K_ACL)
+    test.assert_eq(ll_data.dpdu_llid(var l.nxt), ll_data.LLID_CONTINUE)
+    test.assert_eq(ll_data.dpdu_len(var l.nxt), 3)
+    test.assert_eq(l.nxt_md, 0)
+
+@test
+fn test_ll_control_goes_before_queued_acl_data()
+    var l = t_link()
+    test.assert(t_queue(var l, true, 2))
+    test.assert(t_queue(var l, false, 3))
+    test.assert_eq(l.nxt_kind, K_ACL)
+    // The request is queued while one fragment is next and one waits.
+    test.assert_eq(link_read_features(var l), 0)
+    test.assert_eq(l.nxt_kind, K_ACL)
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 0, 0)
+    let _c = link_rx_fast(var l, t_hdr(1, 1, 0))
+    let _d = t_slow(var l, 1, 0)
+    // The first fragment is in flight; the request takes the place before the second.
+    test.assert_eq(l.cur_kind, K_ACL)
+    test.assert_eq(l.nxt_kind, K_CTRL)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_PERIPHERAL_FEATURE_REQ)
+    test.assert_eq(l.txq_count, 1)
+    test.assert_eq(l.nxt_md, 1)
+
+@test
+fn test_unknown_opcode_is_answered_with_unknown_response()
+    var l = t_link()
+    var p = t_ctrl(0x1A, [1, 2, 3])
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    test.assert_eq(l.nxt_kind, K_CTRL)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x1A)
+    // So is an opcode this end knows only as the Central's (it is the
+    // Peripheral).
+    var m = t_link()
+    var q = t_ctrl(ll_data.OP_PERIPHERAL_FEATURE_REQ, [0, 0, 0, 0, 0, 0, 0, 0])
+    let _s = t_packet(var m, var q, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_opcode(var m.nxt), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var m.nxt, 1), 0x0E)
+
+@test
+fn test_a_control_pdu_of_the_wrong_length_is_ignored()
+    var l = t_link()
+    var p = t_ctrl(ll_data.OP_PING_REQ, [1])
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    test.assert_eq(l.nxt_kind, K_EMPTY)
+    test.assert_eq(l.cq_count, 0)
+
+@test
+fn test_ping_is_answered_and_its_response_counted()
+    var l = t_link()
+    var p = t_ctrl(ll_data.OP_PING_REQ, [])
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_PING_RSP)
+    var q = t_ctrl(ll_data.OP_PING_RSP, [])
+    let _s = t_packet(var l, var q, 1, 0, 0)
+    test.assert_eq(l.ping_rsps, 1)
+
+@test
+fn test_a_periodic_sync_ind_is_left_to_the_controller_in_a_build_with_the_transfer_and_unknown_to_one_without()
+    var zeros: [Int] = []
+    for _ in 0..34
+        list.push(zeros, 0)
+    var l = t_link()
+    var p = t_ctrl(ll_data.OP_PERIODIC_SYNC_IND, zeros)
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    if (ctl_limits.features_octet3() & FEAT3_PAST) != 0
+        test.assert(l.ctl_in)
+    else
+        test.assert(not l.ctl_in)
+        test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+        test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), ll_data.OP_PERIODIC_SYNC_IND)
+    // A PDU with another length is none of the procedure's, whatever the build.
+    var m = t_link()
+    var short: [Int] = []
+    for _ in 0..33
+        list.push(short, 0)
+    var q = t_ctrl(ll_data.OP_PERIODIC_SYNC_IND, short)
+    let _s = t_packet(var m, var q, 0, 0, 0)
+    test.assert(not m.ctl_in)
+
+@test
+fn test_feature_request_is_answered_with_the_common_features()
+    var l = t_link()
+    var p = t_ctrl(ll_data.OP_FEATURE_REQ, [0x1F, 1, 2, 3, 4, 5, 6, 7])
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    test.assert(l.have_feat)
+    test.assert_eq(l.peer_feat[0] as Int, 0x1F)
+    test.assert_eq(l.peer_feat[7] as Int, 7)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_FEATURE_RSP)
+    // Octet 0 is the AND of the two ends' octet 0, the rest this end's.
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x1F)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 2), ctl_limits.features_octet1())
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 3), FEATURES_OCTET2)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 4), ctl_limits.features_octet3())
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 5), ctl_limits.features_octet4())
+    var m = t_link()
+    var q = t_ctrl(ll_data.OP_FEATURE_REQ, [0x80, 0, 0, 0, 0, 0, 0, 0])
+    let _s = t_packet(var m, var q, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_byte(var m.nxt, 1), 0)
+
+@test
+fn test_read_remote_features_runs_the_peripheral_initiated_procedure()
+    var l = t_link()
+    test.assert_eq(link_read_features(var l), 0)
+    test.assert_eq(l.proc, PROC_FEATURES)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_PERIPHERAL_FEATURE_REQ)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), FEATURES_OCTET0)
+    // One procedure at a time.
+    test.assert_eq(link_read_features(var l), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(link_read_version(var l), STATUS_COMMAND_DISALLOWED)
+    var r = t_ctrl(ll_data.OP_FEATURE_RSP, [0x08, 9, 8, 7, 6, 5, 4, 3])
+    let _x = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(link_owes(var l, EV_FEATURES))
+    test.assert_eq(l.feat_status, 0)
+    test.assert_eq(l.peer_feat[0] as Int, 8)
+    // The set is known now: a second read answers at once.
+    link_sent(var l, EV_FEATURES)
+    test.assert_eq(link_read_features(var l), 0)
+    test.assert(link_owes(var l, EV_FEATURES))
+    test.assert_eq(l.proc, PROC_NONE)
+
+@test
+fn test_a_central_that_does_not_know_the_features_request_is_reported()
+    var l = t_link()
+    test.assert_eq(link_read_features(var l), 0)
+    var r = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_PERIPHERAL_FEATURE_REQ])
+    let _x = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert_eq(l.feat_status, STATUS_UNSUPPORTED_REMOTE)
+    test.assert(link_owes(var l, EV_FEATURES))
+    // An unknown response to something else, or with no procedure, is ignored.
+    var m = t_link()
+    var s = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_PERIPHERAL_FEATURE_REQ])
+    let _y = t_packet(var m, var s, 0, 0, 0)
+    test.assert(not link_owes(var m, EV_FEATURES))
+    test.assert_eq(link_read_features(var m), 0)
+    var u = t_ctrl(ll_data.OP_UNKNOWN_RSP, [0x20])
+    let _z = t_packet(var m, var u, 1, 0, 0)
+    test.assert_eq(m.proc, PROC_FEATURES)
+
+@test
+fn test_a_feature_response_nobody_asked_for_is_ignored()
+    var l = t_link()
+    var r = t_ctrl(ll_data.OP_FEATURE_RSP, [0x08, 0, 0, 0, 0, 0, 0, 0])
+    let _x = t_packet(var l, var r, 0, 0, 0)
+    test.assert(not l.have_feat)
+    test.assert(not link_owes(var l, EV_FEATURES))
+
+@test
+fn test_version_exchange_sends_one_version_and_reads_the_peers()
+    var l = t_link()
+    // The peer begins: this end answers with its own, once.
+    var v = t_ctrl(ll_data.OP_VERSION_IND, [0x0E, 0x59, 0x00, 0x34, 0x12])
+    let _a = t_packet(var l, var v, 0, 0, 0)
+    test.assert(l.ver_rcvd)
+    test.assert(l.ver_sent)
+    test.assert_eq(l.peer_ver, 0x0E)
+    test.assert_eq(l.peer_company, 0x59)
+    test.assert_eq(l.peer_sub, 0x1234)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_VERSION_IND)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), LL_VERSION)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 2), LL_COMPANY)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 4), LL_SUBVERSION)
+    // A second one is ignored.
+    var w = t_ctrl(ll_data.OP_VERSION_IND, [0x01, 0x01, 0x00, 0x01, 0x00])
+    let _b = t_packet(var l, var w, 1, 0, 0)
+    test.assert_eq(l.peer_ver, 0x0E)
+    test.assert_eq(l.cq_count, 0)
+    // The Host asks now: the answer is at once.
+    test.assert_eq(link_read_version(var l), 0)
+    test.assert(link_owes(var l, EV_VERSION))
+    test.assert_eq(l.ver_status, 0)
+
+@test
+fn test_read_remote_version_sends_ours_and_waits_for_the_peers()
+    var l = t_link()
+    test.assert_eq(link_read_version(var l), 0)
+    test.assert_eq(l.proc, PROC_VERSION)
+    test.assert(l.ver_sent)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_VERSION_IND)
+    var v = t_ctrl(ll_data.OP_VERSION_IND, [0x0E, 0x59, 0x00, 0x34, 0x12])
+    let _a = t_packet(var l, var v, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(link_owes(var l, EV_VERSION))
+    // Ours went once only: nothing more is queued.
+    test.assert_eq(l.cq_count, 0)
+
+@test
+fn test_read_remote_version_waits_when_ours_is_already_out()
+    var l = t_link()
+    test.assert_eq(link_read_version(var l), 0)
+    t_proc(var l, PROC_NONE)
+    // Ours is sent, theirs not here: the procedure waits again without a second PDU.
+    test.assert_eq(link_read_version(var l), 0)
+    test.assert_eq(l.proc, PROC_VERSION)
+    test.assert_eq(l.cq_count, 0)
+
+@test
+fn test_host_commands_refuse_a_link_that_is_not_there()
+    var l = link_new()
+    test.assert_eq(link_disconnect(var l, 0x13), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_read_version(var l), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_read_features(var l), STATUS_UNKNOWN_CONNECTION)
+    var m = t_link()
+    link_close(var m, 0x08)
+    test.assert_eq(link_read_version(var m), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_read_features(var m), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_disconnect(var m, 0x13), STATUS_COMMAND_DISALLOWED)
+
+@test
+fn test_host_commands_fail_when_the_control_queue_is_full()
+    var l = t_link()
+    for _ in 0..CTRL_SLOTS
+        var p = t_ctrl(ll_data.OP_PING_RSP, [])
+        test.assert(ctrl_queue(var l, var p))
+    var q = t_ctrl(ll_data.OP_PING_RSP, [])
+    test.assert(not ctrl_queue(var l, var q))
+    test.assert_eq(link_disconnect(var l, 0x13), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(link_read_version(var l), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(link_read_features(var l), STATUS_COMMAND_DISALLOWED)
+    test.assert(not l.term_sent)
+    test.assert_eq(l.proc, PROC_NONE)
+
+@test
+fn test_disconnect_sends_terminate_and_ends_when_it_is_acknowledged()
+    var l = t_link()
+    test.assert_eq(link_disconnect(var l, 0x13), 0)
+    test.assert_eq(link_disconnect(var l, 0x13), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(l.nxt_kind, K_CTRL)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_TERMINATE_IND)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x13)
+    let _a = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _b = t_slow(var l, 1, 0)
+    test.assert(not l.closing)
+    // The empty PDU in flight is acknowledged: the terminate goes out.
+    let _c = link_rx_fast(var l, t_hdr(1, 1, 0))
+    let _d = t_slow(var l, 1, 0)
+    test.assert(not l.closing)
+    test.assert_eq(l.cur_kind, K_CTRL)
+    // And is acknowledged.
+    let _e = link_rx_fast(var l, t_hdr(0, 0, 0))
+    let _f = t_slow(var l, 1, 0)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_LOCAL_HOST)
+
+@test
+fn test_terminate_from_the_central_ends_the_connection_with_its_reason()
+    var l = t_link()
+    var p = t_ctrl(ll_data.OP_TERMINATE_IND, [0x13])
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, 0x13)
+    // The packet was acknowledged all the same.
+    test.assert_eq(l.nesn, 1)
+
+@test
+fn test_release_leaves_the_disconnection_to_tell_the_host()
+    var l = t_link()
+    link_close(var l, 0x08)
+    test.assert(link_ended(var l))
+    link_released(var l)
+    test.assert(not link_live(var l))
+    test.assert(not link_ended(var l))
+    test.assert(link_owes(var l, EV_DISCONNECTED))
+    test.assert(not link_owes(var l, EV_CONNECTED))
+    link_sent(var l, EV_DISCONNECTED)
+    test.assert_eq(l.owed, 0)
+    test.assert_eq(l.reason, 0x08)
+
+@test
+fn test_connection_update_changes_the_parameters_at_its_instant()
+    var l = t_link()
+    // Event 0 heard at 3100.
+    let _c0 = link_event_begin(var l)
+    link_note_rx(var l, 3100, true)
+    link_event_done(var l, 3600)
+    // Interval 24 (30 ms), latency 2, timeout 300, window 3 units at offset 4,
+    // instant 6.
+    var u = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [3, 4, 0, 24, 0, 2, 0, 44, 1, 6, 0])
+    let _r = t_packet(var l, var u, 0, 0, 0)
+    test.assert(l.upd_pending)
+    test.assert_eq(l.upd_instant, 6)
+    // Events 1 to 4 run on the old interval.
+    for _ in 1..5
+        let _ch = link_event_begin(var l)
+        test.assert_eq(l.interval, 6)
+        link_note_rx(var l, l.due, true)
+        link_event_done(var l, l.due + 500)
+    // The next event is 5, due one old interval later; the instant is 6.
+    let _c5 = link_event_begin(var l)
+    link_note_rx(var l, l.due, true)
+    let a5 = l.anchor
+    link_event_done(var l, a5 + 500)
+    // Event 6 is the instant: its window starts one old interval and the offset
+    // after event 5's anchor and is 3 units long.
+    test.assert_eq(l.due, a5 + 7500 + 4 * 1250)
+    test.assert_eq(l.win_len, 3 * 1250)
+    test.assert_eq(link_listen_end(var l) - link_listen_start(var l), 3 * 1250 + 2 * widening(var l))
+    let due6 = l.due
+    let _c6 = link_event_begin(var l)
+    test.assert_eq(l.interval, 24)
+    test.assert_eq(l.latency, 2)
+    test.assert_eq(l.timeout, 300)
+    test.assert(not l.upd_pending)
+    test.assert(link_owes(var l, EV_UPDATED))
+    // The supervision timer restarts at the instant.
+    test.assert_eq(l.last_rx, due6)
+    link_note_rx(var l, due6 + 1000, true)
+    link_event_done(var l, due6 + 1500)
+    // The next anchor is one new interval after the first of the instant.
+    test.assert_eq(l.due, due6 + 1000 + 30000)
+    test.assert_eq(l.win_len, 0)
+
+@test
+fn test_a_missed_instant_event_keeps_the_new_window_open()
+    var l = t_link()
+    var u = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0, 0, 200, 0, 1, 0])
+    // Instant 1 is the next event, and the PDU arrived in event 0.
+    let _c0 = link_event_begin(var l)
+    link_note_rx(var l, 3100, true)
+    let _r = t_packet(var l, var u, 0, 0, 0)
+    link_event_done(var l, 3600)
+    test.assert_eq(l.win_len, 2 * 1250)
+    let d1 = l.due
+    let _c1 = link_event_begin(var l)
+    link_event_done(var l, d1 + 5000)
+    // The instant event heard nothing: the next window is a new interval after
+    // the start of this one, and still as wide.
+    test.assert_eq(l.due, d1 + 30000)
+    test.assert_eq(l.win_len, 2 * 1250)
+
+@test
+fn test_connection_update_with_bad_values_or_a_passed_instant()
+    var l = t_link()
+    var bad_interval = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 5, 0, 0, 0, 200, 0, 9, 0])
+    let _a = t_packet(var l, var bad_interval, 0, 0, 0)
+    test.assert(not l.upd_pending)
+    var bad_latency = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0xF4, 1, 200, 0, 9, 0])
+    let _b = t_packet(var l, var bad_latency, 1, 0, 0)
+    test.assert(not l.upd_pending)
+    var bad_timeout = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0, 0, 9, 0, 9, 0])
+    let _c = t_packet(var l, var bad_timeout, 0, 0, 0)
+    test.assert(not l.upd_pending)
+    var short_timeout = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 2, 0, 18, 0, 9, 0])
+    let _d = t_packet(var l, var short_timeout, 1, 0, 0)
+    test.assert(not l.upd_pending)
+    var too_big = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 0x81, 0x0C, 0, 0, 200, 0, 9, 0])
+    let _e = t_packet(var l, var too_big, 0, 0, 0)
+    test.assert(not l.upd_pending)
+    test.assert(not l.closing)
+    // The instant is this event, or in the past: Instant Passed.
+    var now_event = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0, 0, 200, 0, 0, 0])
+    let _f = t_packet(var l, var now_event, 1, 0, 0)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_INSTANT_PASSED)
+    var m = t_link()
+    t_ev_count(var m, 10)
+    var past = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0, 0, 200, 0, 4, 0])
+    let _g = t_packet(var m, var past, 0, 0, 0)
+    test.assert_eq(m.reason, REASON_INSTANT_PASSED)
+    // 32767 ahead is still in the future, 32768 is the past.
+    var n = t_link()
+    var far = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0, 0, 200, 0, 0xFF, 0x7F])
+    let _h = t_packet(var n, var far, 0, 0, 0)
+    test.assert(n.upd_pending)
+    var o = t_link()
+    var gone = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 24, 0, 0, 0, 200, 0, 0x00, 0x80])
+    let _i = t_packet(var o, var gone, 0, 0, 0)
+    test.assert_eq(o.reason, REASON_INSTANT_PASSED)
+
+@test
+fn test_channel_map_update_takes_effect_at_its_instant()
+    var l = t_link()
+    // Channels 0 to 4 only, instant 3.
+    var m = t_ctrl(ll_data.OP_CHANNEL_MAP_IND, [0x1F, 0, 0, 0, 0, 3, 0])
+    let _r = t_packet(var l, var m, 0, 0, 0)
+    test.assert(l.chm_pending)
+    test.assert_eq(l.chm_instant, 3)
+    test.assert_eq(l.chm_map, 0x1F)
+    // Events 0 to 2 use all channels: 7, 14, 21.
+    test.assert_eq(link_event_begin(var l), 7)
+    link_event_done(var l, 3000)
+    test.assert_eq(link_event_begin(var l), 14)
+    link_event_done(var l, 3000)
+    test.assert_eq(link_event_begin(var l), 21)
+    link_event_done(var l, 3000)
+    test.assert_eq(l.n_used, 37)
+    // Event 3: unmapped 28, remapped into the five channels: 28 % 5 = 3.
+    test.assert_eq(link_event_begin(var l), 3)
+    test.assert_eq(l.n_used, 5)
+    test.assert(not l.chm_pending)
+
+@test
+fn test_channel_map_update_with_a_bad_map_or_instant()
+    var l = t_link()
+    var one = t_ctrl(ll_data.OP_CHANNEL_MAP_IND, [0x01, 0, 0, 0, 0, 3, 0])
+    let _a = t_packet(var l, var one, 0, 0, 0)
+    test.assert(not l.chm_pending)
+    var high = t_ctrl(ll_data.OP_CHANNEL_MAP_IND, [0x03, 0, 0, 0, 0x20, 3, 0])
+    let _b = t_packet(var l, var high, 1, 0, 0)
+    test.assert(not l.chm_pending)
+    test.assert(not l.closing)
+    var late = t_ctrl(ll_data.OP_CHANNEL_MAP_IND, [0x03, 0, 0, 0, 0, 0, 0])
+    let _c = t_packet(var l, var late, 0, 0, 0)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_INSTANT_PASSED)
+
+@test
+fn test_catch_up_skips_the_events_whose_windows_have_closed()
+    var l = t_link()
+    test.assert(not link_event_late(var l, 2000))
+    test.assert_eq(link_catch_up(var l, 2000), 0)
+    // 40 ms after the first window: the events at 2250, 9750, 17250, 24750
+    // and 32250 are over, the one due at 39750 is not.
+    test.assert_eq(link_catch_up(var l, 40000), 5)
+    test.assert_eq(l.ev_count, 5)
+    test.assert_eq(l.due, 2250 + 5 * 7500)
+    test.assert(not link_event_late(var l, 40000))
+    // A link that has ended skips nothing.
+    link_close(var l, 0x08)
+    test.assert(not link_event_late(var l, 4000000))
+    var m = link_new()
+    test.assert(not link_event_late(var m, 4000000))
+
+// On a subrated link the events the grid leaves unused are not late events: the catch-up misses the used ones (0 and 4 of a factor of 4) and the schedule
+// moves to the next used event.
+@test
+fn test_catch_up_follows_the_subrate_grid()
+    if not ctl_limits.sub_on()
+        return
+    var l = t_link()
+    t_alive(var l, 3200, 1000 + 70 * 7500)
+    sub_set(var l, 4, 0, 0, 0, 3200)
+    test.assert_eq(link_catch_up(var l, 40000), 2)
+    test.assert_eq(l.ev_count, 8)
+    test.assert_eq(l.due, 2250 + 8 * 7500)
+    test.assert(not link_event_late(var l, 40000))
+
+@test
+fn test_catch_up_stops_at_its_limit()
+    var l = t_link()
+    t_alive(var l, 3200, 1000 + 70 * 7500)
+    let n = link_catch_up(var l, 1000 + 70 * 7500)
+    test.assert_eq(n, CATCH_UP_MAX)
+
+@test
+fn test_room_needs_pool_slots_and_control_queue_space()
+    var l = t_link()
+    link_set_room(var l, 4)
+    test.assert(l.room)
+    link_set_room(var l, 2)
+    test.assert(l.room)
+    link_set_room(var l, 1)
+    test.assert(not l.room)
+    link_set_room(var l, 0)
+    test.assert(not l.room)
+
+@test
+fn test_reset_clears_everything_the_connection_held()
+    var l = t_link()
+    test.assert(t_queue(var l, true, 3))
+    test.assert_eq(link_disconnect(var l, 0x13), 0)
+    link_reset(var l)
+    test.assert(not link_live(var l))
+    test.assert_eq(l.owed, 0)
+    test.assert_eq(l.txq_count, 0)
+    test.assert_eq(l.cq_count, 0)
+    test.assert(not l.term_sent)
+    test.assert_eq(l.nxt_kind, K_EMPTY)
+    test.assert_eq(l.proc, PROC_NONE)
+
+// ── The Central role ────────────────────────────────────────────────
+
+// A link opened as Central on the usual request, the CONNECT_IND having ended at
+// time 1000: the initiator is the random address 0x40..0x45, the advertiser the
+// public address 0x10..0x15.
+fn t_central() -> Link
+    var l = link_new()
+    var p = t_usual()
+    link_open_central(var l, 2, var p, 1000)
+    l
+
+@test
+fn test_open_central_takes_the_parameters_and_fixes_the_first_anchor()
+    var l = t_central()
+    test.assert(link_live(var l))
+    test.assert(link_is_central(var l))
+    test.assert_eq(l.handle, 2)
+    test.assert_eq(l.aa, 0x50655A12)
+    test.assert_eq(l.crc_init, 0x332211)
+    test.assert_eq(l.interval, 6)
+    test.assert_eq(l.n_used, 37)
+    test.assert_eq(l.hop, 7)
+    // The initiator's address is own, the advertiser's the peer's.
+    test.assert_eq(l.own_type, 1)
+    test.assert_eq(l.own[0] as Int, 0x40)
+    test.assert_eq(l.peer_type, 0)
+    test.assert_eq(l.peer[0] as Int, 0x10)
+    test.assert_eq(l.peer[5] as Int, 0x15)
+    // The anchor is the start of the transmit window, and nothing is owed yet.
+    test.assert_eq(l.due, 1000 + 1250)
+    test.assert_eq(l.win_len, 0)
+    test.assert_eq(l.owed, 0)
+    var q = t_connect(24, 0, 400, 2, 3, 0x1FFFFFFFFF, 7, 0)
+    link_open_central(var l, 1, var q, 5000)
+    test.assert_eq(l.due, 5000 + 1250 + 3 * 1250)
+    // A link opened as Peripheral is not a Central, and a reset clears the role.
+    var m = t_link()
+    test.assert(not link_is_central(var m))
+    link_reset(var l)
+    test.assert(not link_is_central(var l))
+
+@test
+fn test_a_central_listens_at_a_point_without_widening()
+    var l = t_central()
+    test.assert_eq(widening(var l), 0)
+    test.assert_eq(link_listen_start(var l), l.due)
+    test.assert_eq(link_listen_end(var l), l.due)
+    t_due(var l, l.t_ref + 20000000)
+    test.assert_eq(widening(var l), 0)
+
+@test
+fn test_a_central_event_is_anchored_at_the_time_it_sends()
+    var l = t_central()
+    test.assert_eq(link_event_begin(var l), 7)
+    test.assert(l.ev_anchor)
+    test.assert_eq(l.anchor, 2250)
+    // The Peripheral's packet does not move the anchor.
+    link_note_rx(var l, 2250 + 500, true)
+    test.assert_eq(l.anchor, 2250)
+    link_event_done(var l, 3500)
+    test.assert_eq(l.due, 2250 + 7500)
+    test.assert_eq(l.t_ref, 2250)
+    // An event the Peripheral does not answer keeps the schedule as well.
+    let _c = link_event_begin(var l)
+    link_event_done(var l, 10000)
+    test.assert_eq(l.due, 2250 + 15000)
+    test.assert_eq(l.ev_count, 2)
+
+@test
+fn test_a_central_connection_is_made_by_the_first_good_packet()
+    var l = t_central()
+    let _c = link_event_begin(var l)
+    // A packet with a CRC error does not make it, nor does it count as synchronised.
+    link_note_rx(var l, 2500, false)
+    test.assert(not l.synced)
+    test.assert_eq(l.owed, 0)
+    test.assert_eq(l.bad_run, 1)
+    link_note_rx(var l, 2600, true)
+    test.assert(l.synced)
+    test.assert(link_owes(var l, EV_CONNECTED))
+    test.assert_eq(l.conn_status, 0)
+    link_sent(var l, EV_CONNECTED)
+    // A second good packet owes nothing more.
+    link_note_rx(var l, 2700, true)
+    test.assert_eq(l.owed, 0)
+    test.assert_eq(l.last_rx, 2700)
+
+@test
+fn test_a_central_ends_the_event_at_a_packet_with_a_crc_error()
+    var l = t_central()
+    test.assert(not link_answers_bad(var l))
+    var p = t_link()
+    test.assert(link_answers_bad(var p))
+
+@test
+fn test_a_central_connection_that_hears_nothing_fails_to_establish_and_reports_it()
+    var l = t_central()
+    var n = 0
+    while not l.closing and n < 40
+        let _c = link_event_begin(var l)
+        link_event_done(var l, l.due + 7500)
+        n = n + 1
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_FAILED_TO_ESTABLISH)
+    test.assert(n >= 6)
+    test.assert(n <= 9)
+    link_released(var l)
+    // The Host is owed the LE Connection Complete event with the status, not a
+    // Disconnection Complete.
+    test.assert(link_owes(var l, EV_CONNECTED))
+    test.assert(not link_owes(var l, EV_DISCONNECTED))
+    test.assert_eq(l.conn_status, REASON_FAILED_TO_ESTABLISH)
+    // A Central that was made and then lost reports Disconnection Complete.
+    var m = t_central()
+    let _d = link_event_begin(var m)
+    link_note_rx(var m, 2300, true)
+    link_sent(var m, EV_CONNECTED)
+    link_event_done(var m, 3000)
+    link_close(var m, REASON_TIMEOUT)
+    link_released(var m)
+    test.assert(link_owes(var m, EV_DISCONNECTED))
+    test.assert(not link_owes(var m, EV_CONNECTED))
+
+@test
+fn test_a_central_supervises_from_the_last_good_packet()
+    var l = t_central()
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, 2300, true)
+    link_event_done(var l, 3000)
+    let _d = link_event_begin(var l)
+    link_event_done(var l, 2300 + 2000000)
+    test.assert(not l.closing)
+    let _e = link_event_begin(var l)
+    link_event_done(var l, 2300 + 2000001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_TIMEOUT)
+
+@test
+fn test_the_first_header_of_a_central_event_carries_its_sequence_numbers()
+    var l = t_central()
+    // The empty PDU in flight, SN 0 and NESN 0, no more data.
+    test.assert_eq(link_first_header(var l), 1)
+    test.assert(t_queue(var l, true, 4))
+    // The data waits behind the PDU in flight; the header is still the empty one,
+    // but MD says more waits.
+    test.assert_eq(link_first_header(var l), 1)
+    // The Peripheral acknowledged the empty PDU (NESN 1) and sent a new one (SN 0).
+    let _a = link_rx_fast(var l, t_hdr(0, 1, 0))
+    test.assert(l.acked)
+    var dd = t_data(1, 0)
+    let r = link_rx_slow(var l, var dd)
+    test.assert_eq(r, RX_NOTHING)
+    // The data PDU is in flight, SN 1; the Peripheral's SN 0 was taken, NESN 1.
+    test.assert_eq(link_first_header(var l), ll_data.LLID_START | (1 << 2) | (1 << 3))
+
+@test
+fn test_a_central_starts_the_feature_exchange_with_the_central_request()
+    var l = t_central()
+    test.assert_eq(features_request_opcode(var l), ll_data.OP_FEATURE_REQ)
+    test.assert_eq(link_read_features(var l), 0)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_FEATURE_REQ)
+    // The Peripheral's answer completes it.
+    var rsp = t_ctrl(ll_data.OP_FEATURE_RSP, [0x10, 0, 0, 0, 0, 0, 0, 0])
+    let _r = t_packet(var l, var rsp, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(link_owes(var l, EV_FEATURES))
+    test.assert_eq(l.feat_status, STATUS_SUCCESS)
+    // A peer that does not know the request answers LL_UNKNOWN_RSP with its opcode.
+    var m = t_central()
+    test.assert_eq(link_read_features(var m), 0)
+    var unk = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_FEATURE_REQ])
+    let _s = t_packet(var m, var unk, 0, 0, 0)
+    test.assert_eq(m.feat_status, STATUS_UNSUPPORTED_REMOTE)
+    // The Peripheral's request opcode in an answer is not the one this end sent.
+    var n = t_central()
+    test.assert_eq(link_read_features(var n), 0)
+    var other = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_PERIPHERAL_FEATURE_REQ])
+    let _t = t_packet(var n, var other, 0, 0, 0)
+    test.assert_eq(n.proc, PROC_FEATURES)
+
+@test
+fn test_a_central_answers_the_peripheral_initiated_feature_request()
+    var l = t_central()
+    var req = t_ctrl(ll_data.OP_PERIPHERAL_FEATURE_REQ, [0x18, 0, 0, 0, 0, 0, 0, 0])
+    let _r = t_packet(var l, var req, 0, 0, 0)
+    test.assert(l.have_feat)
+    test.assert_eq(l.peer_feat[0] as Int, 0x18)
+    test.assert_eq(l.nxt_kind, K_CTRL)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_FEATURE_RSP)
+    // The octet the Central answers is the features both ends have.
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), FEATURES_OCTET0 & 0x18)
+
+@test
+fn test_a_central_does_not_know_the_updates_and_feature_request_of_a_central()
+    var l = t_central()
+    var upd = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 2, 0, 24, 0, 0, 0, 0x90, 0x01, 9, 0])
+    let _a = t_packet(var l, var upd, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x00)
+    test.assert(not l.upd_pending)
+    var m = t_central()
+    var map = t_ctrl(ll_data.OP_CHANNEL_MAP_IND, [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 9, 0])
+    let _b = t_packet(var m, var map, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_byte(var m.nxt, 1), 0x01)
+    test.assert(not m.chm_pending)
+    var n = t_central()
+    var fr = t_ctrl(ll_data.OP_FEATURE_REQ, [0, 0, 0, 0, 0, 0, 0, 0])
+    let _c = t_packet(var n, var fr, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_byte(var n.nxt, 1), 0x08)
+
+@test
+fn test_a_central_takes_termination_and_version_like_a_peripheral()
+    var l = t_central()
+    var term = t_ctrl(ll_data.OP_TERMINATE_IND, [0x13])
+    let _a = t_packet(var l, var term, 0, 0, 0)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, 0x13)
+    var m = t_central()
+    test.assert_eq(link_read_version(var m), 0)
+    var ver = t_ctrl(ll_data.OP_VERSION_IND, [0x0E, 0x59, 0x00, 0x34, 0x12])
+    let _b = t_packet(var m, var ver, 0, 0, 0)
+    test.assert(link_owes(var m, EV_VERSION))
+    test.assert_eq(m.peer_ver, 0x0E)
+
+// ── The LL Control procedures of Section 5 ──────────────────────────
+
+fn t_chsel(var p: Pdu)
+    p.b[0] = (p.b[0] as Int | ll_pdu.CHSEL) as u8
+
+fn t_have_features(var l: Link, b0: Int)
+    l.have_feat = true
+    l.peer_feat[0] = b0 as u8
+
+fn t_fill_cq(var l: Link)
+    for _ in 0..CTRL_SLOTS
+        var p = ll_pdu.pdu_new()
+        ll_data.ctrl_begin(var p, ll_data.OP_PING_RSP)
+        ll_data.dpdu_finish(var p)
+        let _a = ctrl_queue(var l, var p)
+
+fn t_pop_cq(var l: Link)
+    var scratch = ll_pdu.pdu_new()
+    slot_get_cq(var l, l.cq_head, var scratch)
+    l.cq_head = (l.cq_head + 1) % CTRL_SLOTS
+    l.cq_count = l.cq_count - 1
+
+fn t_rq_wait(var l: Link, v: Bool)
+    l.rq_wait = v
+
+fn t_upd_pending(var l: Link)
+    l.upd_pending = true
+
+// LL_CONNECTION_PARAM_REQ or _RSP from the peer.
+fn t_param_pdu(op: Int, i_min: Int, i_max: Int, latency: Int, timeout: Int, period: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_param(var p, op, i_min, i_max, latency, timeout, period, 0)
+    p
+
+fn t_set_phase(var l: Link, ping_ok: Bool, pinged: Bool)
+    l.ping_ok = ping_ok
+    l.pinged = pinged
+
+fn t_central_with(var l: Link, min_used: Int)
+    l.min_used = min_used
+
+// The PDU the link sends next, the opcode and one payload octet.
+fn t_next_op(var l: Link) -> Int
+    ll_data.dpdu_opcode(var l.nxt)
+
+fn t_next_byte(var l: Link, i: Int) -> Int
+    ll_data.dpdu_byte(var l.nxt, i)
+
+@test
+fn test_a_connect_ind_with_chsel_may_carry_any_hop_and_selects_algorithm_2()
+    var p = t_connect(6, 0, 200, 2, 0, 0x1FFFFFFFFF, 0, 0)
+    test.assert(not connect_valid(var p))
+    t_chsel(var p)
+    test.assert(connect_valid(var p))
+    var l = link_new()
+    link_open(var l, 1, var p, 1000)
+    test.assert(l.csa2)
+    test.assert_eq(l.chan_id, (0x50655A12 >>> 16) ^ (0x50655A12 & 0xFFFF))
+    var q = t_central()
+    test.assert(not q.csa2)
+    var r = t_usual()
+    t_chsel(var r)
+    link_open_central(var q, 1, var r, 1000)
+    test.assert(q.csa2)
+    // A reset forgets it.
+    link_reset(var q)
+    test.assert(not q.csa2)
+
+@test
+fn test_algorithm_2_follows_the_sample_data_of_the_specification()
+    // Sample data 1: 37 used channels.
+    let all = 0x1FFFFFFFFF
+    test.assert_eq(csa2_prn(0x305F, 0), 56857)
+    test.assert_eq(csa2_prn(0x305F, 1), 1685)
+    test.assert_eq(csa2_channel(0x305F, 0, all, 37), 25)
+    test.assert_eq(csa2_channel(0x305F, 1, all, 37), 20)
+    test.assert_eq(csa2_channel(0x305F, 2, all, 37), 6)
+    test.assert_eq(csa2_channel(0x305F, 3, all, 37), 21)
+    // Sample data 2: 9 used channels, an unused channel remapped.
+    let nine = 0x1E00E00600
+    test.assert_eq(popcount(nine), 9)
+    test.assert_eq(csa2_channel(0x305F, 6, nine, 9), 23)
+    test.assert_eq(csa2_channel(0x305F, 7, nine, 9), 9)
+    test.assert_eq(csa2_channel(0x305F, 8, nine, 9), 34)
+    // Sample data 3: 3 used channels.
+    test.assert_eq(csa2_channel(0x305F, 11, 0x106, 3), 1)
+    test.assert_eq(csa2_channel(0x305F, 12, 0x106, 3), 2)
+    test.assert_eq(csa2_channel(0x305F, 13, 0x106, 3), 2)
+    test.assert_eq(reverse_octet(0x01), 0x80)
+    test.assert_eq(csa2_permute(0x0102), 0x8040)
+
+@test
+fn test_a_link_with_algorithm_2_takes_its_channel_from_the_event_counter()
+    var p = t_connect(6, 0, 200, 2, 0, 0x1FFFFFFFFF, 7, 0)
+    t_chsel(var p)
+    var l = link_new()
+    link_open(var l, 1, var p, 1000)
+    let id = l.chan_id
+    for k in 0..6
+        test.assert_eq(link_event_begin(var l), csa2_channel(id, k, l.chmap, l.n_used))
+        link_event_done(var l, 2000 + 8000 * k)
+
+@test
+fn test_an_unknown_response_ends_the_procedures_that_asked()
+    // The Connection Parameters Request: Unsupported Remote Feature, and the peer is
+    // remembered as without the procedure.
+    var l = t_link()
+    test.assert_eq(link_connection_update(var l, 24, 24, 0, 400), STATUS_SUCCESS)
+    test.assert_eq(l.proc, PROC_PARAM)
+    var u = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_CONNECTION_PARAM_REQ])
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(l.cpr_no)
+    test.assert(link_owes(var l, EV_UPDATED))
+    test.assert_eq(l.upd_status, STATUS_UNSUPPORTED_REMOTE)
+    test.assert_eq(link_connection_update(var l, 24, 24, 0, 400), STATUS_UNSUPPORTED_REMOTE)
+    // The ping: the peer is not asked again.
+    var m = t_link()
+    t_proc(var m, PROC_PING)
+    var v = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_PING_REQ])
+    let _b = t_packet(var m, var v, 0, 0, 0)
+    test.assert_eq(m.proc, PROC_NONE)
+    test.assert(not m.ping_ok)
+    // An unknown response to something else leaves a procedure alone.
+    var n = t_link()
+    t_proc(var n, PROC_PARAM)
+    var w = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_PING_REQ])
+    let _c = t_packet(var n, var w, 0, 0, 0)
+    test.assert_eq(n.proc, PROC_PARAM)
+
+@test
+fn test_a_reject_ends_the_parameter_request_with_its_code()
+    var l = t_link()
+    test.assert_eq(link_connection_update(var l, 24, 24, 0, 400), STATUS_SUCCESS)
+    var r = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_CONNECTION_PARAM_REQ, 0x20])
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert_eq(l.upd_status, 0x20)
+    test.assert(link_owes(var l, EV_UPDATED))
+    // LL_REJECT_IND is the same without the opcode.
+    var m = t_link()
+    test.assert_eq(link_connection_update(var m, 24, 24, 0, 400), STATUS_SUCCESS)
+    var s = t_ctrl(ll_data.OP_REJECT_IND, [0x3B])
+    let _b = t_packet(var m, var s, 0, 0, 0)
+    test.assert_eq(m.upd_status, 0x3B)
+    // A reject of another PDU, or with no request, is ignored.
+    var n = t_link()
+    test.assert_eq(link_connection_update(var n, 24, 24, 0, 400), STATUS_SUCCESS)
+    var o = t_ctrl(ll_data.OP_REJECT_EXT_IND, [0x03, 0x06])
+    let _c = t_packet(var n, var o, 0, 0, 0)
+    test.assert_eq(n.proc, PROC_PARAM)
+    var q = t_link()
+    var p = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_CONNECTION_PARAM_REQ, 0x20])
+    let _d = t_packet(var q, var p, 0, 0, 0)
+    test.assert(not link_owes(var q, EV_UPDATED))
+
+@test
+fn test_a_peer_without_extended_reject_is_refused_with_a_plain_reject()
+    var l = t_central()
+    t_have_features(var l, 0x02)
+    t_upd_pending(var l)
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 6, 6, 0, 200, 0)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(t_next_op(var l), ll_data.OP_REJECT_IND)
+    test.assert_eq(t_next_byte(var l, 1), CODE_COLLISION)
+
+@test
+fn test_a_peripheral_does_not_know_the_response_to_a_request_it_never_made()
+    var l = t_link()
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_RSP, 6, 6, 0, 200, 0)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(t_next_op(var l), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(t_next_byte(var l, 1), ll_data.OP_CONNECTION_PARAM_RSP)
+
+@test
+fn test_a_request_out_of_range_or_while_the_host_is_asked_is_refused()
+    var l = t_central()
+    // An interval below 6.
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 4, 6, 0, 200, 0)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(t_next_op(var l), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(t_next_byte(var l, 1), ll_data.OP_CONNECTION_PARAM_REQ)
+    test.assert_eq(t_next_byte(var l, 2), CODE_INVALID_LL_PARAMETERS)
+    // A request the Host has not answered yet holds the next off.
+    var m = t_central()
+    link_set_indicate(var m, true)
+    var s = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 6, 6, 0, 300, 0)
+    let _b = t_packet(var m, var s, 0, 0, 0)
+    test.assert(m.rq_wait)
+    test.assert(link_owes(var m, EV_PARAM_REQUEST))
+    test.assert_eq(m.rq_min, 6)
+    test.assert_eq(m.rq_timeout, 300)
+    var s2 = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 6, 6, 0, 300, 0)
+    let _c = t_packet(var m, var s2, 1, 0, 0)
+    test.assert_eq(t_next_op(var m), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(t_next_byte(var m, 2), CODE_BUSY)
+
+@test
+fn test_the_central_picks_a_multiple_of_the_preferred_periodicity()
+    test.assert_eq(pick_interval(10, 100, 0), 100)
+    test.assert_eq(pick_interval(10, 100, 30), 90)
+    test.assert_eq(pick_interval(10, 100, 120), 100)
+    test.assert_eq(pick_interval(50, 50, 30), 50)
+    test.assert_eq(pick_interval(40, 50, 30), 50)
+    test.assert(params_valid(6, 6, 0, 10))
+    test.assert(not params_valid(5, 6, 0, 100))
+    test.assert(not params_valid(6, 3201, 0, 3200))
+    test.assert(not params_valid(8, 6, 0, 100))
+    test.assert(not params_valid(6, 6, 500, 3200))
+    test.assert(not params_valid(6, 6, 0, 9))
+    test.assert(not params_valid(6, 6, 0, 3201))
+    test.assert(not params_valid(100, 100, 0, 25))
+
+@test
+fn test_the_minimum_of_used_channels_is_heard_by_a_central_alone()
+    var l = t_central()
+    var m = t_ctrl(ll_data.OP_MIN_USED_CHANNELS_IND, [1, 20])
+    let _a = t_packet(var l, var m, 0, 0, 0)
+    test.assert_eq(l.min_used, 20)
+    // Another PHY, a count out of range: not noted.
+    var n = t_central()
+    var m2 = t_ctrl(ll_data.OP_MIN_USED_CHANNELS_IND, [2, 20])
+    let _b = t_packet(var n, var m2, 0, 0, 0)
+    test.assert_eq(n.min_used, 0)
+    var m3 = t_ctrl(ll_data.OP_MIN_USED_CHANNELS_IND, [1, 1])
+    let _c = t_packet(var n, var m3, 1, 0, 0)
+    test.assert_eq(n.min_used, 0)
+    var m4 = t_ctrl(ll_data.OP_MIN_USED_CHANNELS_IND, [1, 38])
+    let _d = t_packet(var n, var m4, 0, 0, 0)
+    test.assert_eq(n.min_used, 0)
+    // A Peripheral does not know it.
+    var p = t_link()
+    var m5 = t_ctrl(ll_data.OP_MIN_USED_CHANNELS_IND, [1, 20])
+    let _e = t_packet(var p, var m5, 0, 0, 0)
+    test.assert_eq(t_next_op(var p), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(t_next_byte(var p, 1), ll_data.OP_MIN_USED_CHANNELS_IND)
+
+@test
+fn test_the_map_the_central_wants_is_the_hosts_with_channels_added()
+    test.assert_eq(pad_map(0x3FF, 12), 0xFFF)
+    test.assert_eq(pad_map(0x3FF, 5), 0x3FF)
+    test.assert_eq(pad_map(0x1000, 3), 0x1003)
+    var l = t_central()
+    test.assert_eq(wanted_map(var l), 0x1FFFFFFFFF)
+    link_set_host_map(var l, 0x1000000001)
+    test.assert_eq(wanted_map(var l), 0x1000000001)
+    link_set_host_map(var l, 0x400)
+    test.assert_eq(wanted_map(var l), 0x401)
+    t_central_with(var l, 5)
+    test.assert_eq(wanted_map(var l), 0x40F)
+
+@test
+fn test_a_central_sends_the_map_when_it_can_and_a_full_queue_waits()
+    var l = t_central()
+    link_set_host_map(var l, 0x3FF)
+    t_fill_cq(var l)
+    link_event_done(var l, 1500)
+    test.assert(not l.chm_pending)
+    // The queue has room again: the next event sends it.
+    t_pop_cq(var l)
+    link_event_done(var l, 9000)
+    test.assert(l.chm_pending)
+    test.assert_eq(l.chm_map, 0x3FF)
+    // Nothing more is sent while it is under way.
+    let count = l.cq_count
+    link_event_done(var l, 16500)
+    test.assert_eq(l.cq_count, count)
+    // A Central that waits for its Host does not start one.
+    var m = t_central()
+    link_set_host_map(var m, 0x3FF)
+    t_rq_wait(var m, true)
+    link_event_done(var m, 1500)
+    test.assert(not m.chm_pending)
+
+@test
+fn test_the_host_commands_of_the_parameter_procedures_check_the_link()
+    var l = t_link()
+    link_close(var l, REASON_TIMEOUT)
+    test.assert_eq(link_connection_update(var l, 24, 24, 0, 400), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_param_reply(var l, 24, 24, 0, 400), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_param_negative(var l, 0x3B), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_set_apto(var l, 100), STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(link_request_min_used(var l, 20), STATUS_COMMAND_DISALLOWED)
+    var m = t_link()
+    test.assert_eq(link_connection_update(var m, 5, 5, 0, 400), STATUS_INVALID_PARAMETERS)
+    t_fill_cq(var m)
+    test.assert_eq(link_connection_update(var m, 24, 24, 0, 400), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(m.proc, PROC_NONE)
+    test.assert_eq(link_request_min_used(var m, 20), STATUS_COMMAND_DISALLOWED)
+    var c = t_central()
+    t_fill_cq(var c)
+    test.assert_eq(link_connection_update(var c, 24, 24, 0, 400), STATUS_COMMAND_DISALLOWED)
+    test.assert(not c.upd_pending)
+    // Replies need a request waiting.
+    var r = t_link()
+    test.assert_eq(link_param_reply(var r, 24, 24, 0, 400), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(link_param_negative(var r, 0x3B), STATUS_COMMAND_DISALLOWED)
+    t_rq_wait(var r, true)
+    test.assert_eq(link_param_reply(var r, 5, 5, 0, 400), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(link_param_negative(var r, 0x3B), STATUS_SUCCESS)
+    test.assert(not r.rq_wait)
+    test.assert_eq(t_next_op(var r), ll_data.OP_REJECT_EXT_IND)
+
+@test
+fn test_an_update_that_changes_nothing_and_was_not_asked_for_is_not_reported()
+    var l = t_link()
+    var u = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 6, 0, 0, 0, 200, 0, 3, 0])
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert(l.upd_pending)
+    for _ in 0..4
+        let _c = link_event_begin(var l)
+        link_event_done(var l, 9000)
+    test.assert(not l.upd_pending)
+    test.assert(not link_owes(var l, EV_UPDATED))
+
+@test
+fn test_a_response_timeout_applies_to_every_procedure_and_a_queued_pdu_restarts_it()
+    var l = t_link()
+    test.assert_eq(link_connection_update(var l, 24, 24, 0, 400), STATUS_SUCCESS)
+    t_alive(var l, 3200, 41000000)
+    link_event_done(var l, 40000001)
+    test.assert(not l.closing)
+    link_event_done(var l, 41000001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_RESPONSE_TIMEOUT)
+    // A PDU queued meanwhile starts the timer again.
+    var m = t_link()
+    test.assert_eq(link_connection_update(var m, 24, 24, 0, 400), STATUS_SUCCESS)
+    t_now(var m, 30000000)
+    var p = t_ctrl(ll_data.OP_PING_RSP, [])
+    test.assert(ctrl_queue(var m, var p))
+    test.assert_eq(m.proc_t0, 30000000)
+    t_alive(var m, 3200, 69000000)
+    link_event_done(var m, 69000000)
+    test.assert(not m.closing)
+    // The ping that is not answered ends the connection too.
+    var n = t_link()
+    t_proc(var n, PROC_PING)
+    t_alive(var n, 3200, 41000000)
+    link_event_done(var n, 41000000)
+    test.assert(n.closing)
+
+@test
+fn test_the_authenticated_payload_timer_pings_early_expires_and_restarts()
+    var l = t_link()
+    t_alive(var l, 3200, 0)
+    // 7.5 ms events and a timeout of 1 s: the ping goes 30 ms before it.
+    test.assert_eq(link_set_apto(var l, 100), STATUS_SUCCESS)
+    link_set_auth(var l, true, 0)
+    link_event_done(var l, 900000)
+    test.assert_eq(l.proc, PROC_NONE)
+    link_event_done(var l, 970000)
+    test.assert_eq(l.proc, PROC_PING)
+    test.assert(l.pinged)
+    test.assert_eq(t_next_op(var l), ll_data.OP_PING_REQ)
+    // The answer ends the procedure; no second ping in the period.
+    var r = t_ctrl(ll_data.OP_PING_RSP, [])
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    link_event_done(var l, 980000)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(not link_owes(var l, EV_APTO))
+    link_event_done(var l, 1000000)
+    test.assert(link_owes(var l, EV_APTO))
+    test.assert_eq(l.auth_t0, 1000000)
+    test.assert(not l.pinged)
+    // Off, the timer does nothing.
+    var m = t_link()
+    t_alive(var m, 3200, 40000000)
+    link_event_done(var m, 40000000)
+    test.assert(not link_owes(var m, EV_APTO))
+
+@test
+fn test_a_short_timeout_pings_at_half_and_a_ping_waits_for_a_free_procedure()
+    // A timeout of 40 ms: the lead of four intervals is more than half of it.
+    var l = t_link()
+    t_alive(var l, 3200, 0)
+    test.assert_eq(link_set_apto(var l, 4), STATUS_SUCCESS)
+    link_set_auth(var l, true, 0)
+    link_event_done(var l, 15000)
+    test.assert_eq(l.proc, PROC_NONE)
+    link_event_done(var l, 21000)
+    test.assert_eq(l.proc, PROC_PING)
+    // Another procedure under way: the ping waits.
+    var m = t_link()
+    t_alive(var m, 3200, 0)
+    test.assert_eq(link_set_apto(var m, 4), STATUS_SUCCESS)
+    link_set_auth(var m, true, 0)
+    t_proc(var m, PROC_VERSION)
+    link_event_done(var m, 21000)
+    test.assert_eq(m.proc, PROC_VERSION)
+    test.assert(not m.pinged)
+    // A peer that does not know the ping is not sent one.
+    var n = t_link()
+    t_alive(var n, 3200, 0)
+    test.assert_eq(link_set_apto(var n, 4), STATUS_SUCCESS)
+    link_set_auth(var n, true, 0)
+    t_set_phase(var n, false, false)
+    link_event_done(var n, 21000)
+    test.assert_eq(n.proc, PROC_NONE)
+    // A full queue: the next event tries again.
+    var o = t_link()
+    t_alive(var o, 3200, 0)
+    test.assert_eq(link_set_apto(var o, 4), STATUS_SUCCESS)
+    link_set_auth(var o, true, 0)
+    t_fill_cq(var o)
+    link_event_done(var o, 21000)
+    test.assert_eq(o.proc, PROC_NONE)
+    test.assert(not o.pinged)
+
+@test
+fn test_the_timeout_is_checked_against_the_interval_and_a_valid_mic_restarts_the_timer()
+    var l = t_link()
+    // 7.5 ms with no latency: 1 unit of 10 ms is enough, 0 is not.
+    test.assert_eq(link_set_apto(var l, 1), STATUS_SUCCESS)
+    test.assert_eq(link_set_apto(var l, 0), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(link_set_apto(var l, 0x10000), STATUS_INVALID_PARAMETERS)
+    var m = t_central()
+    test.assert_eq(link_set_apto(var m, 100), STATUS_SUCCESS)
+    link_set_auth(var m, true, 0)
+    link_auth_rx(var m, 5000)
+    test.assert_eq(m.auth_t0, 5000)
+
+@test
+fn test_a_peripheral_asks_the_central_for_a_minimum_of_channels()
+    var l = t_link()
+    test.assert_eq(link_request_min_used(var l, 20), STATUS_SUCCESS)
+    test.assert_eq(t_next_op(var l), ll_data.OP_MIN_USED_CHANNELS_IND)
+    test.assert_eq(t_next_byte(var l, 1), 1)
+    test.assert_eq(t_next_byte(var l, 2), 20)
+    var c = t_central()
+    test.assert_eq(link_request_min_used(var c, 20), STATUS_COMMAND_DISALLOWED)
+
+@test
+fn test_a_request_wider_than_the_hosts_range_is_cut_to_it()
+    var l = t_central()
+    link_host_range(var l, 40, 60, 2, 200)
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 30, 80, 0, 200, 0)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert(not l.rq_wait)
+    test.assert(l.upd_pending)
+    test.assert_eq(l.upd_interval, 60)
+    test.assert_eq(l.upd_timeout, 200)
+    // A request below the range, or with another timeout, is the Host's to answer.
+    var m = t_central()
+    link_host_range(var m, 40, 60, 2, 200)
+    link_set_indicate(var m, true)
+    var s = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 10, 30, 0, 200, 0)
+    let _b = t_packet(var m, var s, 0, 0, 0)
+    test.assert(m.rq_wait)
+    test.assert(not m.upd_pending)
+    var n = t_central()
+    link_host_range(var n, 40, 60, 2, 200)
+    link_set_indicate(var n, true)
+    var u = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 40, 60, 0, 300, 0)
+    let _c = t_packet(var n, var u, 0, 0, 0)
+    test.assert(n.rq_wait)
+    var o = t_central()
+    link_host_range(var o, 40, 60, 2, 200)
+    link_set_indicate(var o, true)
+    var v = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 40, 60, 3, 200, 0)
+    let _d = t_packet(var o, var v, 0, 0, 0)
+    test.assert(o.rq_wait)
+
+// ── The data length and the PHY ──────────────────────────────────────
+
+// The peer's limits, for a test: it receives and sends `oct` octets in `us` microseconds.
+// Setters of the fields a test moves: a test cannot assign to the field of a link it holds.
+fn t_set_chm_pending(var l: Link, v: Bool)
+    l.chm_pending = v
+
+fn t_set_cq_count(var l: Link, v: Int)
+    l.cq_count = v
+
+fn t_set_dl_rem_rx_octets(var l: Link, v: Int)
+    l.dl_rem_rx_octets = v
+
+fn t_set_dl_rem_rx_time(var l: Link, v: Int)
+    l.dl_rem_rx_time = v
+
+fn t_set_dl_rem_tx_octets(var l: Link, v: Int)
+    l.dl_rem_tx_octets = v
+
+fn t_set_dl_rem_tx_time(var l: Link, v: Int)
+    l.dl_rem_tx_time = v
+
+fn t_set_dl_rx_octets(var l: Link, v: Int)
+    l.dl_rx_octets = v
+
+fn t_set_dl_rx_time(var l: Link, v: Int)
+    l.dl_rx_time = v
+
+fn t_set_dl_started(var l: Link, v: Bool)
+    l.dl_started = v
+
+fn t_set_dl_tx_octets(var l: Link, v: Int)
+    l.dl_tx_octets = v
+
+fn t_set_dl_tx_time(var l: Link, v: Int)
+    l.dl_tx_time = v
+
+fn t_set_dl_wait(var l: Link, v: Bool)
+    l.dl_wait = v
+
+fn t_set_ev_count(var l: Link, v: Int)
+    l.ev_count = v
+
+fn t_set_have_feat(var l: Link, v: Bool)
+    l.have_feat = v
+
+fn t_set_interval(var l: Link, v: Int)
+    l.interval = v
+
+fn t_set_nxt_kind(var l: Link, v: Int)
+    l.nxt_kind = v
+
+fn t_set_phy(var l: Link, v: Int)
+    l.phy = v
+
+fn t_set_phy_host(var l: Link, v: Bool)
+    l.phy_host = v
+
+fn t_set_phy_new(var l: Link, v: Int)
+    l.phy_new = v
+
+fn t_set_phy_off(var l: Link, v: Int)
+    l.phy_off = v
+
+fn t_set_phy_opt(var l: Link, v: Int)
+    l.phy_opt = v
+
+fn t_set_phy_pending(var l: Link, v: Bool)
+    l.phy_pending = v
+
+fn t_set_phy_pref_rx(var l: Link, v: Int)
+    l.phy_pref_rx = v
+
+fn t_set_phy_pref_set(var l: Link, v: Bool)
+    l.phy_pref_set = v
+
+fn t_set_phy_pref_tx(var l: Link, v: Int)
+    l.phy_pref_tx = v
+
+fn t_set_phy_state(var l: Link, v: Int)
+    l.phy_state = v
+
+fn t_set_phy_t0(var l: Link, v: Int)
+    l.phy_t0 = v
+
+fn t_set_phy_unsup(var l: Link, v: Bool)
+    l.phy_unsup = v
+
+fn t_set_room(var l: Link, v: Bool)
+    l.room = v
+
+fn t_set_rq_wait(var l: Link, v: Bool)
+    l.rq_wait = v
+
+fn t_set_upd_pending(var l: Link, v: Bool)
+    l.upd_pending = v
+
+fn t_set_enc_tx(var l: Link, v: Bool)
+    l.enc_tx = v
+
+fn t_set_enc_rx(var l: Link, v: Bool)
+    l.enc_rx = v
+
+fn t_set_enc_ph(var l: Link, v: Int)
+    l.enc_ph = v
+
+fn t_set_enc_wait(var l: Link, v: Bool)
+    l.enc_wait = v
+
+fn t_set_feat1(var l: Link, v: Int)
+    l.peer_feat[1] = v as u8
+
+fn t_remote(var l: Link, oct: Int, us: Int)
+    l.dl_rem_rx_octets = oct
+    l.dl_rem_tx_octets = oct
+    l.dl_rem_rx_time = us
+    l.dl_rem_tx_time = us
+    dle_refresh(var l)
+
+// Both ends have the full length, 251 octets and 2120 microseconds.
+fn t_full(var l: Link)
+    t_remote(var l, 251, 2120)
+
+// Take what the link sends: the PDU in `nxt` goes, and the next waiting moves up.
+fn t_take(var l: Link)
+    l.nxt_kind = K_EMPTY
+    ll_data.dpdu_empty(var l.nxt)
+    link_prepare(var l)
+
+fn t_length_pdu(op: Int, rx_oct: Int, rx_time: Int, tx_oct: Int, tx_time: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_length(var p, op, rx_oct, rx_time, tx_oct, tx_time)
+    p
+
+fn t_phy_pdu(op: Int, tx: Int, rx: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_phy(var p, op, tx, rx)
+    p
+
+fn t_update_pdu(c2p: Int, p2c: Int, instant: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_phy_update(var p, c2p, p2c, instant)
+    p
+
+@test
+fn test_a_new_connection_has_the_initial_length_and_phy()
+    var l = t_link()
+    test.assert_eq(l.dl_tx_octets, 251)
+    test.assert_eq(l.dl_rx_octets, 251)
+    test.assert_eq(l.dl_rem_tx_octets, 27)
+    test.assert_eq(l.dl_rem_rx_time, 328)
+    test.assert_eq(l.phy, ll_phy.PHY_1M)
+    test.assert_eq(l.phy_pref_tx, PHYS_SUPPORTED)
+    // The link starts nothing by itself until the Controller gives it the Host's defaults.
+    test.assert(l.dl_started)
+    test.assert(l.phy_auto)
+    // The peer's 27 octets and 328 microseconds are the limits until it says otherwise.
+    test.assert_eq(eff_tx_octets(var l), 27)
+    test.assert_eq(eff_rx_octets(var l), 27)
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_1M), 328)
+    test.assert_eq(eff_rx_time(var l, ll_phy.PHY_2M), 328)
+    test.assert_eq(l.dl_ev_tx_octets, 27)
+    test.assert(not link_owes(var l, EV_DATA_LENGTH))
+
+@test
+fn test_the_effective_values_are_the_lesser_of_the_local_and_the_remote_limit()
+    var l = t_link()
+    t_set_dl_tx_octets(var l, 200)
+    t_set_dl_tx_time(var l, 1700)
+    t_set_dl_rx_octets(var l, 100)
+    t_set_dl_rx_time(var l, 900)
+    t_set_dl_rem_rx_octets(var l, 251)
+    t_set_dl_rem_rx_time(var l, 2120)
+    t_set_dl_rem_tx_octets(var l, 60)
+    t_set_dl_rem_tx_time(var l, 700)
+    test.assert_eq(eff_tx_octets(var l), 200)
+    test.assert_eq(eff_rx_octets(var l), 60)
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_1M), 1700)
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_2M), 1700)
+    test.assert_eq(eff_rx_time(var l, ll_phy.PHY_1M), 700)
+
+@test
+fn test_on_the_coded_phy_the_times_are_never_below_2704_and_the_interval_cuts_the_transmit_time()
+    var l = t_link()
+    t_full(var l)
+    // The receive time of 2120 is under 2704 on the LE Coded PHY, which makes it 2704.
+    test.assert_eq(eff_rx_time(var l, ll_phy.PHY_CODED), 2704)
+    // The transmit time is cut by the interval (7500 us) less T_IFS twice and the packet of the other direction, but
+    // never goes below 2704: here 2120.
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_CODED), 2704)
+    // The Host sets the longest time on both sides: the interval leaves 7500 - 300 - 2704 = 4496.
+    t_set_dl_tx_time(var l, 17040)
+    t_set_dl_rem_rx_time(var l, 17040)
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_CODED), 4496)
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_1M), 17040)
+    // A long interval leaves all of it.
+    t_set_interval(var l, 800)
+    test.assert_eq(eff_tx_time(var l, ll_phy.PHY_CODED), 17040)
+
+@test
+fn test_the_payload_limit_follows_the_octets_the_time_and_the_phys_of_a_procedure()
+    var l = t_link()
+    test.assert_eq(tx_limit(var l), 27)
+    t_full(var l)
+    test.assert_eq(tx_limit(var l), 251)
+    // 100 octets and 1000 us: 1000 us is 117 octets at LE 1M after the header and the MIC.
+    t_set_dl_tx_octets(var l, 100)
+    test.assert_eq(tx_limit(var l), 100)
+    t_set_dl_tx_octets(var l, 251)
+    t_set_dl_tx_time(var l, 700)
+    test.assert_eq(tx_limit(var l), 73)
+    // On LE Coded S=8 with 2704 us: 27 octets; the LE Coded PHY pending cuts the PDUs queued before the instant.
+    t_set_dl_tx_time(var l, 2120)
+    t_set_phy_pending(var l, true)
+    t_set_phy_new(var l, ll_phy.PHY_CODED)
+    test.assert_eq(tx_limit(var l), 27)
+    t_set_phy_new(var l, ll_phy.PHY_2M)
+    test.assert_eq(tx_limit(var l), 251)
+    t_set_phy_pending(var l, false)
+    // A request this end made offers the PHYs it names: the PDUs wait for none of them to be longer than the time.
+    t_set_phy_state(var l, PHY_WAIT_IND)
+    t_set_phy_off(var l, ll_phy.MASK_CODED)
+    test.assert_eq(tx_limit(var l), 27)
+    t_set_phy_off(var l, ll_phy.MASK_1M | ll_phy.MASK_2M)
+    test.assert_eq(tx_limit(var l), 251)
+    t_set_phy_state(var l, PHY_IDLE)
+    // The S=2 coding of the LE Coded PHY fits more octets in the same time.
+    t_set_phy(var l, ll_phy.PHY_CODED)
+    t_set_phy_opt(var l, ll_phy.OPT_S2)
+    test.assert(tx_limit(var l) > 100)
+    t_set_phy_opt(var l, ll_phy.OPT_S8)
+    test.assert_eq(tx_limit(var l), 27)
+
+@test
+fn test_the_host_is_owed_a_data_length_change_when_an_effective_value_moves()
+    var l = t_link()
+    dle_refresh(var l)
+    test.assert(not link_owes(var l, EV_DATA_LENGTH))
+    t_full(var l)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+    test.assert_eq(l.dl_ev_tx_octets, 251)
+    test.assert_eq(l.dl_ev_tx_time, 2120)
+    test.assert_eq(l.dl_ev_rx_octets, 251)
+    test.assert_eq(l.dl_ev_rx_time, 2120)
+    link_sent(var l, EV_DATA_LENGTH)
+    dle_refresh(var l)
+    test.assert(not link_owes(var l, EV_DATA_LENGTH))
+    // Each of the four moves it.
+    t_set_dl_rem_tx_time(var l, 1500)
+    dle_refresh(var l)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+    link_sent(var l, EV_DATA_LENGTH)
+    t_set_dl_rem_rx_time(var l, 1500)
+    dle_refresh(var l)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+    link_sent(var l, EV_DATA_LENGTH)
+    t_set_dl_rem_tx_octets(var l, 100)
+    dle_refresh(var l)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+    link_sent(var l, EV_DATA_LENGTH)
+    t_set_dl_rem_rx_octets(var l, 100)
+    dle_refresh(var l)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+
+@test
+fn test_the_times_on_the_wire_are_cut_to_2128_for_a_peer_without_the_coded_phy()
+    var l = t_link()
+    t_set_dl_tx_time(var l, 17040)
+    test.assert_eq(dle_wire_time(var l, l.dl_tx_time), 2128)
+    // The peer's features show the LE Coded PHY: the whole time goes.
+    t_set_have_feat(var l, true)
+    t_set_feat1(var l, FEAT1_CODED)
+    test.assert_eq(dle_wire_time(var l, l.dl_tx_time), 17040)
+    // Features without it: 2128 again.
+    t_set_feat1(var l, FEAT1_2M)
+    test.assert_eq(dle_wire_time(var l, l.dl_tx_time), 2128)
+    test.assert_eq(dle_wire_time(var l, 1000), 1000)
+
+@test
+fn test_the_data_length_update_procedure_sends_a_request_and_ends_with_the_response()
+    var l = t_link()
+    dle_start(var l)
+    test.assert(l.dl_wait)
+    test.assert_eq(t_next_op(var l), ll_data.OP_LENGTH_REQ)
+    // Max RX octets and time, then max TX octets and time: 251 and 2120 both ways.
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 1), 251)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 3), 2120)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 5), 251)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 7), 2120)
+    // A second start while the request is out asks again after the answer.
+    t_set_dl_tx_octets(var l, 100)
+    dle_start(var l)
+    test.assert(l.dl_resend)
+    test.assert_eq(l.cq_count, 0)
+    var r = t_length_pdu(ll_data.OP_LENGTH_RSP, 251, 2120, 251, 2120)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.dl_rem_rx_octets, 251)
+    test.assert_eq(l.dl_rem_tx_time, 2120)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+    // The second request went out with the new values.
+    test.assert(l.dl_wait)
+    test.assert(not l.dl_resend)
+    test.assert_eq(l.cq_count, 1)
+    var scratch = ll_pdu.pdu_new()
+    slot_get_cq(var l, l.cq_head, var scratch)
+    test.assert_eq(ll_data.dpdu_u16(var scratch, 5), 100)
+    var r2 = t_length_pdu(ll_data.OP_LENGTH_RSP, 251, 2120, 251, 2120)
+    let _b = t_packet(var l, var r2, 1, 1, 0)
+    test.assert(not l.dl_wait)
+
+@test
+fn test_a_length_response_nobody_asked_for_is_ignored_and_bad_values_are_not_kept()
+    var l = t_link()
+    var r = t_length_pdu(ll_data.OP_LENGTH_RSP, 251, 2120, 251, 2120)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.dl_rem_rx_octets, 27)
+    dle_start(var l)
+    var bad = t_length_pdu(ll_data.OP_LENGTH_RSP, 20, 2120, 251, 2120)
+    let _b = t_packet(var l, var bad, 1, 0, 0)
+    // The procedure ends, the values stay.
+    test.assert(not l.dl_wait)
+    test.assert_eq(l.dl_rem_rx_octets, 27)
+
+@test
+fn test_a_length_request_is_answered_with_this_ends_values_and_a_bad_one_is_refused()
+    var l = t_link()
+    var q = t_length_pdu(ll_data.OP_LENGTH_REQ, 251, 2120, 180, 1600)
+    let _a = t_packet(var l, var q, 0, 0, 0)
+    test.assert_eq(l.dl_rem_rx_octets, 251)
+    test.assert_eq(l.dl_rem_tx_octets, 180)
+    test.assert_eq(l.dl_rem_tx_time, 1600)
+    test.assert_eq(t_next_op(var l), ll_data.OP_LENGTH_RSP)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 1), 251)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 5), 251)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+    // Values out of range: LL_REJECT_EXT_IND with Invalid LL Parameters, nothing kept.
+    var m = t_link()
+    for k in 0..4
+        var bad_rx = t_length_pdu(ll_data.OP_LENGTH_REQ,
+            (if k == 0 then 26 else 251),
+            (if k == 1 then 327 else 2120),
+            (if k == 2 then 252 else 251),
+            (if k == 3 then 17041 else 2120))
+        t_set_dl_rem_rx_octets(var m, 27)
+        t_set_nxt_kind(var m, K_EMPTY)
+        ll_data.dpdu_empty(var m.nxt)
+        let _b = t_packet(var m, var bad_rx, k % 2, 0, 0)
+        test.assert_eq(t_next_op(var m), ll_data.OP_REJECT_EXT_IND)
+        test.assert_eq(t_next_byte(var m, 1), ll_data.OP_LENGTH_REQ)
+        test.assert_eq(t_next_byte(var m, 2), CODE_INVALID_LL_PARAMETERS)
+        test.assert_eq(m.dl_rem_rx_octets, 27)
+
+@test
+fn test_the_procedure_is_refused_or_not_known_and_a_peer_without_it_is_not_asked()
+    var l = t_link()
+    dle_start(var l)
+    var u = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_LENGTH_REQ])
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert(not l.dl_wait)
+    test.assert(l.dl_unsup)
+    dle_start(var l)
+    test.assert(not l.dl_wait)
+    // A reject names the request and ends it, the peer stays a peer that has the procedure.
+    var m = t_link()
+    dle_start(var m)
+    var r = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_LENGTH_REQ, 0x23])
+    let _b = t_packet(var m, var r, 0, 0, 0)
+    test.assert(not m.dl_wait)
+    test.assert(not m.dl_unsup)
+    var n = t_link()
+    dle_start(var n)
+    var r2 = t_ctrl(ll_data.OP_REJECT_IND, [0x23])
+    let _c = t_packet(var n, var r2, 0, 0, 0)
+    test.assert(not n.dl_wait)
+    // A peer whose features lack it is never asked.
+    var o = t_link()
+    t_have_features(var o, 0x1F)
+    dle_start(var o)
+    test.assert(o.dl_unsup)
+    test.assert(not o.dl_wait)
+    test.assert_eq(o.cq_count + (if o.nxt_kind == K_EMPTY then 0 else 1), 0)
+    // And a full queue leaves no request out.
+    var p = t_link()
+    t_fill_cq(var p)
+    dle_start(var p)
+    test.assert(not p.dl_wait)
+
+@test
+fn test_the_host_sets_the_data_length_and_the_peer_is_told()
+    var l = t_link()
+    test.assert_eq(link_set_data_length(var l, 100, 1000), STATUS_SUCCESS)
+    test.assert_eq(l.dl_tx_octets, 100)
+    test.assert_eq(l.dl_tx_time, 1000)
+    test.assert_eq(t_next_op(var l), ll_data.OP_LENGTH_REQ)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 5), 100)
+    test.assert_eq(ll_data.dpdu_u16(var l.nxt, 7), 1000)
+    // The same values again change nothing and send nothing more.
+    t_set_cq_count(var l, 0)
+    test.assert_eq(link_set_data_length(var l, 100, 1000), STATUS_SUCCESS)
+    test.assert_eq(l.cq_count, 0)
+    test.assert_eq(link_set_data_length(var l, 26, 1000), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(link_set_data_length(var l, 252, 1000), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(link_set_data_length(var l, 100, 327), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(link_set_data_length(var l, 100, 17041), STATUS_INVALID_PARAMETERS)
+    var dead = link_new()
+    test.assert_eq(link_set_data_length(var dead, 100, 1000), STATUS_UNKNOWN_CONNECTION)
+    link_close(var l, 0x08)
+    test.assert_eq(link_set_data_length(var l, 100, 1100), STATUS_UNKNOWN_CONNECTION)
+
+@test
+fn test_the_defaults_of_the_host_are_taken_for_a_new_connection()
+    var l = t_link()
+    link_set_defaults(var l, true, 120, 1200, true, 2, 3)
+    test.assert_eq(l.dl_tx_octets, 120)
+    test.assert_eq(l.dl_tx_time, 1200)
+    test.assert(l.phy_pref_set)
+    test.assert_eq(l.phy_pref_tx, 2)
+    test.assert_eq(l.phy_pref_rx, 3)
+    // The connection starts the procedures itself from now on.
+    test.assert(not l.dl_started)
+    test.assert(not l.phy_auto)
+    var m = t_link()
+    link_set_defaults(var m, false, 27, 328, false, 7, 7)
+    test.assert_eq(m.dl_tx_octets, 251)
+    test.assert(not m.phy_pref_set)
+
+@test
+fn test_a_packet_longer_than_the_data_length_goes_out_in_pieces_and_frees_the_buffer_with_the_last()
+    var l = t_link()
+    test.assert(t_queue(var l, true, 100))
+    // The first piece: 27 octets, LLID start, and the packet stays at the head of the queue.
+    test.assert_eq(l.nxt_kind, K_ACL_PART)
+    test.assert_eq(ll_data.dpdu_llid(var l.nxt), ll_data.LLID_START)
+    test.assert_eq(ll_data.dpdu_len(var l.nxt), 27)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 0), 0x60)
+    test.assert_eq(l.txq_off, 27)
+    test.assert_eq(l.txq_count, 1)
+    t_take(var l)
+    test.assert_eq(l.nxt_kind, K_ACL_PART)
+    test.assert_eq(ll_data.dpdu_llid(var l.nxt), ll_data.LLID_CONTINUE)
+    test.assert_eq(ll_data.dpdu_len(var l.nxt), 27)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 0), 0x60 + (27 & 0x1F))
+    t_take(var l)
+    t_take(var l)
+    // The last piece is the 19 octets left, and it is the one that returns the Host's buffer.
+    test.assert_eq(l.nxt_kind, K_ACL)
+    test.assert_eq(ll_data.dpdu_llid(var l.nxt), ll_data.LLID_CONTINUE)
+    test.assert_eq(ll_data.dpdu_len(var l.nxt), 19)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 18), 0x60 + (99 & 0x1F))
+    test.assert_eq(l.txq_count, 0)
+    test.assert_eq(l.txq_off, 0)
+    // A piece that is acknowledged returns nothing, the last one returns the buffer.
+    var m = t_link()
+    test.assert(t_queue(var m, true, 60))
+    test.assert_eq(m.nxt_kind, K_ACL_PART)
+    let _a = t_slow(var m, ll_data.LLID_CONTINUE, 0)
+    var e = t_data(ll_data.LLID_CONTINUE, 0)
+    let _b = t_packet(var m, var e, 0, 1, 0)
+    test.assert_eq(m.completed, 0)
+    test.assert_eq(m.cur_kind, K_ACL_PART)
+    var e2 = t_data(ll_data.LLID_CONTINUE, 0)
+    let _c = t_packet(var m, var e2, 1, 0, 0)
+    test.assert_eq(m.completed, 0)
+
+@test
+fn test_the_whole_packet_goes_as_one_pdu_when_the_length_allows_it()
+    var l = t_link()
+    t_full(var l)
+    test.assert(t_queue(var l, true, 251))
+    test.assert_eq(l.nxt_kind, K_ACL)
+    test.assert_eq(ll_data.dpdu_len(var l.nxt), 251)
+    test.assert_eq(l.nxt.n, 253)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 250), 0x60 + (250 & 0x1F))
+    test.assert_eq(l.txq_count, 0)
+    // All three slots hold a packet each.
+    var m = t_link()
+    t_full(var m)
+    test.assert(t_queue(var m, true, 10))
+    test.assert(t_queue(var m, true, 11))
+    test.assert(t_queue(var m, false, 12))
+    test.assert(t_queue(var m, false, 13))
+    test.assert(not t_queue(var m, false, 14))
+    test.assert_eq(ll_data.dpdu_len(var m.nxt), 10)
+    t_take(var m)
+    test.assert_eq(ll_data.dpdu_len(var m.nxt), 11)
+    t_take(var m)
+    test.assert_eq(ll_data.dpdu_len(var m.nxt), 12)
+    test.assert_eq(ll_data.dpdu_llid(var m.nxt), ll_data.LLID_CONTINUE)
+    t_take(var m)
+    test.assert_eq(ll_data.dpdu_len(var m.nxt), 13)
+
+@test
+fn test_the_phy_to_ask_for_is_the_fastest_of_those_the_host_prefers()
+    test.assert_eq(phy_best(7), ll_phy.PHY_2M)
+    test.assert_eq(phy_best(6), ll_phy.PHY_2M)
+    test.assert_eq(phy_best(5), ll_phy.PHY_1M)
+    test.assert_eq(phy_best(1), ll_phy.PHY_1M)
+    test.assert_eq(phy_best(4), ll_phy.PHY_CODED)
+    test.assert_eq(phy_best(0), 0)
+    test.assert_eq(phy_best(8), 0)
+    var l = t_link()
+    test.assert_eq(phy_wanted(var l), 7)
+    t_set_phy_pref_tx(var l, 6)
+    t_set_phy_pref_rx(var l, 3)
+    test.assert_eq(phy_wanted(var l), 2)
+    test.assert(peer_has_phy(var l, ll_phy.PHY_2M))
+    t_set_have_feat(var l, true)
+    test.assert(peer_has_phy(var l, ll_phy.PHY_1M))
+    test.assert(not peer_has_phy(var l, ll_phy.PHY_2M))
+    test.assert(not peer_has_phy(var l, ll_phy.PHY_CODED))
+    t_set_feat1(var l, FEAT1_2M | FEAT1_CODED)
+    test.assert(peer_has_phy(var l, ll_phy.PHY_2M))
+    test.assert(peer_has_phy(var l, ll_phy.PHY_CODED))
+
+@test
+fn test_set_phy_checks_what_the_host_asks_and_asks_the_peer_for_the_fastest()
+    var l = t_link()
+    // The Host prefers LE 2M both ways: the request names it in both fields.
+    test.assert_eq(link_set_phy(var l, 0, 2, 2, 0), STATUS_SUCCESS)
+    test.assert_eq(l.phy_state, PHY_WAIT_IND)
+    test.assert(l.phy_host)
+    test.assert_eq(l.phy_off, 2)
+    test.assert_eq(t_next_op(var l), ll_data.OP_PHY_REQ)
+    test.assert_eq(t_next_byte(var l, 1), 2)
+    test.assert_eq(t_next_byte(var l, 2), 2)
+    // One procedure at a time.
+    test.assert_eq(link_set_phy(var l, 0, 1, 1, 0), STATUS_COMMAND_DISALLOWED)
+    var c = t_central()
+    test.assert_eq(link_set_phy(var c, 3, 0, 0, 0), STATUS_SUCCESS)
+    test.assert_eq(c.phy_state, PHY_WAIT_RSP)
+    test.assert_eq(c.phy_pref_tx, 7)
+    // The options are kept as the Host gave them.
+    var o = t_link()
+    test.assert_eq(link_set_phy(var o, 0, 4, 4, 3), STATUS_SUCCESS)
+    test.assert_eq(o.phy_opt, 3)
+    var o2 = t_link()
+    test.assert_eq(link_set_phy(var o2, 0, 4, 4, 0xFE), STATUS_SUCCESS)
+    test.assert_eq(o2.phy_opt, 2)
+
+@test
+fn test_set_phy_refuses_what_a_symmetric_controller_cannot_do()
+    var l = t_link()
+    test.assert_eq(link_set_phy(var l, 0, 1, 2, 0), STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(link_set_phy(var l, 0, 8, 8, 0), STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(link_set_phy(var l, 0, 0, 0, 0), STATUS_INVALID_PARAMETERS)
+    test.assert_eq(link_set_phy(var l, 1, 0, 2, 0), STATUS_SUCCESS)
+    var m = t_link()
+    test.assert_eq(link_set_phy(var m, 2, 2, 0, 0), STATUS_SUCCESS)
+    // No preference for the transmitter and LE 1M only for the receiver: the PHYs both name are LE 1M.
+    var n = t_link()
+    test.assert_eq(link_set_phy(var n, 1, 0, 1, 0), STATUS_SUCCESS)
+    test.assert_eq(n.phy_pref_tx, 7)
+    test.assert_eq(n.phy_pref_rx, 1)
+    var dead = link_new()
+    test.assert_eq(link_set_phy(var dead, 0, 2, 2, 0), STATUS_UNKNOWN_CONNECTION)
+    // No PHY in common between the two fields.
+    var q = t_link()
+    test.assert_eq(link_set_phy(var q, 1, 0, 4, 0), STATUS_SUCCESS)
+    var r = t_link()
+    t_set_phy_state(var r, PHY_WAIT_IND)
+    test.assert_eq(link_set_phy(var r, 0, 2, 2, 0), STATUS_COMMAND_DISALLOWED)
+    var s = t_link()
+    t_set_phy_pending(var s, true)
+    test.assert_eq(link_set_phy(var s, 0, 2, 2, 0), STATUS_COMMAND_DISALLOWED)
+
+@test
+fn test_the_controllers_own_start_waits_for_a_procedure_under_way()
+    var l = t_link()
+    t_set_phy_state(var l, PHY_RESPONDED)
+    test.assert_eq(phy_begin(var l, false), STATUS_COMMAND_DISALLOWED)
+    var m = t_link()
+    t_set_phy_pending(var m, true)
+    test.assert_eq(phy_begin(var m, false), STATUS_COMMAND_DISALLOWED)
+
+@test
+fn test_a_request_for_the_phy_in_force_is_answered_at_once_to_the_host()
+    var l = t_link()
+    test.assert_eq(link_set_phy(var l, 0, 1, 1, 0), STATUS_SUCCESS)
+    test.assert(link_owes(var l, EV_PHY))
+    test.assert_eq(l.phy_status, STATUS_SUCCESS)
+    test.assert_eq(l.cq_count, 0)
+    test.assert_eq(l.nxt_kind, K_EMPTY)
+    test.assert_eq(l.phy_state, PHY_IDLE)
+    // The Controller's own start for the same needs no answer to anyone.
+    var m = t_link()
+    t_set_phy_pref_set(var m, true)
+    t_set_phy_pref_tx(var m, 1)
+    t_set_phy_pref_rx(var m, 1)
+    test.assert_eq(phy_begin(var m, false), STATUS_SUCCESS)
+    test.assert(not link_owes(var m, EV_PHY))
+    // No PHY wanted at all.
+    var n = t_link()
+    t_set_phy_pref_tx(var n, 1)
+    t_set_phy_pref_rx(var n, 2)
+    test.assert_eq(phy_begin(var n, true), STATUS_SUCCESS)
+    test.assert(link_owes(var n, EV_PHY))
+
+@test
+fn test_a_peer_without_the_phy_is_not_asked_and_the_host_hears_unsupported_remote_feature()
+    var l = t_link()
+    t_have_features(var l, 0x1F)
+    test.assert_eq(link_set_phy(var l, 0, 2, 2, 0), STATUS_SUCCESS)
+    test.assert(link_owes(var l, EV_PHY))
+    test.assert_eq(l.phy_status, STATUS_UNSUPPORTED_REMOTE)
+    test.assert_eq(l.phy_state, PHY_IDLE)
+    test.assert_eq(l.cq_count, 0)
+    // The same for a peer that answered LL_UNKNOWN_RSP, and nothing for the Controller's own start.
+    var m = t_link()
+    t_set_phy_unsup(var m, true)
+    test.assert_eq(link_set_phy(var m, 0, 2, 2, 0), STATUS_SUCCESS)
+    test.assert_eq(m.phy_status, STATUS_UNSUPPORTED_REMOTE)
+    var n = t_link()
+    t_set_phy_unsup(var n, true)
+    t_set_phy_pref_set(var n, true)
+    t_set_phy_pref_tx(var n, 2)
+    t_set_phy_pref_rx(var n, 2)
+    test.assert_eq(phy_begin(var n, false), STATUS_SUCCESS)
+    test.assert(not link_owes(var n, EV_PHY))
+
+@test
+fn test_a_request_waits_for_the_data_length_procedure_and_a_full_queue_refuses_it()
+    var l = t_link()
+    dle_start(var l)
+    test.assert_eq(link_set_phy(var l, 0, 2, 2, 0), STATUS_SUCCESS)
+    test.assert_eq(l.phy_state, PHY_DEFERRED)
+    test.assert_eq(l.cq_count, 0)
+    test.assert(l.phy_host)
+    // The response comes; the request goes out at the next work after an event.
+    var r = t_length_pdu(ll_data.OP_LENGTH_RSP, 251, 2120, 251, 2120)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    t_alive(var l, 3200, 5000)
+    auto_tasks(var l)
+    test.assert_eq(l.phy_state, PHY_WAIT_IND)
+    test.assert_eq(l.phy_off, 2)
+    test.assert(l.cq_count + (if l.nxt_kind == K_CTRL then 1 else 0) >= 1)
+    // The Host changed its mind meanwhile: the PHY in force is the one it wants, and it hears so.
+    var m = t_link()
+    dle_start(var m)
+    test.assert_eq(link_set_phy(var m, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_set_phy_pref_tx(var m, 1)
+    t_set_phy_pref_rx(var m, 1)
+    t_set_dl_wait(var m, false)
+    t_alive(var m, 3200, 5000)
+    auto_tasks(var m)
+    test.assert_eq(m.phy_state, PHY_IDLE)
+    test.assert(link_owes(var m, EV_PHY))
+    test.assert_eq(m.phy_status, STATUS_SUCCESS)
+    // A queue without room leaves nothing out.
+    var n = t_link()
+    t_fill_cq(var n)
+    test.assert_eq(link_set_phy(var n, 0, 2, 2, 0), STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(n.phy_state, PHY_IDLE)
+    var o = t_link()
+    dle_start(var o)
+    test.assert_eq(link_set_phy(var o, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_set_dl_wait(var o, false)
+    t_fill_cq(var o)
+    t_alive(var o, 3200, 5000)
+    auto_tasks(var o)
+    // The queue is crowded: it waits for the next work.
+    test.assert_eq(o.phy_state, PHY_DEFERRED)
+
+@test
+fn test_the_central_picks_the_fastest_phy_the_request_and_the_host_share_and_sends_the_update()
+    var c = t_central()
+    t_set_ev_count(var c, 10)
+    var q = t_phy_pdu(ll_data.OP_PHY_REQ, 7, 7)
+    let _a = t_packet(var c, var q, 0, 0, 0)
+    test.assert_eq(t_next_op(var c), ll_data.OP_PHY_UPDATE_IND)
+    test.assert_eq(t_next_byte(var c, 1), 2)
+    test.assert_eq(t_next_byte(var c, 2), 2)
+    test.assert(c.phy_pending)
+    test.assert_eq(c.phy_new, ll_phy.PHY_2M)
+    test.assert_eq(ll_data.dpdu_u16(var c.nxt, 3), c.phy_instant)
+    test.assert_eq(c.phy_instant, (10 + INSTANT_LEAD * (1 + c.latency) + INSTANT_SLACK) & 0xFFFF)
+    test.assert_eq(c.phy_state, PHY_IDLE)
+    // The Host prefers LE 1M and Coded: LE 1M is the PHY in force, so nothing changes.
+    var d = t_central()
+    t_set_phy_pref_tx(var d, 5)
+    t_set_phy_pref_rx(var d, 5)
+    var q2 = t_phy_pdu(ll_data.OP_PHY_REQ, 7, 7)
+    let _b = t_packet(var d, var q2, 0, 0, 0)
+    test.assert_eq(t_next_op(var d), ll_data.OP_PHY_UPDATE_IND)
+    test.assert_eq(t_next_byte(var d, 1), 0)
+    test.assert_eq(t_next_byte(var d, 2), 0)
+    test.assert(not d.phy_pending)
+    // A request that names an asymmetric pair shares no PHY, and nothing changes.
+    var e = t_central()
+    var q3 = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 1)
+    let _c = t_packet(var e, var q3, 0, 0, 0)
+    test.assert_eq(t_next_byte(var e, 1), 0)
+    test.assert(not e.phy_pending)
+
+@test
+fn test_the_central_refuses_a_request_that_collides_with_a_procedure_of_its_own()
+    var c = t_central()
+    t_set_phy_state(var c, PHY_WAIT_RSP)
+    var q = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 2)
+    let _a = t_packet(var c, var q, 0, 0, 0)
+    test.assert_eq(t_next_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(t_next_byte(var c, 1), ll_data.OP_PHY_REQ)
+    test.assert_eq(t_next_byte(var c, 2), CODE_COLLISION)
+    var d = t_central()
+    t_set_phy_pending(var d, true)
+    var q2 = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 2)
+    let _b = t_packet(var d, var q2, 0, 0, 0)
+    test.assert_eq(t_next_byte(var d, 2), CODE_COLLISION)
+    // A different procedure with an instant: Different Transaction Collision.
+    var e = t_central()
+    t_set_upd_pending(var e, true)
+    var q3 = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 2)
+    let _c = t_packet(var e, var q3, 0, 0, 0)
+    test.assert_eq(t_next_byte(var e, 2), CODE_DIFFERENT_COLLISION)
+    var f = t_central()
+    t_set_chm_pending(var f, true)
+    var q4 = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 2)
+    let _d = t_packet(var f, var q4, 0, 0, 0)
+    test.assert_eq(t_next_byte(var f, 2), CODE_DIFFERENT_COLLISION)
+    var g = t_central()
+    t_set_rq_wait(var g, true)
+    var q5 = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 2)
+    let _e = t_packet(var g, var q5, 0, 0, 0)
+    test.assert_eq(t_next_byte(var g, 2), CODE_DIFFERENT_COLLISION)
+    // And the other way: a request for a connection parameter meets a PHY update of this end.
+    var h = t_central()
+    t_set_phy_pending(var h, true)
+    var p = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 24, 24, 0, 300, 0)
+    let _f = t_packet(var h, var p, 0, 0, 0)
+    test.assert_eq(t_next_byte(var h, 2), CODE_DIFFERENT_COLLISION)
+    var i = t_central()
+    t_set_phy_state(var i, PHY_WAIT_RSP)
+    var p2 = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 24, 24, 0, 300, 0)
+    let _g = t_packet(var i, var p2, 0, 0, 0)
+    test.assert_eq(t_next_byte(var i, 2), CODE_DIFFERENT_COLLISION)
+
+@test
+fn test_the_central_that_asked_decides_from_the_response()
+    var c = t_central()
+    test.assert_eq(link_set_phy(var c, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_take(var c)
+    var r = t_phy_pdu(ll_data.OP_PHY_RSP, 3, 3)
+    let _a = t_packet(var c, var r, 0, 0, 0)
+    test.assert(c.phy_pending)
+    test.assert_eq(c.phy_new, ll_phy.PHY_2M)
+    test.assert_eq(c.phy_state, PHY_IDLE)
+    test.assert_eq(t_next_op(var c), ll_data.OP_PHY_UPDATE_IND)
+    test.assert_eq(t_next_byte(var c, 1), 2)
+    // The Peripheral takes the PHY for one direction only: nothing changes, and the Host hears so.
+    var d = t_central()
+    test.assert_eq(link_set_phy(var d, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_take(var d)
+    var r2 = t_phy_pdu(ll_data.OP_PHY_RSP, 2, 1)
+    let _b = t_packet(var d, var r2, 0, 0, 0)
+    test.assert(not d.phy_pending)
+    test.assert_eq(t_next_byte(var d, 1), 0)
+    test.assert_eq(d.phy_state, PHY_IDLE)
+    test.assert(link_owes(var d, EV_PHY))
+    var e = t_central()
+    test.assert_eq(link_set_phy(var e, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_take(var e)
+    var r3 = t_phy_pdu(ll_data.OP_PHY_RSP, 1, 2)
+    let _c = t_packet(var e, var r3, 0, 0, 0)
+    test.assert(not e.phy_pending)
+    // A response nothing asked for is ignored.
+    var f = t_central()
+    var r4 = t_phy_pdu(ll_data.OP_PHY_RSP, 2, 2)
+    let _d = t_packet(var f, var r4, 0, 0, 0)
+    test.assert(not f.phy_pending)
+    test.assert_eq(f.nxt_kind, K_EMPTY)
+    // The update could not be queued: the Host hears Command Disallowed.
+    var g = t_central()
+    test.assert_eq(link_set_phy(var g, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_take(var g)
+    t_fill_cq(var g)
+    t_set_cq_count(var g, CTRL_SLOTS)
+    var r5 = t_phy_pdu(ll_data.OP_PHY_RSP, 2, 2)
+    t_set_room(var g, true)
+    ctrl_rx(var g, var r5)
+    test.assert(not g.phy_pending)
+    test.assert_eq(g.phy_status, STATUS_COMMAND_DISALLOWED)
+
+@test
+fn test_the_peripheral_answers_the_request_with_one_phy_and_waits_for_the_update()
+    var l = t_link()
+    var q = t_phy_pdu(ll_data.OP_PHY_REQ, 7, 7)
+    let _a = t_packet(var l, var q, 0, 0, 0)
+    test.assert_eq(t_next_op(var l), ll_data.OP_PHY_RSP)
+    test.assert_eq(t_next_byte(var l, 1), 2)
+    test.assert_eq(t_next_byte(var l, 2), 2)
+    test.assert_eq(l.phy_state, PHY_RESPONDED)
+    test.assert_eq(l.phy_off, 2)
+    // Its own request that crossed the Central's is given up for the Central's procedure.
+    var m = t_link()
+    test.assert_eq(link_set_phy(var m, 0, 4, 4, 0), STATUS_SUCCESS)
+    var q2 = t_phy_pdu(ll_data.OP_PHY_REQ, 7, 7)
+    let _b = t_packet(var m, var q2, 0, 0, 0)
+    test.assert_eq(m.phy_state, PHY_RESPONDED)
+    test.assert(m.phy_host)
+    // With no PHY the Host and the request share, the answer is the PHY in force.
+    var n = t_link()
+    t_set_phy_pref_tx(var n, 4)
+    t_set_phy_pref_rx(var n, 4)
+    var q3 = t_phy_pdu(ll_data.OP_PHY_REQ, 3, 3)
+    let _c = t_packet(var n, var q3, 0, 0, 0)
+    test.assert_eq(t_next_byte(var n, 1), 1)
+    test.assert_eq(t_next_byte(var n, 2), 1)
+    // An update is under way: Procedure Collision.
+    var o = t_link()
+    t_set_phy_pending(var o, true)
+    var q4 = t_phy_pdu(ll_data.OP_PHY_REQ, 2, 2)
+    let _d = t_packet(var o, var q4, 0, 0, 0)
+    test.assert_eq(t_next_op(var o), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(t_next_byte(var o, 2), CODE_COLLISION)
+
+@test
+fn test_the_update_indication_sets_the_phy_for_the_instant_and_the_host_hears_it_then()
+    var l = t_link()
+    t_set_phy_state(var l, PHY_RESPONDED)
+    t_set_phy_host(var l, true)
+    var u = t_update_pdu(2, 2, 30)
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert(l.phy_pending)
+    test.assert_eq(l.phy_new, 2)
+    test.assert_eq(l.phy_instant, 30)
+    test.assert_eq(l.phy_state, PHY_IDLE)
+    test.assert_eq(l.phy, 1)
+    // Events up to the instant keep the PHY; the event of the instant changes it.
+    t_ev_count(var l, 29)
+    let _b = link_event_begin(var l)
+    test.assert_eq(l.phy, 1)
+    test.assert(not link_owes(var l, EV_PHY))
+    link_event_done(var l, 5000)
+    let _c = link_event_begin(var l)
+    test.assert_eq(l.phy, 2)
+    test.assert(not l.phy_pending)
+    test.assert(link_owes(var l, EV_PHY))
+    test.assert_eq(l.phy_status, STATUS_SUCCESS)
+    test.assert(not l.phy_host)
+
+@test
+fn test_the_update_indication_with_nothing_to_change_ends_the_procedure()
+    var l = t_link()
+    t_set_phy_state(var l, PHY_WAIT_IND)
+    t_set_phy_host(var l, true)
+    var u = t_update_pdu(0, 0, 0)
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert_eq(l.phy_state, PHY_IDLE)
+    test.assert(link_owes(var l, EV_PHY))
+    test.assert(not l.phy_pending)
+    // The Controller's own start for it: no event.
+    var m = t_link()
+    t_set_phy_state(var m, PHY_WAIT_IND)
+    var u2 = t_update_pdu(0, 0, 0)
+    let _b = t_packet(var m, var u2, 0, 0, 0)
+    test.assert(not link_owes(var m, EV_PHY))
+    // The PHY in force named again changes nothing either.
+    var n = t_link()
+    var u3 = t_update_pdu(1, 1, 30)
+    let _c = t_packet(var n, var u3, 0, 0, 0)
+    test.assert(not n.phy_pending)
+    test.assert(not n.closing)
+
+@test
+fn test_an_update_for_two_phys_or_an_instant_in_the_past_ends_the_connection()
+    var l = t_link()
+    var u = t_update_pdu(2, 4, 30)
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_UNSUPPORTED_PARAMETER)
+    // One direction changing alone is an asymmetric connection too.
+    var m = t_link()
+    var u2 = t_update_pdu(2, 0, 30)
+    let _b = t_packet(var m, var u2, 0, 0, 0)
+    test.assert_eq(m.reason, REASON_UNSUPPORTED_PARAMETER)
+    var n = t_link()
+    var u3 = t_update_pdu(0, 2, 30)
+    let _c = t_packet(var n, var u3, 0, 0, 0)
+    test.assert_eq(n.reason, REASON_UNSUPPORTED_PARAMETER)
+    // An instant already passed.
+    var o = t_link()
+    t_ev_count(var o, 40)
+    var u4 = t_update_pdu(2, 2, 30)
+    let _d = t_packet(var o, var u4, 0, 0, 0)
+    test.assert(o.closing)
+    test.assert_eq(o.reason, REASON_INSTANT_PASSED)
+    // A field with a bit set that is no PHY changes nothing in its direction, and a reserved bit is no PHY.
+    var p = t_link()
+    var u5 = t_update_pdu(0x82, 0x82, 30)
+    let _e = t_packet(var p, var u5, 0, 0, 0)
+    test.assert(p.phy_pending)
+    test.assert_eq(p.phy_new, 2)
+
+@test
+fn test_the_roles_that_do_not_send_an_opcode_do_not_know_it()
+    var c = t_central()
+    var u = t_update_pdu(2, 2, 30)
+    let _a = t_packet(var c, var u, 0, 0, 0)
+    test.assert_eq(t_next_op(var c), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(t_next_byte(var c, 1), ll_data.OP_PHY_UPDATE_IND)
+    var p = t_link()
+    var r = t_phy_pdu(ll_data.OP_PHY_RSP, 2, 2)
+    let _b = t_packet(var p, var r, 0, 0, 0)
+    test.assert_eq(t_next_op(var p), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(t_next_byte(var p, 1), ll_data.OP_PHY_RSP)
+
+@test
+fn test_a_refused_phy_update_ends_with_the_code_for_the_host_that_asked()
+    var l = t_link()
+    test.assert_eq(link_set_phy(var l, 0, 2, 2, 0), STATUS_SUCCESS)
+    var u = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_PHY_REQ])
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert_eq(l.phy_state, PHY_IDLE)
+    test.assert(l.phy_unsup)
+    test.assert_eq(l.phy_status, STATUS_UNSUPPORTED_REMOTE)
+    test.assert(link_owes(var l, EV_PHY))
+    var m = t_link()
+    test.assert_eq(link_set_phy(var m, 0, 2, 2, 0), STATUS_SUCCESS)
+    var r = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_PHY_REQ, CODE_COLLISION])
+    let _b = t_packet(var m, var r, 0, 0, 0)
+    test.assert_eq(m.phy_state, PHY_IDLE)
+    test.assert(not m.phy_unsup)
+    test.assert_eq(m.phy_status, CODE_COLLISION)
+    var n = t_link()
+    test.assert_eq(link_set_phy(var n, 0, 2, 2, 0), STATUS_SUCCESS)
+    var r2 = t_ctrl(ll_data.OP_REJECT_IND, [CODE_BUSY])
+    let _c = t_packet(var n, var r2, 0, 0, 0)
+    test.assert_eq(n.phy_state, PHY_IDLE)
+    test.assert_eq(n.phy_status, CODE_BUSY)
+    // The Peripheral that gave its own request up for the Central's takes no notice of the Central's reject of it.
+    var o = t_link()
+    t_set_phy_state(var o, PHY_RESPONDED)
+    var r3 = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_PHY_REQ, CODE_COLLISION])
+    let _d = t_packet(var o, var r3, 0, 0, 0)
+    test.assert_eq(o.phy_state, PHY_RESPONDED)
+    // A reject of another opcode is not about it.
+    var q = t_link()
+    test.assert_eq(link_set_phy(var q, 0, 2, 2, 0), STATUS_SUCCESS)
+    var r4 = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_PING_REQ, CODE_COLLISION])
+    let _e = t_packet(var q, var r4, 0, 0, 0)
+    test.assert_eq(q.phy_state, PHY_WAIT_IND)
+
+@test
+fn test_the_connection_asks_for_the_data_length_once_and_for_the_phy_the_host_prefers()
+    var l = t_link()
+    link_set_defaults(var l, false, 27, 328, true, 2, 2)
+    // Not before the peer has been heard, and not with the queue crowded.
+    auto_tasks(var l)
+    test.assert(not l.dl_wait)
+    t_alive(var l, 3200, 5000)
+    t_fill_cq(var l)
+    auto_tasks(var l)
+    test.assert(not l.dl_started)
+    var m = t_link()
+    link_set_defaults(var m, false, 27, 328, true, 2, 2)
+    t_alive(var m, 3200, 5000)
+    auto_tasks(var m)
+    test.assert(m.dl_started)
+    test.assert(m.dl_wait)
+    test.assert_eq(t_next_op(var m), ll_data.OP_LENGTH_REQ)
+    // The PHY request waits for the length procedure and for a few events, then goes.
+    auto_tasks(var m)
+    test.assert(not m.phy_auto)
+    t_set_dl_wait(var m, false)
+    auto_tasks(var m)
+    test.assert(not m.phy_auto)
+    t_ev_count(var m, AUTO_PHY_EVENTS)
+    auto_tasks(var m)
+    test.assert(m.phy_auto)
+    test.assert_eq(m.phy_state, PHY_WAIT_IND)
+    test.assert(not m.phy_host)
+    // A Central with a procedure with an instant under way waits.
+    var c = t_central()
+    link_set_defaults(var c, false, 27, 328, true, 2, 2)
+    t_alive(var c, 3200, 5000)
+    t_set_dl_started(var c, true)
+    t_ev_count(var c, 10)
+    t_set_upd_pending(var c, true)
+    auto_tasks(var c)
+    test.assert(not c.phy_auto)
+    t_set_upd_pending(var c, false)
+    auto_tasks(var c)
+    test.assert(c.phy_auto)
+    test.assert_eq(c.phy_state, PHY_WAIT_RSP)
+    // No preference of the Host: no request.
+    var d = t_link()
+    link_set_defaults(var d, false, 27, 328, false, 7, 7)
+    t_alive(var d, 3200, 5000)
+    t_set_dl_started(var d, true)
+    t_ev_count(var d, 10)
+    auto_tasks(var d)
+    test.assert(not d.phy_auto)
+
+@test
+fn test_a_procedure_the_peer_does_not_answer_ends_the_connection_after_40_seconds()
+    var l = t_link()
+    dle_start(var l)
+    t_alive(var l, 3200, 41000000)
+    link_event_done(var l, 39000000)
+    test.assert(not l.closing)
+    link_event_done(var l, 41000001)
+    test.assert(l.closing)
+    test.assert_eq(l.reason, REASON_RESPONSE_TIMEOUT)
+    var m = t_link()
+    test.assert_eq(link_set_phy(var m, 0, 2, 2, 0), STATUS_SUCCESS)
+    t_alive(var m, 3200, 41000000)
+    link_event_done(var m, 39000000)
+    test.assert(not m.closing)
+    link_event_done(var m, 41000001)
+    test.assert(m.closing)
+    test.assert_eq(m.reason, REASON_RESPONSE_TIMEOUT)
+    var n = t_link()
+    t_set_phy_state(var n, PHY_RESPONDED)
+    t_set_phy_t0(var n, 0)
+    t_alive(var n, 3200, 41000000)
+    link_event_done(var n, 41000001)
+    test.assert(n.closing)
+
+@test
+fn test_the_connection_update_applies_the_new_interval_to_the_coded_transmit_time()
+    var l = t_link()
+    t_full(var l)
+    t_set_dl_tx_time(var l, 17040)
+    t_set_dl_rem_rx_time(var l, 17040)
+    t_set_phy(var l, ll_phy.PHY_CODED)
+    dle_refresh(var l)
+    let before = l.dl_ev_tx_time
+    test.assert_eq(before, 4496)
+    link_sent(var l, EV_DATA_LENGTH)
+    // An update to a 100 ms interval at the next instant: the Host is told the time grew.
+    var u = t_ctrl(ll_data.OP_CONNECTION_UPDATE_IND, [2, 0, 0, 80, 0, 0, 0, 200, 0, 3, 0])
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    t_ev_count(var l, 3)
+    let _b = link_event_begin(var l)
+    test.assert_eq(l.interval, 80)
+    test.assert_eq(l.dl_ev_tx_time, 17040)
+    test.assert(link_owes(var l, EV_DATA_LENGTH))
+
+@test
+fn test_the_booking_of_a_connection_event_grows_with_the_packets_in_force()
+    var l = t_link()
+    // 27 octets at LE 1M fit the base.
+    test.assert_eq(link_book_us(var l, 3000), 3000)
+    t_full(var l)
+    // Two exchanges of 2120 us packets and 80 us acknowledgements: not more than the interval less a millisecond.
+    test.assert_eq(link_book_us(var l, 3000), 6500)
+    t_set_interval(var l, 80)
+    test.assert_eq(link_book_us(var l, 3000), 2 * (2120 + 2120 + 300))
+    // LE 2M halves the packets.
+    t_set_phy(var l, ll_phy.PHY_2M)
+    test.assert_eq(link_book_us(var l, 3000), 2 * (1064 + 1064 + 300))
+    // LE Coded at 2704 us: 27 octets each way.
+    t_set_phy(var l, ll_phy.PHY_CODED)
+    test.assert_eq(link_book_us(var l, 3000), 2 * (2704 + 2704 + 300))
+
+@test
+fn test_the_central_starts_encryption_after_its_own_phy_update_is_over()
+    var l = t_central()
+    t_alive(var l, 3200, 5000)
+    t_set_phy_pending(var l, true)
+    // The Host's LE Start Encryption is taken, and the procedure waits for the instant.
+    test.assert_eq(link_start_encryption(var l, 0x1234), STATUS_SUCCESS)
+    test.assert(l.enc_wait)
+    test.assert_eq(l.enc_ph, ENC_IDLE)
+    test.assert_eq(l.cq_count, 0)
+    test.assert_eq(link_start_encryption(var l, 0x1234), STATUS_COMMAND_DISALLOWED)
+    auto_tasks(var l)
+    test.assert(l.enc_wait)
+    t_set_phy_pending(var l, false)
+    auto_tasks(var l)
+    test.assert(not l.enc_wait)
+    test.assert_eq(l.enc_ph, ENC_NEED_RANDOM)
+    test.assert_eq(l.enc_ediv, 0x1234)
+    // On an encrypted link it is the pause that waits, and a crowded queue makes it wait once more.
+    var m = t_central()
+    t_alive(var m, 3200, 5000)
+    t_set_enc_tx(var m, true)
+    t_set_enc_rx(var m, true)
+    t_set_phy_state(var m, PHY_WAIT_RSP)
+    test.assert_eq(link_start_encryption(var m, 0x4321), STATUS_SUCCESS)
+    test.assert(m.enc_wait)
+    t_set_phy_state(var m, PHY_IDLE)
+    t_fill_cq(var m)
+    test.assert_eq(enc_begin(var m), STATUS_COMMAND_DISALLOWED)
+    t_pop_cq(var m)
+    t_pop_cq(var m)
+    t_pop_cq(var m)
+    t_pop_cq(var m)
+    auto_tasks(var m)
+    test.assert(not m.enc_wait)
+    test.assert_eq(m.enc_ph, ENC_C_PAUSE_WAIT_RSP)
+    test.assert_eq(t_next_op(var m), ll_data.OP_PAUSE_ENC_REQ)
+    // A request for a PHY that is only deferred does not hold the encryption back.
+    var n = t_central()
+    t_alive(var n, 3200, 5000)
+    t_set_phy_state(var n, PHY_DEFERRED)
+    test.assert_eq(link_start_encryption(var n, 0x1111), STATUS_SUCCESS)
+    test.assert(not n.enc_wait)
+    test.assert_eq(n.enc_ph, ENC_NEED_RANDOM)
+
+@test
+fn test_a_request_for_a_phy_waits_for_an_encryption_procedure_and_goes_after_it()
+    var l = t_link()
+    t_set_enc_ph(var l, ENC_P_WAIT_LTK)
+    test.assert_eq(link_set_phy(var l, 0, 2, 2, 0), STATUS_SUCCESS)
+    test.assert_eq(l.phy_state, PHY_DEFERRED)
+    t_alive(var l, 3200, 5000)
+    auto_tasks(var l)
+    test.assert_eq(l.phy_state, PHY_DEFERRED)
+    t_set_enc_ph(var l, ENC_IDLE)
+    auto_tasks(var l)
+    test.assert_eq(l.phy_state, PHY_WAIT_IND)
+    // The same while the Central's start of encryption waits.
+    var m = t_central()
+    t_set_enc_wait(var m, true)
+    test.assert_eq(link_set_phy(var m, 0, 2, 2, 0), STATUS_SUCCESS)
+    test.assert_eq(m.phy_state, PHY_DEFERRED)
+    // The Controller's own start for the Host's preference waits too.
+    var o = t_link()
+    link_set_defaults(var o, false, 27, 328, true, 2, 2)
+    t_set_enc_ph(var o, ENC_P_WAIT_START_RSP)
+    t_alive(var o, 3200, 5000)
+    t_set_dl_started(var o, true)
+    t_ev_count(var o, 10)
+    auto_tasks(var o)
+    test.assert(not o.phy_auto)
+
+// The opcode and a byte of the PDU at the head of the control queue, behind the one in
+// flight.
+fn t_cq_op(var l: Link) -> Int
+    var p = ll_pdu.pdu_new()
+    slot_get_cq(var l, l.cq_head, var p)
+    ll_data.dpdu_opcode(var p)
+
+fn t_cq_byte(var l: Link, i: Int) -> Int
+    var p = ll_pdu.pdu_new()
+    slot_get_cq(var l, l.cq_head, var p)
+    ll_data.dpdu_byte(var p, i)
+
+// ── The Central's Connection Parameters Request and the anchor offsets ──────
+
+@test
+fn test_the_central_asks_the_peer_with_a_connection_parameters_request()
+    var l = t_central()
+    test.assert_eq(link_connection_update(var l, 24, 40, 0, 400), STATUS_SUCCESS)
+    test.assert_eq(l.proc, PROC_PARAM)
+    test.assert(not l.upd_pending)
+    test.assert_eq(t_next_op(var l), ll_data.OP_CONNECTION_PARAM_REQ)
+    // A range names a preferred periodicity (the minimum), a single interval needs none.
+    test.assert_eq(t_next_byte(var l, 9), 24)
+    var m = t_central()
+    test.assert_eq(link_connection_update(var m, 24, 24, 0, 400), STATUS_SUCCESS)
+    test.assert_eq(t_next_byte(var m, 9), 0)
+    // A second update waits for the first.
+    test.assert_eq(link_connection_update(var l, 30, 30, 0, 400), STATUS_COMMAND_DISALLOWED)
+
+@test
+fn test_the_central_updates_with_the_peripherals_response()
+    var l = t_central()
+    test.assert_eq(link_connection_update(var l, 24, 40, 0, 400), STATUS_SUCCESS)
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_RSP, 24, 40, 0, 400, 24)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(l.upd_pending)
+    test.assert(l.upd_host)
+    test.assert_eq(l.upd_interval, 24)
+    test.assert_eq(t_cq_op(var l), ll_data.OP_CONNECTION_UPDATE_IND)
+    // Values out of range end the procedure with a reject, and the Host is told.
+    var m = t_central()
+    test.assert_eq(link_connection_update(var m, 24, 40, 0, 400), STATUS_SUCCESS)
+    var bad = t_param_pdu(ll_data.OP_CONNECTION_PARAM_RSP, 4, 6, 0, 400, 0)
+    let _b = t_packet(var m, var bad, 0, 0, 0)
+    test.assert_eq(m.proc, PROC_NONE)
+    test.assert(not m.upd_pending)
+    test.assert_eq(t_cq_op(var m), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(t_cq_byte(var m, 2), CODE_INVALID_LL_PARAMETERS)
+    test.assert_eq(m.upd_status, CODE_INVALID_LL_PARAMETERS)
+    test.assert(link_owes(var m, EV_UPDATED))
+
+@test
+fn test_the_central_falls_back_to_the_update_when_the_peer_lacks_the_procedure()
+    // LL_UNKNOWN_RSP (BV-81), and the peer is remembered.
+    var l = t_central()
+    test.assert_eq(link_connection_update(var l, 24, 40, 0, 400), STATUS_SUCCESS)
+    var u = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_CONNECTION_PARAM_REQ])
+    let _a = t_packet(var l, var u, 0, 0, 0)
+    test.assert(l.cpr_no)
+    test.assert_eq(l.proc, PROC_NONE)
+    test.assert(l.upd_pending)
+    test.assert_eq(l.upd_interval, 40)
+    test.assert_eq(t_cq_op(var l), ll_data.OP_CONNECTION_UPDATE_IND)
+    // A peer whose features lack the procedure is sent the update at once (BV-82).
+    var n = t_central()
+    t_have_features(var n, 0x00)
+    test.assert_eq(link_connection_update(var n, 24, 40, 0, 400), STATUS_SUCCESS)
+    test.assert(n.upd_pending)
+    test.assert_eq(n.proc, PROC_NONE)
+    // Unsupported Remote Feature from a legacy Host (BV-29) does the same.
+    var o = t_central()
+    test.assert_eq(link_connection_update(var o, 24, 40, 0, 400), STATUS_SUCCESS)
+    var r = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_CONNECTION_PARAM_REQ, STATUS_UNSUPPORTED_REMOTE])
+    let _b = t_packet(var o, var r, 0, 0, 0)
+    test.assert(o.upd_pending)
+    test.assert_eq(o.proc, PROC_NONE)
+    test.assert_eq(t_cq_op(var o), ll_data.OP_CONNECTION_UPDATE_IND)
+    // Any other code is the Host's answer (BV-25).
+    var q = t_central()
+    test.assert_eq(link_connection_update(var q, 24, 40, 0, 400), STATUS_SUCCESS)
+    var s = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_CONNECTION_PARAM_REQ, 0x3B])
+    let _c = t_packet(var q, var s, 0, 0, 0)
+    test.assert(not q.upd_pending)
+    test.assert_eq(q.upd_status, 0x3B)
+    test.assert(link_owes(var q, EV_UPDATED))
+
+@test
+fn test_the_central_refuses_a_request_while_its_own_is_out()
+    var l = t_central()
+    test.assert_eq(link_connection_update(var l, 24, 40, 0, 400), STATUS_SUCCESS)
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 30, 30, 0, 400, 0)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(t_cq_op(var l), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(t_cq_byte(var l, 2), CODE_COLLISION)
+    test.assert_eq(l.proc, PROC_PARAM)
+
+@test
+fn test_the_anchor_offset_follows_the_specifications_example()
+    // Section 5.1.7.3.3: old interval 12, new 30, Instant 0x1F06, Reference 0x1F00,
+    // Offset0 3 units: 21 units after the instant.
+    test.assert_eq(anchor_offset(12, 30, 0x1F06, 0x1F00, 3), 21)
+    // The same interval: the offset itself, and an offset of the interval less one unit.
+    test.assert_eq(anchor_offset(24, 24, 0x0100, 0x00F6, 1), 1)
+    test.assert_eq(anchor_offset(24, 24, 0x0100, 0x00F6, 23), 23)
+    // A Reference after the Instant, and across the wrap of the counter.
+    test.assert_eq(anchor_offset(12, 30, 0x1F00, 0x1F06, 3), 15)
+    test.assert_eq(anchor_offset(12, 30, 0x0002, 0xFFFC, 3), 21)
+
+@test
+fn test_the_first_valid_offset_is_the_one_used()
+    var p = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 24, 24, 0, 400, 0)
+    test.assert_eq(first_offset(var p), -1)
+    p.b[16] = 0x02
+    p.b[17] = 0x00
+    test.assert_eq(first_offset(var p), 2)
+    p.b[14] = 0x07
+    p.b[15] = 0x00
+    test.assert_eq(first_offset(var p), 7)
+
+@test
+fn test_a_request_that_moves_the_anchor_points_alone_is_not_asked_of_the_host()
+    // The Central sets the transmit window offset from Offset0 (BV-31): 1.25 ms.
+    var l = t_central()
+    link_set_indicate(var l, true)
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, l.interval, l.interval, l.latency, l.timeout, 0)
+    r.b[14] = 0x01
+    r.b[15] = 0x00
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert(not l.rq_wait)
+    test.assert(not link_owes(var l, EV_PARAM_REQUEST))
+    test.assert(l.upd_pending)
+    test.assert_eq(l.upd_win_offset, 1)
+    test.assert_eq(l.upd_interval, l.interval)
+    test.assert_eq(t_next_op(var l), ll_data.OP_CONNECTION_UPDATE_IND)
+    // The Peripheral answers with LL_CONNECTION_PARAM_RSP.
+    var m = t_link()
+    link_set_indicate(var m, true)
+    var s = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, m.interval, m.interval, m.latency, m.timeout, 0)
+    s.b[14] = 0x01
+    s.b[15] = 0x00
+    let _b = t_packet(var m, var s, 0, 0, 0)
+    test.assert(not m.rq_wait)
+    test.assert_eq(t_next_op(var m), ll_data.OP_CONNECTION_PARAM_RSP)
+
+@test
+fn test_the_offset_of_a_request_the_host_accepted_reaches_the_update()
+    // BV-33: a new interval with a preferred periodicity and Offset0, the Host accepts.
+    var l = t_central()
+    link_set_indicate(var l, true)
+    var r = t_param_pdu(ll_data.OP_CONNECTION_PARAM_REQ, 24, 40, 0, 400, 24)
+    r.b[14] = 0x01
+    r.b[15] = 0x00
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert(l.rq_wait)
+    test.assert_eq(l.rq_off, 1)
+    test.assert_eq(link_param_reply(var l, 24, 40, 0, 400), STATUS_SUCCESS)
+    test.assert(l.upd_pending)
+    test.assert_eq(l.upd_interval, 24)
+    test.assert_eq(l.upd_win_offset, anchor_offset(l.interval, 24, l.upd_instant, l.rq_ref, 1))
+
+// ── Connection Rate (a build with `ctl_limits.rate_on()`; a build without it answers the PDUs as unknown) ────────────
+
+// LL_CONNECTION_RATE_IND from the Central: the window offset and interval (125 us), the instant, the factor, latency, continuation number and timeout.
+fn t_rate_ind(woff: Int, iv: Int, instant: Int, factor: Int, lat: Int, cont: Int, to: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_rate.put_ind(var p, woff, iv, instant, factor, lat, cont, to)
+    p
+
+// LL_CONNECTION_RATE_REQ from the Peripheral with a usual range.
+fn t_rate_req() -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_rate.put_req(var p, 60, 400, 1, 4, 0, 0, 500, 0, 0, 0xFFFF)
+    p
+
+@test
+fn test_a_build_without_connection_rate_answers_its_pdus_as_unknown()
+    if ctl_limits.rate_on()
+        return
+    var l = t_link()
+    var p = t_rate_ind(0, 240, 6, 4, 0, 1, 300)
+    let _r = t_packet(var l, var p, 0, 0, 0)
+    test.assert(not l.upd_pending)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x3F)
+    var m = t_central()
+    var q = t_rate_req()
+    let _s = t_packet(var m, var q, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_opcode(var m.nxt), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var m.nxt, 1), 0x3E)
+
+@test
+fn test_a_peripheral_applies_the_rate_indication_at_its_instant()
+    if not ctl_limits.rate_on()
+        return
+    var l = t_link()
+    let _c0 = link_event_begin(var l)
+    link_note_rx(var l, 3100, true)
+    link_event_done(var l, 3600)
+    // Window offset 40 (5 ms), interval 240 (30 ms), instant 6, factor 4, latency 0, continuation 1, timeout 300.
+    var u = t_rate_ind(40, 240, 6, 4, 0, 1, 300)
+    let _r = t_packet(var l, var u, 0, 0, 0)
+    test.assert(l.upd_pending)
+    test.assert_eq(l.upd_instant, 6)
+    test.assert_eq(fx_get(l, FX_RATE, 1), 1)
+    for _ in 1..5
+        let _ch = link_event_begin(var l)
+        test.assert_eq(l.interval, 6)
+        link_note_rx(var l, l.due, true)
+        link_event_done(var l, l.due + 500)
+    let _c5 = link_event_begin(var l)
+    link_note_rx(var l, l.due, true)
+    let a5 = l.anchor
+    link_event_done(var l, a5 + 500)
+    // The instant event starts one old interval and the window offset after the last event of the old connection; no window is open.
+    test.assert_eq(l.due, a5 + 7500 + 4 * 1250)
+    test.assert_eq(l.win_len, 0)
+    let due6 = l.due
+    let _c6 = link_event_begin(var l)
+    test.assert_eq(l.interval, 24)
+    test.assert_eq(l.timeout, 300)
+    test.assert_eq(l.sub_factor as Int, 4)
+    test.assert_eq(l.sub_cont as Int, 1)
+    test.assert_eq(l.sub_res as Int, 2)
+    test.assert(not l.upd_pending)
+    test.assert_eq(fx_get(l, FX_RATE, 1), 0)
+    test.assert_eq(fx_get(l, FX_RATEEV, 1), 1)
+    test.assert(link_owes(var l, EV_SUBRATE))
+    test.assert(not link_owes(var l, EV_UPDATED))
+    test.assert_eq(l.last_rx, due6)
+    link_note_rx(var l, due6 + 1000, true)
+    link_event_done(var l, due6 + 1500)
+    // The events 7 to 9 are not used: the next used one is event 10, four new intervals after the first.
+    test.assert_eq(l.ev_count, 10)
+    test.assert_eq(l.due, due6 + 1000 + 4 * 30000)
+
+@test
+fn test_an_indication_with_a_value_this_link_layer_does_not_support_is_unknown()
+    if not ctl_limits.rate_on()
+        return
+    // An interval or a window offset that is not a multiple of 1.25 ms, a window offset past the interval, a factor or continuation number
+    // out of range, a timeout out of range or too short for the interval.
+    let bad: [[Int]] = [[0, 245, 6, 4, 0, 1, 300], [15, 240, 6, 4, 0, 1, 300], [250, 240, 6, 4, 0, 1, 300], [0, 240, 6, 0, 0, 0, 300],
+                        [0, 240, 6, 501, 0, 0, 300], [0, 240, 6, 4, 0, 4, 300], [0, 240, 6, 4, 125, 0, 300], [0, 240, 6, 4, 0, 1, 9],
+                        [0, 240, 6, 4, 0, 1, 3201], [0, 240, 6, 100, 4, 0, 50], [0, 9, 6, 1, 0, 0, 300]]
+    for v in bad
+        var l = t_link()
+        var u = t_rate_ind(v[0], v[1], v[2], v[3], v[4], v[5], v[6])
+        let _r = t_packet(var l, var u, 0, 0, 0)
+        test.assert(not l.upd_pending)
+        test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+        test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x3F)
+
+@test
+fn test_an_indication_whose_instant_has_passed_ends_the_connection()
+    if not ctl_limits.rate_on()
+        return
+    var l = t_link()
+    var u = t_rate_ind(0, 240, 0, 4, 0, 1, 300)
+    let _r = t_packet(var l, var u, 0, 0, 0)
+    test.assert(not l.upd_pending)
+    test.assert_eq(l.reason, REASON_INSTANT_PASSED)
+
+@test
+fn test_each_role_knows_only_the_connection_rate_pdu_it_receives()
+    if not ctl_limits.rate_on()
+        return
+    // The Central does not read LL_CONNECTION_RATE_IND, the Peripheral does not read LL_CONNECTION_RATE_REQ.
+    var c = t_central()
+    var u = t_rate_ind(0, 240, 6, 4, 0, 1, 300)
+    let _r = t_packet(var c, var u, 0, 0, 0)
+    test.assert(not c.upd_pending)
+    test.assert_eq(ll_data.dpdu_opcode(var c.nxt), ll_data.OP_UNKNOWN_RSP)
+    var l = t_link()
+    var q = t_rate_req()
+    let _s = t_packet(var l, var q, 0, 0, 0)
+    test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x3E)
+    // A Central passes the request on to the Controller.
+    var m = t_central()
+    var p = t_rate_req()
+    let _t = t_packet(var m, var p, 0, 0, 0)
+    test.assert(m.ctl_in)
+
+@test
+fn test_a_central_sends_the_indication_and_applies_it_at_the_instant()
+    if not ctl_limits.rate_on()
+        return
+    var l = t_central()
+    let _c0 = link_event_begin(var l)
+    link_note_rx(var l, 3100, true)
+    link_event_done(var l, 3600)
+    // The Host asked: 30 ms, factor 4, latency 0, continuation 1, timeout 300.
+    test.assert_eq(rate_central_start(var l, 24, 4, 0, 1, 300, true, 0, -1), STATUS_SUCCESS)
+    test.assert(l.upd_pending)
+    test.assert_eq(fx_get(l, FX_RATE, 1), 1)
+    test.assert_eq(t_next_op(var l), ll_data.OP_CONNECTION_RATE_IND)
+    test.assert_eq(ll_sub.get16(var l.nxt, 1), 0)
+    test.assert_eq(ll_sub.get16(var l.nxt, 3), 240)
+    test.assert_eq(ll_sub.get16(var l.nxt, 5), l.upd_instant)
+    test.assert_eq(ll_sub.get16(var l.nxt, 7), 4)
+    test.assert_eq(ll_sub.get16(var l.nxt, 11), 1)
+    test.assert_eq(ll_sub.get16(var l.nxt, 13), 300)
+    // The instant is the least the Peripheral's events away that Section 5.5 asks for.
+    test.assert_eq(l.upd_instant, (l.ev_count + INSTANT_LEAD + INSTANT_SLACK) & 0xFFFF)
+    // Another update cannot start beside it.
+    test.assert(not sub_can_start(var l))
+    var guard = 0
+    while l.ev_count != l.upd_instant and guard < 40
+        let _e = link_event_begin(var l)
+        link_note_rx(var l, l.due, true)
+        link_event_done(var l, l.due + 500)
+        guard = guard + 1
+    let _ci = link_event_begin(var l)
+    test.assert_eq(l.interval, 24)
+    test.assert_eq(l.sub_factor as Int, 4)
+    test.assert_eq(l.sub_cont as Int, 1)
+    test.assert_eq(l.sub_res as Int, l.upd_instant % 4)
+    test.assert(link_owes(var l, EV_SUBRATE))
+    test.assert_eq(fx_get(l, FX_RATEEV, 1), 1)
+
+@test
+fn test_the_host_hears_of_a_rate_update_that_changed_nothing_when_it_asked()
+    if not ctl_limits.rate_on()
+        return
+    var l = t_central()
+    let _c0 = link_event_begin(var l)
+    link_note_rx(var l, 3100, true)
+    link_event_done(var l, 3600)
+    // The values in force: interval 6, latency 0, timeout 200 (the usual request), factor 1.
+    test.assert_eq(rate_central_start(var l, 6, 1, 0, 0, 200, false, 0, -1), STATUS_SUCCESS)
+    var guard = 0
+    while l.ev_count != l.upd_instant and guard < 40
+        let _e = link_event_begin(var l)
+        link_note_rx(var l, l.due, true)
+        link_event_done(var l, l.due + 500)
+        guard = guard + 1
+    let _ci = link_event_begin(var l)
+    test.assert(not link_owes(var l, EV_SUBRATE))
+    // The same update at the Host's asking is reported.
+    var m = t_central()
+    let _m0 = link_event_begin(var m)
+    link_note_rx(var m, 3100, true)
+    link_event_done(var m, 3600)
+    test.assert_eq(rate_central_start(var m, 6, 1, 0, 0, 200, true, 0, -1), STATUS_SUCCESS)
+    guard = 0
+    while m.ev_count != m.upd_instant and guard < 40
+        let _e = link_event_begin(var m)
+        link_note_rx(var m, m.due, true)
+        link_event_done(var m, m.due + 500)
+        guard = guard + 1
+    let _mi = link_event_begin(var m)
+    test.assert(link_owes(var m, EV_SUBRATE))
+    test.assert_eq(m.sub_status as Int, STATUS_SUCCESS)
+
+@test
+fn test_the_anchor_offset_of_a_request_moves_the_first_event_of_the_new_rate()
+    if not ctl_limits.rate_on()
+        return
+    var l = t_central()
+    let _c0 = link_event_begin(var l)
+    link_note_rx(var l, 3100, true)
+    link_event_done(var l, 3600)
+    // The peer prefers an anchor 2 units (2.5 ms) after its event `ref`.
+    test.assert_eq(rate_central_start(var l, 24, 1, 0, 0, 300, false, l.ev_count, 2), STATUS_SUCCESS)
+    test.assert_eq(l.upd_win_offset, anchor_offset(6, 24, l.upd_instant, l.ev_count, 2))
+    test.assert_eq(ll_sub.get16(var l.nxt, 1), l.upd_win_offset * 10)
+
+@test
+fn test_page_1_bits_of_the_peer_and_the_host_support_bit()
+    var l = t_link()
+    // Features 72 and 73 are bits 8 and 9 of page 1; a peer's page is held once the exchange has run.
+    test.assert(not rate_peer_ok(l))
+    fx_put(var l, FX_PEER, 0xFFFFFF, 0x300)
+    fx_put(var l, FX_HAVE, 1, 1)
+    test.assert(rate_peer_ok(l))
+    fx_put(var l, FX_PEER, 0xFFFFFF, 0x100)
+    test.assert(not rate_peer_ok(l))
+    // The Host support bit goes to the peer in page 1, and survives a reset of the link.
+    test.assert(not rate_host(l))
+    link_set_host_rate(var l, true)
+    test.assert(rate_host(l))
+    test.assert_eq(fx_get(l, FX_LOCAL, 0xFFFF) & 0x200, 0x200)
+    link_reset(var l)
+    test.assert(rate_host(l))
+    link_set_host_rate(var l, false)
+    test.assert(not rate_host(l))
+
+@test
+fn test_the_local_page_1_bit_72_follows_the_build()
+    var l = link_new()
+    var want = 0
+    if ctl_limits.rate_on()
+        want = 0x100
+    // Bit 65, Frame Space Update, is bit 1 of page 1.
+    if ctl_limits.fs_on()
+        want = want | 0x2
+    test.assert_eq(fx_get(l, FX_LOCAL, 0xFFFF), want)
+    test.assert_eq(ctl_limits.page1_bits(), want)
+
+@test
+fn test_a_peer_is_known_to_lack_frame_space_update_from_either_page()
+    var l = t_link()
+    test.assert(not fs_peer_lacks(l))
+    // Page 0 without feature 63: there is no page 1.
+    t_peer_features(var l, 7, 0)
+    test.assert(fs_peer_lacks(l))
+    t_peer_features(var l, 7, ll_feat.OCTET7_EXT)
+    test.assert(not fs_peer_lacks(l))
+    // Page 1 held: bit 65 decides.
+    fx_put(var l, FX_PEER, 0xFFFFFF, 0x100)
+    fx_put(var l, FX_HAVE, 1, 1)
+    test.assert(fs_peer_lacks(l))
+    fx_put(var l, FX_PEER, 0xFFFFFF, 0x102)
+    test.assert(not fs_peer_lacks(l))
+
+@test
+fn test_frame_space_pdus_reach_the_controller_in_either_role_when_the_build_has_the_feature()
+    var l = t_link()
+    var m = t_central()
+    var q = ll_pdu.pdu_new()
+    ll_fs.put_req(var q, 150, 150, 1, 1)
+    var r = ll_pdu.pdu_new()
+    ll_fs.put_rsp(var r, 150, 0, 0)
+    var bad = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var bad, ll_data.OP_FRAME_SPACE_REQ)
+    ll_data.dpdu_finish(var bad)
+    if not ctl_limits.fs_on()
+        // A build without the feature answers both PDUs as unknown.
+        let _a = t_packet(var l, var q, 0, 0, 0)
+        test.assert(not l.ctl_in)
+        test.assert_eq(ll_data.dpdu_opcode(var l.nxt), ll_data.OP_UNKNOWN_RSP)
+        test.assert_eq(ll_data.dpdu_byte(var l.nxt, 1), 0x3B)
+        let _b = t_packet(var m, var r, 0, 0, 0)
+        test.assert_eq(ll_data.dpdu_byte(var m.nxt, 1), 0x3C)
+        return
+    let _c = t_packet(var l, var q, 0, 0, 0)
+    test.assert(l.ctl_in)
+    let _d = t_packet(var m, var r, 0, 0, 0)
+    test.assert(m.ctl_in)
+    // A PDU of the wrong length is dropped, as the others are.
+    var n = t_link()
+    let _e = t_packet(var n, var bad, 0, 0, 0)
+    test.assert(not n.ctl_in)
+    // A refusal of the request reaches the Controller.
+    var k = t_link()
+    var u = ll_pdu.pdu_new()
+    ll_data.ctrl_unknown_rsp(var u, ll_data.OP_FRAME_SPACE_REQ)
+    let _f = t_packet(var k, var u, 0, 0, 0)
+    test.assert(k.ctl_in)
+
+@test
+fn test_the_controllers_own_page_fetch_is_not_told_to_the_host()
+    if not ctl_limits.rate_on() or not ctl_limits.feat_on()
+        return
+    var l = t_central()
+    t_peer_features(var l, 7, ll_feat.OCTET7_EXT)
+    test.assert_eq(rate_fetch(var l), STATUS_SUCCESS)
+    test.assert_eq(t_next_op(var l), ll_data.OP_FEATURE_EXT_REQ)
+    test.assert(not rate_fetch_over(l))
+    var r = ll_pdu.pdu_new()
+    ll_feat.put_ext(var r, ll_data.OP_FEATURE_EXT_RSP, 1, 1, 0x300)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert(rate_fetch_over(l))
+    test.assert(rate_peer_ok(l))
+    test.assert(not link_owes(var l, EV_FEATEXT))

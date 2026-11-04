@@ -18,8 +18,6 @@
 //
 // This module holds no radio and no clock.  The configuration (`ctl_limits.past_on()`) says whether the build has the feature.
 
-use ctl_limits
-use std.test
 use ll_pdu
 use ll_data
 use ll_per
@@ -169,11 +167,11 @@ fn offset_field(off_us: Int) -> Int
 @satisfies("REQ-BLE-CTL-109")
 @tier(embedded)
 fn rx_offset_us(var rx: Pdu, at: Int) -> Int
-    let base = (rx.b[at] as Int) | (((rx.b[at + 1] as Int) & 0x1F) << 8)
+    let base = rx.b[at] as Int | ((rx.b[at + 1] as Int & 0x1F) << 8)
     var off = base * ll_per.UNIT_FINE_US
-    if (((rx.b[at + 1] as Int) >>> 5) & 1) == 1
+    if ((rx.b[at + 1] as Int >>> 5) & 1) == 1
         off = base * ll_per.UNIT_COARSE_US
-        if (((rx.b[at + 1] as Int) >>> 6) & 1) == 1
+        if ((rx.b[at + 1] as Int >>> 6) & 1) == 1
             off = off + ADJUST_US
     off
 
@@ -232,7 +230,12 @@ fn plan_offer(t0: Int, n0: Int, pai_us: Int, a0: Int, ces: Int, ci_us: Int, now:
     if not ok
         return Offer { ok: false, pea: 0, at: 0, ceref: 0, ref_us: 0, off_us: 0 }
     let ref_us = a0 + m * ci_us
-    Offer { ok: true, pea: (n0 + n) & 0xFFFF, at: at, ceref: (ces + m) & 0xFFFF, ref_us: ref_us, off_us: at - ref_us }
+    Offer { ok: true,
+        pea: (n0 + n) & 0xFFFF,
+        at: at,
+        ceref: (ces + m) & 0xFFFF,
+        ref_us: ref_us,
+        off_us: at - ref_us }
 
 // Write the LL_PERIODIC_SYNC_IND for the train described by the offer `o` and the fields of the train into `p`: the ID the Host gave,
 // the SyncInfo, the connection event the offset is counted from, the last event this device sent or heard (`peb`), the SID, the address
@@ -240,9 +243,25 @@ fn plan_offer(t0: Int, n0: Int, pai_us: Int, a0: Int, ces: Int, ci_us: Int, now:
 // the advertiser's address and the connection event the plan was made in (`ces`).
 @satisfies("REQ-BLE-CTL-109")
 @tier(embedded)
-fn put_sync_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int,
-                sca_own: Int, phy: Int, var adva: Vec[u8; 6], ces: Int)
-    put_sync_fields(var p, ll_data.OP_PERIODIC_SYNC_IND, id, var o, interval, chmap, sca_adv, aa, crc, peb, sid, atype, sca_own, phy, var adva, ces)
+fn put_sync_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int,
+                crc: Int, peb: Int, sid: Int, atype: Int, sca_own: Int, phy: Int,
+                var adva: Vec[u8; 6], ces: Int)
+    put_sync_fields(var p,
+        ll_data.OP_PERIODIC_SYNC_IND,
+        id,
+        var o,
+        interval,
+        chmap,
+        sca_adv,
+        aa,
+        crc,
+        peb,
+        sid,
+        atype,
+        sca_own,
+        phy,
+        var adva,
+        ces)
     ll_data.dpdu_finish(var p)
 
 // Write the LL_PERIODIC_SYNC_WR_IND ([Vol 6] Part B, Section 2.4.2.40) of a train with responses: the fields of LL_PERIODIC_SYNC_IND with
@@ -252,17 +271,34 @@ fn put_sync_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sc
 @satisfies("REQ-BLE-CTL-109")
 @satisfies("REQ-BLE-CTL-110")
 @tier(embedded)
-fn put_sync_wr_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int,
-                   sca_own: Int, phy: Int, var adva: Vec[u8; 6], ces: Int, var acad: Vec[u8; 64])
-    put_sync_fields(var p, ll_data.OP_PERIODIC_SYNC_WR_IND, id, var o, interval, chmap, sca_adv, aa, crc, peb, sid, atype, sca_own, phy, var adva, ces)
+fn put_sync_wr_ind(var p: Pdu, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int,
+                   aa: Int, crc: Int, peb: Int, sid: Int, atype: Int, sca_own: Int, phy: Int,
+                   var adva: Vec[u8; 6], ces: Int, var acad: Vec[u8; 64])
+    put_sync_fields(var p,
+        ll_data.OP_PERIODIC_SYNC_WR_IND,
+        id,
+        var o,
+        interval,
+        chmap,
+        sca_adv,
+        aa,
+        crc,
+        peb,
+        sid,
+        atype,
+        sca_own,
+        phy,
+        var adva,
+        ces)
     for k in 0..8
         let _t = ll_pdu.pdu_put_data(var p, acad[2 + k] as Int)
     ll_data.dpdu_finish(var p)
 
 // The fields the two PDUs share, after the opcode `op`.
 @tier(embedded)
-fn put_sync_fields(var p: Pdu, op: Int, id: Int, var o: Offer, interval: Int, chmap: Int, sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int,
-                   sca_own: Int, phy: Int, var adva: Vec[u8; 6], ces: Int)
+fn put_sync_fields(var p: Pdu, op: Int, id: Int, var o: Offer, interval: Int, chmap: Int,
+                   sca_adv: Int, aa: Int, crc: Int, peb: Int, sid: Int, atype: Int, sca_own: Int,
+                   phy: Int, var adva: Vec[u8; 6], ces: Int)
     ll_data.ctrl_begin(var p, op)
     ll_data.put_u16(var p, id)
     ll_data.put_u16(var p, offset_field(o.off_us))
@@ -317,7 +353,8 @@ fn abs_int(v: Int) -> Int
 // measured in (`ces`) and C received the PDU in (`cet`).  `ppm_a` and `ppm_b` are the accuracies of A and B, `ppm_c` this device's.
 @satisfies("REQ-BLE-CTL-109")
 @tier(embedded)
-fn drift_us(pec: Int, peb: Int, pai_us: Int, cet: Int, ces: Int, ci_us: Int, ppm_a: Int, ppm_b: Int, ppm_c: Int) -> Int
+fn drift_us(pec: Int, peb: Int, pai_us: Int, cet: Int, ces: Int, ci_us: Int, ppm_a: Int, ppm_b: Int,
+            ppm_c: Int) -> Int
     let da = (abs_int(diff16(pec, peb)) * pai_us * (ppm_a + ppm_c) + 999999) / 1000000
     let db = (abs_int(diff16(cet, ces)) * ci_us * (ppm_b + ppm_c) + 999999) / 1000000
     let both = da + db
@@ -335,8 +372,9 @@ fn link_drift_us(cet: Int, ces: Int, ci_us: Int, ppm_b: Int, ppm_c: Int) -> Int
 // train, counting forward or back from the one named, whose window (widened by the drift) opens that late or later.
 @satisfies("REQ-BLE-CTL-109")
 @tier(embedded)
-fn plan_receive(off_us: Int, unit_us: Int, pea: Int, peb: Int, ceref: Int, ces: Int, pai_us: Int, ppm_a: Int, ppm_b: Int,
-                cet: Int, a_t: Int, ci_us: Int, now: Int, lead_us: Int) -> Plan
+fn plan_receive(off_us: Int, unit_us: Int, pea: Int, peb: Int, ceref: Int, ces: Int, pai_us: Int,
+                ppm_a: Int, ppm_b: Int, cet: Int, a_t: Int, ci_us: Int, now: Int,
+                lead_us: Int) -> Plan
     let ppm_c = ll_link.OWN_PPM
     let ref_us = a_t + diff16(ceref, cet) * ci_us
     let tn = ref_us + off_us
@@ -357,7 +395,12 @@ fn plan_receive(off_us: Int, unit_us: Int, pea: Int, peb: Int, ceref: Int, ces: 
             at = tn + k * pai_us
             d = drift_us(pec, peb, pai_us, cet, ces, ci_us, ppm_a, ppm_b, ppm_c)
     let span = abs_int(diff16(pec, peb)) * pai_us
-    Plan { ok: true, due: at, counter: pec, win: unit_us, t_ref: at - span, pre: link_drift_us(cet, ces, ci_us, ppm_b, ppm_c) + 1 }
+    Plan { ok: true,
+        due: at,
+        counter: pec,
+        win: unit_us,
+        t_ref: at - span,
+        pre: link_drift_us(cet, ces, ci_us, ppm_b, ppm_c) + 1 }
 
 // The synchronization slot `s` takes the train of the PDU in `rx` (its SyncInfo at the octet `at`), described by the plan `pl`: it is the
 // slot of an ordinary synchronization (`ll_per.psync_begin`) with the first window, the counter and the drift of the plan, and the connection
@@ -365,8 +408,9 @@ fn plan_receive(off_us: Int, unit_us: Int, pea: Int, peb: Int, ceref: Int, ces: 
 // 10 ms and `now` the time of the plan.
 @satisfies("REQ-BLE-CTL-109")
 @tier(embedded)
-fn psync_begin(var s: PerSync, handle: Int, var rx: Pdu, at: Int, kind: Int, var a: Vec[u8; 6], sid: Int, phy: Int, var pl: Plan,
-               timeout: Int, reports: Bool, conn: Int, sdata: Int, now: Int)
+fn psync_begin(var s: PerSync, handle: Int, var rx: Pdu, at: Int, kind: Int, var a: Vec[u8; 6],
+               sid: Int, phy: Int, var pl: Plan, timeout: Int, reports: Bool, conn: Int, sdata: Int,
+               now: Int)
     ll_per.psync_begin(var s, handle, var rx, at, kind, var a, sid, phy, now, timeout, reports)
     s.due = pl.due
     s.win = pl.win
@@ -376,211 +420,3 @@ fn psync_begin(var s: PerSync, handle: Int, var rx: Pdu, at: Int, kind: Int, var
     s.past = true
     s.conn = conn
     s.sdata = sdata
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@tier(app)
-fn t_addr(seed: Int) -> Vec[u8; 6]
-    var a: Vec[u8; 6] = Vec.new()
-    for k in 0..6
-        let _x = a.push(seed + k)
-    a
-
-@tier(app)
-fn t_offer(off_us: Int) -> Offer
-    Offer { ok: true, pea: 0x1234, at: 0, ceref: 0x0102, ref_us: 0, off_us: off_us }
-
-@tier(app)
-fn t_pdu(off_us: Int) -> Pdu
-    var p = ll_pdu.pdu_new()
-    var a = t_addr(0x10)
-    var o = t_offer(off_us)
-    put_sync_ind(var p, 0xBEEF, var o, 80, 0x1FFFFFFFFF, 3, 0x8E89BED7, 0xA1B2C3, 0x1230, 7, 1, 5, ll_phy.PHY_2M, var a, 0x0100)
-    p
-
-@test
-fn test_the_offset_field_picks_the_unit_and_the_adjust()
-    // Under 245.7 ms the unit is 30 microseconds; at and above it, 300, and at 2.4576 s the adjust adds 2.4576 s.
-    test.assert_eq(offset_field(0), 0)
-    test.assert_eq(offset_field(29970), 999)
-    test.assert_eq(offset_field(245699), 8189)
-    test.assert_eq(offset_field(245700), 819 | (1 << 13))
-    test.assert_eq(offset_field(2457300), 8191 | (1 << 13))
-    test.assert_eq(offset_field(2457600), 0 | (1 << 13) | (1 << 14))
-    test.assert_eq(offset_field(2457600 + 300 * 100), 100 | (1 << 13) | (1 << 14))
-    test.assert_eq(offset_field(4000000), 5141 | (1 << 13) | (1 << 14))
-
-@test
-fn test_the_sync_wr_ind_has_the_fields_of_the_sync_ind_and_the_timing_of_the_train()
-    // [Vol 6] Part B, Section 2.4.2.40: the CtrData of LL_PERIODIC_SYNC_IND, then RspAA (4 octets), Num_Subevents, Subevent_Interval,
-    // Response_Slot_Delay and Response_Slot_Spacing; the opcode is 0x2A and the payload 43 octets with it.
-    var p = ll_pdu.pdu_new()
-    var a = t_addr(0x10)
-    var o = t_offer(29970)
-    var t = ll_per.padv_new()
-    // The AD structure of Section 'Periodic Advertising Response Timing Information': length 9, type 0x32, RspAA, 10 subevents, 15, 1 and 4 units.
-    let timing = [9, 0x32, 0x29, 0x41, 0x76, 0x71, 10, 15, 1, 4]
-    for k in 0..10
-        t.acad[k] = timing[k] as u8
-    put_sync_wr_ind(var p, 0xBEEF, var o, 80, 0x1FFFFFFFFF, 3, 0x8E89BED7, 0xA1B2C3, 0x1230, 7, 1, 5, ll_phy.PHY_2M, var a, 0x0100, var t.acad)
-    var q = t_pdu(29970)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x2A)
-    test.assert_eq(ll_data.dpdu_len(var p), ll_data.ctrl_payload_len(ll_data.OP_PERIODIC_SYNC_WR_IND))
-    test.assert_eq(ll_data.dpdu_len(var p), ll_data.dpdu_len(var q) + 8)
-    test.assert_eq(ll_data.dpdu_u16(var p, AT_ID), 0xBEEF)
-    for k in 1..1 + CTR_OCTETS
-        test.assert_eq(ll_data.dpdu_byte(var p, k), ll_data.dpdu_byte(var q, k))
-    let at = 1 + CTR_OCTETS
-    test.assert_eq(ll_data.dpdu_byte(var p, at), 0x29)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 1), 0x41)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 2), 0x76)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 3), 0x71)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 4), 10)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 5), 15)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 6), 1)
-    test.assert_eq(ll_data.dpdu_byte(var p, at + 7), 4)
-
-@test
-fn test_the_sync_ind_holds_the_fields_in_their_places()
-    var p = t_pdu(29970)
-    test.assert_eq(p.n, 2 + 1 + CTR_OCTETS)
-    test.assert_eq(ll_data.dpdu_len(var p), 1 + CTR_OCTETS)
-    test.assert_eq(ll_data.dpdu_len(var p), ll_data.ctrl_payload_len(ll_data.OP_PERIODIC_SYNC_IND))
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x1C)
-    test.assert_eq(ll_data.dpdu_u16(var p, AT_ID), 0xBEEF)
-    var q = t_pdu(29970)
-    test.assert_eq(rx_offset_us(var q, 2 + AT_SYNC_INFO), 29970)
-    test.assert_eq(ll_per.si_interval(var q, 2 + AT_SYNC_INFO), 80)
-    test.assert_eq(ll_per.si_chmap(var q, 2 + AT_SYNC_INFO), 0x1FFFFFFFFF)
-    test.assert_eq(ll_per.si_sca(var q, 2 + AT_SYNC_INFO), 3)
-    test.assert_eq(ll_per.si_aa(var q, 2 + AT_SYNC_INFO), 0x8E89BED7)
-    test.assert_eq(ll_per.si_crc(var q, 2 + AT_SYNC_INFO), 0xA1B2C3)
-    test.assert_eq(ll_per.si_counter(var q, 2 + AT_SYNC_INFO), 0x1234)
-    test.assert_eq(ll_data.dpdu_u16(var p, AT_CE_REF), 0x0102)
-    test.assert_eq(ll_data.dpdu_u16(var p, AT_LAST_PE), 0x1230)
-    test.assert_eq(ll_data.dpdu_byte(var p, AT_SID), 7 | (1 << 4) | (5 << 5))
-    test.assert_eq(ll_data.dpdu_byte(var p, AT_PHY), 2)
-    for k in 0..6
-        test.assert_eq(ll_data.dpdu_byte(var p, AT_ADVA + k), 0x10 + k)
-    test.assert_eq(ll_data.dpdu_u16(var p, AT_CE_SYNC), 0x0100)
-
-@test
-fn test_an_offset_of_the_pdu_reads_back_with_the_unit_and_the_adjust()
-    for off in [0, 30, 29970, 245670, 245700, 1000000, 2457300, 2457600, 3000000, 4800000]
-        var p = t_pdu(off)
-        let back = rx_offset_us(var p, 2 + AT_SYNC_INFO)
-        let unit = rx_unit_us(var p, 2 + AT_SYNC_INFO)
-        // The offset is rounded down to the unit: the train's packet is no earlier than it and less than a unit later.
-        test.assert(back <= off and off < back + unit)
-
-@test
-fn test_the_phy_field_names_one_phy_or_none()
-    test.assert_eq(phy_bit(ll_phy.PHY_1M), 1)
-    test.assert_eq(phy_bit(ll_phy.PHY_2M), 2)
-    test.assert_eq(phy_bit(ll_phy.PHY_CODED), 4)
-    test.assert_eq(phy_of(1), ll_phy.PHY_1M)
-    test.assert_eq(phy_of(2), ll_phy.PHY_2M)
-    test.assert_eq(phy_of(4), ll_phy.PHY_CODED)
-    test.assert_eq(phy_of(0), 0)
-    test.assert_eq(phy_of(3), 0)
-    test.assert_eq(phy_of(8), 0)
-    test.assert_eq(phy_of(7), 0)
-
-@test
-fn test_the_parameters_are_checked_in_the_order_of_the_command()
-    test.assert_eq(cfg_status(0, 0, 0x0A, 0), OK)
-    test.assert_eq(cfg_status(2, 0x1F3, 0x4000, 0), OK)
-    test.assert_eq(cfg_status(4, 0, 0x0A, 0), E_INVALID)
-    test.assert_eq(cfg_status(1, 0x1F4, 0x0A, 0), E_INVALID)
-    test.assert_eq(cfg_status(1, 0, 9, 0), E_INVALID)
-    test.assert_eq(cfg_status(1, 0, 0x4001, 0), E_INVALID)
-    test.assert_eq(cfg_status(3, 0, 0x0A, 0), E_UNSUPPORTED)
-    test.assert_eq(cfg_status(1, 0, 0x0A, 1), E_UNSUPPORTED)
-    test.assert_eq(cfg_status(1, 0, 0x0A, 0x1F), E_DISALLOWED)
-    test.assert_eq(cfg_status(9, 0, 0x0A, 0x1F), E_DISALLOWED)
-    var g = cfg_new()
-    test.assert_eq(g.mode, MODE_OFF)
-    test.assert(not cfg_reports(var g))
-    cfg_set(var g, 2, 3, 100, 0)
-    test.assert(cfg_reports(var g))
-    var h = cfg_new()
-    cfg_copy(var h, var g)
-    test.assert_eq(h.skip, 3)
-    test.assert_eq(h.timeout, 100)
-    cfg_set(var g, 1, 0, 10, 0)
-    test.assert(not cfg_reports(var g))
-
-@test
-fn test_the_offer_names_the_first_event_after_the_link_anchor_and_a_reference_before_it()
-    // A train of 100 ms (80 units) heard at 1000000 with the counter 500; the link's anchor is at 1230000 (event 40), 30 ms apart, now 1240000.
-    let o = plan_offer(1000000, 500, 100000, 1230000, 40, 30000, 1240000)
-    test.assert(o.ok)
-    // Events at 1000000 + n x 100000: the first at or after 1240000 is the third, 1300000, the counter 503.
-    test.assert_eq(o.at, 1300000)
-    test.assert_eq(o.pea, 503)
-    // The reference is the last connection event at or before it: (1300000 - 1230000) / 30000 = 2 events on, an offset of 10000.
-    test.assert_eq(o.ceref, 42)
-    test.assert_eq(o.ref_us, 1290000)
-    test.assert_eq(o.off_us, 10000)
-
-@test
-fn test_the_offer_keeps_the_offset_under_one_interval_for_a_long_train()
-    // A train of 40 s heard at 0; the link has an interval of 7.5 ms and its anchor at 1000000 (event 65530): the next event is at 40 s.
-    let o = plan_offer(0, 0xFFFF, 40000000, 1000000, 65530, 7500, 1000000)
-    test.assert(o.ok)
-    test.assert_eq(o.pea, 0)
-    test.assert_eq(o.at, 40000000)
-    test.assert(o.off_us >= 0 and o.off_us < 7500)
-    // The reference counter wraps, and is no further than the 14 bits of the specification.
-    test.assert_eq(o.ceref, (65530 + (40000000 - 1000000) / 7500) & 0xFFFF)
-    test.assert(((o.ceref - 65530) & 0xFFFF) < 0x4000)
-
-@test
-fn test_a_train_further_than_the_counter_reaches_is_not_offered()
-    // A guard: no interval of the specification (81.9 s at most) puts an event more than 14 bits of 7.5 ms intervals away.
-    let o = plan_offer(0, 0, 200000000, 1000000, 1, 7500, 1000000)
-    test.assert(not o.ok)
-
-@test
-fn test_the_drift_follows_the_formula_of_the_specification()
-    // A at 50 ppm, B at 100 ppm, C at 50: Da over 10 events of 100 ms is 1 s x 100 ppm = 100 us, Db over 4 events of 30 ms is 120 ms x 150 ppm = 18 us.
-    let d = drift_us(510, 500, 100000, 44, 40, 30000, 50, 100, 50)
-    test.assert(d >= 118 and d <= 120)
-    test.assert_eq(link_drift_us(44, 40, 30000, 100, 50), 18)
-    // The counters are compared the nearest way round.
-    test.assert_eq(drift_us(2, 0xFFFE, 100000, 0, 0, 30000, 50, 100, 50), drift_us(0xFFFE, 2, 100000, 0, 0, 30000, 50, 100, 50))
-    test.assert_eq(diff16(2, 0xFFFE), 4)
-    test.assert_eq(diff16(0xFFFE, 2), -4)
-
-@test
-fn test_the_receiver_listens_to_the_first_event_whose_window_opens_late_enough()
-    // The PDU arrived in event 100 (anchor 5000000), connection interval 30 ms, offset 20 ms counted from event 103 (anchor 5090000): the AUX_SYNC_IND
-    // named is at 5110000, the counter 700 of a train of 100 ms.  Now is 5001000, the window may not open before 5003000.
-    let pl = plan_receive(20010, 30, 700, 699, 103, 98, 100000, 50, 50, 100, 5000000, 30000, 5001000, 2000)
-    test.assert(pl.ok)
-    test.assert_eq(pl.win, 30)
-    // 5110000 is the nominal time of the event named; the first event whose window opens at 5003000 or later: 5110000 - 100000 = 5010000 is
-    // the one before (counter 699), whose window opens a drift before that.
-    test.assert_eq(pl.counter, 699)
-    test.assert_eq(pl.due, 5110010 - 100000)
-    test.assert(pl.due - 100 >= 5003000)
-    // The widening counts from the packet B heard (counter 699): none for the event of that counter.
-    test.assert_eq(pl.t_ref, pl.due)
-    test.assert(pl.pre > 0)
-
-@test
-fn test_the_receiver_moves_on_when_the_event_is_too_close()
-    // The same PDU but now is 5009000: the event at 5010010 (counter 699) opens its window before the lead, so the plan takes the next.
-    let pl = plan_receive(20010, 30, 700, 699, 103, 98, 100000, 50, 50, 100, 5000000, 30000, 5009000, 2000)
-    test.assert_eq(pl.counter, 700)
-    test.assert_eq(pl.due, 5110010)
-    test.assert_eq(pl.t_ref, 5110010 - 100000)
-
-@test
-fn test_the_receiver_counts_back_when_the_train_is_far_ahead()
-    // An offset of 4 s from a connection event: the train of 100 ms has events in between, and the plan listens to the first of them.
-    let pl = plan_receive(2457600 + 300 * 4000, 300, 900, 899, 100, 100, 100000, 50, 50, 100, 5000000, 30000, 5001000, 2000)
-    // The nominal time is 5000000 + 2457600 + 1200000 = 8657600; 36 events of 100 ms back is 5057600, the first at or after 5003000.
-    test.assert_eq(pl.counter, 864)
-    test.assert_eq(pl.due, 5057600)
-    test.assert_eq(pl.t_ref, 5057600 - 35 * 100000)

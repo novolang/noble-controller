@@ -54,7 +54,21 @@ not depend on the Host, so an image that holds only a Controller carries no
 Host code.  `docs/controller.md` describes the modules, the configuration
 and the seams.
 
-`novo test src/ll_scan.nv` in this directory runs the unit tests beside a
-module, and `novo test tests/ctl_air_tests.nv` runs one of the suites that
-drive the Controller through HCI against a scripted radio.  A suite that
-needs a profile takes it with `--config configs/ctl_iso.toml`.
+## Install, build and test
+
+```sh
+novo pkg add noble-controller
+```
+
+adds the package to the `[dependencies]` table of the consumer's `novo.toml`.  In a checkout of the package:
+
+```sh
+novo build
+novo test
+```
+
+`novo build` type-checks and effect-checks every module under `src/`; the package is a library and writes no binary.
+`novo test` runs the suites under `tests/`: one for each module that holds logic (`tests/<module>_tests.nv`, for
+example `novo test tests/ll_scan_tests.nv`), and the suites that drive the Controller through HCI against a scripted
+radio (`tests/ctl_*_tests.nv`, for example `novo test tests/ctl_air_tests.nv`).  A suite that needs a profile takes it
+with `--config configs/ctl_iso.toml`.  The tests are not part of the published package.

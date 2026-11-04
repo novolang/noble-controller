@@ -109,7 +109,7 @@ const MAX_EXCHANGES = 4000000
 
 // `rx_on` says the receiver runs for a scan window, on `rx_ch` and the PHY `rx_phy`.  `held` says
 // the radio's power state is held.  The counters follow.
-@value
+pub @value
 struct Rf
     rx_on: Bool
     rx_ch: Int
@@ -237,7 +237,8 @@ struct Rf
     big_work_max: Int
     sc: Pdu
 
-@tier(embedded)
+// The state of the radio program at rest: the receiver off and every counter at its starting value.
+pub @tier(embedded)
 fn rf_new() -> Rf
     rf_make()
 
@@ -309,7 +310,7 @@ fn get_tail<R: Radio[e]>(var air: R, buf: Int, var p: Pdu, n: Int) [e]
 fn patch_request<R: Radio[e]>(var air: R, chsel: Bool, var req: Pdu) [e]
     let hdr = air.octet(ll_radio.BUF_RX, 0)
     var keep = 0x3F
-    var add = ((hdr & 0x40) << 1) | ((req.b[0] as Int) & 0x40)
+    var add = ((hdr & 0x40) << 1) | (req.b[0] as Int & 0x40)
     if chsel
         keep = 0x1F
         add = add | (hdr & ll_pdu.CHSEL)
@@ -346,7 +347,7 @@ fn cis_unarm<R: Radio[e]>(var air: R, var rf: Rf) [e]
 
 // Start a new window of the extremes: the counts go on, the minima and maxima
 // begin again.
-fn reset_window(var rf: Rf)
+pub fn reset_window(var rf: Rf)
     rf.tifs_min_ns = 1000000000
     rf.tifs_max_ns = 0
     rf.err_min_us = 1000000
@@ -440,7 +441,10 @@ fn abort_answer<R: Radio[e]>(var air: R, var rf: Rf) [e]
 // same channel.  `scannable` says a SCAN_REQ may come, so the scan response is
 // armed.  `tx_end` is the time the PDU ended.  Answers whether a SCAN_REQ was
 // answered.
-fn listen_for_request<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var policy: P, tx_end: Int, scannable: Bool) -> Bool [e, t]
+fn listen_for_request<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller,
+                                                                var rf: Rf, var rx: Pdu,
+                                                                var policy: P, tx_end: Int,
+                                                                scannable: Bool) -> Bool [e, t]
     if not air.wait_address(tx_end + ll_radio.T_IFS_US + ADDRESS_WAIT_US + 20)
         rf.listen_idle = rf.listen_idle + 1
         air.halt()
@@ -506,7 +510,9 @@ fn listen_for_request<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var 
 // connection if its checks and the policy allow.  `addr_mark` is the mark of the
 // access address of the CONNECT_IND, which fixes the end of it, the point the
 // transmit window is counted from.
-fn take_connection<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf, var policy: P, var rx: Pdu, addr_mark: Int) [e, t]
+fn take_connection<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller,
+                                                             var rf: Rf, var policy: P, var rx: Pdu,
+                                                             addr_mark: Int) [e, t]
     let end = air.mark_us(addr_mark) - ll_radio.AA_END_US + ll_pdu.airtime_us(rx.n)
     ctl_hci.ctl_set_time(var c, air.now_us())
     if ctl_hci.ctl_connect_ind(var c, var policy, var rx, end)
@@ -515,7 +521,8 @@ fn take_connection<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: 
 // Run one advertising event: a PDU on each channel of the map, each started
 // at the time the Link Layer planned.  The call returns when the event is
 // over.
-fn adv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var policy: P) [e, t]
+fn adv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf,
+                                                       var rx: Pdu, var policy: P) [e, t]
     hold(var air, var rf)
     // Advertising that was turned off and on again starts the spacing of events afresh.
     if c.adv.entered != rf.adv_entered
@@ -594,7 +601,8 @@ fn adv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Contro
 // (`THEN_REST`, or `THEN_RX` for a PDU a request can follow).  The packet has the access address `aa` and the CRC seed `crc`: those of
 // the advertising channels for an extended advertising event, those of the train for a periodic one.  The answer is the time the first bit
 // was on air, -1 when the transmitter did not start.
-fn xadv_tx<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, ch: Int, phy: Int, s8: Bool, dbm: Int, due: Int, next: Int, aa: Int, crc: Int) -> Int [e, t]
+fn xadv_tx<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, ch: Int, phy: Int, s8: Bool, dbm: Int,
+                                      due: Int, next: Int, aa: Int, crc: Int) -> Int [e, t]
     air.config(aa, crc, ll_radio.DATA_MAXLEN)
     air.phy(phy, s8)
     let _dbm = air.power(dbm)
@@ -629,7 +637,8 @@ fn xadv_wait_end<R: Radio[e] + Timebase[t]>(var air: R) -> Int [e, t]
 // The chain of PDUs after the one that started at `prev` (its pointer, `off` microseconds on, names channel `ch`), of the
 // advertising data (`rsp` false) or of the scan response data from PDU `from` on: each is built with the pointer to the next
 // and sent where the one before points.
-fn xadv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, i: Int, rsp: Bool, from: Int, prev: Int, off: Int, ch: Int) [e, t]
+fn xadv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, i: Int,
+                                         rsp: Bool, from: Int, prev: Int, off: Int, ch: Int) [e, t]
     let sphy = c.xsets[i].sphy as Int
     let dbm = c.xsets[i].txp
     var len = c.xsets[i].dlen
@@ -654,7 +663,16 @@ fn xadv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
         else
             ll_xadv.build_chain(var c.xsets[i], var c.xv, k * chunk, n, more, next_ch, next_off)
         air.put(ll_radio.BUF_TX, var c.xv)
-        start = xadv_tx(var air, var rf, on, sphy, ll_xadv.sec_s8(var c.xsets[i]), dbm, at, ll_radio.THEN_REST, ll_radio.ADV_ACCESS_ADDRESS, ll_radio.ADV_CRC_INIT)
+        start = xadv_tx(var air,
+            var rf,
+            on,
+            sphy,
+            ll_xadv.sec_s8(var c.xsets[i]),
+            dbm,
+            at,
+            ll_radio.THEN_REST,
+            ll_radio.ADV_ACCESS_ADDRESS,
+            ll_radio.ADV_CRC_INIT)
         if start < 0
             return
         let _e = xadv_wait_end(var air)
@@ -666,7 +684,10 @@ fn xadv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
 // request is answered with the AUX_SCAN_RSP the radio sends by itself, whose chain follows; a connection request with the
 // AUX_CONNECT_RSP, and the connection opens from the end of the request.  `rsp_n` and `rsp_off` are the octets of the
 // first AUX_SCAN_RSP and the pointer in it, `rsp_ch` the channel it names.
-fn xadv_listen<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var policy: P, i: Int, tx_end: Int, rsp_off: Int, rsp_ch: Int) [e, t]
+fn xadv_listen<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf,
+                                                         var rx: Pdu, var policy: P, i: Int,
+                                                         tx_end: Int, rsp_off: Int,
+                                                         rsp_ch: Int) [e, t]
     let phy = c.xsets[i].sphy as Int
     if not air.wait_address(tx_end + ll_radio.T_IFS_US + ll_phy.aa_end_us(phy) + 60)
         rf.listen_idle = rf.listen_idle + 1
@@ -689,7 +710,9 @@ fn xadv_listen<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Cont
             note_judge(var air, var rf, seen)
             if act == ll_adv.RX_CONNECT_IND
                 // The AUX_CONNECT_RSP names the initiator: its type as RxAdd and its address as TargetA.
-                air.set_octet(ll_radio.BUF_ANS, 0, (air.octet(ll_radio.BUF_ANS, 0) & 0x7F) | ((air.octet(ll_radio.BUF_RX, 0) & 0x40) << 1))
+                air.set_octet(ll_radio.BUF_ANS,
+                    0,
+                    (air.octet(ll_radio.BUF_ANS, 0) & 0x7F) | ((air.octet(ll_radio.BUF_RX, 0) & 0x40) << 1))
                 for k in 0..6
                     air.set_octet(ll_radio.BUF_ANS, 10 + k, air.octet(ll_radio.BUF_RX, 2 + k))
     if act == ll_adv.RX_NONE
@@ -720,7 +743,9 @@ fn xadv_listen<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Cont
             rf.conn_open = rf.conn_open + 1
 
 // The AUX_ADV_IND of the event whose first ADV_EXT_IND started at `t0`, at `start`, on channel `ch`, and what follows it.
-fn xadv_aux<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var policy: P, i: Int, start: Int, ch: Int) [e, t]
+fn xadv_aux<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf,
+                                                      var rx: Pdu, var policy: P, i: Int,
+                                                      start: Int, ch: Int) [e, t]
     let sphy = c.xsets[i].sphy as Int
     let dbm = c.xsets[i].txp
     let scan = ll_xadv.is_scannable(var c.xsets[i])
@@ -771,7 +796,16 @@ fn xadv_aux<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Control
     var next = ll_radio.THEN_REST
     if listens
         next = ll_radio.THEN_RX
-    let st = xadv_tx(var air, var rf, ch, sphy, ll_xadv.sec_s8(var c.xsets[i]), dbm, start, next, ll_radio.ADV_ACCESS_ADDRESS, ll_radio.ADV_CRC_INIT)
+    let st = xadv_tx(var air,
+        var rf,
+        ch,
+        sphy,
+        ll_xadv.sec_s8(var c.xsets[i]),
+        dbm,
+        start,
+        next,
+        ll_radio.ADV_ACCESS_ADDRESS,
+        ll_radio.ADV_CRC_INIT)
     if st < 0
         return
     rf.x_adv_aux = rf.x_adv_aux + 1
@@ -789,7 +823,8 @@ fn xadv_aux<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Control
 
 // Run one event of the set of extended PDUs whose event is due first.
 @satisfies("REQ-BLE-CTL-091")
-fn xadv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var policy: P) [e, t]
+fn xadv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Controller, var rf: Rf,
+                                                        var rx: Pdu, var policy: P) [e, t]
     let i = ctl_hci.ctl_xadv_pick(var c)
     if i < 0
         return
@@ -815,7 +850,16 @@ fn xadv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Contr
         if ok
             ll_xadv.build_ext_ind(var c.xsets[i], var c.xv, aux_ch, aux_rel - k * spacing)
             air.put(ll_radio.BUF_TX, var c.xv)
-            let st = xadv_tx(var air, var rf, ll_xadv.prim_channel(var c.xsets[i], k), pphy, ll_xadv.prim_s8(var c.xsets[i]), dbm, t0 + k * spacing, ll_radio.THEN_REST, ll_radio.ADV_ACCESS_ADDRESS, ll_radio.ADV_CRC_INIT)
+            let st = xadv_tx(var air,
+                var rf,
+                ll_xadv.prim_channel(var c.xsets[i], k),
+                pphy,
+                ll_xadv.prim_s8(var c.xsets[i]),
+                dbm,
+                t0 + k * spacing,
+                ll_radio.THEN_REST,
+                ll_radio.ADV_ACCESS_ADDRESS,
+                ll_radio.ADV_CRC_INIT)
             if st < 0
                 ok = false
             else
@@ -840,7 +884,8 @@ fn xadv_event<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Contr
 
 // The PDUs behind the AUX_SYNC_IND of the train in slot `k`, which started at `prev` on `phy`: each is built with the pointer to the next and
 // sent where the one before points.
-fn padv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, k: Int, i: Int, prev: Int, off: Int, ch: Int) [e, t]
+fn padv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, k: Int, i: Int,
+                                         prev: Int, off: Int, ch: Int) [e, t]
     let phy = c.xsets[i].sphy as Int
     let dbm = c.xsets[i].txp
     let s8 = ll_xadv.sec_s8(var c.xsets[i])
@@ -890,7 +935,16 @@ fn padv_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
         off0 = ll_xadv.next_rel_us(phy, ll_per.sync_octets(var c.pads[k], n0, true))
     ll_per.build_sync_ind(var c.pads[k], var c.xv, 0, n0, more, ch1, off0, phy, c.xsets[i].txp)
     air.put(ll_radio.BUF_TX, var c.xv)
-    let st = xadv_tx(var air, var rf, ch, phy, ll_xadv.sec_s8(var c.xsets[i]), c.xsets[i].txp, due, ll_radio.THEN_REST, c.pads[k].aa, c.pads[k].crc)
+    let st = xadv_tx(var air,
+        var rf,
+        ch,
+        phy,
+        ll_xadv.sec_s8(var c.xsets[i]),
+        c.xsets[i].txp,
+        due,
+        ll_radio.THEN_REST,
+        c.pads[k].aa,
+        c.pads[k].crc)
     if st >= 0
         let _e = xadv_wait_end(var air)
         rf.x_per_events = rf.x_per_events + 1
@@ -915,7 +969,8 @@ const PSYNC_CHAIN_MAX = 8
 
 // Follow the Auxiliary Pointer at octet `at` of the PDU in `rx` (the first bit of which was on air at `t0`) of the synchronization in slot
 // `k`, to the end of the chain.
-fn psync_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, k: Int, t0: Int, at: Int) [e, t]
+fn psync_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                           k: Int, t0: Int, at: Int) [e, t]
     var from = t0
     var aux_ptr = at
     var done = false
@@ -972,7 +1027,8 @@ fn psync_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf
 
 // Run the event of the synchronization in slot `k`.
 @satisfies("REQ-BLE-CTL-094")
-fn psync_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, k: Int) [e, t]
+fn psync_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                          k: Int) [e, t]
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
     let due = c.psyncs[k].due
@@ -1024,7 +1080,8 @@ fn psync_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
     adv_radio_setup(var air)
 
 // Run the periodic event `p` (`ctl_hci.ctl_per_pick`) the arbiter granted the radio for.
-fn per_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, p: Int) [e, t]
+fn per_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                        p: Int) [e, t]
     if p < ctl_limits.padv_n()
         if ctl_limits.pawr_adv_on() and ctl_hci.ctl_pawr_train(var c, p)
             pawr_event(var air, var c, var rf, var rx, p)
@@ -1036,7 +1093,6 @@ fn per_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: R
         else
             psync_event(var air, var c, var rf, var rx, p - ctl_limits.padv_n())
 
-
 // ── Periodic advertising with responses ─────────────────────────────
 //
 // A subevent of a train with responses is an AUX_SYNC_SUBEVENT_IND on the data channel that channel selection algorithm #2 gives the event counter
@@ -1047,14 +1103,15 @@ fn per_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: R
 // The widening of a window `after` microseconds from the packet the time is counted from: the jitter, and 500 ppm of the peer's clock and ours over
 // `after`, at most a quarter of the spacing of the slots (less the margin the start of the next window needs).
 fn pawr_widen(after: Int, spacing: Int) -> Int
-    var w = ll_link.JITTER_US + ((500 + ll_link.OWN_PPM) * after) / 1000000
+    var w = ll_link.JITTER_US + (500 + ll_link.OWN_PPM) * after / 1000000
     let cap = spacing / 4
     if w > cap
         w = cap
     w
 
 // Listen in the response slot `slot` of the subevent of the train in slot `k` that started at `st` on channel `ch`.
-fn pawr_listen<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, k: Int, st: Int, ch: Int, phy: Int, slot: Int) [e, t]
+fn pawr_listen<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                          k: Int, st: Int, ch: Int, phy: Int, slot: Int) [e, t]
     let at = ll_pawr.slot_at(st, c.pwa[k].delay_us, c.pwa[k].spacing_us, slot)
     let widen = pawr_widen(at - st, c.pwa[k].spacing_us)
     ctl_hci.ctl_set_time(var c, air.now_us())
@@ -1087,7 +1144,8 @@ fn pawr_listen<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
 
 // Run the subevent due of the train with responses in slot `k`.
 @satisfies("REQ-BLE-CTL-110")
-fn pawr_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, k: Int) [e, t]
+fn pawr_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                         k: Int) [e, t]
     let i = ctl_hci.ctl_padv_set(var c, k)
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
@@ -1100,7 +1158,16 @@ fn pawr_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
     let sub = ctl_hci.ctl_pawr_build(var c, k, i)
     let ch = ll_pawr.sub_channel(c.pads[k].aa, c.pads[k].counter, sub, c.pads[k].chmap, c.pads[k].n_used)
     air.put(ll_radio.BUF_TX, var c.xv)
-    let st = xadv_tx(var air, var rf, ch, phy, ll_xadv.sec_s8(var c.xsets[i]), c.xsets[i].txp, due, ll_radio.THEN_REST, c.pads[k].aa, c.pads[k].crc)
+    let st = xadv_tx(var air,
+        var rf,
+        ch,
+        phy,
+        ll_xadv.sec_s8(var c.xsets[i]),
+        c.xsets[i].txp,
+        due,
+        ll_radio.THEN_REST,
+        c.pads[k].aa,
+        c.pads[k].crc)
     var ok = false
     if st >= 0
         let _e = xadv_wait_end(var air)
@@ -1115,13 +1182,23 @@ fn pawr_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
 
 // The response the Host gave for this subevent of the synchronization in slot `k`, in buffer `b`, is sent in its slot; the subevent's
 // AUX_SYNC_SUBEVENT_IND started at `st` on channel `ch`.
-fn pwsync_respond<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, k: Int, b: Int, st: Int, ch: Int) [e, t]
+fn pwsync_respond<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, k: Int,
+                                             b: Int, st: Int, ch: Int) [e, t]
     let phy = c.psyncs[k].phy
     let at = ctl_hci.ctl_pwsync_rsp(var c, k, b, st)
     ctl_hci.ctl_set_time(var c, air.now_us())
     if c.now + air.tx_lead_us() + 60 <= at
         air.put(ll_radio.BUF_TX, var c.xv)
-        let s = xadv_tx(var air, var rf, ch, phy, phy == ll_phy.PHY_CODED, 0, at, ll_radio.THEN_REST, c.pws[k].rsp_aa, c.psyncs[k].crc)
+        let s = xadv_tx(var air,
+            var rf,
+            ch,
+            phy,
+            phy == ll_phy.PHY_CODED,
+            0,
+            at,
+            ll_radio.THEN_REST,
+            c.pws[k].rsp_aa,
+            c.psyncs[k].crc)
         if s >= 0
             let _e = xadv_wait_end(var air)
             rf.x_pawr_tx = rf.x_pawr_tx + 1
@@ -1130,7 +1207,8 @@ fn pwsync_respond<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var 
 // Run the window of the synchronization to a train with responses in slot `k`: listen for the AUX_SYNC_SUBEVENT_IND of the subevent due, report it,
 // and send the response the Host gave for it.
 @satisfies("REQ-BLE-CTL-110")
-fn pwsync_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, k: Int) [e, t]
+fn pwsync_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                           k: Int) [e, t]
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
     let due = c.psyncs[k].due
@@ -1185,7 +1263,8 @@ fn pwsync_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf
 // Start the receiver for a scan window on `ch`.  The SCAN_REQ the window may send
 // is written to the answer buffer first, with the advertiser's address still to
 // be patched in.
-fn start_rx<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, ch: Int, phy: Int) [e, t]
+fn start_rx<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, ch: Int,
+                                       phy: Int) [e, t]
     hold(var air, var rf)
     air.put(ll_radio.BUF_ANS, var c.scan.req)
     // A scanner of the extended commands takes the longest ADV_EXT_IND the primary channels carry (the length field of a primary
@@ -1247,7 +1326,8 @@ fn get_whole<R: Radio[e]>(var air: R, buf: Int, var p: Pdu, n: Int) [e]
 // AUX_ADV_IND, or the AUX_SCAN_RSP), -1 for none; `rf.x_t0` is the time that PDU's first bit was on air.  The
 // radio is at rest when this returns.
 @satisfies("REQ-BLE-CTL-090")
-fn xscan_first<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, phy: Int, pphy: Int, t_first: Int) -> Int [e, t]
+fn xscan_first<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                          phy: Int, pphy: Int, t_first: Int) -> Int [e, t]
     let will_ask = ll_scan.scan_may_ask(var c.scan)
     if will_ask
         air.packet(ll_radio.BUF_ANS)
@@ -1341,7 +1421,8 @@ fn xscan_first<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
 // answer is the octet of an Auxiliary Pointer to follow in it, -1 for none (`rf.x_t0` is the time its first bit was
 // on air).
 @satisfies("REQ-BLE-CTL-090")
-fn xscan_chain_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, phy: Int, t_first: Int) -> Int [e, t]
+fn xscan_chain_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                                 var rx: Pdu, phy: Int, t_first: Int) -> Int [e, t]
     let good = air.wait_rx() == ll_radio.RX_GOOD
     let seen = air.now_us()
     air.clear_address()
@@ -1369,7 +1450,8 @@ fn xscan_chain_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, 
 // primary PHY `pphy`: the AUX_ADV_IND and the PDUs that chain after it.  The radio is at rest, and set for the
 // advertising channels' packets again, when this returns.
 @satisfies("REQ-BLE-CTL-090")
-fn xscan_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, t0: Int, at: Int, pphy: Int) [e, t]
+fn xscan_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                           t0: Int, at: Int, pphy: Int) [e, t]
     var from = t0
     var aux_ptr = at
     var first = true
@@ -1422,7 +1504,8 @@ fn xscan_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf
 // A packet arrived while scanning (the access address is seen): judge it and, if
 // the Link Layer asks, send the SCAN_REQ and listen for the SCAN_RSP.  The
 // radio is at rest again when this returns.
-fn scan_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu) [e, t]
+fn scan_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                          var rx: Pdu) [e, t]
     // A scan request is armed at once when the next scannable PDU is to be
     // answered; the header is not known yet, so any packet arms it and the
     // judgement below takes it back.
@@ -1454,7 +1537,13 @@ fn scan_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
             get_whole(var air, ll_radio.BUF_RX, var rx, n)
             let at = ctl_hci.ctl_xscan_primary(var c, var rx, n)
             if at >= 0
-                xscan_follow(var air, var c, var rf, var rx, air.mark_us(ext_mark) - ll_phy.aa_end_us(rf.rx_phy), at, rf.rx_phy)
+                xscan_follow(var air,
+                    var c,
+                    var rf,
+                    var rx,
+                    air.mark_us(ext_mark) - ll_phy.aa_end_us(rf.rx_phy),
+                    at,
+                    rf.rx_phy)
         return
     if rf.rx_phy != ll_phy.PHY_1M
         // Only extended PDUs are sent on LE Coded.
@@ -1541,7 +1630,8 @@ fn scan_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
 // One slice of a scan window: keep the receiver on the window's channel,
 // take a packet that arrives, and stop at the end of the window or the guard
 // before the next advertising event.
-fn scan_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu) [e, t]
+fn scan_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                         var rx: Pdu) [e, t]
     let now = air.now_us()
     ctl_hci.ctl_set_time(var c, now)
     let ch = ll_scan.scan_channel(var c.scan, now)
@@ -1624,7 +1714,8 @@ fn note_rx_len<R: Radio[e]>(var air: R, var rf: Rf) [e]
 
 // Write the PDU in flight and the next into the radio's buffers.  Octet 0 of each
 // carries the LLID alone; the answer to a packet adds SN, NESN and MD.
-fn conn_mirror<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, slot: Int, var cc: C) [e, t, k]
+fn conn_mirror<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                        slot: Int, var cc: C) [e, t, k]
     let t0 = air.stamp()
     let f0 = cc.faults()
     ctl_hci.ctl_conn_air(var c, slot, var cc, false, var rf.sc)
@@ -1668,7 +1759,8 @@ fn get_data_pdu<R: Radio[e]>(var air: R, buf: Int, var p: Pdu) -> Int [e]
 // Open the packet just read into `rx` when the link receives encrypted, and count
 // what it took.  A MIC that does not match ends the connection (MIC Failure); an
 // engine that failed ends it with Hardware Failure.
-fn open_rx<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, slot: Int, var cc: C, var rx: Pdu) [e, t, k]
+fn open_rx<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                    slot: Int, var cc: C, var rx: Pdu) [e, t, k]
     let t0 = air.stamp()
     let f0 = cc.faults()
     ctl_hci.ctl_conn_rx_open(var c, slot, var cc, var rx)
@@ -1689,7 +1781,9 @@ fn open_rx<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controlle
 // answer is for, so it is made first and the rest of the work waits for the
 // answer to be on air.  Answers whether the event goes on: the packet after this
 // one is awaited.
-fn conn_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, slot: Int, first: Bool, due: Int, var cc: C) -> Bool [e, t, k]
+fn conn_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                          var rx: Pdu, slot: Int, first: Bool,
+                                                          due: Int, var cc: C) -> Bool [e, t, k]
     air.packet(ll_radio.BUF_CUR)
     air.arm(ll_radio.THEN_TX, true)
     let verdict = air.wait_rx()
@@ -1786,7 +1880,9 @@ fn conn_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Con
 // receiver is started so that it listens from the opening of the window, and the
 // exchanges follow as long as the packets do.  The event ends the schedule's step
 // whatever happened in it.
-fn peripheral_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, slot: Int, var cc: C) [e, t, k]
+fn peripheral_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller,
+                                                                var rf: Rf, var rx: Pdu, slot: Int,
+                                                                var cc: C) [e, t, k]
     let ch = ctl_hci.ctl_conn_begin(var c, slot)
     conn_radio_setup(var air, var c.links[slot], ch)
     // The two links share the radio's buffers, so each event writes its own PDUs
@@ -1826,7 +1922,9 @@ fn peripheral_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var 
 // armed packet is taken back before the transmitter starts.  A packet with a CRC error
 // ends the event with nothing sent (Section 4.5.6).  Answers whether the event goes on:
 // the Peripheral's next packet is awaited.
-fn central_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, slot: Int, var cc: C) -> Bool [e, t, k]
+fn central_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller,
+                                                             var rf: Rf, var rx: Pdu, slot: Int,
+                                                             var cc: C) -> Bool [e, t, k]
     air.packet(ll_radio.BUF_CUR)
     air.arm(ll_radio.THEN_TX, true)
     let verdict = air.wait_rx()
@@ -1906,7 +2004,9 @@ fn central_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: 
 // Run one connection event of the Central role on the link of `slot`: the
 // first packet starts at the anchor point the Link Layer fixed, and the exchanges
 // follow as long as the packets do.
-fn central_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, slot: Int, var cc: C) [e, t, k]
+fn central_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller,
+                                                             var rf: Rf, var rx: Pdu, slot: Int,
+                                                             var cc: C) [e, t, k]
     let ch = ctl_hci.ctl_conn_begin(var c, slot)
     conn_radio_setup(var air, var c.links[slot], ch)
     // The two links share the radio's buffers, so each event writes its own PDUs
@@ -1956,7 +2056,8 @@ fn central_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: 
     ctl_hci.ctl_conn_done(var c, slot, air.now_us())
 
 // Run one connection event on the link of `slot`, in the role the link has.
-fn conn_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, slot: Int, var cc: C) [e, t, k]
+fn conn_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                       var rx: Pdu, slot: Int, var cc: C) [e, t, k]
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
     let skipped = ctl_hci.ctl_conn_catch_up(var c, slot, c.now)
@@ -1989,7 +2090,9 @@ fn cis_radio_setup<R: Radio[e]>(var air: R, var c: Controller, var rf: Rf, i: In
 // Write the two PDUs the Peripheral can answer with into the radio's buffers: payload `cur`, the
 // one in flight, and `nxt`, the one behind it, either a Null PDU when -1.  Which of the two goes
 // is decided by the header of the Central's packet (`ll_iso.rx_fast`).
-fn cis_mirror<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, i: Int, var cc: C, cur: Int, nxt: Int) [e, t, k]
+fn cis_mirror<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                       i: Int, var cc: C, cur: Int,
+                                                       nxt: Int) [e, t, k]
     let t0 = air.stamp()
     let f0 = cc.faults()
     ctl_hci.ctl_cis_air(var c, i, var cc, cur, var rf.sc)
@@ -2010,7 +2113,9 @@ fn cis_mirror<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Contro
 // payload it acknowledges, as a connection event does.  The work for the packet (opening it,
 // the Host's side, the bookkeeping) follows the answer.  A packet that does not come ends the
 // subevent with nothing sent.
-fn cis_subevent_p<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, i: Int, var cc: C) [e, t, k]
+fn cis_subevent_p<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller,
+                                                           var rf: Rf, var rx: Pdu, i: Int,
+                                                           var cc: C) [e, t, k]
     let ch = ctl_hci.ctl_cis_begin(var c, i)
     // The receiver of the last subevent was armed for this one (`armed` below) when the subevent that comes is the same stream's, on the
     // channel it was armed for; any other receiver is stopped.
@@ -2156,12 +2261,13 @@ fn cis_subevent_p<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Co
         rf.cis_bad = rf.cis_bad + 1
     ctl_hci.ctl_cis_done(var c, i, air.now_us())
 
-
 // Run one subevent of the stream in slot `i` in the Central role.  The transmitter starts at the subevent's start, on the channel
 // the algorithm gives, with the stream's access address; the radio turns to the receiver by itself T_IFS_CIS after the packet, and
 // the Peripheral's answer is read when it ends.  A packet that does not come, or comes with a CRC error, is a subevent with
 // nothing acknowledged: the payload goes again in the next.
-fn cis_subevent_c<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, i: Int, var cc: C) [e, t, k]
+fn cis_subevent_c<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller,
+                                                           var rf: Rf, var rx: Pdu, i: Int,
+                                                           var cc: C) [e, t, k]
     cis_unarm(var air, var rf)
     let _w = ctl_hci.ctl_cis_flush_copies(var c, var cc, var rx)
     let ch = ctl_hci.ctl_cis_begin(var c, i)
@@ -2290,12 +2396,14 @@ const CIS_WORK_SPAN_US = 1500
 // subevent started the second one late and missed the third.  The next subevent is run from here when it is the isochronous
 // class's, which holds the radio first whenever a booking of it is within `ll_arb.lead_of` of the isochronous class: a connection event, an advertising
 // event or a scan window is picked again when no subevent is that near.
-fn cis_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var cc: C) [e, t, k]
+fn cis_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                      var rx: Pdu, var cc: C) [e, t, k]
     cis_chain(var air, var c, var rf, var rx, var cc)
     // The payload the last subevent left to place goes in place before the main loop can read the SDU, and before `rx` is used.
     let _w = ctl_hci.ctl_cis_flush_copies(var c, var cc, var rx)
 
-fn cis_chain<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var cc: C) [e, t, k]
+fn cis_chain<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                      var rx: Pdu, var cc: C) [e, t, k]
     for _ in 0..CIS_CHAIN_MAX
         hold(var air, var rf)
         ctl_hci.ctl_set_time(var c, air.now_us())
@@ -2340,7 +2448,8 @@ fn big_setup<R: Radio[e]>(var air: R, var c: Controller, g: Int, bis: Int, ch: I
 
 // Send the PDU in packet buffer `buf` with its first bit at `due`.  True when the transmitter started and the packet is on air; the
 // caller waits for its end (`xadv_wait_end`).
-fn big_send<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, due: Int, buf: Int, phy: Int) -> Bool [e, t]
+fn big_send<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, due: Int, buf: Int,
+                                       phy: Int) -> Bool [e, t]
     air.packet(buf)
     air.clear_all()
     air.arm(ll_radio.THEN_REST, false)
@@ -2358,7 +2467,8 @@ fn big_send<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, due: Int, buf: In
 // Run the event of the group in slot `g` as the Isochronous Broadcaster.
 @satisfies("REQ-BLE-CTL-100")
 @satisfies("REQ-BLE-CTL-102")
-fn big_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, g: Int, var cc: C) [e, t, k]
+fn big_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                      var rx: Pdu, g: Int, var cc: C) [e, t, k]
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
     let n = ctl_hci.ctl_big_begin(var c, g, c.now)
@@ -2423,7 +2533,8 @@ fn big_event<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Control
 // packet of the event fixes the anchor point; a BIS that has all its payloads is left alone for the rest of the event.  The control subevent
 // is listened to when a packet had the Control Subevent Transmission Flag set.
 @satisfies("REQ-BLE-CTL-104")
-fn big_event_rx<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, g: Int, var cc: C) [e, t, k]
+fn big_event_rx<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                         var rx: Pdu, g: Int, var cc: C) [e, t, k]
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
     let n = ctl_hci.ctl_big_begin_rx(var c, g, c.now)
@@ -2525,7 +2636,7 @@ fn ll_radio_stamps<R: Timebase[t]>(var air: R) -> Int [t]
 
 // Give the Controller the ramp-up of the radio under it: the lead of the arbiter, the spacing the subevents of a stream need and
 // the lateness one is run with are derived from it (`ll_radio.RadioProfile`).
-fn air_profile<R: Radio[e]>(var air: R, var c: Controller) [e]
+pub fn air_profile<R: Radio[e]>(var air: R, var c: Controller) [e]
     ctl_hci.ctl_set_radio(var c, ll_radio.profile_of(var air))
     ctl_hci.ctl_set_coded(var c, air.supports_phy(ll_phy.PHY_CODED))
 
@@ -2534,7 +2645,8 @@ fn air_profile<R: Radio[e]>(var air: R, var c: Controller) [e]
 // Start the receiver for an Initiating window on `ch`.  The CONNECT_IND the window
 // may send is written to the answer buffer first, with the advertiser's address
 // still to be patched in.
-fn start_rx_init<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, ch: Int, phy: Int) [e, t]
+fn start_rx_init<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, ch: Int,
+                                            phy: Int) [e, t]
     hold(var air, var rf)
     air.put(ll_radio.BUF_ANS, var c.init.req)
     // As a scan window: the longest ADV_EXT_IND of the primary channels, and the PHY of the window (LE Coded listens for either coding).
@@ -2556,7 +2668,8 @@ fn start_rx_init<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var r
 // PDU, and open the connection from the time it ended.  The CONNECT_IND is armed
 // while the PDU arrives, since the header is not yet known, and taken back when the
 // PDU is not one to answer.  The radio is at rest again when this returns.
-fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu) [e, t]
+fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                          var rx: Pdu) [e, t]
     air.packet(ll_radio.BUF_ANS)
     air.arm(ll_radio.THEN_TX, true)
     let good = air.wait_rx() == ll_radio.RX_GOOD
@@ -2597,7 +2710,12 @@ fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
         if ext_n > 0
             let at = ctl_hci.ctl_init_aux_plan(var c, var rx, ext_n)
             if at >= 0
-                init_follow(var air, var c, var rf, var rx, air.mark_us(ext_mark) - ll_phy.aa_end_us(rf.rx_phy), at)
+                init_follow(var air,
+                    var c,
+                    var rf,
+                    var rx,
+                    air.mark_us(ext_mark) - ll_phy.aa_end_us(rf.rx_phy),
+                    at)
         return
     // The CONNECT_IND goes T_IFS after the advertisement.  The access address of the
     // advertisement was cleared before the judgement, so one that is seen now is the
@@ -2654,7 +2772,8 @@ const AUX_RSP_WAIT_US = 1000
 // ADV_EXT_IND whose exchange would run into one is not followed (`aux_skipped`).  An AUX_ADV_IND that
 // does not come is `aux_missed`.
 @satisfies("REQ-BLE-CTL-080")
-fn init_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, t0: Int, at: Int) [e, t]
+fn init_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu,
+                                          t0: Int, at: Int) [e, t]
     let ch = ll_init.aux_channel(var rx, at)
     let phy = ll_init.aux_phy_of(var rx, at)
     let target = t0 + ll_init.aux_offset_us(var rx, at)
@@ -2685,7 +2804,8 @@ fn init_follow<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
 // AUX_CONNECT_RSP, which the receiver listens for T_IFS after the request; the connection opens
 // when it has come, from the time the request ended, and the transmit window is 2.5 ms after it.
 @satisfies("REQ-BLE-CTL-080")
-fn init_aux_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, phy: Int) [e, t]
+fn init_aux_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                              var rx: Pdu, phy: Int) [e, t]
     air.packet(ll_radio.BUF_ANS)
     air.arm(ll_radio.THEN_TX, true)
     let good = air.wait_rx() == ll_radio.RX_GOOD
@@ -2747,7 +2867,8 @@ fn init_aux_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var
 // One slice of an Initiating window: keep the receiver on the window's channel,
 // take a packet that arrives, and stop at the end of the window or the guard
 // before the next advertising event.
-fn init_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu) [e, t]
+fn init_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                         var rx: Pdu) [e, t]
     let now = air.now_us()
     ctl_hci.ctl_set_time(var c, now)
     let ch = ll_init.init_channel(var c.init, now)
@@ -2767,7 +2888,8 @@ fn init_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
 // a transmitter, the test packet written into the radio's buffer once; a receiver is started
 // and left to turn to the next packet by itself.
 @satisfies("REQ-BLE-CTL-073")
-fn dtm_setup<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu) [e, t]
+fn dtm_setup<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                        var rx: Pdu) [e, t]
     if rf.rx_on
         stop_rx(var air, var rf)
     hold(var air, var rf)
@@ -2824,7 +2946,8 @@ fn dtm_receive<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
     air.clear_packet()
 
 // One step of Direct Test Mode.
-fn dtm_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu) [e, t]
+fn dtm_slice<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
+                                        var rx: Pdu) [e, t]
     ctl_hci.ctl_set_time(var c, air.now_us())
     if c.dtm.fresh
         dtm_setup(var air, var c, var rf, var rx)
@@ -2847,7 +2970,11 @@ fn dtm_stop<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf) [e, t]
 // Run the Link Layer for one step.  A connection runs one event; advertising a
 // whole event, a PDU at a time as far as a connection event leaves room; scanning
 // or initiating a slice.  Nothing runs when none is on.
-fn ll_poll<R: Radio[e] + Timebase[t], P: LinkPolicy, C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf, var rx: Pdu, var policy: P, var cc: C) [e, t, k]
+pub fn ll_poll<R: Radio[e] + Timebase[t], P: LinkPolicy, C: Cipher[k]>(var air: R,
+                                                                       var c: Controller,
+                                                                       var rf: Rf, var rx: Pdu,
+                                                                       var policy: P,
+                                                                       var cc: C) [e, t, k]
     // A Controller told nothing of its radio learns the ramp-up from it now; an image that does it at start-up (`air_profile`)
     // has the budgets before the Host's first command.
     if not c.radio.known

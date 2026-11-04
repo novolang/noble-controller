@@ -1,0 +1,21 @@
+// tests/ll_policy_tests.nv — the unit tests of src/ll_policy.nv.
+//
+//   novo test tests/ll_policy_tests.nv
+
+use std.test
+use ll_policy.{ conn_request_new, default_link_policy }
+
+@test
+fn test_default_policy_takes_every_request()
+    var p = default_link_policy()
+    var r = conn_request_new()
+    test.assert(p.accept_connection(r))
+    test.assert(p.accept_connection(r))
+    test.assert_eq(p.asked, 2)
+
+@test
+fn test_a_request_starts_with_an_empty_address()
+    let r = conn_request_new()
+    test.assert_eq(r.peer.len(), 6)
+    test.assert_eq(r.peer[5] as Int, 0)
+    test.assert_eq(r.peer_type, 0)

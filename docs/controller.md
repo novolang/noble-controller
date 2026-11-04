@@ -57,9 +57,26 @@ The same names exist in `orbit/ble/configs/`, whose `[noble-controller]`
 sections equal these; the script `tests/orbit/test_ble_config_equals_limits.sh`
 checks the two.
 
+## The public surface
+
+A Host package and a chip image name 99 items of the package; they are `pub`, each with a doc comment, and every other item is
+private.  `novo doc` prints them.
+
+| Module | Public items |
+|---|---|
+| `ctl_hci` (57) | `Controller` and `controller_new`; the capability flags `CAP_ECB`, `CAP_RNG`, `CAP_LL`, `CAP_ECDH`; the Host's stream (`HostTx`, `ctl_rx`, `ctl_in_packet`, `ctl_tx_pending`, `ctl_tx_next`, `ctl_tx_drain`, `ctl_pool_free`, `ctl_flush_events`); the main loop (`ctl_step`, `ctl_set_time`, `ctl_set_room`, `ctl_ll_room`, `ctl_ll_book`); the judgement of a received PDU in each state (`ctl_adv_rx`, `ctl_scan_rx`, `ctl_scan_decide`, `ctl_scan_note`, `ctl_init_decide`, `ctl_connect_ind` and the others); the work the chip owes (`ctl_entropy_*`, `ctl_async_*`, `ctl_ecdh_*`, `ctl_privacy_*`, `ctl_secure_*`, `ctl_big_*`) |
+| `ll_air` (5) | `ll_poll`, the radio program's entry, its state `Rf` with `rf_new` and `reset_window`, and `air_profile` |
+| `ll_policy` (3) | `LinkPolicy`, the product's say in taking a connection, `DefaultLinkPolicy` and `default_link_policy` |
+| `ll_privacy` (8), `ll_adv` (4), `ll_iso` (4), `ll_scan` (3), `ll_arb` (2), `ctl_pool` (2), `ll_big`, `ll_ccm`, `ll_link` (1 each) | the records and constants the glue reads, among them `rl_new` and `rl_add` of the resolving list and `soft_cipher_new` |
+| `ctl_limits` (6), `ll_per`, `ll_xadv` | the derived limits the images size their tables with (`cis_slots`, `big_slots`, `bis_slots`, `arb_classes`, `big_on`, `per_on`) and the aliases `PerData` and `AdvData` |
+
+The configuration module `noble_controller_config` is generated from the keys of `novo.toml`; a consumer reads its constants
+and sets them in its own config file.
+
 ## Tests
 
-Each module carries its unit tests.  `tests/` holds the suites that drive
+`tests/<module>_tests.nv` holds the unit tests of each module that has logic
+of its own, and `src/` ships none.  The other suites in `tests/` drive
 the whole Controller: `ctl_hci_tests` (the command layer), `ctl_ll_tests`,
 `ctl_conn_tests`, `ctl_central_tests`, `ctl_llcp_tests` and `ctl_enc_tests`
 (the connection, the Central role, the control procedures, encryption),

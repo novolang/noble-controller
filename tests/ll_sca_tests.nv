@@ -1,0 +1,20 @@
+// tests/ll_sca_tests.nv — the unit tests of src/ll_sca.nv.
+//
+//   novo test tests/ll_sca_tests.nv
+
+use std.test
+use ll_sca.{ class_ok, peer_lacks }
+
+@test
+fn test_classes_are_zero_to_seven()
+    test.assert(class_ok(0))
+    test.assert(class_ok(7))
+    test.assert(not class_ok(8))
+    test.assert(not class_ok(-1))
+
+@test
+fn test_feature_26_is_bit_2_of_octet_3()
+    test.assert(peer_lacks(0))
+    test.assert(peer_lacks(0xFB))
+    test.assert(not peer_lacks(0x04))
+    test.assert(not peer_lacks(0xF4))

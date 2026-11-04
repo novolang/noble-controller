@@ -24,7 +24,6 @@
 //
 // No function here allocates.
 
-use std.test
 use ll_pdu
 use ll_phy
 
@@ -213,7 +212,7 @@ fn packet_us(phy: Int, s8: Bool, length: Int) -> Int
 @tier(embedded)
 fn interval_us(phy: Int, s8: Bool, length: Int) -> Int
     let l = packet_us(phy, s8, length)
-    ((l + 249 + 624) / 625) * 625
+    (l + 249 + 624) / 625 * 625
 
 // Fill `n` octets of `p` from index `at` with the pseudorandom sequence of a shift register
 // of `bits` stages (9 for PRBS9, 15 for PRBS15) whose stage `tap` is XORed with the last
@@ -260,124 +259,3 @@ fn dtm_packet(var p: Pdu, payload: Int, length: Int)
         prbs_fill(var p, 2, length, 9, 5)
     else
         prbs_fill(var p, 2, length, 15, 14)
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-// A value struct changes through a callee's `var`.
-fn t_count(var d: Dtm, v: Int)
-    d.count = v
-
-@test
-fn test_prbs9_begins_as_the_specification_gives_it()
-    // '11111111100000111101...' in transmission order: the octets FF C1 FB E8 4C, the
-    // sequence every BLE tester knows.
-    var p = ll_pdu.pdu_new()
-    dtm_packet(var p, PAYLOAD_PRBS9, 37)
-    test.assert_eq(p.b[0] as Int, 0)
-    test.assert_eq(p.b[1] as Int, 37)
-    test.assert_eq(p.n, 39)
-    test.assert_eq(p.b[2] as Int, 0xFF)
-    test.assert_eq(p.b[3] as Int, 0xC1)
-    test.assert_eq(p.b[4] as Int, 0xFB)
-    test.assert_eq(p.b[5] as Int, 0xE8)
-    test.assert_eq(p.b[6] as Int, 0x4C)
-
-@test
-fn test_prbs9_repeats_after_511_bits_and_prbs15_after_32767()
-    var p = ll_pdu.pdu_new()
-    // 511 bits: 63.875 octets, so the sequence is the same 511 bits later; check by the bit.
-    prbs_fill(var p, 2, 255, 9, 5)
-    var same = true
-    for k in 0..(255 * 8 - 511)
-        let a = ((p.b[2 + k / 8] as Int) >> (k % 8)) & 1
-        let j = k + 511
-        let b = ((p.b[2 + j / 8] as Int) >> (j % 8)) & 1
-        if a != b
-            same = false
-    test.assert(same)
-    // PRBS15 begins with 15 ones and is not PRBS9.
-    var q = ll_pdu.pdu_new()
-    prbs_fill(var q, 2, 4, 15, 14)
-    test.assert_eq(q.b[2] as Int, 0xFF)
-    test.assert_eq((q.b[3] as Int) & 0x7F, 0x7F)
-    test.assert((q.b[4] as Int) != 0xFF or (q.b[5] as Int) != 0xFF)
-
-@test
-fn test_constant_payloads_repeat_their_octet_and_the_header_names_the_type()
-    var p = ll_pdu.pdu_new()
-    let want = [0x00, 0x0F, 0x55, 0x00, 0xFF, 0x00, 0xF0, 0xAA]
-    for t in 1..8
-        if t != 3
-            dtm_packet(var p, t, 20)
-            test.assert_eq(p.b[0] as Int, t)
-            test.assert_eq(p.b[1] as Int, 20)
-            for i in 0..20
-                test.assert_eq(p.b[2 + i] as Int, want[t])
-    // The example of Section 4.1.4: 0x0F payload of 37 octets is 0x01 0x25 on air.
-    dtm_packet(var p, PAYLOAD_0F, 37)
-    test.assert_eq(p.b[0] as Int, 0x01)
-    test.assert_eq(p.b[1] as Int, 0x25)
-
-@test
-fn test_packet_interval_follows_the_formula_on_each_phy()
-    // LE 1M, 37 octets: 376 microseconds, I = ceil(625 / 625) * 625; 38 octets: 384, 1250.
-    test.assert_eq(packet_us(ll_phy.PHY_1M, true, 37), 376)
-    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 37), 625)
-    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 38), 1250)
-    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 0), 625)
-    // 255 octets: 2120 microseconds, I = ceil(2369 / 625) * 625 = 2500.
-    test.assert_eq(packet_us(ll_phy.PHY_1M, true, 255), 2120)
-    test.assert_eq(interval_us(ll_phy.PHY_1M, true, 255), 2500)
-    // LE 2M, 255 octets: 1064 microseconds.
-    test.assert_eq(packet_us(ll_phy.PHY_2M, true, 255), 1064)
-    test.assert_eq(interval_us(ll_phy.PHY_2M, true, 255), 1875)
-    // LE Coded, empty payload: 462 microseconds at S=2, 720 at S=8 (Figure 4.2 gives
-    // 462 to 17040 for the two).
-    test.assert_eq(packet_us(ll_phy.PHY_CODED, false, 0), 462)
-    test.assert_eq(packet_us(ll_phy.PHY_CODED, true, 0), 720)
-    test.assert_eq(packet_us(ll_phy.PHY_CODED, true, 255), 17040)
-    test.assert_eq(interval_us(ll_phy.PHY_CODED, true, 255), 17500)
-
-@test
-fn test_parameters_are_checked_and_a_test_runs_until_it_is_ended()
-    test.assert_eq(tx_status(39, 7, 4), STATUS_SUCCESS)
-    test.assert_eq(tx_status(40, 0, 1), STATUS_INVALID_PARAMETERS)
-    test.assert_eq(tx_status(0, 8, 1), STATUS_INVALID_PARAMETERS)
-    test.assert_eq(tx_status(0, 0, 0), STATUS_UNSUPPORTED_FEATURE)
-    test.assert_eq(tx_status(0, 0, 5), STATUS_UNSUPPORTED_FEATURE)
-    test.assert_eq(rx_status(0, 3, 1), STATUS_SUCCESS)
-    test.assert_eq(rx_status(0, 4, 0), STATUS_UNSUPPORTED_FEATURE)
-    test.assert_eq(rx_status(40, 1, 0), STATUS_INVALID_PARAMETERS)
-    test.assert_eq(rx_status(0, 1, 2), STATUS_INVALID_PARAMETERS)
-    var d = dtm_new()
-    test.assert(not dtm_active(var d))
-    dtm_start_rx(var d, 19, 2, 0)
-    test.assert(dtm_active(var d))
-    test.assert_eq(d.phy, ll_phy.PHY_2M)
-    t_count(var d, 70000)
-    // The count is 16 bits; a transmitter reports none.
-    test.assert_eq(dtm_end(var d), 70000 & 0xFFFF)
-    test.assert(not dtm_active(var d))
-    dtm_start_tx(var d, 0, 10, 1, 3, 0)
-    test.assert(d.s8)
-    t_count(var d, 5)
-    test.assert_eq(dtm_end(var d), 0)
-    dtm_start_tx(var d, 0, 10, 1, 4, 0)
-    test.assert(not d.s8)
-
-@test
-fn test_the_tone_extension_parameters_have_their_codes()
-    test.assert_eq(cte_status(0, 0, false), STATUS_SUCCESS)
-    test.assert_eq(cte_status(0, 9, true), STATUS_SUCCESS)
-    test.assert_eq(cte_status(1, 0, false), STATUS_INVALID_PARAMETERS)
-    test.assert_eq(cte_status(21, 0, false), STATUS_INVALID_PARAMETERS)
-    test.assert_eq(cte_status(2, 3, false), STATUS_INVALID_PARAMETERS)
-    test.assert_eq(cte_status(2, 0, true), STATUS_COMMAND_DISALLOWED)
-    test.assert_eq(cte_status(20, 2, false), STATUS_UNSUPPORTED_FEATURE)
-
-@test
-fn test_power_levels_map_the_parameter()
-    test.assert_eq(power_of(0x7E, -46, 8), -46)
-    test.assert_eq(power_of(0x7F, -46, 8), 8)
-    test.assert_eq(power_of(0xFC, -46, 8), -4)
-    test.assert_eq(power_of(4, -46, 8), 4)

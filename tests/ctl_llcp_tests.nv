@@ -39,7 +39,7 @@ fn host_read(var c: ctl_hci.Controller, var log: [Int])
 // Run a command and keep what came back in `log`; the answer is that alone.
 fn cmd(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> [Int]
     var out: [Int] = []
-    send(c, opcode, params)
+    send(var c, opcode, params)
     host_read(var c, var out)
     for b in out
         list.push(log, b)
@@ -51,10 +51,7 @@ fn packets_of(bytes: [Int]) -> [[Int]]
     var i = 0
     while i < list.len(bytes)
         let n = 3 + bytes[i + 2]
-        var e: [Int] = []
-        for k in 0..n
-            list.push(e, bytes[i + k])
-        list.push(out, e)
+        list.push(out, bytes[i:i + n])
         i = i + n
     out
 
@@ -74,7 +71,7 @@ fn meta_events(bytes: [Int], sub: Int) -> [[Int]]
 
 // The status of the Command Status event of a command.
 fn status_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> Int
-    let r = cmd(c, log, opcode, params)
+    let r = cmd(var c, var log, opcode, params)
     let st = events_coded(r, 0x0F)
     test.assert_eq(list.len(st), 1)
     test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
@@ -82,7 +79,7 @@ fn status_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [In
 
 // The status of the Command Complete event of a command.
 fn complete_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> Int
-    let r = cmd(c, log, opcode, params)
+    let r = cmd(var c, var log, opcode, params)
     let done = events_coded(r, 0x0E)
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
@@ -149,7 +146,7 @@ fn conn_req(aa: Int, interval: Int, latency: Int, timeout: Int, chsel: Bool) -> 
     var p = ll_pdu.pdu_new()
     ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 0, 0)
     if chsel
-        p.b[0] = ((p.b[0] as Int) | ll_pdu.CHSEL) as u8
+        p.b[0] = (p.b[0] as Int | ll_pdu.CHSEL) as u8
     for i in 0..6
         let _a = ll_pdu.pdu_put(var p, 0xA0 + i)
     for i in 0..6
@@ -168,7 +165,8 @@ fn conn_req(aa: Int, interval: Int, latency: Int, timeout: Int, chsel: Bool) -> 
 
 // A connection between the two Controllers, the first anchor 1.25 ms after the end
 // of the CONNECT_IND at 1000.
-fn world_with(aa: Int, interval: Int, latency: Int, timeout: Int, chsel: Bool, le_mask: Int) -> World
+fn world_with(aa: Int, interval: Int, latency: Int, timeout: Int, chsel: Bool,
+              le_mask: Int) -> World
     var a = host_ctl(0xA0, le_mask)
     var b = host_ctl(0xB0, le_mask)
     var req = conn_req(aa, interval, latency, timeout, chsel)
@@ -254,7 +252,7 @@ fn event(var w: World, mute: Bool)
             // The Central answers a termination of the Peripheral with one more
             // packet, which is the acknowledgement.
             let peer_ends = ll_data.dpdu_llid(var reply) == ll_data.LLID_CONTROL and ll_data.dpdu_opcode(var reply) == ll_data.OP_TERMINATE_IND
-            open = (w.a.links[0].cont and not w.a.links[0].closing and not w.b.links[0].closing) or (peer_ends and not w.b.links[0].closing)
+            open = w.a.links[0].cont and not w.a.links[0].closing and not w.b.links[0].closing or peer_ends and not w.b.links[0].closing
             tx = next
             hdr = nh
     ctl_hci.ctl_conn_done(var w.a, 0, t)
@@ -266,7 +264,7 @@ fn event(var w: World, mute: Bool)
 
 fn events(var w: World, n: Int)
     for _ in 0..n
-        event(w, false)
+        event(var w, false)
 
 // How many events of `log` of LL Control PDUs sent by an end have the opcode.
 fn sent(ops: [Int], op: Int) -> Int
@@ -277,7 +275,7 @@ fn sent(ops: [Int], op: Int) -> Int
     n
 
 fn ch_map_of(var c: ctl_hci.Controller, var log: [Int]) -> Int
-    let r = cmd(c, log, 0x2015, le16(1))
+    let r = cmd(var c, var log, 0x2015, le16(1))
     let done = events_coded(r, 0x0E)
     var map = 0
     for k in 0..5
@@ -315,7 +313,7 @@ fn set_request_owed(var l: ll_link.Link)
 fn test_the_central_updates_the_connection_at_its_instant()
     var w = world()
     events(var w, 4)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
     // Six events of the Peripheral's listening and four more of margin.
     test.assert_eq(w.a.links[0].upd_instant, 4 + 6 + 4)
     test.assert_eq(w.a.links[0].upd_interval, 48)
@@ -353,7 +351,7 @@ fn test_the_central_updates_the_connection_at_its_instant()
 fn test_a_central_update_picks_the_longest_interval_of_the_range()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(20, 40, 2, 800)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(20, 40, 2, 800)), 0)
     test.assert_eq(w.a.links[0].upd_interval, 40)
     events(var w, 14)
     test.assert_eq(w.b.links[0].interval, 40)
@@ -363,7 +361,7 @@ fn test_a_central_update_picks_the_longest_interval_of_the_range()
 fn test_an_update_that_changes_nothing_still_answers_the_host_that_asked()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(24, 24, 0, 400)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(24, 24, 0, 400)), 0)
     events(var w, 14)
     // The Central's Host asked, so it hears; the Peripheral's Host sees no change.
     test.assert_eq(list.len(updates(w.ha)), 1)
@@ -374,7 +372,7 @@ fn test_an_update_that_changes_nothing_still_answers_the_host_that_asked()
 fn test_the_peripheral_asks_and_the_central_host_accepts()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
     test.assert_eq(w.b.links[0].proc, ll_link.PROC_PARAM)
     events(var w, 4)
     // The Central's Host is asked, with the values of the request.
@@ -388,7 +386,7 @@ fn test_the_peripheral_asks_and_the_central_host_accepts()
     test.assert(w.a.links[0].rq_wait)
     test.assert(not w.a.links[0].upd_pending)
     // The Host accepts: the update follows and both Hosts hear it.
-    let r = cmd(w.a, w.ha, 0x2020, update_params(48, 48, 0, 600))
+    let r = cmd(var w.a, var w.ha, 0x2020, update_params(48, 48, 0, 600))
     let done = events_coded(r, 0x0E)
     test.assert_eq(done[0][6], 0)
     test.assert_eq(done[0][7] | (done[0][8] << 8), 1)
@@ -406,10 +404,10 @@ fn test_the_peripheral_asks_and_the_central_host_accepts()
 fn test_the_central_host_refuses_and_the_peripheral_hears_why()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var w, 4)
     test.assert_eq(list.len(requests(w.ha)), 1)
-    let r = cmd(w.a, w.ha, 0x2021, [1, 0, 0x3B])
+    let r = cmd(var w.a, var w.ha, 0x2021, [1, 0, 0x3B])
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0)
     events(var w, 4)
     test.assert_eq(sent(w.ops_a, 0x11), 1)
@@ -418,14 +416,14 @@ fn test_the_central_host_refuses_and_the_peripheral_hears_why()
     test.assert_eq(updates(w.hb)[0][4], 0x3B)
     // Nothing changed and a new request can be made.
     test.assert_eq(w.b.links[0].interval, 24)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
 
 @test
 fn test_a_request_inside_the_range_the_host_gave_needs_no_asking()
     var w = world()
     ll_link.link_host_range(var w.a.links[0], 20, 60, 2, 400)
     events(var w, 2)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(30, 80, 0, 400)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(30, 80, 0, 400)), 0)
     events(var w, 20)
     // The Host was not asked, and the interval is the most the two ranges share.
     test.assert_eq(list.len(requests(w.ha)), 0)
@@ -438,7 +436,7 @@ fn test_a_request_outside_the_range_is_refused_when_the_event_is_masked()
     var w = world_with(0x50655A12, 24, 0, 400, false, 0x1F)
     ll_link.link_host_range(var w.a.links[0], 20, 30, 0, 400)
     events(var w, 2)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var w, 6)
     test.assert_eq(list.len(requests(w.ha)), 0)
     test.assert_eq(sent(w.ops_a, 0x11), 1)
@@ -470,7 +468,7 @@ fn test_a_peripheral_host_answers_a_request_of_its_central()
     events(var w, 4)
     test.assert_eq(list.len(requests(w.hb)), 1)
     test.assert_eq(w.b.links[0].rq_wait, true)
-    let r = cmd(w.b, w.hb, 0x2020, update_params(40, 50, 0, 500))
+    let r = cmd(var w.b, var w.hb, 0x2020, update_params(40, 50, 0, 500))
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0)
     events(var w, 4)
     // The Peripheral answers with LL_CONNECTION_PARAM_RSP, which the Central takes
@@ -485,8 +483,8 @@ fn test_a_peripheral_host_answers_a_request_of_its_central()
 fn test_a_request_that_crosses_the_centrals_update_is_refused_as_a_collision()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(60, 60, 0, 700)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(60, 60, 0, 700)), 0)
     events(var w, 20)
     // The Central refuses the request with LL Procedure Collision, and goes on
     // with its own update, which the Peripheral takes as the answer to its request.
@@ -504,7 +502,7 @@ fn test_a_request_that_crosses_the_centrals_channel_map_is_refused_as_a_differen
     test.assert_eq(complete_of(var w.a, var w.ha, 0x2014, [0xFF, 0x03, 0, 0, 0]), 0)
     events(var w, 1)
     test.assert(w.a.links[0].chm_pending)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var w, 20)
     // The request is refused with Different Transaction Collision; the Peripheral
     // takes the map and its Host hears the reason.
@@ -521,8 +519,8 @@ fn test_two_procedures_with_an_instant_do_not_start_together()
     events(var w, 2)
     // An update in progress holds off another update, and a channel map waits for
     // its instant.
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(60, 60, 0, 600)), 0x0C)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(60, 60, 0, 600)), 0x0C)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x2014, [0xFF, 0x03, 0, 0, 0]), 0)
     events(var w, 1)
     test.assert(not w.a.links[0].chm_pending)
@@ -538,12 +536,12 @@ fn test_two_procedures_with_an_instant_do_not_start_together()
     // its instant has passed.
     var v = world()
     events(var v, 2)
-    test.assert_eq(status_of(v.a, v.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var v.a, var v.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var v, 4)
     test.assert(v.b.links[0].upd_pending)
-    test.assert_eq(status_of(v.b, v.hb, 0x2013, update_params(60, 60, 0, 700)), 0x0C)
+    test.assert_eq(status_of(var v.b, var v.hb, 0x2013, update_params(60, 60, 0, 700)), 0x0C)
     events(var v, 12)
-    test.assert_eq(status_of(v.b, v.hb, 0x2013, update_params(60, 60, 0, 700)), 0)
+    test.assert_eq(status_of(var v.b, var v.hb, 0x2013, update_params(60, 60, 0, 700)), 0)
 
 // ── Channel Map Update, minimum used channels, channel selection ────
 
@@ -623,7 +621,7 @@ fn test_both_ends_follow_the_sequence_of_algorithm_2_across_a_map_update()
 fn test_the_central_reads_the_peripherals_features()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2016, le16(1)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2016, le16(1)), 0)
     events(var w, 4)
     let ev = meta_events(w.ha, 0x04)
     test.assert_eq(list.len(ev), 1)
@@ -634,7 +632,7 @@ fn test_the_central_reads_the_peripherals_features()
     test.assert_eq(sent(w.ops_a, 0x08), 1)
     test.assert_eq(sent(w.ops_b, 0x09), 1)
     // Read again, the answer is at once from what is known.
-    test.assert_eq(status_of(w.a, w.ha, 0x2016, le16(1)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2016, le16(1)), 0)
     host_read(var w.a, var w.ha)
     test.assert_eq(list.len(meta_events(w.ha, 0x04)), 2)
     test.assert_eq(sent(w.ops_a, 0x08), 1)
@@ -643,8 +641,8 @@ fn test_the_central_reads_the_peripherals_features()
 fn test_the_peripheral_reads_the_centrals_features_and_both_may_ask_at_once()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.b, w.hb, 0x2016, le16(1)), 0)
-    test.assert_eq(status_of(w.a, w.ha, 0x2016, le16(1)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2016, le16(1)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2016, le16(1)), 0)
     events(var w, 6)
     test.assert_eq(list.len(meta_events(w.hb, 0x04)), 1)
     test.assert_eq(list.len(meta_events(w.ha, 0x04)), 1)
@@ -659,8 +657,8 @@ fn test_the_peripheral_reads_the_centrals_features_and_both_may_ask_at_once()
 fn test_each_end_sends_one_version_whoever_begins_and_both_hosts_hear()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x041D, le16(1)), 0)
-    test.assert_eq(status_of(w.b, w.hb, 0x041D, le16(1)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x041D, le16(1)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x041D, le16(1)), 0)
     events(var w, 6)
     test.assert_eq(sent(w.ops_a, 0x0C), 1)
     test.assert_eq(sent(w.ops_b, 0x0C), 1)
@@ -677,7 +675,7 @@ fn test_each_end_sends_one_version_whoever_begins_and_both_hosts_hear()
 fn test_the_central_ends_the_connection_and_both_hosts_hear_the_reasons()
     var w = world()
     events(var w, 3)
-    test.assert_eq(status_of(w.a, w.ha, 0x0406, [1, 0, 0x13]), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x0406, [1, 0, 0x13]), 0)
     events(var w, 6)
     let da = events_coded(w.ha, 0x05)
     let db = events_coded(w.hb, 0x05)
@@ -694,7 +692,7 @@ fn test_the_central_ends_the_connection_and_both_hosts_hear_the_reasons()
 fn test_the_peripheral_ends_the_connection_and_the_central_acknowledges_it()
     var w = world()
     events(var w, 3)
-    test.assert_eq(status_of(w.b, w.hb, 0x0406, [1, 0, 0x15]), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x0406, [1, 0, 0x15]), 0)
     events(var w, 6)
     test.assert_eq(events_coded(w.hb, 0x05)[0][6], 0x16)
     test.assert_eq(events_coded(w.ha, 0x05)[0][6], 0x15)
@@ -704,8 +702,8 @@ fn test_the_peripheral_ends_the_connection_and_the_central_acknowledges_it()
 fn test_both_ends_ending_the_connection_at_once_end_it_once_each()
     var w = world()
     events(var w, 3)
-    test.assert_eq(status_of(w.a, w.ha, 0x0406, [1, 0, 0x13]), 0)
-    test.assert_eq(status_of(w.b, w.hb, 0x0406, [1, 0, 0x13]), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x0406, [1, 0, 0x13]), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x0406, [1, 0, 0x13]), 0)
     events(var w, 8)
     test.assert_eq(list.len(events_coded(w.ha, 0x05)), 1)
     test.assert_eq(list.len(events_coded(w.hb, 0x05)), 1)
@@ -716,10 +714,10 @@ fn test_a_termination_nobody_answers_ends_when_the_timer_runs_out()
     var w = world()
     events(var w, 3)
     let t_cmd = w.a.links[0].now
-    test.assert_eq(status_of(w.a, w.ha, 0x0406, [1, 0, 0x13]), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x0406, [1, 0, 0x13]), 0)
     var guard = 0
     while ctl_hci.ctl_conn_active(var w.a, 0) and guard < 400
-        event(w, true)
+        event(var w, true)
         guard = guard + 1
     test.assert(not ctl_hci.ctl_conn_active(var w.a, 0))
     let d = events_coded(w.ha, 0x05)
@@ -739,7 +737,7 @@ fn test_the_supervision_timeout_fires_at_the_configured_time()
     let heard = w.a.links[0].last_rx
     var guard = 0
     while ctl_hci.ctl_conn_active(var w.a, 0) and guard < 400
-        event(w, true)
+        event(var w, true)
         guard = guard + 1
     test.assert_eq(events_coded(w.ha, 0x05)[0][6], 0x08)
     test.assert(heard > 0)
@@ -752,13 +750,13 @@ fn test_the_supervision_timeout_fires_at_the_configured_time()
 fn test_the_new_timeout_of_an_update_applies_from_its_instant()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(24, 24, 0, 800)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(24, 24, 0, 800)), 0)
     events(var w, 14)
     test.assert_eq(w.a.links[0].timeout, 800)
     let heard = w.a.links[0].last_rx
     var guard = 0
     while ctl_hci.ctl_conn_active(var w.a, 0) and guard < 600
-        event(w, true)
+        event(var w, true)
         guard = guard + 1
     let last = list.len(w.ends) - 1
     test.assert(w.ends[last] - heard > 8000000)
@@ -786,10 +784,10 @@ fn test_a_peripheral_that_hears_nothing_loses_the_connection_at_the_timeout()
 fn test_an_update_that_reaches_the_peripheral_after_its_instant_ends_the_connection()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
     // The Peripheral hears nothing for 13 events, so the instant of 12 goes by.
     for _ in 0..13
-        event(w, true)
+        event(var w, true)
     events(var w, 3)
     test.assert(not ctl_hci.ctl_conn_active(var w.b, 0))
     let d = events_coded(w.hb, 0x05)
@@ -803,21 +801,21 @@ fn test_the_authenticated_payload_timeout_is_written_read_and_checked()
     var w = world()
     events(var w, 2)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x0C7C, [1, 0, 100, 0]), 0)
-    let r = cmd(w.a, w.ha, 0x0C7B, [1, 0])
+    let r = cmd(var w.a, var w.ha, 0x0C7B, [1, 0])
     let done = events_coded(r, 0x0E)
     test.assert_eq(done[0][6], 0)
     test.assert_eq(done[0][7] | (done[0][8] << 8), 1)
     test.assert_eq(done[0][9] | (done[0][10] << 8), 100)
     // The default is 30 s; less than one interval, zero and an unknown handle are
     // refused.
-    let d = cmd(w.b, w.hb, 0x0C7B, [1, 0])
+    let d = cmd(var w.b, var w.hb, 0x0C7B, [1, 0])
     let e0 = events_coded(d, 0x0E)[0]
     test.assert_eq(e0[9] | (e0[10] << 8), 3000)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x0C7C, [1, 0, 2, 0]), 0x12)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x0C7C, [1, 0, 0, 0]), 0x12)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x0C7C, [5, 0, 100, 0]), 0x02)
     test.assert_eq(complete_of(var w.b, var w.hb, 0x0C7C, [1, 0, 100, 0]), 0)
-    let e = cmd(w.a, w.ha, 0x0C7B, [5, 0])
+    let e = cmd(var w.a, var w.ha, 0x0C7B, [5, 0])
     test.assert_eq(events_coded(e, 0x0E)[0][6], 0x02)
 
 @test
@@ -861,19 +859,19 @@ fn test_the_expiry_event_stays_unsent_when_the_host_masked_it()
 fn test_le_connection_update_answers_the_statuses_the_command_names()
     var w = world()
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, [5, 0, 24, 0, 24, 0, 0, 0, 100, 0, 0, 0, 0, 0]), 0x02)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(60, 40, 0, 400)), 0x12)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(24, 24, 500, 3200)), 0x12)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(24, 24, 0, 5)), 0x12)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, [5, 0, 24, 0, 24, 0, 0, 0, 100, 0, 0, 0, 0, 0]), 0x02)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(60, 40, 0, 400)), 0x12)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(24, 24, 500, 3200)), 0x12)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(24, 24, 0, 5)), 0x12)
     var ce = update_params(24, 24, 0, 400)
     ce[10] = 5
     ce[12] = 4
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, ce), 0x12)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, ce), 0x12)
     // A command of the wrong length.
-    let r = cmd(w.a, w.ha, 0x2013, [1, 0])
+    let r = cmd(var w.a, var w.ha, 0x2013, [1, 0])
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0x0C)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0x0C)
 
 @test
 fn test_a_peripheral_update_is_refused_for_a_peer_without_the_procedure()
@@ -881,15 +879,15 @@ fn test_a_peripheral_update_is_refused_for_a_peer_without_the_procedure()
     events(var w, 2)
     // Known from the exchange of features.
     set_features(var w.b.links[0], 0x00)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0x1A)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0x1A)
     set_features(var w.b.links[0], 0x02)
     // One procedure at a time on the Peripheral.
-    test.assert_eq(status_of(w.b, w.hb, 0x041D, le16(1)), 0)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0x0C)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x041D, le16(1)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0x0C)
     events(var w, 4)
     // The peer that answered LL_UNKNOWN_RSP to the request is remembered.
     set_cpr_no(var w.b.links[0])
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0x1A)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0x1A)
 
 @test
 fn test_the_replies_to_a_parameter_request_need_a_request_and_a_connection()
@@ -899,7 +897,7 @@ fn test_the_replies_to_a_parameter_request_need_a_request_and_a_connection()
     test.assert_eq(complete_of(var w.a, var w.ha, 0x2021, [1, 0, 0x3B]), 0x0C)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x2020, [5, 0, 48, 0, 48, 0, 0, 0, 88, 2, 0, 0, 0, 0]), 0x02)
     test.assert_eq(complete_of(var w.a, var w.ha, 0x2021, [5, 0, 0x3B]), 0x02)
-    test.assert_eq(status_of(w.b, w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.b, var w.hb, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var w, 4)
     test.assert(w.a.links[0].rq_wait)
     // Values out of range are refused and the request stays for the Host.
@@ -927,12 +925,12 @@ fn test_a_request_whose_event_the_host_masked_meanwhile_is_refused_for_the_peer(
 fn test_the_controller_reports_its_features_and_commands()
     var c = host_ctl(0xA0, 0x3F)
     var trace: [Int] = []
-    let f = events_coded(cmd(c, trace, 0x2003, []), 0x0E)[0]
+    let f = events_coded(cmd(var c, var trace, 0x2003, []), 0x0E)[0]
     test.assert_eq(f[6], 0)
     test.assert_eq(f[7], 0x7F)
     test.assert_eq(f[8], ctl_limits.features_octet1())
     test.assert_eq(f[9], 0x01)
-    let s = events_coded(cmd(c, trace, 0x1002, []), 0x0E)[0]
+    let s = events_coded(cmd(var c, var trace, 0x1002, []), 0x0E)[0]
     // The octets of Supported_Commands start at index 7.
     test.assert_eq((s[7 + 22] >>> 2) & 1, 1)
     test.assert_eq((s[7 + 27] >>> 2) & 1, 1)
@@ -960,10 +958,10 @@ fn test_the_commands_of_the_procedures_reach_the_link_of_their_handle()
     ll_link.link_open(var c.links[0], 1, var req, 1000)
     ll_link.link_open_central(var c.links[1], 2, var req, 1000)
     host_read(var c, var trace)
-    test.assert_eq(status_of(c, trace, 0x2013, update_params_for(2, 48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var c, var trace, 0x2013, update_params_for(2, 48, 48, 0, 600)), 0)
     test.assert_eq(c.links[1].proc, ll_link.PROC_PARAM)
     test.assert_eq(c.links[0].proc, ll_link.PROC_NONE)
-    test.assert_eq(status_of(c, trace, 0x2013, update_params_for(1, 48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var c, var trace, 0x2013, update_params_for(1, 48, 48, 0, 600)), 0)
     test.assert_eq(c.links[0].proc, ll_link.PROC_PARAM)
     // The replies name the link that was asked.
     var d = host_ctl(0xA0, 0x3F)
@@ -984,9 +982,9 @@ fn test_the_commands_of_the_procedures_reach_the_link_of_their_handle()
     // The authenticated payload timeout of each link, and the classification of the
     // Central's.
     test.assert_eq(complete_of(var c, var trace, 0x0C7C, [2, 0, 77, 0]), 0)
-    let r = events_coded(cmd(c, trace, 0x0C7B, [2, 0]), 0x0E)[0]
+    let r = events_coded(cmd(var c, var trace, 0x0C7B, [2, 0]), 0x0E)[0]
     test.assert_eq(r[9] | (r[10] << 8), 77)
-    let q = events_coded(cmd(c, trace, 0x0C7B, [1, 0]), 0x0E)[0]
+    let q = events_coded(cmd(var c, var trace, 0x0C7B, [1, 0]), 0x0E)[0]
     test.assert_eq(q[9] | (q[10] << 8), 3000)
     test.assert_eq(complete_of(var c, var trace, 0x0C7C, [1, 0, 88, 0]), 0)
     test.assert_eq(complete_of(var c, var trace, 0x2014, [0xFF, 0x03, 0, 0, 0]), 0)
@@ -998,7 +996,7 @@ fn test_an_update_the_host_masked_the_event_of_is_still_consumed()
     // The LE event mask lacks LE Connection Update Complete (subevent 3).
     var w = world_with(0x50655A12, 24, 0, 400, false, 0x1B)
     events(var w, 2)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var w, 14)
     test.assert_eq(w.b.links[0].interval, 48)
     test.assert_eq(list.len(updates(w.ha)), 0)
@@ -1051,7 +1049,7 @@ fn test_the_central_updates_through_the_connection_parameters_request()
     var w = world_with(0x50655A12, 24, 0, 400, false, 0x1F)
     clear_cpr_no(var w.a.links[0])
     events(var w, 4)
-    test.assert_eq(status_of(w.a, w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2013, update_params(48, 48, 0, 600)), 0)
     events(var w, 30)
     // LL_CONNECTION_PARAM_REQ, LL_CONNECTION_PARAM_RSP, then LL_CONNECTION_UPDATE_IND.
     test.assert_eq(sent(w.ops_a, 0x0F), 1)
@@ -1064,4 +1062,3 @@ fn test_the_central_updates_through_the_connection_parameters_request()
     // The Central's Host hears of it once, with the parameters in force.
     test.assert_eq(list.len(updates(w.ha)), 1)
     test.assert_eq(updates(w.ha)[0][4], 0)
-

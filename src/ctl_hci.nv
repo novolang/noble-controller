@@ -44,7 +44,6 @@
 
 use noble_controller_config
 use ctl_limits
-use std.test
 use hci_frame
 use ctl_pool
 use h4_rx
@@ -69,7 +68,6 @@ use ll_per
 use ll_past
 use ll_pcl
 use ll_ploss
-use ll_sca
 use ll_sub
 use ll_rate
 use ll_fs
@@ -80,7 +78,10 @@ use ll_cmac
 
 // A table of an absent feature keeps one record: a `Vec` holds at least one element.
 const fn max1(n: Int) -> Int
-    if n > 1 then n else 1
+    if n > 1
+        n
+    else
+        1
 
 // The functions below take the Controller as a `var` parameter even where they only read
 // it, which passes its address.  A plain parameter is a copy, and a copy of a
@@ -335,10 +336,13 @@ const HW_ERROR_STREAM_LOST = 0x01
 
 // What the hardware under the Controller can do, `caps` of `controller_new`.
 // A command that needs one that is absent is not answered.
-const CAP_ECB = 1
-const CAP_RNG = 2
-const CAP_LL = 4
-const CAP_ECDH = 8
+pub const CAP_ECB = 1
+// The hardware has a random number generator.
+pub const CAP_RNG = 2
+// The Controller has a Link Layer, which the commands that start or read an activity need.
+pub const CAP_LL = 4
+// The hardware has a P-256 ECDH engine.
+pub const CAP_ECDH = 8
 
 // The transmit power the radio is set to for advertising channel PDUs, in
 // dBm, and the range the part supports (LE Read Transmit Power).
@@ -382,8 +386,10 @@ const ADV_EVENT_BOOK_US = 6000
 // The Controller's own work in flight for a command that needs the
 // hardware, `pending`.
 const PEND_NONE = 0
-const PEND_ENCRYPT = 1
-const PEND_RAND = 2
+// The work in flight is LE Encrypt, which waits for the cipher.
+pub const PEND_ENCRYPT = 1
+// The work in flight is LE Rand, which waits for the random number generator.
+pub const PEND_RAND = 2
 
 // The event mask a Reset restores: bits 0 to 44 set ([Vol 4] Part E,
 // Section 6.1).
@@ -435,7 +441,7 @@ const LE_MASK_DEFAULT = 0x1F
 // from the keys `ctl_cis` and `ctl_cigs`.  `host_iso` is the Connected Isochronous Stream (Host Support) feature
 // bit the Host set and `iso_dropped` the ISO Data packets the Host sent that found no room or path.  The CIS
 // procedures build their PDUs in the `tmp` of the link they go out on.
-@value
+pub @value
 struct Controller
     rx: H4Rx
     pool: PacketPool
@@ -556,7 +562,7 @@ struct Controller
 
 // A Controller in its power-on state, for hardware with the capabilities
 // `caps`.  The public address is zero until `ctl_set_public` gives it.
-@tier(embedded)
+pub @tier(embedded)
 fn controller_new(caps: Int) -> Controller
     var c = Controller {
         rx: h4_rx.h4_new(), pool: ctl_pool.pool_new(), caps: caps as u8,
@@ -628,7 +634,7 @@ fn controller_new(caps: Int) -> Controller
     for _ in 0..FILTER_ACCEPT_LIST_SIZE
         let _c = c.fal_used.push(false)
         let _d = c.fal_type.push(0)
-    for _ in 0..(FILTER_ACCEPT_LIST_SIZE * 6)
+    for _ in 0..FILTER_ACCEPT_LIST_SIZE * 6
         let _e = c.fal_addr.push(0)
     for _ in 0..16
         let _f = c.block.push(0)
@@ -638,7 +644,7 @@ fn controller_new(caps: Int) -> Controller
     c
 
 // Octet `i` of the public device address, least significant first.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_set_public(var c: Controller, i: Int, v: Int)
     if i >= 0 and i < 6
         c.public[i] = (v & 0xFF) as u8
@@ -767,7 +773,7 @@ fn le_event_enabled(var c: Controller, sub: Int) -> Bool
 // first.
 @tier(embedded)
 fn param_u32(var c: Controller, at: Int) -> Int
-    (h4_rx.h4_param(var c.rx, at))
+    h4_rx.h4_param(var c.rx, at)
         | (h4_rx.h4_param(var c.rx, at + 1) << 8)
         | (h4_rx.h4_param(var c.rx, at + 2) << 16)
         | (h4_rx.h4_param(var c.rx, at + 3) << 24)
@@ -775,7 +781,7 @@ fn param_u32(var c: Controller, at: Int) -> Int
 // Two octets of the command's parameters from `at`, least significant first.
 @tier(embedded)
 fn param_u16(var c: Controller, at: Int) -> Int
-    (h4_rx.h4_param(var c.rx, at)) | (h4_rx.h4_param(var c.rx, at + 1) << 8)
+    h4_rx.h4_param(var c.rx, at) | (h4_rx.h4_param(var c.rx, at + 1) << 8)
 
 // ── Commands that are answered ──────────────────────────────────────
 
@@ -787,17 +793,17 @@ fn param_u16(var c: Controller, at: Int) -> Int
 @tier(embedded)
 fn command_bit_base(opcode: Int) -> Int
     match opcode
-        0x0406 => 0 * 8 + 5
-        0x041D => 2 * 8 + 7
-        0x0C01 => 5 * 8 + 6
-        0x0C03 => 5 * 8 + 7
-        0x0C2D => 10 * 8 + 2
-        0x0C31 => 10 * 8 + 5
-        0x0C33 => 10 * 8 + 6
-        0x0C35 => 10 * 8 + 7
-        0x0C63 => 22 * 8 + 2
-        0x0C7B => 32 * 8 + 4
-        0x0C7C => 32 * 8 + 5
+        0x406  => 0 * 8 + 5
+        0x41d  => 2 * 8 + 7
+        0xc01  => 5 * 8 + 6
+        0xc03  => 5 * 8 + 7
+        0xc2d  => 10 * 8 + 2
+        0xc31  => 10 * 8 + 5
+        0xc33  => 10 * 8 + 6
+        0xc35  => 10 * 8 + 7
+        0xc63  => 22 * 8 + 2
+        0xc7b  => 32 * 8 + 4
+        0xc7c  => 32 * 8 + 5
         0x1001 => 14 * 8 + 3
         0x1003 => 14 * 8 + 5
         0x1009 => 15 * 8 + 1
@@ -810,12 +816,12 @@ fn command_bit_base(opcode: Int) -> Int
         0x2007 => 25 * 8 + 6
         0x2008 => 25 * 8 + 7
         0x2009 => 26 * 8 + 0
-        0x200A => 26 * 8 + 1
-        0x200B => 26 * 8 + 2
-        0x200C => 26 * 8 + 3
-        0x200D => 26 * 8 + 4
-        0x200E => 26 * 8 + 5
-        0x200F => 26 * 8 + 6
+        0x200a => 26 * 8 + 1
+        0x200b => 26 * 8 + 2
+        0x200c => 26 * 8 + 3
+        0x200d => 26 * 8 + 4
+        0x200e => 26 * 8 + 5
+        0x200f => 26 * 8 + 6
         0x2010 => 26 * 8 + 7
         0x2011 => 27 * 8 + 0
         0x2012 => 27 * 8 + 1
@@ -829,40 +835,40 @@ fn command_bit_base(opcode: Int) -> Int
         0x2022 => 33 * 8 + 6
         0x2023 => 33 * 8 + 7
         0x2024 => 34 * 8 + 0
-        0x202F => 35 * 8 + 3
+        0x202f => 35 * 8 + 3
         0x2030 => 35 * 8 + 4
         0x2031 => 35 * 8 + 5
         0x2032 => 35 * 8 + 6
-        0x201A => 28 * 8 + 1
-        0x201B => 28 * 8 + 2
-        0x201C => 28 * 8 + 3
+        0x201a => 28 * 8 + 1
+        0x201b => 28 * 8 + 2
+        0x201c => 28 * 8 + 3
         0x2025 => 34 * 8 + 1
         0x2026 => 34 * 8 + 2
-        0x205E => 41 * 8 + 2
+        0x205e => 41 * 8 + 2
         0x2027 => 34 * 8 + 3
         0x2028 => 34 * 8 + 4
         0x2029 => 34 * 8 + 5
-        0x202A => 34 * 8 + 6
-        0x202B => 34 * 8 + 7
-        0x202C => 35 * 8 + 0
-        0x202D => 35 * 8 + 1
-        0x202E => 35 * 8 + 2
-        0x204E => 39 * 8 + 2
+        0x202a => 34 * 8 + 6
+        0x202b => 34 * 8 + 7
+        0x202c => 35 * 8 + 0
+        0x202d => 35 * 8 + 1
+        0x202e => 35 * 8 + 2
+        0x204e => 39 * 8 + 2
         0x2020 => 33 * 8 + 4
         0x2021 => 33 * 8 + 5
-        0x204B => 38 * 8 + 7
-        0x207F => 46 * 8 + 2
+        0x204b => 38 * 8 + 7
+        0x207f => 46 * 8 + 2
         0x2035 => 36 * 8 + 1
         0x2036 => 36 * 8 + 2
         0x2037 => 36 * 8 + 3
         0x2038 => 36 * 8 + 4
         0x2039 => 36 * 8 + 5
-        0x203A => 36 * 8 + 6
-        0x203B => 36 * 8 + 7
-        0x203C => 37 * 8 + 0
-        0x203D => 37 * 8 + 1
-        0x203E => 37 * 8 + 2
-        0x203F => 37 * 8 + 3
+        0x203a => 36 * 8 + 6
+        0x203b => 36 * 8 + 7
+        0x203c => 37 * 8 + 0
+        0x203d => 37 * 8 + 1
+        0x203e => 37 * 8 + 2
+        0x203f => 37 * 8 + 3
         0x2040 => 37 * 8 + 4
         0x2044 => 38 * 8 + 0
         0x2045 => 38 * 8 + 1
@@ -870,12 +876,12 @@ fn command_bit_base(opcode: Int) -> Int
         0x2047 => 38 * 8 + 3
         0x2048 => 38 * 8 + 4
         0x2049 => 38 * 8 + 5
-        0x204A => 38 * 8 + 6
+        0x204a => 38 * 8 + 6
         0x2059 => 40 * 8 + 5
-        0x205A => 40 * 8 + 6
-        0x205B => 40 * 8 + 7
-        0x205C => 41 * 8 + 0
-        0x205D => 41 * 8 + 1
+        0x205a => 40 * 8 + 6
+        0x205b => 40 * 8 + 7
+        0x205c => 41 * 8 + 0
+        0x205d => 41 * 8 + 1
         0x2086 => 47 * 8 + 1
         0x2041 => 37 * 8 + 5
         0x2042 => 37 * 8 + 6
@@ -891,39 +897,39 @@ fn command_bit_base(opcode: Int) -> Int
         0x2067 => 42 * 8 + 4
         0x2068 => 42 * 8 + 5
         0x2069 => 42 * 8 + 6
-        0x206A => 42 * 8 + 7
-        0x206B => 43 * 8 + 0
-        0x206C => 43 * 8 + 1
-        0x206E => 43 * 8 + 3
-        0x206F => 43 * 8 + 4
+        0x206a => 42 * 8 + 7
+        0x206b => 43 * 8 + 0
+        0x206c => 43 * 8 + 1
+        0x206e => 43 * 8 + 3
+        0x206f => 43 * 8 + 4
         0x2074 => 44 * 8 + 1
         0x2076 => 44 * 8 + 3
         0x2077 => 44 * 8 + 4
-        0x207D => 46 * 8
-        0x207E => 46 * 8 + 1
+        0x207d => 46 * 8
+        0x207e => 46 * 8 + 1
         0x2087 => 47 * 8 + 2
         0x2088 => 47 * 8 + 3
-        0x207A => 44 * 8 + 7
+        0x207a => 44 * 8 + 7
         0x2075 => 44 * 8 + 2
-        0x201D => 28 * 8 + 4
-        0x201E => 28 * 8 + 5
-        0x201F => 28 * 8 + 6
+        0x201d => 28 * 8 + 4
+        0x201e => 28 * 8 + 5
+        0x201f => 28 * 8 + 6
         0x2033 => 35 * 8 + 7
         0x2034 => 36 * 8 + 0
-        0x204F => 39 * 8 + 3
+        0x204f => 39 * 8 + 3
         0x2050 => 39 * 8 + 4
-        0x207B => 45 * 8 + 0
-        _ => -1
+        0x207b => 45 * 8 + 0
+        _      => -1
 
 // The capability a command needs, 0 for none.
 @tier(embedded)
 fn command_needs_base(opcode: Int) -> Int
     match opcode
-        0x0406 => CAP_LL
-        0x041D => CAP_LL
-        0x0C7B => CAP_LL
-        0x0C7C => CAP_LL
-        0x0C2D => CAP_LL
+        0x406  => CAP_LL
+        0x41d  => CAP_LL
+        0xc7b  => CAP_LL
+        0xc7c  => CAP_LL
+        0xc2d  => CAP_LL
         0x1405 => CAP_LL
         0x2013 => CAP_LL
         0x2015 => CAP_LL
@@ -932,44 +938,44 @@ fn command_needs_base(opcode: Int) -> Int
         0x2007 => CAP_LL
         0x2008 => CAP_LL
         0x2009 => CAP_LL
-        0x200A => CAP_LL
-        0x200B => CAP_LL
-        0x200C => CAP_LL
-        0x200D => CAP_LL
-        0x200E => CAP_LL
+        0x200a => CAP_LL
+        0x200b => CAP_LL
+        0x200c => CAP_LL
+        0x200d => CAP_LL
+        0x200e => CAP_LL
         0x2014 => CAP_LL
         0x2017 => CAP_ECB
         0x2018 => CAP_RNG
         0x2019 => CAP_LL
-        0x201A => CAP_LL
-        0x201B => CAP_LL
+        0x201a => CAP_LL
+        0x201b => CAP_LL
         0x2025 => CAP_ECDH
         0x2026 => CAP_ECDH
-        0x205E => CAP_ECDH
+        0x205e => CAP_ECDH
         0x2027 => CAP_LL
         0x2028 => CAP_LL
         0x2029 => CAP_LL
-        0x202A => CAP_LL
-        0x202B => CAP_LL
-        0x202C => CAP_LL
-        0x202D => CAP_LL
-        0x202E => CAP_LL
-        0x204E => CAP_LL
+        0x202a => CAP_LL
+        0x202b => CAP_LL
+        0x202c => CAP_LL
+        0x202d => CAP_LL
+        0x202e => CAP_LL
+        0x204e => CAP_LL
         0x2020 => CAP_LL
         0x2021 => CAP_LL
-        0x204B => CAP_LL
-        0x207F => CAP_LL
+        0x204b => CAP_LL
+        0x207f => CAP_LL
         0x2035 => CAP_LL
         0x2036 => CAP_LL
         0x2037 => CAP_LL
         0x2038 => CAP_LL
         0x2039 => CAP_LL
-        0x203A => CAP_LL
-        0x203B => CAP_LL
-        0x203C => CAP_LL
-        0x203D => CAP_LL
-        0x203E => CAP_LL
-        0x203F => CAP_LL
+        0x203a => CAP_LL
+        0x203b => CAP_LL
+        0x203c => CAP_LL
+        0x203d => CAP_LL
+        0x203e => CAP_LL
+        0x203f => CAP_LL
         0x2040 => CAP_LL
         0x2044 => CAP_LL
         0x2045 => CAP_LL
@@ -977,36 +983,36 @@ fn command_needs_base(opcode: Int) -> Int
         0x2047 => CAP_LL
         0x2048 => CAP_LL
         0x2049 => CAP_LL
-        0x204A => CAP_LL
+        0x204a => CAP_LL
         0x2059 => CAP_LL
-        0x205A => CAP_LL
-        0x205B => CAP_LL
-        0x205C => CAP_LL
-        0x205D => CAP_LL
+        0x205a => CAP_LL
+        0x205b => CAP_LL
+        0x205c => CAP_LL
+        0x205d => CAP_LL
         0x2076 => CAP_LL
         0x2077 => CAP_LL
-        0x207D => CAP_LL
-        0x207E => CAP_LL
+        0x207d => CAP_LL
+        0x207e => CAP_LL
         0x2087 => CAP_LL
         0x2088 => CAP_LL
-        0x207A => CAP_LL
+        0x207a => CAP_LL
         0x2086 => CAP_LL
         0x2041 => CAP_LL
         0x2042 => CAP_LL
         0x2043 => CAP_LL
         0x2085 => CAP_LL
-        0x201D => CAP_LL
-        0x201E => CAP_LL
-        0x201F => CAP_LL
+        0x201d => CAP_LL
+        0x201e => CAP_LL
+        0x201f => CAP_LL
         0x2033 => CAP_LL
         0x2034 => CAP_LL
-        0x204F => CAP_LL
+        0x204f => CAP_LL
         0x2050 => CAP_LL
-        0x207B => CAP_LL
+        0x207b => CAP_LL
         0x2022 => CAP_LL
         0x2023 => CAP_LL
         0x2024 => CAP_LL
-        0x202F => CAP_LL
+        0x202f => CAP_LL
         0x2030 => CAP_LL
         0x2031 => CAP_LL
         0x2032 => CAP_LL
@@ -1020,29 +1026,29 @@ fn command_needs_base(opcode: Int) -> Int
         0x2067 => CAP_LL
         0x2068 => CAP_LL
         0x2069 => CAP_LL
-        0x206A => CAP_LL
-        0x206B => CAP_LL
-        0x206C => CAP_LL
-        0x206E => CAP_LL
-        0x206F => CAP_LL
+        0x206a => CAP_LL
+        0x206b => CAP_LL
+        0x206c => CAP_LL
+        0x206e => CAP_LL
+        0x206f => CAP_LL
         0x2070 => CAP_LL
         0x2071 => CAP_LL
         0x2072 => CAP_LL
         0x2073 => CAP_LL
         0x2074 => CAP_LL
         0x2075 => CAP_LL
-        _ => 0
+        _      => 0
 
 // Whether the command with `opcode` is one of extended advertising, which a build with no advertising sets does not answer.
 @tier(embedded)
 fn xadv_command(opcode: Int) -> Bool
-    (opcode >= 0x2035 and opcode <= 0x203D) or opcode == 0x207F
+    opcode >= 0x2035 and opcode <= 0x203D or opcode == 0x207F
 
 // Whether `opcode` is a command of periodic advertising or synchronization, which a build with no train and no
 // synchronization does not answer.
 @tier(embedded)
 fn per_command(opcode: Int) -> Bool
-    (opcode >= 0x203E and opcode <= 0x2040) or (opcode >= 0x2044 and opcode <= 0x204A) or opcode == 0x2059 or opcode == 0x2086
+    opcode >= 0x203E and opcode <= 0x2040 or opcode >= 0x2044 and opcode <= 0x204A or opcode == 0x2059 or opcode == 0x2086
 
 // The tables of the three commands of periodic advertising with responses, which a build without either side of it does not carry: the bit in
 // Supported Commands (-1 for none), the capabilities (0 for none) and the number of parameter octets (-2 when the length is the command's to check, -1 for none).
@@ -1054,7 +1060,7 @@ fn pawr_bit(opcode: Int) -> Int
         0x2082 => 46 * 8 + 5
         0x2083 => 46 * 8 + 6
         0x2084 => 46 * 8 + 7
-        _ => -1
+        _      => -1
 
 @tier(embedded)
 fn pawr_needs(opcode: Int) -> Int
@@ -1072,7 +1078,7 @@ fn pawr_params(opcode: Int) -> Int
         0x2082 => -2
         0x2083 => 8
         0x2084 => 5
-        _ => -1
+        _      => -1
 
 // The same for the four commands of the ISO test mode (LE ISO Transmit Test 0x2070, Receive Test 0x2071, Read Test Counters 0x2072 and Test End 0x2073), which a
 // build without broadcast groups does not carry.
@@ -1083,7 +1089,7 @@ fn isotest_bit(opcode: Int) -> Int
         0x2071 => 43 * 8 + 6
         0x2072 => 43 * 8 + 7
         0x2073 => 44 * 8 + 0
-        _ => -1
+        _      => -1
 
 @tier(embedded)
 fn isotest_params(opcode: Int) -> Int
@@ -1092,7 +1098,7 @@ fn isotest_params(opcode: Int) -> Int
         0x2071 => 3
         0x2072 => 2
         0x2073 => 2
-        _ => -1
+        _      => -1
 
 // The tables above with the commands of periodic advertising with responses, in a build that has either side of it, and the ISO test mode in one that has broadcast groups.
 @tier(embedded)
@@ -1180,7 +1186,7 @@ fn sub_command(opcode: Int) -> Bool
 // Parameters (0x20A2) and LE Read Minimum Supported Connection Interval (0x20A3).
 @tier(embedded)
 fn rate_command(opcode: Int) -> Bool
-    opcode == 0x2097 or (opcode >= 0x20A1 and opcode <= 0x20A3)
+    opcode == 0x2097 or opcode >= 0x20A1 and opcode <= 0x20A3
 
 // The tables of those four commands, which a build without Connection Rate does not carry: the bit in Supported Commands (-1 for none) and the
 // number of parameter octets (-1 for none).
@@ -1188,19 +1194,19 @@ fn rate_command(opcode: Int) -> Bool
 fn rate_bit(opcode: Int) -> Int
     match opcode
         0x2097 => 47 * 8 + 4
-        0x20A1 => 48 * 8 + 5
-        0x20A2 => 48 * 8 + 6
-        0x20A3 => 48 * 8 + 7
-        _ => -1
+        0x20a1 => 48 * 8 + 5
+        0x20a2 => 48 * 8 + 6
+        0x20a3 => 48 * 8 + 7
+        _      => -1
 
 @tier(embedded)
 fn rate_params(opcode: Int) -> Int
     match opcode
         0x2097 => 3
-        0x20A1 => 20
-        0x20A2 => 18
-        0x20A3 => 0
-        _ => -1
+        0x20a1 => 20
+        0x20a2 => 18
+        0x20a3 => 0
+        _      => -1
 
 // Whether `opcode` is LE Frame Space Update (0x209D), which has bit 1 of octet 48 in Supported Commands and nine parameter octets.
 @tier(embedded)
@@ -1248,7 +1254,7 @@ fn command_answered(var c: Controller, opcode: Int) -> Bool
         if opcode != OP_LE_SET_PERIODIC_ADVERTISING_SUBEVENT_DATA and not ctl_limits.pawr_sync_on()
             return false
     let need = command_needs(opcode)
-    need == 0 or ((c.caps as Int) & need) != 0
+    need == 0 or (c.caps as Int & need) != 0
 
 // Set, in the 64 octets of Supported_Commands that start at index `base` of
 // `slot`, a bit for each command this build answers.  The field is built from
@@ -1260,7 +1266,19 @@ fn command_answered(var c: Controller, opcode: Int) -> Bool
 @tier(embedded)
 fn supported_commands_fill(var c: Controller, var p: PacketPool, slot: Int, base: Int)
     for group in 0..5
-        let ogf = if group == 0 then 0x01 else if group == 1 then 0x03 else if group == 2 then 0x04 else if group == 3 then 0x05 else 0x08
+        let ogf = if group == 0
+            0x01
+        else
+            if group == 1
+                0x03
+            else
+                if group == 2
+                    0x04
+                else
+                    if group == 3
+                        0x05
+                    else
+                        0x08
         for ocf in 0..0x100
             let opcode = hci_frame.pack_opcode(ogf, ocf)
             let bit = command_bit(opcode)
@@ -1273,17 +1291,17 @@ fn supported_commands_fill(var c: Controller, var p: PacketPool, slot: Int, base
 @tier(embedded)
 fn command_params_base(opcode: Int) -> Int
     match opcode
-        0x0406 => 3
-        0x041D => 2
-        0x0C01 => 8
-        0x0C03 => 0
-        0x0C2D => 3
-        0x0C31 => 1
-        0x0C33 => 7
-        0x0C35 => -2
-        0x0C63 => 8
-        0x0C7B => 2
-        0x0C7C => 4
+        0x406  => 3
+        0x41d  => 2
+        0xc01  => 8
+        0xc03  => 0
+        0xc2d  => 3
+        0xc31  => 1
+        0xc33  => 7
+        0xc35  => -2
+        0xc63  => 8
+        0xc7b  => 2
+        0xc7c  => 4
         0x1001 => 0
         0x1002 => 0
         0x1003 => 0
@@ -1297,12 +1315,12 @@ fn command_params_base(opcode: Int) -> Int
         0x2007 => 0
         0x2008 => 32
         0x2009 => 32
-        0x200A => 1
-        0x200B => 7
-        0x200C => 2
-        0x200D => 25
-        0x200E => 0
-        0x200F => 0
+        0x200a => 1
+        0x200b => 7
+        0x200c => 2
+        0x200d => 25
+        0x200e => 0
+        0x200f => 0
         0x2010 => 0
         0x2011 => 7
         0x2012 => 7
@@ -1313,36 +1331,36 @@ fn command_params_base(opcode: Int) -> Int
         0x2017 => 32
         0x2018 => 0
         0x2019 => 28
-        0x201A => 18
-        0x201B => 2
-        0x201C => 0
+        0x201a => 18
+        0x201b => 2
+        0x201c => 0
         0x2025 => 0
         0x2026 => 64
-        0x205E => 65
+        0x205e => 65
         0x2027 => 39
         0x2028 => 7
         0x2029 => 0
-        0x202A => 0
-        0x202B => 7
-        0x202C => 7
-        0x202D => 1
-        0x202E => 2
-        0x204E => 8
+        0x202a => 0
+        0x202b => 7
+        0x202c => 7
+        0x202d => 1
+        0x202e => 2
+        0x204e => 8
         0x2020 => 14
         0x2021 => 3
-        0x204B => 0
-        0x207F => 27
+        0x204b => 0
+        0x207f => 27
         0x2035 => 7
         0x2036 => 25
         0x2037 => 4
         0x2038 => 4
         0x2039 => 2
-        0x203A => 0
-        0x203B => 0
-        0x203C => 1
-        0x203D => 0
-        0x203E => 7
-        0x203F => 3
+        0x203a => 0
+        0x203b => 0
+        0x203c => 1
+        0x203d => 0
+        0x203e => 7
+        0x203f => 3
         0x2040 => 2
         0x2044 => 14
         0x2045 => 0
@@ -1350,36 +1368,36 @@ fn command_params_base(opcode: Int) -> Int
         0x2047 => 8
         0x2048 => 8
         0x2049 => 0
-        0x204A => 0
+        0x204a => 0
         0x2059 => 3
-        0x205A => 6
-        0x205B => 5
-        0x205C => 8
-        0x205D => 6
+        0x205a => 6
+        0x205b => 5
+        0x205c => 8
+        0x205d => 6
         0x2076 => 3
         0x2077 => 3
-        0x207D => 10
-        0x207E => 12
+        0x207d => 10
+        0x207e => 12
         0x2087 => 0
         0x2088 => 3
-        0x207A => 4
+        0x207a => 4
         0x2086 => 12
         0x2041 => 3
         0x2042 => 6
         0x2043 => 10
         0x2085 => 12
-        0x201D => 1
-        0x201E => 3
-        0x201F => 0
+        0x201d => 1
+        0x201e => 3
+        0x201f => 0
         0x2033 => 3
         0x2034 => 4
-        0x204F => 7
+        0x204f => 7
         0x2050 => 7
-        0x207B => 8
+        0x207b => 8
         0x2022 => 6
         0x2023 => 0
         0x2024 => 4
-        0x202F => 0
+        0x202f => 0
         0x2030 => 2
         0x2031 => 3
         0x2032 => 7
@@ -1393,14 +1411,14 @@ fn command_params_base(opcode: Int) -> Int
         0x2067 => 3
         0x2068 => 31
         0x2069 => 36
-        0x206A => 2
-        0x206B => -2
-        0x206C => 1
-        0x206E => -2
-        0x206F => 3
+        0x206a => 2
+        0x206b => -2
+        0x206c => 1
+        0x206e => -2
+        0x206f => 3
         0x2074 => 2
         0x2075 => 2
-        _ => -1
+        _      => -1
 
 // ── Events the Controller builds ────────────────────────────────────
 
@@ -1532,7 +1550,7 @@ fn cmd_host_buffer_size(var c: Controller)
 
 // Host Number Of Completed Packets ([Vol 4] Part E, Section 7.3.40): Num_Handles
 // and, for each, Connection_Handle and Host_Num_Of_Completed_Packets, which
-// return that many of the Host's buffers.  The command has no event in answer,
+// give back that many of the Host's buffers.  The command has no event in answer,
 // so a malformed one is ignored, and so is one while flow control is off, no
 // connection exists or no Host Buffer Size was seen (Section 7.3.40).
 @satisfies("REQ-BLE-HCI-059")
@@ -1630,7 +1648,7 @@ fn cmd_le_features(var c: Controller, opcode: Int)
     var f: Vec[u8; 8] = Vec.new()
     for _ in 0..8
         let _a = f.push(0)
-    if ((c.caps as Int) & CAP_LL) != 0
+    if (c.caps as Int & CAP_LL) != 0
         ll_link.own_features(var f, c.host_iso, c.host_sub)
         if not c.coded
             ll_link.clear_coded(var f)
@@ -1660,7 +1678,7 @@ fn cmd_le_read_all_local(var c: Controller)
         let _b = ctl_pool.pool_put(var c.pool, slot, f[i] as Int)
     for i in 0..8
         let _p = ctl_pool.pool_put(var c.pool, slot, (p1 >>> (8 * i)) & 0xFF)
-    for _ in 0..(ll_feat.PAGE_MAX * ll_feat.PAGE_OCTETS - 8)
+    for _ in 0..ll_feat.PAGE_MAX * ll_feat.PAGE_OCTETS - 8
         let _z = ctl_pool.pool_put(var c.pool, slot, 0)
     complete_send(var c, slot)
 
@@ -1672,7 +1690,7 @@ fn cmd_le_read_supported_states(var c: Controller)
     if slot == ctl_pool.NO_SLOT
         return
     var states = 0
-    if ((c.caps as Int) & CAP_LL) != 0
+    if (c.caps as Int & CAP_LL) != 0
         states = LE_STATES
     for i in 0..8
         let _a = ctl_pool.pool_put(var c.pool, slot, (states >>> (8 * i)) & 0xFF)
@@ -1857,7 +1875,7 @@ fn xsets_on(var c: Controller) -> Bool
     false
 
 // Whether any advertising is on: the legacy advertiser (which also runs the sets of legacy PDUs) or a set of extended PDUs.
-@tier(embedded)
+pub @tier(embedded)
 fn adv_active(var c: Controller) -> Bool
     c.adv.enabled or xsets_on(var c)
 
@@ -1939,7 +1957,18 @@ fn cmd_le_set_extended_advertising_parameters(var c: Controller, v2: Bool)
     let sphy = h4_rx.h4_param(var c.rx, 22)
     let sid = h4_rx.h4_param(var c.rx, 23)
     let notify = h4_rx.h4_param(var c.rx, 24)
-    var status = ll_xadv.xset_status(handle, props, int_min, int_max, chmap, own, peer_type, policy, pphy, sphy, sid, xadv_coded(var c))
+    var status = ll_xadv.xset_status(handle,
+        props,
+        int_min,
+        int_max,
+        chmap,
+        own,
+        peer_type,
+        policy,
+        pphy,
+        sphy,
+        sid,
+        xadv_coded(var c))
     if status == STATUS_SUCCESS and (notify > 1 or popt > 2 or sopt > 2)
         status = STATUS_INVALID_PARAMETERS
     var i = xset_find(var c, handle)
@@ -1959,7 +1988,23 @@ fn cmd_le_set_extended_advertising_parameters(var c: Controller, v2: Bool)
     for k in 0..6
         let _p = peer.push(h4_rx.h4_param(var c.rx, 12 + k) as u8)
     let selected = select_power(txp)
-    ll_xadv.xset_define(var c.xsets[i], handle, props, int_min, int_max, chmap, own, peer_type, var peer, policy, selected, pphy, sphy, popt, sopt, sid, notify == 1)
+    ll_xadv.xset_define(var c.xsets[i],
+        handle,
+        props,
+        int_min,
+        int_max,
+        chmap,
+        own,
+        peer_type,
+        var peer,
+        policy,
+        selected,
+        pphy,
+        sphy,
+        popt,
+        sopt,
+        sid,
+        notify == 1)
     c.adv.fam = 2
     let slot = complete_begin(var c, op, STATUS_SUCCESS)
     if slot == ctl_pool.NO_SLOT
@@ -2039,7 +2084,14 @@ fn legacy_set_start(var c: Controller, i: Int, dur: Int, max_ev: Int) -> Int
         return ll_xadv.E_MEMORY
     let ty = ll_xadv.legacy_type(c.xsets[i].props)
     let own = c.xsets[i].own as Int
-    ll_adv.adv_set_params(var c.adv, c.xsets[i].int_min, c.xsets[i].int_max, ty, own, c.xsets[i].peer_type as Int, c.xsets[i].chmap as Int, c.xsets[i].policy as Int)
+    ll_adv.adv_set_params(var c.adv,
+        c.xsets[i].int_min,
+        c.xsets[i].int_max,
+        ty,
+        own,
+        c.xsets[i].peer_type as Int,
+        c.xsets[i].chmap as Int,
+        c.xsets[i].policy as Int)
     var peer: Vec[u8; 6] = Vec.new()
     for k in 0..6
         let _p = peer.push(c.xsets[i].peer[k])
@@ -2155,7 +2207,7 @@ fn cmd_le_set_extended_advertising_enable(var c: Controller)
     if (c.adv.fam as Int) == 1
         answer_status(var c, op, STATUS_COMMAND_DISALLOWED)
         return
-    if on > 1 or (on == 1 and n == 0) or h4_rx.h4_param_len(var c.rx) != 2 + 4 * n or n > ctl_limits.sets()
+    if on > 1 or on == 1 and n == 0 or h4_rx.h4_param_len(var c.rx) != 2 + 4 * n or n > ctl_limits.sets()
         answer_status(var c, op, STATUS_INVALID_PARAMETERS)
         return
     if on == 0 and n == 0
@@ -2192,7 +2244,7 @@ fn cmd_le_set_extended_advertising_enable(var c: Controller)
             break
     if status == STATUS_SUCCESS and on == 1
         // One set of legacy PDUs runs at a time, and not beside a set of extended PDUs.
-        if legacy_n > 1 or (legacy_n > 0 and (ext_n > 0 or xsets_on(var c))) or (ext_n > 0 and c.adv.enabled)
+        if legacy_n > 1 or legacy_n > 0 and (ext_n > 0 or xsets_on(var c)) or ext_n > 0 and c.adv.enabled
             status = ll_xadv.E_MEMORY
     if status != STATUS_SUCCESS
         answer_status(var c, op, status)
@@ -2415,7 +2467,13 @@ fn padv_parameters(var c: Controller, handle: Int, v2: Bool) -> Int
     if ctl_limits.pawr_adv_on() and n_sub != 0
         if (props & 0xFFBF) != 0
             return STATUS_INVALID_PARAMETERS
-        let ps = ll_pawr.params_status(int_min, int_max, n_sub, h4_rx.h4_param(var c.rx, 8), h4_rx.h4_param(var c.rx, 9), h4_rx.h4_param(var c.rx, 10), h4_rx.h4_param(var c.rx, 11))
+        let ps = ll_pawr.params_status(int_min,
+            int_max,
+            n_sub,
+            h4_rx.h4_param(var c.rx, 8),
+            h4_rx.h4_param(var c.rx, 9),
+            h4_rx.h4_param(var c.rx, 10),
+            h4_rx.h4_param(var c.rx, 11))
         if ps != STATUS_SUCCESS
             return ps
         // One subevent: the Subevent_Interval is ignored, and the subevent is as long as the interval allows (at most the 255 units its octet holds).
@@ -2438,7 +2496,12 @@ fn padv_parameters(var c: Controller, handle: Int, v2: Bool) -> Int
     let old_handle = c.pads[k].handle
     ll_per.padv_define(var c.pads[k], handle, props, int_min, int_max)
     if ctl_limits.pawr_adv_on() and n_sub != 0
-        ll_pawr.pa_define(var c.pwa[k], n_sub, si, h4_rx.h4_param(var c.rx, 9), h4_rx.h4_param(var c.rx, 10), h4_rx.h4_param(var c.rx, 11))
+        ll_pawr.pa_define(var c.pwa[k],
+            n_sub,
+            si,
+            h4_rx.h4_param(var c.rx, 9),
+            h4_rx.h4_param(var c.rx, 10),
+            h4_rx.h4_param(var c.rx, 11))
         ll_per.padv_define_pawr(var c.pads[k], n_sub, c.pwa[k].si_us)
     if ll_per.pick_interval(var c.pads[k], c.xsets[i].sphy as Int) < 0
         c.pads[k].used = old_used
@@ -2482,7 +2545,7 @@ fn cmd_le_set_periodic_advertising_data(var c: Controller)
         answer_status(var c, op_code, ll_xadv.E_UNKNOWN_SET)
         return
     let k = padv_find(var c, handle)
-    if k < 0 or (ctl_limits.pawr_adv_on() and c.pads[k].pawr)
+    if k < 0 or ctl_limits.pawr_adv_on() and c.pads[k].pawr
         // A train with responses takes its data a subevent at a time (LE Set Periodic Advertising Subevent Data).
         answer_status(var c, op_code, STATUS_COMMAND_DISALLOWED)
         return
@@ -2613,7 +2676,7 @@ fn cmd_le_periodic_advertising_create_sync(var c: Controller)
     var status = STATUS_SUCCESS
     if c.preq.pending or (cte & 0x1F) == 0x1F
         status = STATUS_COMMAND_DISALLOWED
-    else if (options & 0xF8) != 0 or ((options & 1) == 0 and (sid > 15 or kind > 1)) or skip > 0x1F3 or timeout < 0x0A or timeout > 0x4000
+    else if (options & 0xF8) != 0 or (options & 1) == 0 and (sid > 15 or kind > 1) or skip > 0x1F3 or timeout < 0x0A or timeout > 0x4000
         status = STATUS_INVALID_PARAMETERS
     else if (options & 4) != 0 or cte != 0
         status = STATUS_UNSUPPORTED_FEATURE
@@ -2675,7 +2738,9 @@ fn cmd_le_add_to_periodic_advertiser_list(var c: Controller)
         answer_status(var c, op, STATUS_COMMAND_DISALLOWED)
         return
     var a = param_addr(var c, 1)
-    answer_status(var c, op, ll_per.pal_add(var c.pal, h4_rx.h4_param(var c.rx, 0), var a, h4_rx.h4_param(var c.rx, 7)))
+    answer_status(var c,
+        op,
+        ll_per.pal_add(var c.pal, h4_rx.h4_param(var c.rx, 0), var a, h4_rx.h4_param(var c.rx, 7)))
 
 @satisfies("REQ-BLE-CTL-094")
 @tier(embedded)
@@ -2685,7 +2750,9 @@ fn cmd_le_remove_from_periodic_advertiser_list(var c: Controller)
         answer_status(var c, op, STATUS_COMMAND_DISALLOWED)
         return
     var a = param_addr(var c, 1)
-    answer_status(var c, op, ll_per.pal_remove(var c.pal, h4_rx.h4_param(var c.rx, 0), var a, h4_rx.h4_param(var c.rx, 7)))
+    answer_status(var c,
+        op,
+        ll_per.pal_remove(var c.pal, h4_rx.h4_param(var c.rx, 0), var a, h4_rx.h4_param(var c.rx, 7)))
 
 @satisfies("REQ-BLE-CTL-094")
 @tier(embedded)
@@ -2739,7 +2806,7 @@ fn cmd_le_set_periodic_advertising_receive_enable(var c: Controller)
 // Whether the peer of the link in slot `ls` told its features and lacks the Periodic Advertising Sync Transfer - Recipient feature (octet 3 bit 1).
 @tier(embedded)
 fn past_peer_lacks(var c: Controller, ls: Int) -> Bool
-    c.links[ls].have_feat and ((c.links[ls].peer_feat[3] as Int) & 0x02) == 0
+    c.links[ls].have_feat and (c.links[ls].peer_feat[3] as Int & 0x02) == 0
 
 // LE Periodic Advertising Sync Transfer ([Vol 4] Part E, Section 7.8.89): the synchronization with the Sync_Handle is described to the connected
 // device with the Connection_Handle; the Command Complete says the description is queued.  Unknown Advertising Identifier for a Sync_Handle that is not
@@ -2806,9 +2873,16 @@ fn cmd_le_set_periodic_advertising_sync_transfer_parameters(var c: Controller)
     if ls < 0
         status = STATUS_UNKNOWN_CONNECTION
     else
-        status = ll_past.cfg_status(h4_rx.h4_param(var c.rx, 2), param_u16(var c, 3), param_u16(var c, 5), h4_rx.h4_param(var c.rx, 7))
+        status = ll_past.cfg_status(h4_rx.h4_param(var c.rx, 2),
+            param_u16(var c, 3),
+            param_u16(var c, 5),
+            h4_rx.h4_param(var c.rx, 7))
     if status == STATUS_SUCCESS
-        ll_past.cfg_set(var c.past_cfg[ls], h4_rx.h4_param(var c.rx, 2), param_u16(var c, 3), param_u16(var c, 5), h4_rx.h4_param(var c.rx, 7))
+        ll_past.cfg_set(var c.past_cfg[ls],
+            h4_rx.h4_param(var c.rx, 2),
+            param_u16(var c, 3),
+            param_u16(var c, 5),
+            h4_rx.h4_param(var c.rx, 7))
     answer_handle(var c, op, status, raw)
 
 // LE Set Default Periodic Advertising Sync Transfer Parameters ([Vol 4] Part E, Section 7.8.92): the parameters of every connection made from
@@ -2817,19 +2891,26 @@ fn cmd_le_set_periodic_advertising_sync_transfer_parameters(var c: Controller)
 @tier(embedded)
 fn cmd_le_set_default_periodic_advertising_sync_transfer_parameters(var c: Controller)
     let op = OP_LE_SET_DEFAULT_PERIODIC_ADVERTISING_SYNC_TRANSFER_PARAMETERS
-    let status = ll_past.cfg_status(h4_rx.h4_param(var c.rx, 0), param_u16(var c, 1), param_u16(var c, 3), h4_rx.h4_param(var c.rx, 5))
+    let status = ll_past.cfg_status(h4_rx.h4_param(var c.rx, 0),
+        param_u16(var c, 1),
+        param_u16(var c, 3),
+        h4_rx.h4_param(var c.rx, 5))
     if status == STATUS_SUCCESS
-        ll_past.cfg_set(var c.past_def, h4_rx.h4_param(var c.rx, 0), param_u16(var c, 1), param_u16(var c, 3), h4_rx.h4_param(var c.rx, 5))
+        ll_past.cfg_set(var c.past_def,
+            h4_rx.h4_param(var c.rx, 0),
+            param_u16(var c, 1),
+            param_u16(var c, 3),
+            h4_rx.h4_param(var c.rx, 5))
     answer_status(var c, op, status)
 
 // Run the command of Periodic Advertising Sync Transfer with `opcode`.
 @tier(embedded)
 fn past_dispatch(var c: Controller, opcode: Int)
     match opcode
-        0x205A => cmd_le_periodic_advertising_sync_transfer(var c)
-        0x205B => cmd_le_periodic_advertising_set_info_transfer(var c)
-        0x205C => cmd_le_set_periodic_advertising_sync_transfer_parameters(var c)
-        _ => cmd_le_set_default_periodic_advertising_sync_transfer_parameters(var c)
+        0x205a => cmd_le_periodic_advertising_sync_transfer(var c)
+        0x205b => cmd_le_periodic_advertising_set_info_transfer(var c)
+        0x205c => cmd_le_set_periodic_advertising_sync_transfer_parameters(var c)
+        _      => cmd_le_set_default_periodic_advertising_sync_transfer_parameters(var c)
 
 // The connection just opened in slot `ls` takes the Host's default transfer parameters.
 @tier(embedded)
@@ -2910,7 +2991,13 @@ fn past_send(var c: Controller, ls: Int) -> Bool
         if not c.pads[k].run or not c.pads[k].sent
             return false
         // The SyncInfo names the start of an event (subevent 0 of a train with responses): `ev_due` and `ev_ctr` are the next such event.
-        var o = ll_past.plan_offer(ll_per.ev_due(var c.pads[k]), ll_per.ev_ctr(var c.pads[k]), ll_per.interval_us(var c.pads[k]), a0, ces, ci, c.now)
+        var o = ll_past.plan_offer(ll_per.ev_due(var c.pads[k]),
+            ll_per.ev_ctr(var c.pads[k]),
+            ll_per.interval_us(var c.pads[k]),
+            a0,
+            ces,
+            ci,
+            c.now)
         if o.ok
             if ctl_limits.pawr_adv_on() and c.pads[k].pawr
                 // A train with responses is described by LL_PERIODIC_SYNC_WR_IND, which adds the timing of the subevents and the response slots.
@@ -2926,7 +3013,13 @@ fn past_send(var c: Controller, ls: Int) -> Bool
         if k >= ctl_limits.psync_n() or c.psyncs[k].state != ll_per.PS_SYNCED
             c.past_tx[ls].used = false
             return true
-        var o = ll_past.plan_offer(c.psyncs[k].last_ok, c.psyncs[k].cx_counter, ll_per.psync_interval_us(var c.psyncs[k]), a0, ces, ci, c.now)
+        var o = ll_past.plan_offer(c.psyncs[k].last_ok,
+            c.psyncs[k].cx_counter,
+            ll_per.psync_interval_us(var c.psyncs[k]),
+            a0,
+            ces,
+            ci,
+            c.now)
         if o.ok
             ll_past.put_sync_ind(var c.links[ls].tmp, c.past_tx[ls].sdata, var o, c.psyncs[k].interval, c.psyncs[k].chmap, c.psyncs[k].sca, c.psyncs[k].aa,
                                  c.psyncs[k].crc, c.psyncs[k].cx_counter, c.psyncs[k].sid, c.psyncs[k].kind, ll_link.OWN_SCA,
@@ -3431,7 +3524,9 @@ fn cmd_le_read_all_remote(var c: Controller)
     if slot < 0
         answer_command_status(var c, OP_LE_READ_ALL_REMOTE_FEATURES, STATUS_UNKNOWN_CONNECTION)
     else
-        answer_command_status(var c, OP_LE_READ_ALL_REMOTE_FEATURES, ll_link.link_read_all_features(var c.links[slot], h4_rx.h4_param(var c.rx, 2)))
+        answer_command_status(var c,
+            OP_LE_READ_ALL_REMOTE_FEATURES,
+            ll_link.link_read_all_features(var c.links[slot], h4_rx.h4_param(var c.rx, 2)))
 
 // LE Read Channel Map ([Vol 4] Part E, Section 7.8.20): the handle and the five
 // octets of the map in use.
@@ -3529,7 +3624,11 @@ fn cmd_le_connection_update(var c: Controller)
     else if param_u16(var c, 10) > param_u16(var c, 12)
         answer_command_status(var c, op, STATUS_INVALID_PARAMETERS)
     else
-        answer_command_status(var c, op, ll_link.link_connection_update(var c.links[slot], param_u16(var c, 2), param_u16(var c, 4), param_u16(var c, 6), param_u16(var c, 8)))
+        answer_command_status(var c, op, ll_link.link_connection_update(var c.links[slot],
+            param_u16(var c, 2),
+            param_u16(var c, 4),
+            param_u16(var c, 6),
+            param_u16(var c, 8)))
 
 // ── The data length and PHY commands ────────────────────────────────
 
@@ -3622,7 +3721,7 @@ fn cmd_le_set_default_phy(var c: Controller)
     if t == 0 or r == 0
         answer_status(var c, OP_LE_SET_DEFAULT_PHY, STATUS_INVALID_PARAMETERS)
         return
-    if (t & (0xFF ^ have)) != 0 or (r & (0xFF ^ have)) != 0 or (all == 0 and t != r)
+    if (t & (0xFF ^ have)) != 0 or (r & (0xFF ^ have)) != 0 or all == 0 and t != r
         answer_status(var c, OP_LE_SET_DEFAULT_PHY, STATUS_UNSUPPORTED_FEATURE)
         return
     c.phy_def_tx = t
@@ -3749,7 +3848,7 @@ fn generate_dhkey(var c: Controller, opcode: Int, key_type: Int)
     if key_type > 1
         answer_command_status(var c, opcode, STATUS_INVALID_PARAMETERS)
         return
-    if c.ecdh_op != 0 or (key_type == 0 and not c.ecdh_have)
+    if c.ecdh_op != 0 or key_type == 0 and not c.ecdh_have
         answer_command_status(var c, opcode, STATUS_COMMAND_DISALLOWED)
         return
     for k in 0..64
@@ -3758,12 +3857,12 @@ fn generate_dhkey(var c: Controller, opcode: Int, key_type: Int)
     answer_command_status(var c, opcode, STATUS_SUCCESS)
 
 // Whether the P-256 work waits for the program.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_ecdh_wanted(var c: Controller) -> Bool
     c.ecdh_op != 0
 
 // Whether the work waits for 32 random octets for a private key.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_ecdh_wants_random(var c: Controller) -> Bool
     c.ecdh_op == 1
 
@@ -3793,9 +3892,10 @@ fn send_dhkey(var c: Controller, status: Int, var key: Vec[u8; 32])
 // command.  The work waits while the Host has not read the events already queued.  A private
 // key the engine refuses is drawn again (false); an engine that failed to finish ends the
 // command with Hardware Failure.  True when it finished a command.
-@satisfies("REQ-BLE-CTL-038")
+pub @satisfies("REQ-BLE-CTL-038")
 @tier(embedded)
-fn ctl_ecdh_poll<E: Ecdh[e]>(var c: Controller, var ecdh: E, var rnd: Vec[u8; 32], have: Bool) -> Bool [e]
+fn ctl_ecdh_poll<E: Ecdh[e]>(var c: Controller, var ecdh: E, var rnd: Vec[u8; 32],
+                             have: Bool) -> Bool [e]
     if c.ecdh_op == 0 or ctl_pool.pool_free(var c.pool) < 2
         return false
     let faults = ecdh.faults()
@@ -3825,13 +3925,16 @@ fn ctl_ecdh_poll<E: Ecdh[e]>(var c: Controller, var ecdh: E, var rnd: Vec[u8; 32
         secret = ll_ecdh.debug_private_key()
     var status = STATUS_SUCCESS
     if not ecdh.dhkey(var secret, var c.ecdh_peer, var key)
-        status = if ecdh.faults() == faults then STATUS_INVALID_PARAMETERS else STATUS_HARDWARE_FAILURE
+        status = if ecdh.faults() == faults
+            STATUS_INVALID_PARAMETERS
+        else
+            STATUS_HARDWARE_FAILURE
     c.ecdh_op = 0
     send_dhkey(var c, status, var key)
     true
 
 // LE Read Resolving List Size (Section 7.8.41).
-@satisfies("REQ-BLE-CTL-036")
+pub @satisfies("REQ-BLE-CTL-036")
 @tier(embedded)
 fn cmd_le_read_resolving_list_size(var c: Controller)
     let slot = complete_begin(var c, OP_LE_READ_RESOLVING_LIST_SIZE, STATUS_SUCCESS)
@@ -3843,7 +3946,7 @@ fn cmd_le_read_resolving_list_size(var c: Controller)
 // LE Read Peer Resolvable Address and LE Read Local Resolvable Address (Sections
 // 7.8.42 and 7.8.43): the RPA in use with the device, or Unknown Connection
 // Identifier when the list does not have the device or none is in use.
-@satisfies("REQ-BLE-CTL-036")
+pub @satisfies("REQ-BLE-CTL-036")
 @tier(embedded)
 fn cmd_le_read_resolvable_address(var c: Controller, op: Int, local: Bool)
     let kind = h4_rx.h4_param(var c.rx, 0)
@@ -3982,7 +4085,11 @@ fn cmd_le_remote_connection_parameter_request_reply(var c: Controller)
     if slot >= 0 and param_u16(var c, 10) > param_u16(var c, 12)
         status = STATUS_INVALID_PARAMETERS
     else if slot >= 0
-        status = ll_link.link_param_reply(var c.links[slot], param_u16(var c, 2), param_u16(var c, 4), param_u16(var c, 6), param_u16(var c, 8))
+        status = ll_link.link_param_reply(var c.links[slot],
+            param_u16(var c, 2),
+            param_u16(var c, 4),
+            param_u16(var c, 6),
+            param_u16(var c, 8))
     answer_handle(var c, op, status, handle)
 
 // LE Remote Connection Parameter Request Negative Reply (Section 7.8.32).
@@ -4084,7 +4191,19 @@ fn cmd_le_create_connection(var c: Controller)
     var peer: Vec[u8; 6] = Vec.new()
     for i in 0..6
         let _a = peer.push(h4_rx.h4_param(var c.rx, 6 + i) as u8)
-    let _s = initiate(var c, op, status, interval, window, policy, peer_type, var peer, own, c_min, c_max, latency, timeout)
+    let _s = initiate(var c,
+        op,
+        status,
+        interval,
+        window,
+        policy,
+        peer_type,
+        var peer,
+        own,
+        c_min,
+        c_max,
+        latency,
+        timeout)
 
 // The octets of the parameters of one PHY in LE Extended Create Connection: the scan interval and
 // window, the connection interval range, the latency, the supervision timeout and the range of the
@@ -4208,8 +4327,30 @@ fn cmd_le_extended_create_connection(var c: Controller, v2: Bool)
         if status == STATUS_SUCCESS and (phys & 2) != 0
             status = ll_init.conn_params_status(x_min, x_max, x_latency, x_timeout, x_ce_min, x_ce_max)
         if status == STATUS_SUCCESS and (phys & 5) == 5
-            status = ll_init.init_params_status(k_interval, k_window, policy, peer_type, own, z_min, z_max, z_latency, z_timeout, z_ce_min, z_ce_max)
-    if initiate(var c, op, status, interval, window, policy, peer_type, var peer, own, c_min, c_max, latency, timeout)
+            status = ll_init.init_params_status(k_interval,
+                k_window,
+                policy,
+                peer_type,
+                own,
+                z_min,
+                z_max,
+                z_latency,
+                z_timeout,
+                z_ce_min,
+                z_ce_max)
+    if initiate(var c,
+        op,
+        status,
+        interval,
+        window,
+        policy,
+        peer_type,
+        var peer,
+        own,
+        c_min,
+        c_max,
+        latency,
+        timeout)
         ll_init.init_ext_enable(var c.init, phys, x_min, x_max, x_latency, x_timeout)
         if (phys & 4) != 0
             ll_init.init_coded_enable(var c.init, z_min, z_max, z_latency, z_timeout, k_interval, k_window)
@@ -4222,7 +4363,9 @@ fn cmd_le_extended_create_connection(var c: Controller, v2: Bool)
 // ([Vol 6] Part B, Section 6.4).
 @satisfies("REQ-BLE-CTL-023")
 @tier(embedded)
-fn initiate(var c: Controller, op: Int, status: Int, interval: Int, window: Int, policy: Int, peer_type: Int, var peer: Vec[u8; 6], own: Int, c_min: Int, c_max: Int, latency: Int, timeout: Int) -> Bool
+fn initiate(var c: Controller, op: Int, status: Int, interval: Int, window: Int, policy: Int,
+            peer_type: Int, var peer: Vec[u8; 6], own: Int, c_min: Int, c_max: Int, latency: Int,
+            timeout: Int) -> Bool
     if status != STATUS_SUCCESS
         answer_command_status(var c, op, status)
         return false
@@ -4247,12 +4390,57 @@ fn initiate(var c: Controller, op: Int, status: Int, interval: Int, window: Int,
     c.init_wait = false
     if loc
         var a = rl_local_vec(var c, ent)
-        ll_init.init_enable(var c.init, c.now, interval, window, policy, peer_type, var peer, var a, 1, c_min, c_max, latency, timeout, connect_chmap(var c), avoid_a, avoid_b)
+        ll_init.init_enable(var c.init,
+            c.now,
+            interval,
+            window,
+            policy,
+            peer_type,
+            var peer,
+            var a,
+            1,
+            c_min,
+            c_max,
+            latency,
+            timeout,
+            connect_chmap(var c),
+            avoid_a,
+            avoid_b)
         c.init_wait = not c.rl.local_ok[ent]
     else if (own & 1) == 0
-        ll_init.init_enable(var c.init, c.now, interval, window, policy, peer_type, var peer, var c.public, 0, c_min, c_max, latency, timeout, connect_chmap(var c), avoid_a, avoid_b)
+        ll_init.init_enable(var c.init,
+            c.now,
+            interval,
+            window,
+            policy,
+            peer_type,
+            var peer,
+            var c.public,
+            0,
+            c_min,
+            c_max,
+            latency,
+            timeout,
+            connect_chmap(var c),
+            avoid_a,
+            avoid_b)
     else
-        ll_init.init_enable(var c.init, c.now, interval, window, policy, peer_type, var peer, var c.random, 1, c_min, c_max, latency, timeout, connect_chmap(var c), avoid_a, avoid_b)
+        ll_init.init_enable(var c.init,
+            c.now,
+            interval,
+            window,
+            policy,
+            peer_type,
+            var peer,
+            var c.random,
+            1,
+            c_min,
+            c_max,
+            latency,
+            timeout,
+            connect_chmap(var c),
+            avoid_a,
+            avoid_b)
     answer_command_status(var c, op, STATUS_SUCCESS)
     true
 
@@ -4373,16 +4561,16 @@ fn dispatch(var c: Controller)
         pawr_dispatch(var c, opcode)
         return
     match opcode
-        0x0406 => cmd_disconnect(var c)
-        0x041D => cmd_read_remote_version(var c)
-        0x0C01 => cmd_set_event_mask(var c)
-        0x0C03 => cmd_reset(var c)
-        0x0C31 => cmd_set_controller_to_host_flow_control(var c)
-        0x0C33 => cmd_host_buffer_size(var c)
-        0x0C35 => cmd_host_number_of_completed_packets(var c)
-        0x0C63 => cmd_set_event_mask_page_2(var c)
-        0x0C7B => cmd_read_authenticated_payload_timeout(var c)
-        0x0C7C => cmd_write_authenticated_payload_timeout(var c)
+        0x406  => cmd_disconnect(var c)
+        0x41d  => cmd_read_remote_version(var c)
+        0xc01  => cmd_set_event_mask(var c)
+        0xc03  => cmd_reset(var c)
+        0xc31  => cmd_set_controller_to_host_flow_control(var c)
+        0xc33  => cmd_host_buffer_size(var c)
+        0xc35  => cmd_host_number_of_completed_packets(var c)
+        0xc63  => cmd_set_event_mask_page_2(var c)
+        0xc7b  => cmd_read_authenticated_payload_timeout(var c)
+        0xc7c  => cmd_write_authenticated_payload_timeout(var c)
         0x1001 => cmd_read_local_version(var c)
         0x1002 => cmd_read_local_supported_commands(var c)
         0x1003 => cmd_read_local_supported_features(var c)
@@ -4395,24 +4583,24 @@ fn dispatch(var c: Controller)
         0x2007 => cmd_le_read_advertising_channel_tx_power(var c)
         0x2008 => cmd_le_set_advertising_data(var c, opcode)
         0x2009 => cmd_le_set_advertising_data(var c, opcode)
-        0x200A => cmd_le_set_advertising_enable(var c)
-        0x200B => cmd_le_set_scan_parameters(var c)
-        0x200C => cmd_le_set_scan_enable(var c)
-        0x200D => cmd_le_create_connection(var c)
-        0x200E => cmd_le_create_connection_cancel(var c)
+        0x200a => cmd_le_set_advertising_enable(var c)
+        0x200b => cmd_le_set_scan_parameters(var c)
+        0x200c => cmd_le_set_scan_enable(var c)
+        0x200d => cmd_le_create_connection(var c)
+        0x200e => cmd_le_create_connection_cancel(var c)
         0x2035 => cmd_le_set_advertising_set_random_address(var c)
         0x2036 => cmd_le_set_extended_advertising_parameters(var c, false)
-        0x207F => cmd_le_set_extended_advertising_parameters(var c, true)
+        0x207f => cmd_le_set_extended_advertising_parameters(var c, true)
         0x2037 => cmd_le_set_extended_advertising_data(var c, false)
         0x2038 => cmd_le_set_extended_advertising_data(var c, true)
         0x2039 => cmd_le_set_extended_advertising_enable(var c)
-        0x203A => cmd_le_read_maximum_advertising_data_length(var c)
-        0x203B => cmd_le_read_number_of_supported_advertising_sets(var c)
-        0x203C => cmd_le_remove_advertising_set(var c)
-        0x203D => cmd_le_clear_advertising_sets(var c)
-        0x203E => cmd_le_set_periodic_advertising_parameters(var c, false)
+        0x203a => cmd_le_read_maximum_advertising_data_length(var c)
+        0x203b => cmd_le_read_number_of_supported_advertising_sets(var c)
+        0x203c => cmd_le_remove_advertising_set(var c)
+        0x203d => cmd_le_clear_advertising_sets(var c)
+        0x203e => cmd_le_set_periodic_advertising_parameters(var c, false)
         0x2086 => cmd_le_set_periodic_advertising_parameters(var c, true)
-        0x203F => cmd_le_set_periodic_advertising_data(var c)
+        0x203f => cmd_le_set_periodic_advertising_data(var c)
         0x2040 => cmd_le_set_periodic_advertising_enable(var c)
         0x2044 => cmd_le_periodic_advertising_create_sync(var c)
         0x2045 => cmd_le_periodic_advertising_create_sync_cancel(var c)
@@ -4420,18 +4608,18 @@ fn dispatch(var c: Controller)
         0x2047 => cmd_le_add_to_periodic_advertiser_list(var c)
         0x2048 => cmd_le_remove_from_periodic_advertiser_list(var c)
         0x2049 => cmd_le_clear_periodic_advertiser_list(var c)
-        0x204A => cmd_le_read_periodic_advertiser_list_size(var c)
+        0x204a => cmd_le_read_periodic_advertiser_list_size(var c)
         0x2059 => cmd_le_set_periodic_advertising_receive_enable(var c)
         0x2041 => cmd_le_set_extended_scan_parameters(var c)
         0x2042 => cmd_le_set_extended_scan_enable(var c)
         0x2043 => cmd_le_extended_create_connection(var c, false)
         0x2085 => cmd_le_extended_create_connection(var c, true)
-        0x200F => cmd_le_read_fal_size(var c)
+        0x200f => cmd_le_read_fal_size(var c)
         0x2010 => cmd_le_clear_fal(var c)
         0x2011 => cmd_le_add_to_fal(var c)
         0x2012 => cmd_le_remove_from_fal(var c)
         0x2013 => cmd_le_connection_update(var c)
-        0x0C2D => cmd_read_transmit_power_level(var c)
+        0xc2d  => cmd_read_transmit_power_level(var c)
         0x1405 => cmd_read_rssi(var c)
         0x2014 => cmd_le_set_host_channel_classification(var c)
         0x2015 => cmd_le_read_channel_map(var c)
@@ -4442,37 +4630,37 @@ fn dispatch(var c: Controller)
         0x2022 => cmd_le_set_data_length(var c)
         0x2023 => cmd_le_read_suggested_default_data_length(var c)
         0x2024 => cmd_le_write_suggested_default_data_length(var c)
-        0x202F => cmd_le_read_maximum_data_length(var c)
+        0x202f => cmd_le_read_maximum_data_length(var c)
         0x2030 => cmd_le_read_phy(var c)
         0x2031 => cmd_le_set_default_phy(var c)
         0x2032 => cmd_le_set_phy(var c)
         0x2025 => cmd_le_read_local_p256(var c)
         0x2026 => cmd_le_generate_dhkey(var c)
-        0x205E => cmd_le_generate_dhkey_v2(var c)
+        0x205e => cmd_le_generate_dhkey_v2(var c)
         0x2027 => cmd_le_add_to_resolving_list(var c)
         0x2028 => cmd_le_remove_from_resolving_list(var c)
         0x2029 => cmd_le_clear_resolving_list(var c)
-        0x202A => cmd_le_read_resolving_list_size(var c)
-        0x202B => cmd_le_read_resolvable_address(var c, OP_LE_READ_PEER_RESOLVABLE_ADDRESS, false)
-        0x202C => cmd_le_read_resolvable_address(var c, OP_LE_READ_LOCAL_RESOLVABLE_ADDRESS, true)
-        0x202D => cmd_le_set_address_resolution_enable(var c)
-        0x202E => cmd_le_set_rpa_timeout(var c)
-        0x204E => cmd_le_set_privacy_mode(var c)
-        0x201A => cmd_le_long_term_key_request_reply(var c)
-        0x201B => cmd_le_long_term_key_request_negative_reply(var c)
-        0x201C => cmd_le_read_supported_states(var c)
+        0x202a => cmd_le_read_resolving_list_size(var c)
+        0x202b => cmd_le_read_resolvable_address(var c, OP_LE_READ_PEER_RESOLVABLE_ADDRESS, false)
+        0x202c => cmd_le_read_resolvable_address(var c, OP_LE_READ_LOCAL_RESOLVABLE_ADDRESS, true)
+        0x202d => cmd_le_set_address_resolution_enable(var c)
+        0x202e => cmd_le_set_rpa_timeout(var c)
+        0x204e => cmd_le_set_privacy_mode(var c)
+        0x201a => cmd_le_long_term_key_request_reply(var c)
+        0x201b => cmd_le_long_term_key_request_negative_reply(var c)
+        0x201c => cmd_le_read_supported_states(var c)
         0x2020 => cmd_le_remote_connection_parameter_request_reply(var c)
         0x2021 => cmd_le_remote_connection_parameter_request_negative_reply(var c)
-        0x204B => cmd_le_read_transmit_power(var c)
-        0x201D => cmd_le_receiver_test(var c, opcode)
+        0x204b => cmd_le_read_transmit_power(var c)
+        0x201d => cmd_le_receiver_test(var c, opcode)
         0x2033 => cmd_le_receiver_test(var c, opcode)
-        0x204F => cmd_le_receiver_test(var c, opcode)
-        0x201E => cmd_le_transmitter_test(var c, opcode)
+        0x204f => cmd_le_receiver_test(var c, opcode)
+        0x201e => cmd_le_transmitter_test(var c, opcode)
         0x2034 => cmd_le_transmitter_test(var c, opcode)
         0x2050 => cmd_le_transmitter_test(var c, opcode)
-        0x207B => cmd_le_transmitter_test(var c, opcode)
-        0x201F => cmd_le_test_end(var c)
-        _ => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
+        0x207b => cmd_le_transmitter_test(var c, opcode)
+        0x201f => cmd_le_test_end(var c)
+        _      => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
 
 // Whether the parameters of the command in `c.rx` have the length the command takes.  The
 // test commands of the third version carry a switching pattern of Switching_Pattern_Length
@@ -4571,7 +4759,9 @@ fn cmd_le_transmitter_test(var c: Controller, opcode: Int)
         cte = h4_rx.h4_param(var c.rx, 4)
         cte_type = h4_rx.h4_param(var c.rx, 5)
     if opcode == OP_LE_TRANSMITTER_TEST_V4
-        power = ll_dtm.power_of(h4_rx.h4_param(var c.rx, h4_rx.h4_param_len(var c.rx) - 1), TX_POWER_MIN_DBM, TX_POWER_MAX_DBM)
+        power = ll_dtm.power_of(h4_rx.h4_param(var c.rx, h4_rx.h4_param_len(var c.rx) - 1),
+            TX_POWER_MIN_DBM,
+            TX_POWER_MAX_DBM)
     var status = ll_dtm.tx_status(channel, payload, phy)
     if status == STATUS_SUCCESS and phy >= 3 and not c.coded
         status = STATUS_UNSUPPORTED_FEATURE
@@ -4604,13 +4794,13 @@ fn cmd_le_test_end(var c: Controller)
 
 // Whether the Controller takes the next octet of the Host's stream.  It does
 // not while a command waits to be answered or waits for the hardware.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_accepts(var c: Controller) -> Bool
     not h4_rx.h4_has_command(var c.rx) and (c.pending as Int) == PEND_NONE
 
 // Whether the Host's stream is inside a packet, the rest of which follows.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_in_packet(var c: Controller) -> Bool
     h4_rx.h4_in_packet(var c.rx)
@@ -4618,7 +4808,7 @@ fn ctl_in_packet(var c: Controller) -> Bool
 // Give the Controller the next octet of the Host's stream.  The caller has
 // checked `ctl_accepts`.  A loss of synchronization queues the Hardware
 // Error event now, or at the next `ctl_step` when no slot is free.
-@satisfies("REQ-BLE-CTL-001")
+pub @satisfies("REQ-BLE-CTL-001")
 @satisfies("REQ-BLE-CTL-002")
 @no_alloc
 @tier(embedded)
@@ -4651,7 +4841,7 @@ fn acl_to_link(var c: Controller)
 // Do the work that is due: send a Hardware Error that was owed, and answer
 // the command that is complete when a slot is free for its answer.  True
 // when a command was run.
-@satisfies("REQ-BLE-CTL-005")
+pub @satisfies("REQ-BLE-CTL-005")
 @no_alloc
 @tier(embedded)
 fn ctl_step(var c: Controller) -> Bool
@@ -4683,19 +4873,19 @@ fn ctl_step(var c: Controller) -> Bool
     true
 
 // The packet slots free for the Host's events.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_pool_free(var c: Controller) -> Int
     ctl_pool.pool_free(var c.pool)
 
 // Whether an octet is waiting to go to the Host.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_tx_pending(var c: Controller) -> Bool
     ctl_pool.pool_tx_pending(var c.pool)
 
 // The next octet to send to the Host, -1 when there is none.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_tx_next(var c: Controller) -> Int
     ctl_pool.pool_tx_next(var c.pool)
@@ -4706,7 +4896,7 @@ fn ctl_tx_next(var c: Controller) -> Int
 // when it does; a port never waits for the Host.  The Link Layer is polled by the same loop and its connection events and
 // isochronous events run on the clock, so a loop that waited here missed them all and every link of the Controller ended with the
 // supervision timeout while the Host was silent.
-trait HostTx[e]
+pub trait HostTx[e]
     // Whether the port can take one more octet now: false when the octet before it has not left (the Host holds it).
     fn ready(var self) -> Bool [e]
     // Hand the port one octet; called only after `ready` answered true.
@@ -4714,7 +4904,7 @@ trait HostTx[e]
 
 // Offer the octets that wait for the Host to `port`, at most `most` of them, and stop at the first the port will not take.  The
 // octets that are not taken stay in the queue, in order; the answer is how many went.
-@satisfies("REQ-BLE-CTL-078")
+pub @satisfies("REQ-BLE-CTL-078")
 @no_alloc
 @tier(embedded)
 fn ctl_tx_drain<P: HostTx[e]>(var c: Controller, var port: P, most: Int) -> Int [e]
@@ -4727,7 +4917,7 @@ fn ctl_tx_drain<P: HostTx[e]>(var c: Controller, var port: P, most: Int) -> Int 
     sent
 
 // The work the hardware owes: `PEND_NONE`, `PEND_ENCRYPT` or `PEND_RAND`.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_async_kind(var c: Controller) -> Int
     c.pending as Int
 
@@ -4747,7 +4937,7 @@ fn ctl_async_plain(var c: Controller, i: Int) -> Int
 // Store octet `i` of the result: the ciphertext of LE Encrypt, most
 // significant octet first, or the first eight octets of the random number
 // of LE Rand.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_async_put(var c: Controller, i: Int, v: Int)
     if i >= 0 and i < 16
@@ -4756,7 +4946,7 @@ fn ctl_async_put(var c: Controller, i: Int, v: Int)
 // Finish the command that waits for the hardware with the result stored by
 // `ctl_async_put`, and queue its Command Complete event.  The Encrypted_Data
 // is returned least significant octet first.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_async_complete(var c: Controller)
     let slot = c.pend_slot
@@ -4776,7 +4966,7 @@ fn ctl_async_complete(var c: Controller)
 // Finish the LE Encrypt command in progress with the cipher: the key and the
 // plaintext are the 16 octets most significant first, and so is the answer, which
 // `ctl_async_complete` returns least significant first.
-@satisfies("REQ-BLE-HCI-031")
+pub @satisfies("REQ-BLE-HCI-031")
 @tier(embedded)
 fn ctl_le_encrypt<C: Cipher[e]>(var c: Controller, var cc: C) [e]
     var key: Vec[u8; 16] = Vec.new()
@@ -4793,7 +4983,7 @@ fn ctl_le_encrypt<C: Cipher[e]>(var c: Controller, var cc: C) [e]
 
 // Finish the command that waits for the hardware with a failure: the
 // Command Complete event carries Hardware Failure and no return parameters.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_async_fail(var c: Controller)
     let slot = c.pend_slot
@@ -4822,14 +5012,14 @@ fn ctl_set_radio(var c: Controller, p: ll_radio.RadioProfile)
     ll_arb.arb_radio(var c.arb, p)
 
 // The program's clock, in microseconds.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_set_time(var c: Controller, now: Int)
     c.now = now
 
 // Seed the generators of advDelay, of the scan request backoff and of the
 // access address of a connection as Central.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_seed(var c: Controller, seed: Int)
     ll_adv.adv_seed(var c.adv, seed)
     ll_scan.scan_seed(var c.scan, seed)
@@ -4854,7 +5044,7 @@ fn links_live(var c: Controller) -> Bool
 
 // Book the arbiter from the state: the advertising event that is due, and
 // the next scan window.  Nothing is booked for an activity that is off.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_ll_book(var c: Controller)
     let xi = ctl_xadv_pick(var c)
     if xi >= 0
@@ -5011,7 +5201,7 @@ const ISO_PACKET_US = 60
 const ISO_SKIPS_MAX = 24
 
 // The time to the next booking that the main loop has for this turn, less the guard: `ctl_ll_room` before the turn.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_set_room(var c: Controller, room: Int)
     c.room_us = room
@@ -5044,7 +5234,7 @@ fn ctl_rx_cost_us(var c: Controller) -> Int
     0
 
 // Whether the main loop, which has `left` microseconds before the next booking's guard, may read the next octet.
-@satisfies("REQ-BLE-CTL-078")
+pub @satisfies("REQ-BLE-CTL-078")
 @no_alloc
 @tier(embedded)
 fn ctl_rx_fits(var c: Controller, left: Int) -> Bool
@@ -5057,7 +5247,7 @@ fn ctl_rx_fits(var c: Controller, left: Int) -> Bool
 // `ctl_ll_pick` (`ll_arb.arb_room`).  It leaves the stream `ll_radio.stream_guard_us` before the start of a booking: the radio
 // program is entered, the radio pointed and the receiver started by the booking's start less its ramp-up, and the octet the
 // stream was on takes 10 more.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_ll_room(var c: Controller, now: Int) -> Int
     ll_arb.arb_room(var c.arb, now, c.arb.stream_guard)
 
@@ -5139,7 +5329,7 @@ fn copy_head(var dst: Pdu, var src: Pdu)
 // address of entry `i`.
 @tier(embedded)
 fn rewrite_in(var c: Controller, var p: Pdu, i: Int)
-    p.b[0] = (((p.b[0] as Int) & 0xBF) | ((c.rl.kind[i] as Int) << 6)) as u8
+    p.b[0] = ((p.b[0] as Int & 0xBF) | (c.rl.kind[i] as Int << 6)) as u8
     for k in 0..6
         p.b[2 + k] = c.rl.addr[i * 6 + k]
 
@@ -5156,8 +5346,8 @@ fn privacy_sender(var c: Controller, var rx: Pdu) -> Int
     c.view_ent = -1
     if not c.rl.enable or ll_privacy.rl_count(var c.rl) == 0
         return 0
-    let kind = ((rx.b[0] as Int) >>> 6) & 1
-    if kind == 1 and ((rx.b[7] as Int) & 0xC0) == 0x40
+    let kind = (rx.b[0] as Int >>> 6) & 1
+    if kind == 1 and (rx.b[7] as Int & 0xC0) == 0x40
         let idx = ll_privacy.rl_cached_at(var c.rl, var rx.b, 2)
         if idx >= 0
             copy_head(var c.view, var rx)
@@ -5216,7 +5406,7 @@ fn start_advertising(var c: Controller, own: Int, ent: Int, loc: Bool)
 // Judge the PDU received after an advertisement: `ll_adv.RX_SCAN_REQ`,
 // `RX_CONNECT_IND` or `RX_NONE`.  The Filter Accept List is read only when the
 // advertising filter policy uses it.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_adv_rx(var c: Controller, var rx: Pdu, got: Int) -> Int
     c.adv_st = 0
     // The sender of a request, ScanA or InitA, is judged as the identity it resolves to.
@@ -5300,7 +5490,14 @@ fn ctl_xadv_room(var c: Controller, i: Int) -> Bool
 fn ctl_xadv_begin(var c: Controller, i: Int, start: Int)
     c.xsets[i].anchor = start
     let ty = ll_xadv.engine_type(var c.xsets[i])
-    ll_adv.adv_set_params(var c.adv, c.xsets[i].int_min, c.xsets[i].int_max, ty, c.xsets[i].own as Int, c.xsets[i].peer_type as Int, c.xsets[i].chmap as Int, c.xsets[i].policy as Int)
+    ll_adv.adv_set_params(var c.adv,
+        c.xsets[i].int_min,
+        c.xsets[i].int_max,
+        ty,
+        c.xsets[i].own as Int,
+        c.xsets[i].peer_type as Int,
+        c.xsets[i].chmap as Int,
+        c.xsets[i].policy as Int)
     for k in 0..6
         c.adv.addr[k] = c.xsets[i].addr[k]
         c.adv.tgt[k] = c.xsets[i].peer[k]
@@ -5350,7 +5547,8 @@ fn ctl_xadv_scan_request(var c: Controller, var rx: Pdu)
 // Advertising Set Terminated (Status Success, the handle of the connection).
 @satisfies("REQ-BLE-CTL-091")
 @tier(embedded)
-fn ctl_xadv_connect<P: LinkPolicy>(var c: Controller, var policy: P, var rx: Pdu, end_us: Int, phy: Int) -> Bool
+fn ctl_xadv_connect<P: LinkPolicy>(var c: Controller, var policy: P, var rx: Pdu, end_us: Int,
+                                   phy: Int) -> Bool
     let i = c.adv_xset
     if i < 0
         return false
@@ -5465,7 +5663,8 @@ fn report_count(len: Int) -> Int
 // complete unless `more` says another PDU of the advertisement follows.  False when the pool had no room.
 @satisfies("REQ-BLE-CTL-090")
 @tier(embedded)
-fn report_ext_data(var c: Controller, rssi: Int, var src: Pdu, at: Int, len: Int, more: Bool) -> Bool
+fn report_ext_data(var c: Controller, rssi: Int, var src: Pdu, at: Int, len: Int,
+                   more: Bool) -> Bool
     var off = 0
     var left = len
     for _ in 0..2
@@ -5539,7 +5738,7 @@ fn report_pdu_id(var c: Controller, var rx: Pdu, rssi: Int, ident: Int)
 // carried (a random address).
 @tier(embedded)
 fn address_to_rpa(var req: Pdu, var rx: Pdu)
-    req.b[0] = ((req.b[0] as Int) | 0x80) as u8
+    req.b[0] = (req.b[0] as Int | 0x80) as u8
     for k in 0..6
         req.b[8 + k] = rx.b[2 + k]
 
@@ -5558,7 +5757,7 @@ fn scan_address_for(var c: Controller, ent: Int)
             var a = rl_local_vec(var c, ent)
             ll_scan.scan_set_scana(var c.scan, var a, 1)
             ll_scan.put_scana(var c.scan)
-    else if ((c.scan.own as Int) & 1) == 0
+    else if (c.scan.own as Int & 1) == 0
         set_scan_plain(var c, var c.public, 0)
     else
         set_scan_plain(var c, var c.random, 1)
@@ -5616,7 +5815,7 @@ fn hold_report(var c: Controller, var rx: Pdu, rssi: Int)
 // `ACT_REQUEST` saying the SCAN_REQ in `c.scan.req` is to go out and
 // `ACT_ACCEPTED` that `ctl_scan_note` is to follow.  The Filter Accept List is
 // read only when the scanning filter policy uses it.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_scan_decide(var c: Controller, var rx: Pdu, got: Int) -> Int
     c.scan_st = 0
     let st = privacy_sender(var c, var rx)
@@ -5646,7 +5845,7 @@ fn ctl_scan_decide(var c: Controller, var rx: Pdu, got: Int) -> Int
 
 // The second part: tell the Host about a PDU `ctl_scan_decide` accepted, unless
 // the duplicate filter has seen the device, with the RSSI in dBm.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_scan_note(var c: Controller, var rx: Pdu, rssi: Int)
     scan_default_address(var c)
     if c.scan_st == 1
@@ -5664,7 +5863,7 @@ fn ctl_scan_note(var c: Controller, var rx: Pdu, rssi: Int)
 
 // Judge and report an advertising PDU in one call.  The answer is the mask of
 // `ll_scan`: `ACT_REQUEST` says the SCAN_REQ in `c.scan.req` is to go out.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_scan_rx(var c: Controller, var rx: Pdu, got: Int, rssi: Int) -> Int
     let act = ctl_scan_decide(var c, var rx, got)
     if (act & ll_scan.ACT_ACCEPTED) == 0
@@ -5677,7 +5876,7 @@ fn ctl_scan_rx(var c: Controller, var rx: Pdu, got: Int, rssi: Int) -> Int
     out
 
 // A PDU received with a good CRC as the answer to the SCAN_REQ.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_scan_rsp_rx(var c: Controller, var rx: Pdu, got: Int, rssi: Int) -> Int
     let st = privacy_sender(var c, var rx)
     if st == 1
@@ -5829,7 +6028,17 @@ fn ctl_xscan_note(var c: Controller, var rx: Pdu, rssi: Int, pphy: Int, sphy: In
     if not c.xview
         ll_ext.xctx_extended(var c.xs, var rx, x, false, pphy, sphy, 0, var c.xv, -1, 0, false)
     else if resolved
-        ll_ext.xctx_extended(var c.xs, var rx, x, false, pphy, sphy, ll_pdu.pdu_tx_add(var c.view), var c.view, 2, 2, false)
+        ll_ext.xctx_extended(var c.xs,
+            var rx,
+            x,
+            false,
+            pphy,
+            sphy,
+            ll_pdu.pdu_tx_add(var c.view),
+            var c.view,
+            2,
+            2,
+            false)
     else
         ll_ext.xctx_extended(var c.xs, var rx, x, false, pphy, sphy, ll_pdu.pdu_tx_add(var c.xv), var c.xv, 2, 0, false)
     c.scan.reports = c.scan.reports + 1
@@ -5846,7 +6055,7 @@ fn ctl_xscan_rsp(var c: Controller, var rx: Pdu, rssi: Int, pphy: Int, sphy: Int
     let x = ll_ext.ext_parse(var rx)
     if not x.ok or not c.scan.waiting or not ll_ext.legacy_view(var rx, x, var c.xp, var c.xv)
         return 0
-    c.xv.b[0] = (((c.xv.b[0] as Int) & 0xF0) | ll_pdu.SCAN_RSP) as u8
+    c.xv.b[0] = ((c.xv.b[0] as Int & 0xF0) | ll_pdu.SCAN_RSP) as u8
     let st = privacy_sender(var c, var c.xv)
     var key = 0x8000
     if x.adi >= 0
@@ -5865,9 +6074,29 @@ fn ctl_xscan_rsp(var c: Controller, var rx: Pdu, rssi: Int, pphy: Int, sphy: Int
         c.dropped_events = c.dropped_events + 1
         return 0
     if st == 1
-        ll_ext.xctx_extended(var c.xs, var rx, x, true, pphy, sphy, ll_pdu.pdu_tx_add(var c.view), var c.view, 2, 2, c.scan.w_conn)
+        ll_ext.xctx_extended(var c.xs,
+            var rx,
+            x,
+            true,
+            pphy,
+            sphy,
+            ll_pdu.pdu_tx_add(var c.view),
+            var c.view,
+            2,
+            2,
+            c.scan.w_conn)
     else
-        ll_ext.xctx_extended(var c.xs, var rx, x, true, pphy, sphy, ll_pdu.pdu_tx_add(var c.xv), var c.xv, 2, 0, c.scan.w_conn)
+        ll_ext.xctx_extended(var c.xs,
+            var rx,
+            x,
+            true,
+            pphy,
+            sphy,
+            ll_pdu.pdu_tx_add(var c.xv),
+            var c.xv,
+            2,
+            0,
+            c.scan.w_conn)
     if report_ext_data(var c, rssi, var rx, x.data_at, x.data_len, more)
         return 1
     0
@@ -5913,7 +6142,9 @@ fn ctl_xscan_end(var c: Controller)
 fn ev_psync_established(var c: Controller, j: Int) -> Bool
     if ctl_limits.past_on() and c.psyncs[j].past
         return ev_psync_transfer(var c, j)
-    let code = psync_code(var c, SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED, SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED_V2)
+    let code = psync_code(var c,
+        SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED,
+        SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED_V2)
     if not le_event_enabled(var c, code)
         c.psyncs[j].owed = ll_per.EV_NONE
         return true
@@ -5965,7 +6196,9 @@ fn pawr_tail_put(var c: Controller, slot: Int, j: Int)
 @satisfies("REQ-BLE-CTL-109")
 @tier(embedded)
 fn ev_psync_transfer(var c: Controller, j: Int) -> Bool
-    let code = psync_code(var c, SUB_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER_RECEIVED, SUB_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER_RECEIVED_V2)
+    let code = psync_code(var c,
+        SUB_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER_RECEIVED,
+        SUB_LE_PERIODIC_ADVERTISING_SYNC_TRANSFER_RECEIVED_V2)
     if not le_event_enabled(var c, code)
         c.psyncs[j].owed = ll_per.EV_NONE
         return true
@@ -5997,7 +6230,9 @@ fn ev_psync_transfer(var c: Controller, j: Int) -> Bool
 @satisfies("REQ-BLE-CTL-094")
 @tier(embedded)
 fn ev_psync_cancelled(var c: Controller) -> Bool
-    let code = psync_code(var c, SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED, SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED_V2)
+    let code = psync_code(var c,
+        SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED,
+        SUB_LE_PERIODIC_ADVERTISING_SYNC_ESTABLISHED_V2)
     if not le_event_enabled(var c, code)
         c.preq.cancel_owed = false
         return true
@@ -6045,7 +6280,8 @@ fn flush_psync(var c: Controller) -> Bool
 // pool had no room.
 @satisfies("REQ-BLE-CTL-094")
 @tier(embedded)
-fn report_periodic(var c: Controller, j: Int, rssi: Int, var src: Pdu, at: Int, len: Int, status: Int) -> Bool
+fn report_periodic(var c: Controller, j: Int, rssi: Int, var src: Pdu, at: Int, len: Int,
+                   status: Int) -> Bool
     let code = psync_code(var c, SUB_LE_PERIODIC_ADVERTISING_REPORT, SUB_LE_PERIODIC_ADVERTISING_REPORT_V2)
     if not le_event_enabled(var c, code)
         return true
@@ -6077,7 +6313,8 @@ fn report_periodic(var c: Controller, j: Int, rssi: Int, var src: Pdu, at: Int, 
 // says another PDU of the event follows, truncated when `trunc` says it cannot.
 @satisfies("REQ-BLE-CTL-094")
 @tier(embedded)
-fn report_periodic_data(var c: Controller, j: Int, rssi: Int, var src: Pdu, at: Int, len: Int, more: Bool, trunc: Bool) -> Bool
+fn report_periodic_data(var c: Controller, j: Int, rssi: Int, var src: Pdu, at: Int, len: Int,
+                        more: Bool, trunc: Bool) -> Bool
     var off = 0
     var left = len
     for _ in 0..2
@@ -6260,7 +6497,17 @@ fn ctl_psync_offer(var c: Controller, var rx: Pdu, n: Int, t_first: Int, phy: In
     let j = psync_free_slot(var c)
     if j < 0
         return false
-    ll_per.psync_begin(var c.psyncs[j], j, var rx, x.sync, kind, var a, sid, phy, t_first, c.preq.timeout, c.preq.reports)
+    ll_per.psync_begin(var c.psyncs[j],
+        j,
+        var rx,
+        x.sync,
+        kind,
+        var a,
+        sid,
+        phy,
+        t_first,
+        c.preq.timeout,
+        c.preq.reports)
     if ctl_limits.pawr_sync_on()
         ll_pawr.ps_clear(var c.pws[j])
         if ti >= 0
@@ -6274,7 +6521,8 @@ fn ctl_psync_offer(var c: Controller, var rx: Pdu, n: Int, t_first: Int, phy: In
 // pointer names a channel and an offset), -1 for none, -2 for a PDU that is none of the train's.
 @satisfies("REQ-BLE-CTL-094")
 @tier(embedded)
-fn ctl_psync_pdu(var c: Controller, j: Int, var rx: Pdu, n: Int, rssi: Int, t_first: Int, chain: Bool) -> Int
+fn ctl_psync_pdu(var c: Controller, j: Int, var rx: Pdu, n: Int, rssi: Int, t_first: Int,
+                 chain: Bool) -> Int
     if n < 3
         return -2
     rx.n = n
@@ -6348,7 +6596,7 @@ fn pawr_dispatch(var c: Controller, opcode: Int)
         0x2082 => cmd_le_set_periodic_advertising_subevent_data(var c)
         0x2083 => cmd_le_set_periodic_advertising_response_data(var c)
         0x2084 => cmd_le_set_periodic_sync_subevent(var c)
-        _ => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
+        _      => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
 
 // The Command Complete of a command that answers the Status and a 12-bit Sync_Handle.
 @tier(embedded)
@@ -6736,7 +6984,7 @@ fn ctl_pwsync_book_us(var c: Controller, j: Int) -> Int
 // Whether the Controller needs Resolvable Private Addresses of its own now.
 @tier(embedded)
 fn privacy_wants_local(var c: Controller) -> Bool
-    (c.adv.enabled and (c.adv_loc or c.adv_tgt)) or (c.init.enabled and c.init_loc) or (c.scan.enabled and (c.scan.own as Int) >= 2) or xsets_want_rpa(var c)
+    c.adv.enabled and (c.adv_loc or c.adv_tgt) or c.init.enabled and c.init_loc or c.scan.enabled and (c.scan.own as Int) >= 2 or xsets_want_rpa(var c)
 
 // Whether a set of extended PDUs that is on advertises with a Resolvable Private Address, or names its peer with one.
 @tier(embedded)
@@ -6749,18 +6997,18 @@ fn xsets_want_rpa(var c: Controller) -> Bool
     false
 
 // Whether the program is to supply random octets to `ctl_entropy_put`.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_entropy_wanted(var c: Controller) -> Bool
     ll_privacy.rl_count(var c.rl) > 0 and ll_privacy.rl_entropy(var c.rl) < 3
 
 // Give the resolving list 12 random octets.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_entropy_put(var c: Controller, var v: Vec[u8; 12])
     ll_privacy.rl_entropy_put(var c.rl, var v)
 
 // Whether the work of `ctl_privacy_poll` is pending: an address to resolve, an RPA to
 // make, or a report or a connection that waits.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_privacy_wanted(var c: Controller) -> Bool
     if c.rq_kind != RQ_NONE or c.rp_valid
         return true
@@ -6833,7 +7081,7 @@ fn sync_privacy(var c: Controller)
                 same = false
         if not same or c.adv.addr_type != 1
             ll_adv.adv_set_addr(var c.adv, var a, 1)
-    c.adv_wait = c.adv.enabled and ((c.adv_loc and c.adv_ent >= 0 and not c.rl.local_ok[c.adv_ent]) or (c.adv_tgt and not c.adv_tgt_ok))
+    c.adv_wait = c.adv.enabled and (c.adv_loc and c.adv_ent >= 0 and not c.rl.local_ok[c.adv_ent] or c.adv_tgt and not c.adv_tgt_ok)
     scan_default_address(var c)
     if c.init.enabled and c.init_loc and c.init_ent >= 0
         c.init_wait = not c.rl.local_ok[c.init_ent]
@@ -6847,7 +7095,7 @@ fn sync_privacy(var c: Controller)
 // Run one unit of the work of privacy that needs the cipher: try the address queued
 // against the list, or make an RPA, or renew them when the RPA timeout has run.  True
 // when it did something.
-@satisfies("REQ-BLE-CTL-036")
+pub @satisfies("REQ-BLE-CTL-036")
 @satisfies("REQ-BLE-CTL-037")
 @tier(embedded)
 fn ctl_privacy_poll<C: Cipher[e]>(var c: Controller, var cc: C) -> Bool [e]
@@ -6925,11 +7173,12 @@ fn ctl_class_slot(cls: Int) -> Int
 // checks of the Link Layer and the policy and a link is free for the Peripheral
 // role: the connection is opened, advertising ends, and the Host is owed LE
 // Connection Complete.  False leaves the advertiser as it was.
-@satisfies("REQ-BLE-CTL-013")
+pub @satisfies("REQ-BLE-CTL-013")
 @satisfies("REQ-BLE-CTL-014")
 @satisfies("REQ-BLE-CTL-024")
 @tier(embedded)
-fn ctl_connect_ind<P: LinkPolicy>(var c: Controller, var policy: P, var rx: Pdu, end_us: Int) -> Bool
+fn ctl_connect_ind<P: LinkPolicy>(var c: Controller, var policy: P, var rx: Pdu,
+                                  end_us: Int) -> Bool
     let slot = connect_open(var c, var policy, var rx, end_us)
     if slot >= 0 and c.adv_set >= 0
         // The connection was made on a set of legacy PDUs: the set ends, and the Host is told.
@@ -6981,7 +7230,13 @@ fn connect_open<P: LinkPolicy>(var c: Controller, var policy: P, var rx: Pdu, en
 @satisfies("REQ-BLE-CTL-043")
 @tier(embedded)
 fn apply_defaults(var c: Controller, ls: Int)
-    ll_link.link_set_defaults(var c.links[ls], c.dl_sugg_set, c.dl_sugg_octets, c.dl_sugg_time, c.phy_def_set, c.phy_def_tx & phy_mask(var c), c.phy_def_rx & phy_mask(var c))
+    ll_link.link_set_defaults(var c.links[ls],
+        c.dl_sugg_set,
+        c.dl_sugg_octets,
+        c.dl_sugg_time,
+        c.phy_def_set,
+        c.phy_def_tx & phy_mask(var c),
+        c.phy_def_rx & phy_mask(var c))
     ll_link.link_set_no_coded(var c.links[ls], not c.coded)
     if ctl_limits.past_on()
         past_defaults(var c, ls)
@@ -7021,7 +7276,14 @@ fn apply_privacy(var c: Controller, ls: Int)
     var idk = -1
     if (c.ci_kind & 4) != 0
         idk = c.links[ls].peer_type
-    ll_link.link_set_privacy(var c.links[ls], var peer, (c.ci_kind & 1) != 0, var local, (c.ci_kind & 2) != 0, idk, var ident, (c.ci_kind & 8) != 0)
+    ll_link.link_set_privacy(var c.links[ls],
+        var peer,
+        (c.ci_kind & 1) != 0,
+        var local,
+        (c.ci_kind & 2) != 0,
+        idk,
+        var ident,
+        (c.ci_kind & 8) != 0)
     c.ci_kind = 0
 @tier(embedded)
 fn slot_handle(slot: Int) -> Int
@@ -7118,7 +7380,7 @@ fn ctl_conn_fail(var c: Controller, slot: Int)
 
 // Whether a link waits for random octets (`rnd` to `ctl_secure_poll`) or for the
 // cipher.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_secure_wanted(var c: Controller) -> Bool
     for slot in 0..noble_controller_config.CTL_LINKS
         if ll_link.link_wants_random(var c.links[slot]) or ll_link.link_wants_cipher(var c.links[slot])
@@ -7126,7 +7388,7 @@ fn ctl_secure_wanted(var c: Controller) -> Bool
     false
 
 // Whether a link waits for random octets.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_wants_random(var c: Controller) -> Bool
     for slot in 0..noble_controller_config.CTL_LINKS
         if ll_link.link_wants_random(var c.links[slot])
@@ -7135,9 +7397,10 @@ fn ctl_wants_random(var c: Controller) -> Bool
 
 // Run the work of the Encryption Start procedure that needs the cipher or random
 // octets, on both links; the random octets serve one link.
-@satisfies("REQ-BLE-CTL-031")
+pub @satisfies("REQ-BLE-CTL-031")
 @tier(embedded)
-fn ctl_secure_poll<C: Cipher[e]>(var c: Controller, var cc: C, var rnd: Vec[u8; 12], have: Bool) -> Bool [e]
+fn ctl_secure_poll<C: Cipher[e]>(var c: Controller, var cc: C, var rnd: Vec[u8; 12],
+                                 have: Bool) -> Bool [e]
     var used = false
     for slot in 0..noble_controller_config.CTL_LINKS
         if ll_link.link_secure_poll(var c.links[slot], var cc, var rnd, have and not used)
@@ -7205,7 +7468,7 @@ fn fal_has_entry(var c: Controller, ent: Int) -> Bool
 // directed advertisement must name this initiator, by its address or by an RPA made with
 // the local IRK.  The InitA is the RPA of the entry's local IRK when the Own_Address_Type
 // asks for it.
-@satisfies("REQ-BLE-CTL-021")
+pub @satisfies("REQ-BLE-CTL-021")
 @satisfies("REQ-BLE-CTL-036")
 @tier(embedded)
 fn ctl_init_decide(var c: Controller, var rx: Pdu, got: Int) -> Bool
@@ -7215,12 +7478,12 @@ fn ctl_init_decide(var c: Controller, var rx: Pdu, got: Int) -> Bool
         return init_plain(var c, var rx, got)
     let hdr = rx.b[0] as Int
     let ty = hdr & 0x0F
-    if (ty != ll_pdu.ADV_IND and ty != ll_pdu.ADV_DIRECT_IND) or not ll_pdu.pdu_well_formed(var rx, got)
+    if ty != ll_pdu.ADV_IND and ty != ll_pdu.ADV_DIRECT_IND or not ll_pdu.pdu_well_formed(var rx, got)
         return false
     let kind = (hdr >>> 6) & 1
     var ent = -1
     var rpa = false
-    if kind == 1 and ((rx.b[7] as Int) & 0xC0) == 0x40
+    if kind == 1 and (rx.b[7] as Int & 0xC0) == 0x40
         rpa = true
         ent = ll_privacy.rl_cached_at(var c.rl, var rx.b, 2)
         if ent < 0
@@ -7279,7 +7542,7 @@ fn init_plain(var c: Controller, var rx: Pdu, got: Int) -> Bool
 // RPA that the local IRK of entry `ent` made (an RPA not seen before is queued).
 @tier(embedded)
 fn directed_to_us(var c: Controller, var rx: Pdu, ent: Int) -> Bool
-    if ll_pdu.pdu_rx_add(var rx) == 1 and ((rx.b[13] as Int) & 0xC0) == 0x40
+    if ll_pdu.pdu_rx_add(var rx) == 1 and (rx.b[13] as Int & 0xC0) == 0x40
         let idx = ll_privacy.rl_seen_at(var c.rl, var rx.b, 8)
         if idx < 0
             let _q = ask_to_resolve(var c, var rx, 8, RQ_TARGET)
@@ -7300,7 +7563,7 @@ fn ask_to_resolve(var c: Controller, var rx: Pdu, off: Int, kind: Int) -> Bool
 
 // The CONNECT_IND that `ctl_init_decide` accepted did not go on air: the state
 // goes on listening.
-@tier(embedded)
+pub @tier(embedded)
 fn ctl_init_unsent(var c: Controller)
     ll_init.init_unsent(var c.init)
 
@@ -7326,7 +7589,7 @@ fn ctl_init_aux_room(var c: Controller, until: Int) -> Bool
 // advertiser is judged as a legacy one is (`ctl_init_decide`) from its legacy shape, and the
 // connection parameters of `phy` are put into the AUX_CONNECT_REQ in `c.init.req`.  True when that
 // request is to go out.
-@satisfies("REQ-BLE-CTL-080")
+pub @satisfies("REQ-BLE-CTL-080")
 @tier(embedded)
 fn ctl_init_aux_decide(var c: Controller, var rx: Pdu, n: Int, phy: Int) -> Bool
     if not c.init.enabled or not c.init.ext or not ll_init.ext_view(var rx, n, var c.view)
@@ -7346,7 +7609,7 @@ fn ctl_init_aux_rsp(var c: Controller, var rx: Pdu, n: Int) -> Bool
 
 // The AUX_CONNECT_RSP did not come: the request did not make a connection, and the state goes on
 // listening.
-@satisfies("REQ-BLE-CTL-080")
+pub @satisfies("REQ-BLE-CTL-080")
 @tier(embedded)
 fn ctl_init_aux_lost(var c: Controller)
     c.init.aux_rsp_missed = c.init.aux_rsp_missed + 1
@@ -7370,7 +7633,7 @@ fn ctl_init_aux_skipped(var c: Controller)
 // at the start of the transmit window.  With no link free (which the reservation
 // of `peripheral_room` prevents) the state ends and the Host is told the
 // connection could not be made.  True when the link opened.
-@satisfies("REQ-BLE-CTL-022")
+pub @satisfies("REQ-BLE-CTL-022")
 @tier(embedded)
 fn ctl_init_sent(var c: Controller, end_us: Int) -> Bool
     let slot = free_slot(var c)
@@ -7625,7 +7888,7 @@ fn ev_featext(var c: Controller, ls: Int) -> Bool
     var valid = 0
     if ok and ll_link.fx_get(c.links[ls], ll_link.FX_HAVE, 1) == 1
         valid = 1
-        if ((c.links[ls].peer_feat[7] as Int) & ll_feat.OCTET7_EXT) != 0
+        if (c.links[ls].peer_feat[7] as Int & ll_feat.OCTET7_EXT) != 0
             remote = ll_link.fx_get(c.links[ls], ll_link.FX_MAX, 0xF)
             if remote > ll_feat.PAGE_MAX
                 remote = ll_feat.PAGE_MAX
@@ -7643,7 +7906,7 @@ fn ev_featext(var c: Controller, ls: Int) -> Bool
         if ok and ll_link.fx_get(c.links[ls], ll_link.FX_HAVE, 1) == 1
             v = (ll_link.fx_get(c.links[ls], ll_link.FX_PEER, 0xFFFFFF) >>> (8 * i)) & 0xFF
         let _f = ctl_pool.pool_put(var c.pool, slot, v)
-    for _ in 0..(ll_feat.PAGE_MAX * ll_feat.PAGE_OCTETS - 8)
+    for _ in 0..ll_feat.PAGE_MAX * ll_feat.PAGE_OCTETS - 8
         let _g = ctl_pool.pool_put(var c.pool, slot, 0)
     event_send(var c, slot)
     lk_sent(var c, ls, ll_link.EV_FEATEXT)
@@ -7672,7 +7935,6 @@ fn put_enc_change(var pool: PacketPool, slot: Int, var l: Link)
 fn put_key_refresh(var pool: PacketPool, slot: Int, var l: Link)
     let _a = ctl_pool.pool_put(var pool, slot, l.enc_status)
     let _b = ctl_pool.pool_put_u16(var pool, slot, l.handle)
-
 
 // LE Connection Complete, or LE Enhanced Connection Complete when the Host
 // enabled that one instead ([Vol 4] Part E, Section 7.7.65.1 and 7.7.65.10), for
@@ -7987,7 +8249,7 @@ fn flush_link(var c: Controller, ls: Int) -> Bool
     true
 
 // Queue the events the connections and the Initiating state owe the Host.
-@satisfies("REQ-BLE-CTL-078")
+pub @satisfies("REQ-BLE-CTL-078")
 @satisfies("REQ-BLE-CTL-014")
 @satisfies("REQ-BLE-CTL-018")
 @tier(embedded)
@@ -8047,7 +8309,7 @@ const CIS_LEAD_US = 600
 // Whether this build has isochronous channels and a Link Layer.
 @tier(embedded)
 fn iso_on(var c: Controller) -> Bool
-    ctl_limits.iso_on() and ((c.caps as Int) & CAP_LL) != 0
+    ctl_limits.iso_on() and (c.caps as Int & CAP_LL) != 0
 
 // Run the isochronous channels' command `opcode`.
 @tier(embedded)
@@ -8068,12 +8330,12 @@ fn iso_dispatch(var c: Controller, opcode: Int)
         0x2065 => cmd_le_remove_cig(var c)
         0x2066 => cmd_le_accept_cis_request(var c)
         0x2067 => cmd_le_reject_cis_request(var c)
-        0x206D => cmd_le_request_peer_sca(var c)
-        0x206E => cmd_le_setup_iso_data_path(var c)
-        0x206F => cmd_le_remove_iso_data_path(var c)
+        0x206d => cmd_le_request_peer_sca(var c)
+        0x206e => cmd_le_setup_iso_data_path(var c)
+        0x206f => cmd_le_remove_iso_data_path(var c)
         0x2074 => cmd_le_set_host_feature(var c)
         0x2075 => cmd_le_read_iso_link_quality(var c)
-        _ => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
+        _      => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
 
 // Run the broadcast isochronous group command `opcode`, or the ISO test mode's (a build with groups carries both).
 @tier(embedded)
@@ -8081,14 +8343,14 @@ fn big_dispatch(var c: Controller, opcode: Int)
     match opcode
         0x2068 => cmd_le_create_big(var c, false)
         0x2069 => cmd_le_create_big(var c, true)
-        0x206A => cmd_le_terminate_big(var c)
-        0x206B => cmd_le_big_create_sync(var c)
-        0x206C => cmd_le_big_terminate_sync(var c)
+        0x206a => cmd_le_terminate_big(var c)
+        0x206b => cmd_le_big_create_sync(var c)
+        0x206c => cmd_le_big_terminate_sync(var c)
         0x2070 => cmd_le_iso_transmit_test(var c)
         0x2071 => cmd_le_iso_receive_test(var c)
         0x2072 => cmd_le_iso_read_test_counters(var c, false)
         0x2073 => cmd_le_iso_read_test_counters(var c, true)
-        _ => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
+        _      => answer_status(var c, opcode, STATUS_UNKNOWN_COMMAND)
 
 // Whether `opcode` is a command of the isochronous channels.
 @tier(embedded)
@@ -8216,7 +8478,8 @@ fn iso_reject(var c: Controller, ls: Int, op: Int, code: Int)
 // the HCI PHY value 1 to 4.  `reason` is `ll_pcl.REASON_*`; the event is dropped when the Host did not unmask it or no event slot is free.
 @satisfies("REQ-BLE-CTL-115")
 @tier(embedded)
-fn pcl_event(var c: Controller, ls: Int, status: Int, reason: Int, idx: Int, level: Int, flags: Int, delta: Int)
+fn pcl_event(var c: Controller, ls: Int, status: Int, reason: Int, idx: Int, level: Int, flags: Int,
+             delta: Int)
     if not le_event_enabled(var c, SUB_LE_TRANSMIT_POWER_REPORTING)
         return
     let slot = meta_begin(var c, SUB_LE_TRANSMIT_POWER_REPORTING)
@@ -8234,7 +8497,7 @@ fn pcl_event(var c: Controller, ls: Int, status: Int, reason: Int, idx: Int, lev
 // Whether the PHY index `idx` is one this Controller transmits on: the two uncoded PHYs always, the coded ones in a build with the LE Coded PHY.
 @tier(embedded)
 fn pcl_phy_ok(var c: Controller, idx: Int) -> Bool
-    idx >= 0 and (idx < 2 or (idx < ll_pcl.PHYS and c.coded))
+    idx >= 0 and (idx < 2 or idx < ll_pcl.PHYS and c.coded)
 
 // The PHY index the link in slot `ls` transmits on now.
 @tier(embedded)
@@ -8244,7 +8507,7 @@ fn pcl_cur(var c: Controller, ls: Int) -> Int
 // Whether the peer of the link in slot `ls` said it lacks LE Power Control Request (feature 33).
 @tier(embedded)
 fn pcl_peer_lacks(var c: Controller, ls: Int) -> Bool
-    c.links[ls].have_feat and ((c.links[ls].peer_feat[4] as Int) & 0x02) == 0
+    c.links[ls].have_feat and (c.links[ls].peer_feat[4] as Int & 0x02) == 0
 
 // LL_POWER_CONTROL_REQ received on the link in slot `ls` ([Vol 6] Part B, Section 5.1.17): the PHY is one supported PHY and the level is a
 // value; a request that crosses this end's own outstanding request is answered with no change.  The new level is the present level moved
@@ -8289,7 +8552,7 @@ fn pcl_rsp(var c: Controller, ls: Int, var rx: Pdu)
     c.pcl[ls].wait = false
     ll_pcl.set_peer(var c.pcl[ls], idx, level, flags)
     let reason = c.pcl[ls].wait_reason
-    if reason == ll_pcl.REASON_READ or (reason == ll_pcl.REASON_REMOTE and c.pcl[ls].remote_rep)
+    if reason == ll_pcl.REASON_READ or reason == ll_pcl.REASON_REMOTE and c.pcl[ls].remote_rep
         pcl_event(var c, ls, STATUS_SUCCESS, reason, idx, level, flags, 0)
 
 // LL_POWER_CHANGE_IND received: the peer moved its level on every PHY the mask names.
@@ -8351,11 +8614,21 @@ fn ctl_pcl_poll(var c: Controller) -> Bool
                 if ctl_limits.ploss_on() and c.pcl[ls].wait_reason == ll_pcl.REASON_PATHLOSS
                     ploss_unavailable(var c, ls)
                 else
-                    pcl_event(var c, ls, STATUS_RESPONSE_TIMEOUT, c.pcl[ls].wait_reason, c.pcl[ls].wait_phy, ll_pcl.TX_UNAVAILABLE, 0, 0)
+                    pcl_event(var c,
+                        ls,
+                        STATUS_RESPONSE_TIMEOUT,
+                        c.pcl[ls].wait_reason,
+                        c.pcl[ls].wait_phy,
+                        ll_pcl.TX_UNAVAILABLE,
+                        0,
+                        0)
                 did = true
             else if not c.pcl[ls].sent
                 let idx = c.pcl[ls].wait_phy
-                ll_pcl.put_req(var c.links[ls].tmp, ll_pcl.index_mask(idx), 0, ll_pcl.own_level(var c.pcl[ls], idx))
+                ll_pcl.put_req(var c.links[ls].tmp,
+                    ll_pcl.index_mask(idx),
+                    0,
+                    ll_pcl.own_level(var c.pcl[ls], idx))
                 if iso_send(c, ls)
                     c.pcl[ls].sent = true
                     did = true
@@ -8451,7 +8724,7 @@ fn pcl_dispatch(var c: Controller, opcode: Int)
     match opcode
         0x2076 => cmd_le_enhanced_read_transmit_power_level(var c)
         0x2077 => cmd_le_read_remote_transmit_power_level(var c)
-        _ => cmd_le_set_transmit_power_reporting_enable(var c)
+        _      => cmd_le_set_transmit_power_reporting_enable(var c)
 
 // ── The Sleep Clock Accuracy request ────────────────────────────────
 
@@ -8649,7 +8922,7 @@ fn ev_subrate(var c: Controller, ls: Int) -> Bool
 // Whether the peer of the link in slot `ls` said it has the Connection Subrating (Host Support) feature.
 @tier(embedded)
 fn sub_peer_ok(var c: Controller, ls: Int) -> Bool
-    c.links[ls].have_feat and ((c.links[ls].peer_feat[4] as Int) & ll_link.FEAT4_SUB_HOST) != 0
+    c.links[ls].have_feat and (c.links[ls].peer_feat[4] as Int & ll_link.FEAT4_SUB_HOST) != 0
 
 // LL_SUBRATE_REQ received by the Central of the link in slot `ls` (Section 5.1.20), or the refusal of the request this end sent.  The Central
 // refuses without the Host's support bit, with a request the Host's limits do not allow, and while another procedure or its own update is open;
@@ -8716,7 +8989,12 @@ fn ctl_sub_poll(var c: Controller) -> Bool
                 sub_event(var c, ls, STATUS_RESPONSE_TIMEOUT)
                 did = true
             else if not c.sub[ls].sent
-                ll_sub.put_req(var c.links[ls].tmp, c.sub[ls].fmin, c.sub[ls].fmax, c.sub[ls].lat, c.sub[ls].cont, c.sub[ls].to)
+                ll_sub.put_req(var c.links[ls].tmp,
+                    c.sub[ls].fmin,
+                    c.sub[ls].fmax,
+                    c.sub[ls].lat,
+                    c.sub[ls].cont,
+                    c.sub[ls].to)
                 if iso_send(c, ls)
                     c.sub[ls].sent = true
                     did = true
@@ -8837,7 +9115,8 @@ fn rate_event(var c: Controller, ls: Int, status: Int)
 // anchor point the peer prefers (`off` -1 for none).  Zero when the update started, otherwise the error code a refusal carries.
 @satisfies("REQ-BLE-CTL-118")
 @tier(embedded)
-fn rate_launch(var c: Controller, ls: Int, iv: Int, fmin: Int, lat: Int, cont: Int, to: Int, host: Bool, ref: Int, off: Int) -> Int
+fn rate_launch(var c: Controller, ls: Int, iv: Int, fmin: Int, lat: Int, cont: Int, to: Int,
+               host: Bool, ref: Int, off: Int) -> Int
     let u = iv / ll_rate.RATE_STEP
     let f = ll_sub.pick_factor(var c.sub[ls], fmin)
     let nto = ll_sub.pick_timeout(var c.sub[ls], to)
@@ -8933,7 +9212,16 @@ fn rate_wait(var c: Controller, ls: Int) -> Bool
         let iv = ll_rate.pick_interval(imin, imax, 0, ll_link.rate_floor(var c.links[ls]))
         var code = ll_rate.E_UNSUPPORTED_PARAM
         if iv >= 0
-            code = rate_launch(var c, ls, iv, c.sub[ls].fmin, c.sub[ls].lat, c.sub[ls].cont, c.sub[ls].to, true, 0, -1)
+            code = rate_launch(var c,
+                ls,
+                iv,
+                c.sub[ls].fmin,
+                c.sub[ls].lat,
+                c.sub[ls].cont,
+                c.sub[ls].to,
+                true,
+                0,
+                -1)
         if code != 0
             rate_event(var c, ls, code)
         else
@@ -8941,7 +9229,17 @@ fn rate_wait(var c: Controller, ls: Int) -> Bool
         return true
     if c.sub[ls].sent
         return false
-    ll_rate.put_req(var c.links[ls].tmp, imin, imax, c.sub[ls].fmin, c.sub[ls].fmax, c.sub[ls].lat, c.sub[ls].cont, c.sub[ls].to, 0, c.links[ls].ev_count, 0xFFFF)
+    ll_rate.put_req(var c.links[ls].tmp,
+        imin,
+        imax,
+        c.sub[ls].fmin,
+        c.sub[ls].fmax,
+        c.sub[ls].lat,
+        c.sub[ls].cont,
+        c.sub[ls].to,
+        0,
+        c.links[ls].ev_count,
+        0xFFFF)
     if iso_send(c, ls)
         c.sub[ls].sent = true
         return true
@@ -8951,7 +9249,8 @@ fn rate_wait(var c: Controller, ls: Int) -> Bool
 // 7.8.155): the ranges, the factor times (latency + 1) within 500, the continuation number below the greatest factor, the supervision timeout
 // above twice the greatest interval times the greatest factor times (latency + 1), and the least connection event length not above the greatest.
 @tier(embedded)
-fn rate_params_ok(imin: Int, imax: Int, fmin: Int, fmax: Int, lat: Int, cont: Int, to: Int, cmin: Int, cmax: Int) -> Bool
+fn rate_params_ok(imin: Int, imax: Int, fmin: Int, fmax: Int, lat: Int, cont: Int, to: Int,
+                  cmin: Int, cmax: Int) -> Bool
     ll_rate.req_valid(imin, imax, fmin, fmax, lat, cont, to, 0) and cont < fmax and imax * fmax * (lat + 1) < to * 40
         and cmin >= 1 and cmax <= 0x7CFF and cmin <= cmax
 
@@ -9005,7 +9304,7 @@ fn cmd_le_connection_rate_request(var c: Controller)
         status = ll_rate.E_UNSUPPORTED_PARAM
     else if imax * 125 < ll_link.rate_required(var c.links[ls])
         status = STATUS_UNSUPPORTED_FEATURE
-    else if c.sub[ls].wait or c.links[ls].proc == ll_link.PROC_PARAM or (c.links[ls].central and ll_link.instant_busy(var c.links[ls]))
+    else if c.sub[ls].wait or c.links[ls].proc == ll_link.PROC_PARAM or c.links[ls].central and ll_link.instant_busy(var c.links[ls])
         status = STATUS_COMMAND_DISALLOWED
     else
         c.sub[ls].amin = fmin
@@ -9050,9 +9349,9 @@ fn cmd_le_set_host_feature_v2(var c: Controller)
 fn rate_dispatch(var c: Controller, opcode: Int)
     match opcode
         0x2097 => cmd_le_set_host_feature_v2(var c)
-        0x20A1 => cmd_le_connection_rate_request(var c)
-        0x20A2 => cmd_le_set_default_rate_parameters(var c)
-        _ => cmd_le_read_minimum_supported_connection_interval(var c)
+        0x20a1 => cmd_le_connection_rate_request(var c)
+        0x20a2 => cmd_le_set_default_rate_parameters(var c)
+        _      => cmd_le_read_minimum_supported_connection_interval(var c)
 
 // ── Frame Space Update ──────────────────────────────────────────────
 
@@ -9107,7 +9406,10 @@ fn fs_rx(var c: Controller, ls: Int, op: Int, var rx: Pdu)
             else
                 fs_event(var c, ls, ll_fs.E_INVALID_PARAMS, 0, 0)
         return
-    let code = ll_fs.refusal(ll_sub.get16(var rx, 1), ll_sub.get16(var rx, 3), ll_data.dpdu_byte(var rx, 5), ll_sub.get16(var rx, 6))
+    let code = ll_fs.refusal(ll_sub.get16(var rx, 1),
+        ll_sub.get16(var rx, 3),
+        ll_data.dpdu_byte(var rx, 5),
+        ll_sub.get16(var rx, 6))
     if code == 0 and mine and c.links[ls].central
         iso_reject(var c, ls, op, ll_fs.E_COLLISION)
     else if code != 0
@@ -9157,7 +9459,7 @@ fn cmd_le_frame_space_update(var c: Controller)
         status = STATUS_UNKNOWN_CONNECTION
     else if fmin > fmax or fmax > ll_fs.FS_MAX_US or phys == 0 or types == 0
         status = STATUS_INVALID_PARAMETERS
-    else if (phys & ~ll_fs.PHYS_MASK) != 0 or (types & ~ll_fs.TYPES_MASK) != 0 or ((phys & 4) != 0 and not c.coded)
+    else if (phys & ~ll_fs.PHYS_MASK) != 0 or (types & ~ll_fs.TYPES_MASK) != 0 or (phys & 4) != 0 and not c.coded
         status = STATUS_UNSUPPORTED_FEATURE
     else if ll_link.fs_peer_lacks(c.links[ls])
         status = STATUS_UNSUPPORTED_REMOTE
@@ -9204,7 +9506,7 @@ fn cmd_le_set_host_feature(var c: Controller)
 @satisfies("REQ-BLE-CTL-057")
 @tier(embedded)
 fn host_feature(var c: Controller, bit: Int, value: Int) -> Int
-    if (bit != 32 and not (bit == 38 and ctl_limits.sub_on()) and not (bit == 73 and ctl_limits.rate_on())) or value > 1
+    if bit != 32 and not (bit == 38 and ctl_limits.sub_on()) and not (bit == 73 and ctl_limits.rate_on()) or value > 1
         return STATUS_UNSUPPORTED_FEATURE
     if links_live(var c)
         return STATUS_COMMAND_DISALLOWED
@@ -9274,10 +9576,10 @@ fn cig_test_check(var c: Controller, n: Int) -> Int
         // A framed direction has a PDU that starts an SDU: a Segmentation Header, a Time_Offset and an octet; in Unsegmented mode the SDU of
         // Max_SDU, whole, with them.
         if h4_rx.h4_param(var c.rx, 13) >= 1
-            if (h4_rx.h4_param(var c.rx, at + 12) > 0 and param_u16(var c, at + 6) < ll_iso.FR_START_MIN) or (h4_rx.h4_param(var c.rx, at + 13) > 0 and param_u16(var c, at + 8) < ll_iso.FR_START_MIN)
+            if h4_rx.h4_param(var c.rx, at + 12) > 0 and param_u16(var c, at + 6) < ll_iso.FR_START_MIN or h4_rx.h4_param(var c.rx, at + 13) > 0 and param_u16(var c, at + 8) < ll_iso.FR_START_MIN
                 return STATUS_INVALID_PARAMETERS
         if h4_rx.h4_param(var c.rx, 13) == 2
-            if (h4_rx.h4_param(var c.rx, at + 12) > 0 and param_u16(var c, at + 6) < ll_iso.FR_HEADER + ll_iso.FR_TOFF + param_u16(var c, at + 2)) or (h4_rx.h4_param(var c.rx, at + 13) > 0 and param_u16(var c, at + 8) < ll_iso.FR_HEADER + ll_iso.FR_TOFF + param_u16(var c, at + 4))
+            if h4_rx.h4_param(var c.rx, at + 12) > 0 and param_u16(var c, at + 6) < ll_iso.FR_HEADER + ll_iso.FR_TOFF + param_u16(var c, at + 2) or h4_rx.h4_param(var c.rx, at + 13) > 0 and param_u16(var c, at + 8) < ll_iso.FR_HEADER + ll_iso.FR_TOFF + param_u16(var c, at + 4)
                 return STATUS_INVALID_PARAMETERS
     var free_cis = 0
     for k in 0..ctl_limits.cis_slots()
@@ -9463,15 +9765,15 @@ fn cmd_le_setup_iso_data_path(var c: Controller)
         // A broadcast stream: the Isochronous Broadcaster's takes data from the Host (input), the Synchronized Receiver's gives it (output).
         if dir > 1 or path_id != 0
             status = STATUS_COMMAND_DISALLOWED
-        else if (c.bis[j].central and dir != 0) or (not c.bis[j].central and dir != 1)
+        else if c.bis[j].central and dir != 0 or not c.bis[j].central and dir != 1
             status = STATUS_COMMAND_DISALLOWED
-        else if (dir == 0 and (c.bis[j].dp_in or ll_iso.test_tx_type(var c.bis[j]) >= 0)) or (dir == 1 and (c.bis[j].dp_out or ll_iso.test_rx_type(var c.bis[j]) >= 0))
+        else if dir == 0 and (c.bis[j].dp_in or ll_iso.test_tx_type(var c.bis[j]) >= 0) or dir == 1 and (c.bis[j].dp_out or ll_iso.test_rx_type(var c.bis[j]) >= 0)
             status = STATUS_COMMAND_DISALLOWED
         else if dir == 0
             c.bis[j].dp_in = true
         else
             c.bis[j].dp_out = true
-    else if i < 0 or (not c.cis[i].central and c.cis[i].state < ll_iso.S_ACCEPTED)
+    else if i < 0 or not c.cis[i].central and c.cis[i].state < ll_iso.S_ACCEPTED
         status = STATUS_UNKNOWN_CONNECTION
     else if dir > 1 or path_id != 0
         status = STATUS_COMMAND_DISALLOWED
@@ -9501,7 +9803,7 @@ fn cmd_le_remove_iso_data_path(var c: Controller)
     if dirs == 0 or dirs > 3
         status = STATUS_INVALID_PARAMETERS
     else if j >= 0
-        if ((dirs & 1) != 0 and not c.bis[j].dp_in) or ((dirs & 2) != 0 and not c.bis[j].dp_out)
+        if (dirs & 1) != 0 and not c.bis[j].dp_in or (dirs & 2) != 0 and not c.bis[j].dp_out
             status = STATUS_COMMAND_DISALLOWED
         else
             if (dirs & 1) != 0
@@ -9510,7 +9812,7 @@ fn cmd_le_remove_iso_data_path(var c: Controller)
                 c.bis[j].dp_out = false
     else if i < 0
         status = STATUS_UNKNOWN_CONNECTION
-    else if ((dirs & 1) != 0 and not c.cis[i].dp_in) or ((dirs & 2) != 0 and not c.cis[i].dp_out)
+    else if (dirs & 1) != 0 and not c.cis[i].dp_in or (dirs & 2) != 0 and not c.cis[i].dp_out
         status = STATUS_COMMAND_DISALLOWED
     else
         if (dirs & 1) != 0
@@ -9883,7 +10185,7 @@ fn iso_req_refuse(var c: Controller, ls: Int, code: Int, why: Int)
 
 // The LL_CIS_REQ PDUs the Link Layers dropped before the Controller saw them, over all links: a payload of the wrong length, or
 // a build without the isochronous feature (answered LL_UNKNOWN_RSP).
-@tier(embedded)
+pub @tier(embedded)
 fn cis_req_dropped(var c: Controller) -> Int
     var n = 0
     for k in 0..noble_controller_config.CTL_LINKS
@@ -9953,16 +10255,16 @@ fn ctl_iso_ctrl(var c: Controller, ls: Int, var rx: Pdu)
     if ctl_limits.past_on() and op == ll_data.OP_PERIODIC_SYNC_IND
         past_rx(var c, ls, var rx)
         return
-    if ctl_limits.fs_on() and (op == ll_data.OP_FRAME_SPACE_REQ or op == ll_data.OP_FRAME_SPACE_RSP or ((op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_FRAME_SPACE_REQ))
+    if ctl_limits.fs_on() and (op == ll_data.OP_FRAME_SPACE_REQ or op == ll_data.OP_FRAME_SPACE_RSP or (op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_FRAME_SPACE_REQ)
         fs_rx(var c, ls, op, var rx)
         return
-    if ctl_limits.rate_on() and (op == ll_data.OP_CONNECTION_RATE_REQ or ((op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_CONNECTION_RATE_REQ) or (op == ll_data.OP_UNKNOWN_RSP and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_CONNECTION_RATE_IND))
+    if ctl_limits.rate_on() and (op == ll_data.OP_CONNECTION_RATE_REQ or (op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_CONNECTION_RATE_REQ or op == ll_data.OP_UNKNOWN_RSP and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_CONNECTION_RATE_IND)
         rate_rx(var c, ls, op, var rx)
         return
-    if ctl_limits.sub_on() and (op == ll_data.OP_SUBRATE_REQ or ((op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_SUBRATE_REQ))
+    if ctl_limits.sub_on() and (op == ll_data.OP_SUBRATE_REQ or (op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_SUBRATE_REQ)
         sub_rx(var c, ls, op, var rx)
         return
-    if ctl_limits.pcl_on() and (op >= ll_data.OP_POWER_CONTROL_REQ or ((op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_POWER_CONTROL_REQ))
+    if ctl_limits.pcl_on() and (op >= ll_data.OP_POWER_CONTROL_REQ or (op == ll_data.OP_REJECT_EXT_IND or op == ll_data.OP_UNKNOWN_RSP) and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_POWER_CONTROL_REQ)
         pcl_rx(var c, ls, op, var rx)
         return
     if not ctl_limits.iso_on() or not iso_on(var c)
@@ -10058,17 +10360,20 @@ fn iso_to_cis(var c: Controller)
                 ok = ll_iso.sdu_frag(var c.cis[i], var c.rx.acl, off, left, pb, 0)
         else
             if h4_rx.h4_iso_ts(var c.rx) and left >= 4
-                stamp = (c.rx.acl[off] as Int) | ((c.rx.acl[off + 1] as Int) << 8) | ((c.rx.acl[off + 2] as Int) << 16) | ((c.rx.acl[off + 3] as Int) << 24)
+                stamp = c.rx.acl[off] as Int | (c.rx.acl[off + 1] as Int << 8) | (c.rx.acl[off + 2] as Int << 16) | (c.rx.acl[off + 3] as Int << 24)
                 off = off + 4
                 left = left - 4
             if left >= 4
-                let len = (c.rx.acl[off + 2] as Int) | ((c.rx.acl[off + 3] as Int) << 8)
+                let len = c.rx.acl[off + 2] as Int | (c.rx.acl[off + 3] as Int << 8)
                 let sdu_len = len & 0x0FFF
-                if (pb == 2 and sdu_len == left - 4) or pb == 0
+                if pb == 2 and sdu_len == left - 4 or pb == 0
                     used = true
                     // The reference time of a framed SDU is the first packet's: a continuation keeps what it set.
                     if c.cis[i].framed
-                        c.cis[i].h_ref = iso_ref(var c.cis[i], c.now, stamp, (c.rx.acl[off] as Int) | ((c.rx.acl[off + 1] as Int) << 8))
+                        c.cis[i].h_ref = iso_ref(var c.cis[i],
+                            c.now,
+                            stamp,
+                            c.rx.acl[off] as Int | (c.rx.acl[off + 1] as Int << 8))
                     ok = ll_iso.sdu_frag(var c.cis[i], var c.rx.acl, off + 4, left - 4, pb, sdu_len)
     if not ok
         c.iso_dropped = c.iso_dropped + 1
@@ -10162,7 +10467,7 @@ fn ev_cis_established(var c: Controller, i: Int) -> Bool
             let _p = ctl_pool.pool_put_u16(var c.pool, slot, c.cis[i].max_sdu_p)
             put_u24(var c, slot, c.cis[i].sdu_int_c)
             put_u24(var c, slot, c.cis[i].sdu_int_p)
-            let _q = ctl_pool.pool_put(var c.pool, slot, if c.cis[i].framed then 1 else 0)
+            let _q = ctl_pool.pool_put(var c.pool, slot, (if c.cis[i].framed then 1 else 0))
     else
         var n = 28
         if v2
@@ -10269,7 +10574,7 @@ fn flush_cis(var c: Controller, i: Int) -> Bool
             return false
         if c.cis[i].state == ll_iso.S_FREE or c.cis[i].state == ll_iso.S_CONFIG
             return true
-    for _ in 0..(ll_iso.OUT_SLOTS * ll_iso.SDU_FRAGS)
+    for _ in 0..ll_iso.OUT_SLOTS * ll_iso.SDU_FRAGS
         if ll_iso.out_ready(var c.cis[i]) and not ev_cis_data(var c, i)
             return false
     if (c.cis[i].owed & ll_iso.EV_COMPLETED) != 0 and not ev_cis_completed(var c, i)
@@ -10418,7 +10723,7 @@ fn ctl_cis_start(var c: Controller, i: Int) -> Int
 // the receiver can be armed for the subevent first.
 @tier(embedded)
 fn ctl_cis_arm_channel(var c: Controller, i: Int, good: Bool, now: Int) -> Int
-    if c.cis[i].sub >= c.cis[i].nse or (good and c.cis[i].f_cie)
+    if c.cis[i].sub >= c.cis[i].nse or good and c.cis[i].f_cie
         return -1
     let ls = c.cis[i].acl
     let start = ll_iso.sub_start(var c.cis[i], c.cis[i].sub + 1)
@@ -10432,7 +10737,7 @@ fn ctl_cis_arm_channel(var c: Controller, i: Int, good: Bool, now: Int) -> Int
     for k in 0..ctl_limits.cis_slots()
         if k != i and cis_running(var c, k)
             let other = ll_iso.sub_start(var c.cis[k], c.cis[k].sub)
-            if other < start or (other == start and k < i)
+            if other < start or other == start and k < i
                 return -1
     ll_iso.sub_channel(c.cis[i].aa, c.cis[i].ev, c.cis[i].sub + 1, c.links[ls].chmap, c.links[ls].n_used)
 
@@ -10475,7 +10780,7 @@ fn cis_key(var c: Controller, i: Int, var ek: EncKey)
     for k in 0..8
         ek.iv[k] = c.links[ls].ek.iv[k]
     for k in 0..4
-        ek.iv[k] = ek.iv[k] ^ (((c.cis[i].aa >>> (8 * k)) & 0xFF) as u8)
+        ek.iv[k] = ek.iv[k] ^ ((c.cis[i].aa >>> (8 * k)) & 0xFF) as u8
 
 // The direction value for the cipher: the directionBit of the PDUs this end sends, and bit 1 saying the PDU is a CIS PDU, whose
 // additional data masks CIE and NPI beside NESN and SN.
@@ -10521,7 +10826,8 @@ fn ctl_cis_sent(var c: Controller, i: Int, num: Int)
 @satisfies("REQ-BLE-CTL-051")
 @satisfies("REQ-BLE-CTL-063")
 @tier(embedded)
-fn ctl_cis_rx_slow<C: Cipher[e]>(var c: Controller, i: Int, var cc: C, var rx: Pdu, good: Bool, start: Int, now: Int, defer_asked: Bool) [e]
+fn ctl_cis_rx_slow<C: Cipher[e]>(var c: Controller, i: Int, var cc: C, var rx: Pdu, good: Bool,
+                                 start: Int, now: Int, defer_asked: Bool) [e]
     if good
         c.cis[i].n_good = c.cis[i].n_good + 1
     else
@@ -10575,8 +10881,6 @@ fn ctl_cis_flush_copies<C: Cipher[e]>(var c: Controller, var cc: C, var rx: Pdu)
 // follows.  A stream the supervision gave up on is closed.
 @satisfies("REQ-BLE-CTL-053")
 @tier(embedded)
-// The radio program started the transmitter of the stream in slot `i` `err` microseconds after the time the schedule gave: the first, the
-// least and the greatest are kept for the status line.
 @tier(embedded)
 fn ctl_cis_note_err(var c: Controller, i: Int, err: Int)
     if c.cis[i].err_n == 0
@@ -10656,7 +10960,8 @@ fn plan_from_command(var c: Controller, k: Int, var p: Vec[CisPlan; 8], j: Int)
 // `ll_iso.plan_cig` derives for the streams of the group, those the command names and those the group already held.
 @satisfies("REQ-BLE-CTL-074")
 @tier(embedded)
-fn cig_plan(var c: Controller, n: Int, var plans: Vec[CisPlan; 8], var g: GroupPlan, var total_out: Vec[Int; 1]) -> Int
+fn cig_plan(var c: Controller, n: Int, var plans: Vec[CisPlan; 8], var g: GroupPlan,
+            var total_out: Vec[Int; 1]) -> Int
     let cig_id = h4_rx.h4_param(var c.rx, 0)
     let sdu_c = h4_rx.h4_param(var c.rx, 1) | (h4_rx.h4_param(var c.rx, 2) << 8) | (h4_rx.h4_param(var c.rx, 3) << 16)
     let sdu_p = h4_rx.h4_param(var c.rx, 4) | (h4_rx.h4_param(var c.rx, 5) << 8) | (h4_rx.h4_param(var c.rx, 6) << 16)
@@ -10851,7 +11156,7 @@ fn cis_busy_acl(var c: Controller, ls: Int, except: Int) -> Bool
     for k in 0..ctl_limits.cis_slots()
         if k != except and c.cis[k].acl == ls
             let st = c.cis[k].state
-            if st == ll_iso.S_IND or (st == ll_iso.S_CREATING and (c.cis[k].owed & ll_iso.EV_SEND_REQ) == 0)
+            if st == ll_iso.S_IND or st == ll_iso.S_CREATING and (c.cis[k].owed & ll_iso.EV_SEND_REQ) == 0
                 return true
     false
 
@@ -10930,7 +11235,7 @@ fn cis_place(var c: Controller, i: Int) -> Bool
     let by_time = CIS_REF_US / conn + 1
     if by_time > first
         first = by_time
-    for k in first..(first + CIS_SEARCH_EVENTS)
+    for k in first..first + CIS_SEARCH_EVENTS
         let ev = (c.links[ls].ev_count + k) & 0xFFFF
         let t = ll_link.link_event_time(var c.links[ls], ev)
         if t < 0
@@ -10976,12 +11281,12 @@ fn ctl_iso_central_poll(var c: Controller) -> Bool
             else if (c.cis[i].owed & ll_iso.EV_WAIT_FEAT) != 0
                 if c.links[ls].have_feat
                     c.cis[i].owed = c.cis[i].owed & (0xFFFF ^ ll_iso.EV_WAIT_FEAT)
-                    if ((c.links[ls].peer_feat[3] as Int) & 0x20) == 0 or (c.cis[i].unseg and ((c.links[ls].peer_feat[5] as Int) & 0x20) == 0)
+                    if (c.links[ls].peer_feat[3] as Int & 0x20) == 0 or c.cis[i].unseg and (c.links[ls].peer_feat[5] as Int & 0x20) == 0
                         cis_close(var c, i, ll_iso.STATUS_UNSUPPORTED_REMOTE)
                     did = true
                 else if c.links[ls].proc == ll_link.PROC_NONE and not ll_link.link_owes(var c.links[ls], ll_link.EV_FEATURES)
                     let _s = ll_link.link_read_features(var c.links[ls])
-            else if (c.cis[i].owed & ll_iso.EV_SEND_REQ) != 0 and c.cis[i].unseg and ((c.links[ls].peer_feat[5] as Int) & 0x20) == 0
+            else if (c.cis[i].owed & ll_iso.EV_SEND_REQ) != 0 and c.cis[i].unseg and (c.links[ls].peer_feat[5] as Int & 0x20) == 0
                 // The peer's feature set is known and has no Unsegmented mode: the stream is not made (a Host can ask for Segmentable mode).
                 cis_close(var c, i, ll_iso.STATUS_UNSUPPORTED_REMOTE)
                 did = true
@@ -11230,13 +11535,13 @@ fn big_active(var c: Controller) -> Bool
 
 // Whether the program is to supply random octets to `ctl_big_random_put`: the GSKD and the GIV of a BIG (24 octets) come from
 // a source of entropy (Section 4.4.6.10), which the program tops up when the Controller has a build with groups.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_big_wants_random(var c: Controller) -> Bool
     ctl_limits.big_on() and c.big_rnd_n < 24
 
 // Give the pool 12 random octets.
-@no_alloc
+pub @no_alloc
 @tier(embedded)
 fn ctl_big_random_put(var c: Controller, var v: Vec[u8; 12])
     for k in 0..12
@@ -11334,9 +11639,35 @@ fn cmd_le_create_big(var c: Controller, test: Bool)
     var plan = ll_big.plan_new()
     if status == STATUS_SUCCESS
         if test
-            status = ll_big.check_big_test(var plan, num, sdu_int, iso, nse, max_sdu, max_pdu, phys, packing, framing, bn, irc, pto, enc == 1, c.coded, c.radio)
+            status = ll_big.check_big_test(var plan,
+                num,
+                sdu_int,
+                iso,
+                nse,
+                max_sdu,
+                max_pdu,
+                phys,
+                packing,
+                framing,
+                bn,
+                irc,
+                pto,
+                enc == 1,
+                c.coded,
+                c.radio)
         else
-            status = ll_big.plan_big(var plan, num, sdu_int, max_sdu, max_lat, rtn, phys, packing, framing, enc == 1, c.coded, c.radio)
+            status = ll_big.plan_big(var plan,
+                num,
+                sdu_int,
+                max_sdu,
+                max_lat,
+                rtn,
+                phys,
+                packing,
+                framing,
+                enc == 1,
+                c.coded,
+                c.radio)
     var g = -1
     var i0 = -1
     if status == STATUS_SUCCESS
@@ -11594,7 +11925,7 @@ fn flush_big(var c: Controller, g: Int) -> Bool
         streams = c.bigs[g].nrx
     for j in 0..streams
         let i = c.bigs[g].bis0 + j
-        for _ in 0..(ll_iso.OUT_SLOTS * ll_iso.SDU_FRAGS)
+        for _ in 0..ll_iso.OUT_SLOTS * ll_iso.SDU_FRAGS
             if ll_iso.out_ready(var c.bis[i]) and not ev_bis_data(var c, i)
                 return false
         if (c.bis[i].owed & ll_iso.EV_COMPLETED) != 0 and not ev_bis_completed(var c, i)
@@ -11649,8 +11980,8 @@ fn ev_biginfo(var c: Controller) -> Bool
     put_u24(var c, slot, c.bi.sdu_int)
     let _i = ctl_pool.pool_put_u16(var c.pool, slot, c.bi.max_sdu)
     let _j = ctl_pool.pool_put(var c.pool, slot, c.bi.phy)
-    let _k = ctl_pool.pool_put(var c.pool, slot, if c.bi.framed then 1 else 0)
-    let _l = ctl_pool.pool_put(var c.pool, slot, if c.bi.enc then 1 else 0)
+    let _k = ctl_pool.pool_put(var c.pool, slot, (if c.bi.framed then 1 else 0))
+    let _l = ctl_pool.pool_put(var c.pool, slot, (if c.bi.enc then 1 else 0))
     event_send(var c, slot)
     c.bi_owed = false
     true
@@ -11718,7 +12049,7 @@ fn cmd_le_big_create_sync(var c: Controller)
     var j = -1
     if status == STATUS_SUCCESS
         j = psync_of_handle(var c, sync_handle)
-        if big_slot(var c, handle) >= 0 or big_waiting(var c) or (j >= 0 and big_on_train(var c, j))
+        if big_slot(var c, handle) >= 0 or big_waiting(var c) or j >= 0 and big_on_train(var c, j)
             status = STATUS_COMMAND_DISALLOWED
         else if j < 0
             status = ll_xadv.E_UNKNOWN_SET
@@ -12016,7 +12347,8 @@ fn ctl_big_rx_ctrl_pdu<C: Cipher[e]>(var c: Controller, g: Int, var cc: C, var p
 @satisfies("REQ-BLE-CTL-104")
 @satisfies("REQ-BLE-CTL-108")
 @tier(embedded)
-fn ctl_big_rx_finish<C: Cipher[e]>(var c: Controller, g: Int, var cc: C, var p: Pdu, var scratch: Pdu) -> Bool [e]
+fn ctl_big_rx_finish<C: Cipher[e]>(var c: Controller, g: Int, var cc: C, var p: Pdu,
+                                   var scratch: Pdu) -> Bool [e]
     let bn = c.bigs[g].bn
     let ev = c.bigs[g].ev
     for q in 0..c.bigs[g].nrx
@@ -12092,17 +12424,20 @@ fn iso_to_bis(var c: Controller, i: Int)
                 ok = ll_iso.sdu_frag(var c.bis[i], var c.rx.acl, off, left, pb, 0)
         else
             if h4_rx.h4_iso_ts(var c.rx) and left >= 4
-                stamp = (c.rx.acl[off] as Int) | ((c.rx.acl[off + 1] as Int) << 8) | ((c.rx.acl[off + 2] as Int) << 16) | ((c.rx.acl[off + 3] as Int) << 24)
+                stamp = c.rx.acl[off] as Int | (c.rx.acl[off + 1] as Int << 8) | (c.rx.acl[off + 2] as Int << 16) | (c.rx.acl[off + 3] as Int << 24)
                 off = off + 4
                 left = left - 4
             if left >= 4
-                let len = (c.rx.acl[off + 2] as Int) | ((c.rx.acl[off + 3] as Int) << 8)
+                let len = c.rx.acl[off + 2] as Int | (c.rx.acl[off + 3] as Int << 8)
                 let sdu_len = len & 0x0FFF
-                if (pb == 2 and sdu_len == left - 4) or pb == 0
+                if pb == 2 and sdu_len == left - 4 or pb == 0
                     used = true
                     // The reference time of a framed SDU is the first packet's, as for a CIS: its Time_Stamp or the time it arrived.
                     if c.bis[i].framed
-                        c.bis[i].h_ref = iso_ref(var c.bis[i], c.now, stamp, (c.rx.acl[off] as Int) | ((c.rx.acl[off + 1] as Int) << 8))
+                        c.bis[i].h_ref = iso_ref(var c.bis[i],
+                            c.now,
+                            stamp,
+                            c.rx.acl[off] as Int | (c.rx.acl[off + 1] as Int << 8))
                     ok = ll_iso.sdu_frag(var c.bis[i], var c.rx.acl, off + 4, left - 4, pb, sdu_len)
     if not ok
         c.iso_dropped = c.iso_dropped + 1
@@ -12231,7 +12566,11 @@ fn ctl_big_phy(var c: Controller, g: Int) -> Int
 @satisfies("REQ-BLE-CTL-100")
 @tier(embedded)
 fn ctl_big_chan(var c: Controller, g: Int, bis: Int, sub: Int) -> Int
-    ll_iso.sub_channel(ll_big.bis_aa(c.bigs[g].saa, bis), c.bigs[g].ev & 0xFFFF, sub, c.bigs[g].chmap, c.bigs[g].n_used)
+    ll_iso.sub_channel(ll_big.bis_aa(c.bigs[g].saa, bis),
+        c.bigs[g].ev & 0xFFFF,
+        sub,
+        c.bigs[g].chmap,
+        c.bigs[g].n_used)
 
 // Whether the event under way carries a BIG Control PDU.
 @tier(embedded)
@@ -12249,7 +12588,7 @@ fn big_key(var c: Controller, g: Int, bis: Int, var ek: EncKey)
     for k in 0..8
         ek.iv[k] = c.bigs[g].ek.iv[k]
     for k in 0..4
-        ek.iv[k] = ek.iv[k] ^ (((aa >>> (8 * k)) & 0xFF) as u8)
+        ek.iv[k] = ek.iv[k] ^ ((aa >>> (8 * k)) & 0xFF) as u8
 
 // The PDU of subevent `sub` of BIS `bis` in the event under way, into `p`, sealed when the group is encrypted: the payload the program
 // gives the subevent (`ll_big.payload_of`) or an empty PDU, with the Control Subevent fields of the event.  The counter of the nonce
@@ -12257,7 +12596,8 @@ fn big_key(var c: Controller, g: Int, bis: Int, var ek: EncKey)
 @satisfies("REQ-BLE-CTL-102")
 @satisfies("REQ-BLE-CTL-108")
 @tier(embedded)
-fn ctl_big_pdu<C: Cipher[e]>(var c: Controller, g: Int, bis: Int, sub: Int, var cc: C, var p: Pdu) [e]
+fn ctl_big_pdu<C: Cipher[e]>(var c: Controller, g: Int, bis: Int, sub: Int, var cc: C,
+                             var p: Pdu) [e]
     let n = ll_big.payload_of(var c.bigs[g], c.bigs[g].ev, sub)
     let i = c.bigs[g].bis0 + bis - 1
     ll_big.tx_build(var c.bis[i], n, var p, c.bigs[g].cssn, ll_big.ctrl_active(var c.bigs[g], c.bigs[g].ev))
@@ -12313,7 +12653,7 @@ fn ctl_padv_big(var c: Controller, k: Int, due: Int)
         return
     let g = c.pads[k].big
     let st = c.bigs[g].state
-    if (st != ll_big.B_CREATE and st != ll_big.B_UP and st != ll_big.B_TERM) or not c.bigs[g].key_ok
+    if st != ll_big.B_CREATE and st != ll_big.B_UP and st != ll_big.B_TERM or not c.bigs[g].key_ok
         return
     let _a = ll_big.info_for(var c.bigs[g], due, ll_big.INFO_PHASE_US)
     ll_per.acad_put(var c.pads[k], var c.bigs[g].info, c.bigs[g].info_n)

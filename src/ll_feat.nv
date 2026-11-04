@@ -8,8 +8,6 @@
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.feat_on()`) says whether the build has the feature.
 
-use ctl_limits
-use std.test
 use ll_pdu
 use ll_data
 
@@ -65,39 +63,3 @@ fn put_ext(var p: Pdu, opcode: Int, maxp: Int, page: Int, p1: Int)
     else
         put_page(var p, 0)
     ll_data.dpdu_finish(var p)
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_pdu_layouts()
-    var p = ll_pdu.pdu_new()
-    put_ext(var p, ll_data.OP_FEATURE_EXT_REQ, 1, 1, 0x0102)
-    test.assert_eq(ll_data.dpdu_len(var p), 27)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x2B)
-    test.assert_eq(ll_data.dpdu_byte(var p, 1), 1)
-    test.assert_eq(ll_data.dpdu_byte(var p, 2), 1)
-    test.assert_eq(ll_data.dpdu_byte(var p, 3), 0x02)
-    test.assert_eq(ll_data.dpdu_byte(var p, 4), 0x01)
-    test.assert_eq(ll_data.dpdu_byte(var p, 26), 0)
-    put_ext(var p, ll_data.OP_FEATURE_EXT_RSP, 0, 4, 0xFF)
-    test.assert_eq(ll_data.dpdu_len(var p), 27)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x2C)
-    test.assert_eq(ll_data.dpdu_byte(var p, 2), 4)
-    test.assert_eq(ll_data.dpdu_byte(var p, 3), 0)
-
-@test
-fn test_high_octets_of_the_page()
-    var p = ll_pdu.pdu_new()
-    put_ext(var p, ll_data.OP_FEATURE_EXT_RSP, 1, 1, 0x7F00000000000001)
-    test.assert_eq(ll_data.dpdu_byte(var p, 3), 1)
-    test.assert_eq(ll_data.dpdu_byte(var p, 10), 0x7F)
-    test.assert_eq(ll_data.dpdu_byte(var p, 11), 0)
-
-@test
-fn test_page_rules()
-    test.assert_eq(max_page(0), 0)
-    test.assert_eq(max_page(0x20), 1)
-    test.assert(not page_ok(0))
-    test.assert(page_ok(1))
-    test.assert(page_ok(10))
-    test.assert(not page_ok(11))

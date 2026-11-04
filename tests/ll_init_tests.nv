@@ -1,0 +1,503 @@
+// tests/ll_init_tests.nv — the unit tests of src/ll_init.nv.
+//
+//   novo test tests/ll_init_tests.nv
+
+use std.test
+use ll_pdu
+use ll_phy
+use ll_init.{ ACT_CONNECT, AUX_CONNECT_RSP, CHMAP_ALL, EXT_ADV, Init, POLICY_LIST, POLICY_PEER, SCA_CLASS, WIN_SIZE, aa_valid, aux_ca, aux_channel, aux_offset_us, aux_phy_of, aux_plan, aux_unit_us, aux_widen_us, bits_differ, conn_params_status, ext_field, ext_mode, ext_view, init_channel, init_decide, init_disable, init_enable, init_ext_enable, init_in_window, init_index, init_new, init_next_start, init_params_status, init_reset, init_seed, init_unsent, init_use_phy, init_window_end, is_connect_rsp }
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var x: Vec[u8; 6] = Vec.new()
+    for k in 0..6
+        let _a = x.push((first + k) as u8)
+    x
+
+// An initiator enabled at time 0 with the address 0xA0..0xA5, looking for the
+// peer 0x10..0x15 of type `peer_type` under `policy`: an interval of 100 ms, a
+// window of 30 ms, a connection interval of 24 units, no latency, a timeout of 400.
+fn t_init(policy: Int, peer_type: Int) -> Init
+    var i = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var i, 0, 160, 48, policy, peer_type, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    i
+
+// An advertisement of PDU type `ty` from the advertiser first..first+5 of address
+// type `tx_add`, with 3 octets of data; a directed one names `target`.
+fn t_adv(ty: Int, first: Int, tx_add: Int, target: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var a = t_addr(first)
+    ll_pdu.pdu_begin(var p, ty, tx_add, 0)
+    ll_pdu.pdu_put_addr(var p, var a)
+    if ty == ll_pdu.ADV_DIRECT_IND
+        var t = t_addr(target)
+        ll_pdu.pdu_put_addr(var p, var t)
+        ll_pdu.pdu_finish(var p)
+        return p
+    for k in 0..3
+        let _x = ll_pdu.pdu_put(var p, k)
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn t_has(var p: Pdu, off: Int, first: Int) -> Bool
+    var a = t_addr(first)
+    ll_pdu.pdu_addr_is(var p, off, var a)
+
+fn t_mark_sent(var i: Init)
+    i.sent = true
+
+fn t_policy_set(var i: Init, p: Int)
+    i.policy = p as u8
+
+@test
+fn test_capacities_match_the_constants()
+    let i = init_new()
+    test.assert_eq(i.peer.capacity(), 6)
+    test.assert_eq(i.addr.capacity(), 6)
+
+@test
+fn test_parameter_status_follows_the_command()
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(init_params_status(0x4000, 0x4000, 1, 1, 1, 3200, 3200, 0, 3200, 0, 0xFFFF), 0)
+    test.assert_eq(init_params_status(3, 3, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x4001, 0x10, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 3, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x4001, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x11, 0, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 2, 0, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 4, 0, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 4, 6, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 5, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 3201, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 8, 7, 0, 100, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 500, 3200, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 9, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 3201, 0, 0), 0x12)
+    // A timeout of 8 s is not longer than twice the 4 s interval.
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 3200, 3200, 0, 800, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 3200, 3200, 0, 801, 0, 0), 0)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 9, 10, 0, 0), 0x12)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 0, 0, 6, 6, 0, 100, 5, 4), 0x12)
+    // The peer types 2 and 3 (an identity the resolving list resolves) and the own types
+    // 2 and 3 are served.
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 2, 0, 6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 3, 3, 6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(init_params_status(0x10, 0x10, 0, 4, 0, 6, 6, 0, 100, 0, 0), 0x12)
+
+@test
+fn test_windows_follow_the_interval_and_rotate_the_channel()
+    var i = t_init(0, 0)
+    test.assert(init_in_window(var i, 0))
+    test.assert(init_in_window(var i, 29999))
+    test.assert(not init_in_window(var i, 30000))
+    test.assert(not init_in_window(var i, 99999))
+    test.assert(init_in_window(var i, 100000))
+    test.assert_eq(init_channel(var i, 0), 37)
+    test.assert_eq(init_channel(var i, 100000), 38)
+    test.assert_eq(init_channel(var i, 250000), 39)
+    test.assert_eq(init_channel(var i, 300000), 37)
+    test.assert_eq(init_window_end(var i, 10000), 30000)
+    test.assert_eq(init_window_end(var i, 110000), 130000)
+    test.assert_eq(init_next_start(var i, 10000), 10000)
+    test.assert_eq(init_next_start(var i, 40000), 100000)
+    test.assert_eq(init_next_start(var i, 99999), 100000)
+    // Before the state was entered the first window is the next.
+    var j = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var j, 5000, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    test.assert_eq(init_next_start(var j, 0), 5000)
+    test.assert_eq(init_index(var j, 0), 0)
+    test.assert(not init_in_window(var j, 0))
+
+@test
+fn test_an_initiator_that_is_off_has_no_window_and_answers_nothing()
+    var i = init_new()
+    test.assert(not init_in_window(var i, 0))
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var p, 11, false), 0)
+    init_reset(var i)
+    test.assert(not i.enabled)
+
+@test
+fn test_enable_and_disable_set_the_state()
+    var i = t_init(0, 0)
+    test.assert(i.enabled)
+    test.assert(not i.sent)
+    init_disable(var i)
+    test.assert(not i.enabled)
+    init_seed(var i, 77)
+    test.assert(i.rng != 0)
+    t_mark_sent(var i)
+    init_reset(var i)
+    test.assert(not i.sent)
+
+@test
+fn test_the_connect_ind_carries_the_parameters_the_host_gave()
+    var i = t_init(0, 0)
+    var r = i.req
+    test.assert_eq(ll_pdu.pdu_type(var r), ll_pdu.CONNECT_IND)
+    test.assert_eq(ll_pdu.pdu_len(var r), ll_pdu.CONNECT_PAYLOAD)
+    test.assert_eq(r.n, 36)
+    test.assert_eq(ll_pdu.pdu_tx_add(var r), 0)
+    test.assert(ll_pdu.pdu_addr_is(var r, 0, var i.addr))
+    let aa = r.b[14] as Int | (r.b[15] as Int << 8) | (r.b[16] as Int << 16) | (r.b[17] as Int << 24)
+    test.assert(aa_valid(aa))
+    test.assert_eq(r.b[21] as Int, WIN_SIZE)
+    test.assert_eq(r.b[22] as Int | (r.b[23] as Int << 8), 0)
+    test.assert_eq(r.b[24] as Int | (r.b[25] as Int << 8), 24)
+    test.assert_eq(r.b[26] as Int | (r.b[27] as Int << 8), 0)
+    test.assert_eq(r.b[28] as Int | (r.b[29] as Int << 8), 400)
+    test.assert_eq(r.b[30] as Int, 0xFF)
+    test.assert_eq(r.b[34] as Int, 0x1F)
+    let hop = r.b[35] as Int & 0x1F
+    test.assert(hop >= 5 and hop <= 16)
+    test.assert_eq(r.b[35] as Int >>> 5, SCA_CLASS)
+    // A random own address is TxAdd 1.
+    var j = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var j, 0, 160, 48, 0, 0, var peer, var me, 1, 24, 24, 0, 400, 0x00FF00FF03, 0, 0)
+    test.assert_eq(ll_pdu.pdu_tx_add(var j.req), 1)
+    test.assert_eq(j.req.b[30] as Int, 0x03)
+    test.assert_eq(j.req.b[31] as Int, 0xFF)
+    test.assert_eq(j.req.b[32] as Int, 0x00)
+
+@test
+fn test_each_enable_makes_a_new_access_address()
+    var i = t_init(0, 0)
+    var seen: [Int] = []
+    for k in 0..20
+        var peer = t_addr(0x10)
+        var me = t_addr(0xA0)
+        init_enable(var i, k * 1000, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+        let aa = i.req.b[14] as Int | (i.req.b[15] as Int << 8) | (i.req.b[16] as Int << 16) | (i.req.b[17] as Int << 24)
+        test.assert(aa_valid(aa))
+        for old in seen
+            test.assert(old != aa)
+        list.push(seen, aa)
+
+@test
+fn test_the_access_address_avoids_the_ones_in_use()
+    var i = t_init(0, 0)
+    let first = i.req.b[14] as Int | (i.req.b[15] as Int << 8) | (i.req.b[16] as Int << 16) | (i.req.b[17] as Int << 24)
+    var j = init_new()
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var j, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    // Same generator state as `i` had, so the same address, unless it is avoided.
+    let same = j.req.b[14] as Int | (j.req.b[15] as Int << 8) | (j.req.b[16] as Int << 16) | (j.req.b[17] as Int << 24)
+    test.assert_eq(same, first)
+    var k = init_new()
+    init_enable(var k, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, first, 0)
+    let other = k.req.b[14] as Int | (k.req.b[15] as Int << 8) | (k.req.b[16] as Int << 16) | (k.req.b[17] as Int << 24)
+    test.assert(other != first)
+    var m = init_new()
+    init_enable(var m, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, first)
+    let third = m.req.b[14] as Int | (m.req.b[15] as Int << 8) | (m.req.b[16] as Int << 16) | (m.req.b[17] as Int << 24)
+    test.assert(third != first)
+
+@test
+fn test_access_address_rules()
+    test.assert(aa_valid(0x50655A12))
+    // The advertising address and one bit from it.
+    test.assert(not aa_valid(0x8E89BED6))
+    test.assert(not aa_valid(0x8E89BED7))
+    // Four equal octets.
+    test.assert(not aa_valid(0x55555555))
+    // A run of ten equal bits.
+    test.assert(not aa_valid(0x5A007FA5))
+    // Twenty-five transitions.
+    test.assert(not aa_valid(0x5A6AA5A5))
+    test.assert(aa_valid(0x9A5A6A5A))
+    // No transition in the six most significant bits.
+    test.assert(not aa_valid(0xFC6A5A12))
+    test.assert_eq(bits_differ(0xF, 0x0), 4)
+
+@test
+fn test_a_connectable_advertisement_from_the_peer_is_answered()
+    var i = t_init(POLICY_PEER, 0)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var p, 11, false), ACT_CONNECT)
+    test.assert(i.sent)
+    test.assert_eq(i.connects, 1)
+    // AdvA and RxAdd are patched in.
+    test.assert(t_has(var i.req, 6, 0x10))
+    test.assert_eq(ll_pdu.pdu_rx_add(var i.req), 0)
+    // A random advertiser sets RxAdd.
+    var j = t_init(POLICY_PEER, 1)
+    var q = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(init_decide(var j, var q, 11, false), ACT_CONNECT)
+    test.assert_eq(ll_pdu.pdu_rx_add(var j.req), 1)
+    // Nothing is answered a second time.
+    test.assert_eq(init_decide(var i, var p, 11, false), 0)
+
+@test
+fn test_other_advertisers_and_other_types_are_not_answered()
+    var i = t_init(POLICY_PEER, 0)
+    var other = t_adv(ll_pdu.ADV_IND, 0x20, 0, 0)
+    test.assert_eq(init_decide(var i, var other, 11, false), 0)
+    var wrong_type = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(init_decide(var i, var wrong_type, 11, false), 0)
+    test.assert_eq(i.filtered, 2)
+    // Non-connectable and scannable PDUs are not connectable.
+    var nc = t_adv(ll_pdu.ADV_NONCONN_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var nc, 11, false), 0)
+    var sc = t_adv(ll_pdu.ADV_SCAN_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var sc, 11, false), 0)
+    // A PDU of the wrong length is not judged.
+    var good = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var i, var good, 12, false), 0)
+    test.assert_eq(i.seen, 2)
+    test.assert(not i.sent)
+
+@test
+fn test_the_list_policy_answers_listed_devices_whoever_they_are()
+    var i = t_init(POLICY_LIST, 0)
+    var other = t_adv(ll_pdu.ADV_IND, 0x20, 0, 0)
+    test.assert_eq(init_decide(var i, var other, 11, false), 0)
+    test.assert_eq(i.filtered, 1)
+    test.assert_eq(init_decide(var i, var other, 11, true), ACT_CONNECT)
+    test.assert(t_has(var i.req, 6, 0x20))
+    var j = t_init(POLICY_PEER, 0)
+    t_policy_set(var j, POLICY_LIST)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(init_decide(var j, var p, 11, false), 0)
+
+@test
+fn test_a_directed_advertisement_is_answered_only_when_it_names_the_initiator()
+    var i = t_init(POLICY_PEER, 0)
+    var other = t_adv(ll_pdu.ADV_DIRECT_IND, 0x10, 0, 0x30)
+    test.assert_eq(init_decide(var i, var other, 14, false), 0)
+    test.assert_eq(i.filtered, 1)
+    var mine = t_adv(ll_pdu.ADV_DIRECT_IND, 0x10, 0, 0xA0)
+    test.assert_eq(init_decide(var i, var mine, 14, false), ACT_CONNECT)
+    // The target's address type must match as well.
+    var j = t_init(POLICY_PEER, 0)
+    var typed = t_adv(ll_pdu.ADV_DIRECT_IND, 0x10, 0, 0xA0)
+    typed.b[0] = (typed.b[0] as Int | ll_pdu.RXADD) as u8
+    test.assert_eq(init_decide(var j, var typed, 14, false), 0)
+
+fn t_chsel(var p: Pdu)
+    p.b[0] = (p.b[0] as Int | ll_pdu.CHSEL) as u8
+
+@test
+fn test_the_connect_ind_takes_the_chsel_of_the_advertisement()
+    // An advertiser that supports algorithm #2 gets a connection that uses it.
+    var i = t_init(POLICY_PEER, 0)
+    var p = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    t_chsel(var p)
+    test.assert_eq(init_decide(var i, var p, 11, false), ACT_CONNECT)
+    test.assert_eq(i.req.b[0] as Int & ll_pdu.CHSEL, ll_pdu.CHSEL)
+    test.assert_eq(ll_pdu.pdu_type(var i.req), ll_pdu.CONNECT_IND)
+    test.assert_eq(ll_pdu.pdu_rx_add(var i.req), 0)
+    test.assert_eq(ll_pdu.pdu_tx_add(var i.req), 0)
+    // One without it gets algorithm #1, and a random advertiser sets RxAdd.
+    var j = t_init(POLICY_PEER, 1)
+    var q = t_adv(ll_pdu.ADV_IND, 0x10, 1, 0)
+    test.assert_eq(init_decide(var j, var q, 11, false), ACT_CONNECT)
+    test.assert_eq(j.req.b[0] as Int & ll_pdu.CHSEL, 0)
+    test.assert_eq(ll_pdu.pdu_rx_add(var j.req), 1)
+
+// An extended advertising PDU of the type `ty` and AdvMode `mode` from the advertiser first..first+5
+// of the address type `tx_add`, with the fields the flags `flags` announce: the AdvA, the TargetA
+// `target` (for a directed one), an ADI of 0x1234 and an Auxiliary Pointer to channel `ch`, offset
+// `offset` units of `unit` (0: 30 microseconds, 1: 300) and PHY `phy` (0: LE 1M).
+fn t_ext(ty: Int, mode: Int, flags: Int, first: Int, tx_add: Int, target: Int, ch: Int, unit: Int,
+         offset: Int, phy: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var rx_add = 0
+    if (flags & 2) != 0
+        rx_add = 1
+    var len = 1
+    if (flags & 1) != 0
+        len = len + 6
+    if (flags & 2) != 0
+        len = len + 6
+    if (flags & 8) != 0
+        len = len + 2
+    if (flags & 16) != 0
+        len = len + 3
+    ll_pdu.pdu_begin(var p, ty, tx_add, rx_add)
+    let _h = ll_pdu.pdu_put(var p, len | (mode << 6))
+    let _f = ll_pdu.pdu_put(var p, flags)
+    if (flags & 1) != 0
+        for k in 0..6
+            let _a = ll_pdu.pdu_put(var p, first + k)
+    if (flags & 2) != 0
+        for k in 0..6
+            let _t = ll_pdu.pdu_put(var p, target + k)
+    if (flags & 8) != 0
+        let _d0 = ll_pdu.pdu_put(var p, 0x34)
+        let _d1 = ll_pdu.pdu_put(var p, 0x12)
+    if (flags & 16) != 0
+        let _p0 = ll_pdu.pdu_put(var p, ch | (unit << 7))
+        let _p1 = ll_pdu.pdu_put(var p, offset & 0xFF)
+        let _p2 = ll_pdu.pdu_put(var p, ((offset >>> 8) & 0x1F) | (phy << 5))
+    ll_pdu.pdu_finish(var p)
+    p
+
+fn t_set_aux(var i: Init, phy: Int)
+    i.aux_phy = phy
+
+fn t_ext_init(phys: Int) -> Init
+    var i = t_init(POLICY_PEER, 0)
+    init_ext_enable(var i, phys, 40, 60, 2, 300)
+    i
+
+@test
+fn test_the_fields_of_the_extended_header_are_found_by_their_flags()
+    var p = t_ext(EXT_ADV, 1, 0x19, 0x10, 0, 0, 12, 0, 100, 0)
+    // AdvA at 4, ADI after it at 10, the pointer after that at 12; no TargetA.
+    test.assert_eq(ext_field(var p, 0), 4)
+    test.assert_eq(ext_field(var p, 1), -1)
+    test.assert_eq(ext_field(var p, 3), 10)
+    test.assert_eq(ext_field(var p, 4), 12)
+    test.assert_eq(ext_field(var p, 5), -1)
+    test.assert_eq(ext_mode(var p), 1)
+    test.assert_eq(aux_channel(var p, 12), 12)
+    test.assert_eq(aux_offset_us(var p, 12), 3000)
+    test.assert_eq(aux_unit_us(var p, 12), 30)
+    test.assert_eq(aux_phy_of(var p, 12), ll_phy.PHY_1M)
+    // 300-microsecond units, LE 2M, the accuracy of 0 to 50 ppm.
+    var q = t_ext(EXT_ADV, 1, 0x10, 0x10, 0, 0, 36, 1, 20, 1)
+    q.b[4] = (q.b[4] as Int | 0x40) as u8
+    test.assert_eq(ext_field(var q, 4), 4)
+    test.assert_eq(aux_offset_us(var q, 4), 6000)
+    test.assert_eq(aux_phy_of(var q, 4), ll_phy.PHY_2M)
+    test.assert_eq(aux_ca(var q, 4), 1)
+    test.assert_eq(aux_widen_us(var q, 4), 300 + 6000 * 100 / 1000000 + 20)
+    // A field past the extended header, or past the octets read, is not there.
+    var r = t_ext(EXT_ADV, 1, 0x10, 0x10, 0, 0, 5, 0, 5, 0)
+    r.b[2] = (2 | (1 << 6)) as u8
+    test.assert_eq(ext_field(var r, 4), -1)
+    var none = t_ext(EXT_ADV, 1, 0x10, 0x10, 0, 0, 5, 0, 5, 0)
+    none.b[2] = (1 << 6) as u8
+    test.assert_eq(ext_field(var none, 4), -1)
+
+@test
+fn test_a_connectable_adv_ext_ind_with_a_pointer_is_followed()
+    var i = t_ext_init(1)
+    var p = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var p, p.n), 6)
+    test.assert_eq(i.aux_seen, 1)
+    test.assert_eq(i.aux_followed, 1)
+    // A scannable or non-connectable one is not, nor one without a pointer, one that points at an
+    // advertising channel, one on a PHY the command left out or on LE Coded, or one too far away.
+    var scan = t_ext(EXT_ADV, 2, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var scan, scan.n), -1)
+    var nonconn = t_ext(EXT_ADV, 0, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var nonconn, nonconn.n), -1)
+    var nopointer = t_ext(EXT_ADV, 1, 0x08, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var nopointer, nopointer.n), -1)
+    var adv_ch = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 37, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var adv_ch, adv_ch.n), -1)
+    var two_m = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 1)
+    test.assert_eq(aux_plan(var i, var two_m, two_m.n), -1)
+    var coded = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 2)
+    test.assert_eq(aux_plan(var i, var coded, coded.n), -1)
+    var far = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 400, 0)
+    test.assert_eq(aux_plan(var i, var far, far.n), -1)
+    // A length that does not match the octets received.
+    var odd = t_ext(EXT_ADV, 1, 0x18, 0x10, 0, 0, 12, 0, 100, 0)
+    test.assert_eq(aux_plan(var i, var odd, odd.n + 1), -1)
+    test.assert_eq(i.aux_followed, 1)
+    // With LE 2M in the command a pointer to LE 2M is followed.
+    var j = t_ext_init(3)
+    test.assert_eq(aux_plan(var j, var two_m, two_m.n), 6)
+    // A legacy state, or an advertisement of the legacy kind, is not followed.
+    var k = t_init(POLICY_PEER, 0)
+    test.assert_eq(aux_plan(var k, var p, p.n), -1)
+    var legacy = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert_eq(aux_plan(var i, var legacy, legacy.n), -1)
+
+@test
+fn test_an_aux_adv_ind_is_judged_in_the_shape_of_a_legacy_advertisement()
+    var i = t_ext_init(1)
+    var v = ll_pdu.pdu_new()
+    var p = t_ext(EXT_ADV, 1, 0x09, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(ext_view(var p, p.n, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_IND)
+    test.assert_eq(v.n, 8)
+    test.assert(t_has(var v, 0, 0x10))
+    test.assert_eq(v.b[0] as Int & ll_pdu.CHSEL, 0)
+    test.assert_eq(init_decide(var i, var v, v.n, false), ACT_CONNECT)
+    // The request has the advertiser's address; its ChSel bit is reserved and clear.
+    test.assert(t_has(var i.req, 6, 0x10))
+    test.assert_eq(i.req.b[0] as Int & ll_pdu.CHSEL, 0)
+    // A random advertiser sets TxAdd, and so RxAdd of the request.
+    var rnd = t_ext(EXT_ADV, 1, 0x09, 0x10, 1, 0, 0, 0, 0, 0)
+    test.assert(ext_view(var rnd, rnd.n, var v))
+    test.assert_eq(ll_pdu.pdu_tx_add(var v), 1)
+    // A directed one has a TargetA and RxAdd.
+    var d = t_ext(EXT_ADV, 1, 0x0B, 0x10, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(ext_view(var d, d.n, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(v.n, 14)
+    test.assert(t_has(var v, 6, 0xA0))
+    test.assert_eq(ll_pdu.pdu_rx_add(var v), 1)
+    var j = t_ext_init(1)
+    test.assert_eq(init_decide(var j, var v, v.n, false), 0)
+    // A scannable one, one without AdvA, and one that is not an extended PDU are not.
+    var scan = t_ext(EXT_ADV, 2, 0x09, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(not ext_view(var scan, scan.n, var v))
+    var noaddr = t_ext(EXT_ADV, 1, 0x08, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(not ext_view(var noaddr, noaddr.n, var v))
+    var legacy = t_adv(ll_pdu.ADV_IND, 0x10, 0, 0)
+    test.assert(not ext_view(var legacy, legacy.n, var v))
+
+@test
+fn test_the_connect_rsp_of_the_advertiser_is_told_by_its_type_and_address()
+    var i = t_ext_init(1)
+    var v = ll_pdu.pdu_new()
+    var p = t_ext(EXT_ADV, 1, 0x09, 0x10, 0, 0, 0, 0, 0, 0)
+    test.assert(ext_view(var p, p.n, var v))
+    test.assert_eq(init_decide(var i, var v, v.n, false), ACT_CONNECT)
+    var rsp = t_ext(AUX_CONNECT_RSP, 0, 0x03, 0x10, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(is_connect_rsp(var i, var rsp, rsp.n))
+    var other = t_ext(AUX_CONNECT_RSP, 0, 0x03, 0x20, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(not is_connect_rsp(var i, var other, other.n))
+    var wrong = t_ext(EXT_ADV, 0, 0x03, 0x10, 0, 0xA0, 0, 0, 0, 0)
+    test.assert(not is_connect_rsp(var i, var wrong, wrong.n))
+    test.assert(not is_connect_rsp(var i, var rsp, rsp.n + 1))
+
+@test
+fn test_the_parameters_of_the_phy_of_the_packet_go_into_the_request()
+    var i = t_ext_init(3)
+    // LE 1M: the set the state was entered with, interval 24 (the maximum), no latency, timeout 400.
+    test.assert_eq(i.req.b[24] as Int | (i.req.b[25] as Int << 8), 24)
+    init_use_phy(var i, ll_phy.PHY_2M)
+    test.assert_eq(i.c_min, 40)
+    test.assert_eq(i.c_max, 60)
+    test.assert_eq(i.latency, 2)
+    test.assert_eq(i.timeout, 300)
+    test.assert_eq(i.req.b[24] as Int | (i.req.b[25] as Int << 8), 60)
+    test.assert_eq(i.req.b[26] as Int | (i.req.b[27] as Int << 8), 2)
+    test.assert_eq(i.req.b[28] as Int | (i.req.b[29] as Int << 8), 300)
+    // A request that did not go out puts the set of LE 1M back.
+    t_mark_sent(var i)
+    t_set_aux(var i, ll_phy.PHY_2M)
+    init_unsent(var i)
+    test.assert_eq(i.aux_phy, 0)
+    test.assert_eq(i.c_max, 24)
+    test.assert_eq(i.req.b[24] as Int | (i.req.b[25] as Int << 8), 24)
+    test.assert_eq(i.req.b[28] as Int | (i.req.b[29] as Int << 8), 400)
+
+@test
+fn test_the_connection_parameters_of_a_phy_are_checked_alone()
+    test.assert_eq(conn_params_status(6, 6, 0, 100, 0, 0), 0)
+    test.assert_eq(conn_params_status(5, 6, 0, 100, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 3201, 0, 100, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 6, 500, 100, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 6, 0, 9, 0, 0), 0x12)
+    test.assert_eq(conn_params_status(6, 6, 0, 100, 5, 4), 0x12)
+    var i = t_init(POLICY_PEER, 0)
+    test.assert(not i.ext)
+    init_ext_enable(var i, 1, 0, 0, 0, 0)
+    test.assert(i.ext)
+    // Entering the state again is a state of LE Create Connection.
+    var peer = t_addr(0x10)
+    var me = t_addr(0xA0)
+    init_enable(var i, 0, 160, 48, 0, 0, var peer, var me, 0, 24, 24, 0, 400, CHMAP_ALL, 0, 0)
+    test.assert(not i.ext)

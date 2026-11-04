@@ -1,0 +1,423 @@
+// tests/ll_adv_tests.nv — the unit tests of src/ll_adv.nv.
+//
+//   novo test tests/ll_adv_tests.nv
+
+use std.test
+use ll_pdu
+use ll_adv.{ ADV_DELAY_MAX_US, Adv, DEFAULT_INTERVAL, FIRST_EVENT_US, HIGH_DUTY_TIMEOUT_US, PDU_GAP_US, RX_CONNECT_IND, RX_NONE, RX_SCAN_REQ, TYPE_DIRECT_HIGH, TYPE_DIRECT_LOW, TYPE_IND, TYPE_NONCONN, TYPE_SCAN, UNIT_US, adv_arm_for, adv_at_event_start, adv_channel, adv_delay, adv_due, adv_enable, adv_new, adv_pdu_end, adv_pdu_start, adv_reset, adv_rx, adv_seed, adv_set_data_len, adv_set_map_policy, adv_set_params, adv_set_rsp_len, adv_timed_out, chan_count, chan_of_slot, params_status, pdu_type_of, rng_step }
+
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var x: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _a = x.push((first + i) as u8)
+    x
+
+// An advertiser enabled at time 0 with the address 0x10..0x15 of `kind`.
+fn t_running(ty: Int, kind: Int) -> Adv
+    var a = adv_new()
+    adv_set_params(var a, 0x20, 0x20, ty, kind, 0, 7, 0)
+    var ad = t_addr(0x10)
+    adv_enable(var a, 0, var ad, kind)
+    a
+
+// A request PDU of `ty` from the sender 0x40..0x45 to the advertiser.
+fn t_request(ty: Int, var target: Vec[u8; 6], rx_add: Int, tx_add: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    var sender = t_addr(0x40)
+    ll_pdu.pdu_begin(var p, ty, tx_add, rx_add)
+    ll_pdu.pdu_put_addr(var p, var sender)
+    ll_pdu.pdu_put_addr(var p, var target)
+    if ty == ll_pdu.CONNECT_IND
+        for _ in 0..22
+            let _x = ll_pdu.pdu_put(var p, 0)
+    ll_pdu.pdu_finish(var p)
+    p
+
+@test
+fn test_capacities_match_the_constants()
+    let a = adv_new()
+    test.assert_eq(a.data.capacity(), ll_pdu.DATA_MAX)
+    test.assert_eq(a.rsp.capacity(), ll_pdu.DATA_MAX)
+    test.assert_eq(a.peer.capacity(), 6)
+    test.assert_eq(a.addr.capacity(), 6)
+
+@test
+fn test_parameter_status_follows_the_command()
+    test.assert_eq(params_status(0x20, 0x4000, 0, 0, 0, 7, 0), 0)
+    test.assert_eq(params_status(0x1F, 0x20, 0, 0, 0, 7, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x4001, 0, 0, 0, 7, 0), 0x12)
+    test.assert_eq(params_status(0x30, 0x20, 0, 0, 0, 7, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x20, 5, 0, 0, 7, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x20, 0, 4, 0, 7, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x20, 0, 0, 2, 7, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x20, 0, 0, 0, 0, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x20, 0, 0, 0, 8, 0), 0x12)
+    test.assert_eq(params_status(0x20, 0x20, 0, 0, 0, 7, 4), 0x12)
+    // The interval of high duty cycle directed advertising is not used.
+    test.assert_eq(params_status(0, 0, 1, 0, 0, 7, 0), 0)
+    test.assert_eq(params_status(0, 0, 4, 0, 0, 7, 0), 0x12)
+    // The own address types 2 and 3 take the Resolvable Private Address of the resolving list.
+    test.assert_eq(params_status(0x20, 0x20, 0, 2, 0, 7, 0), 0)
+    test.assert_eq(params_status(0x20, 0x20, 0, 3, 0, 7, 0), 0)
+
+@test
+fn test_channel_slots_are_ascending_over_the_map()
+    test.assert_eq(chan_count(7), 3)
+    test.assert_eq(chan_count(5), 2)
+    test.assert_eq(chan_count(2), 1)
+    test.assert_eq(chan_of_slot(7, 0), 37)
+    test.assert_eq(chan_of_slot(7, 1), 38)
+    test.assert_eq(chan_of_slot(7, 2), 39)
+    test.assert_eq(chan_of_slot(7, 3), -1)
+    test.assert_eq(chan_of_slot(5, 0), 37)
+    test.assert_eq(chan_of_slot(5, 1), 39)
+    test.assert_eq(chan_of_slot(4, 0), 39)
+    test.assert_eq(chan_of_slot(4, 1), -1)
+
+@test
+fn test_generator_draws_stay_in_the_delay_range()
+    var a = adv_new()
+    adv_seed(var a, 12345)
+    var lo = ADV_DELAY_MAX_US
+    var hi = 0
+    for _ in 0..2000
+        let d = adv_delay(var a)
+        test.assert(d >= 0 and d <= ADV_DELAY_MAX_US)
+        if d < lo
+            lo = d
+        if d > hi
+            hi = d
+    // 2000 draws cover the range well enough to see both ends.
+    test.assert(lo < 200)
+    test.assert(hi > 9800)
+
+@test
+fn test_generator_never_sticks_at_zero()
+    test.assert(rng_step(0) != 0)
+    var x = 1
+    for _ in 0..100
+        x = rng_step(x)
+        test.assert(x != 0)
+
+@test
+fn test_connectable_scannable_pdu_carries_the_address_and_data()
+    var a = adv_new()
+    adv_set_params(var a, 0x20, 0x20, TYPE_IND, 0, 0, 7, 0)
+    a.data[0] = 2
+    a.data[1] = 1
+    a.data[2] = 6
+    adv_set_data_len(var a, 3)
+    a.rsp[0] = 4
+    a.rsp[1] = 9
+    a.rsp[2] = 0x41
+    a.rsp[3] = 0x42
+    adv_set_rsp_len(var a, 4)
+    var ad = t_addr(0x10)
+    adv_enable(var a, 1000, var ad, 1)
+    test.assert_eq(a.pdu.n, 2 + 6 + 3)
+    test.assert_eq(ll_pdu.pdu_type(var a.pdu), ll_pdu.ADV_IND)
+    test.assert_eq(ll_pdu.pdu_tx_add(var a.pdu), 1)
+    test.assert_eq(ll_pdu.pdu_len(var a.pdu), 9)
+    test.assert_eq(ll_pdu.pdu_get(var a.pdu, 2), 0x10)
+    test.assert_eq(ll_pdu.pdu_get(var a.pdu, 7), 0x15)
+    test.assert_eq(ll_pdu.pdu_get(var a.pdu, 8), 2)
+    test.assert_eq(ll_pdu.pdu_get(var a.pdu, 10), 6)
+    test.assert_eq(ll_pdu.pdu_type(var a.rsp_pdu), ll_pdu.SCAN_RSP)
+    test.assert_eq(ll_pdu.pdu_len(var a.rsp_pdu), 10)
+    test.assert_eq(ll_pdu.pdu_get(var a.rsp_pdu, 8), 4)
+
+@test
+fn test_each_advertising_type_sends_its_pdu_type()
+    test.assert_eq(pdu_type_of(TYPE_IND), ll_pdu.ADV_IND)
+    test.assert_eq(pdu_type_of(TYPE_SCAN), ll_pdu.ADV_SCAN_IND)
+    test.assert_eq(pdu_type_of(TYPE_NONCONN), ll_pdu.ADV_NONCONN_IND)
+    test.assert_eq(pdu_type_of(TYPE_DIRECT_HIGH), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(pdu_type_of(TYPE_DIRECT_LOW), ll_pdu.ADV_DIRECT_IND)
+
+@test
+fn test_directed_pdu_names_the_target_and_its_type()
+    var a = adv_new()
+    adv_set_params(var a, 0x20, 0x20, TYPE_DIRECT_LOW, 0, 1, 7, 0)
+    var peer = t_addr(0x70)
+    for i in 0..6
+        a.peer[i] = peer[i]
+    var ad = t_addr(0x10)
+    adv_enable(var a, 0, var ad, 0)
+    test.assert_eq(ll_pdu.pdu_type(var a.pdu), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(ll_pdu.pdu_len(var a.pdu), 12)
+    test.assert_eq(ll_pdu.pdu_tx_add(var a.pdu), 0)
+    test.assert_eq(ll_pdu.pdu_rx_add(var a.pdu), 1)
+    test.assert_eq(ll_pdu.pdu_get(var a.pdu, 8), 0x70)
+    test.assert_eq(ll_pdu.pdu_get(var a.pdu, 13), 0x75)
+
+@test
+fn test_an_event_sends_one_pdu_per_channel_then_waits_the_interval()
+    var a = t_running(TYPE_NONCONN, 0)
+    test.assert_eq(adv_due(var a), FIRST_EVENT_US)
+    test.assert(adv_at_event_start(var a))
+    test.assert_eq(adv_channel(var a), 37)
+    adv_pdu_start(var a, 1000)
+    adv_pdu_end(var a, 1400)
+    test.assert(not adv_at_event_start(var a))
+    test.assert_eq(adv_channel(var a), 38)
+    test.assert_eq(adv_due(var a), 1400 + PDU_GAP_US)
+    adv_pdu_start(var a, 1700)
+    adv_pdu_end(var a, 2100)
+    test.assert_eq(adv_channel(var a), 39)
+    adv_pdu_start(var a, 2400)
+    adv_pdu_end(var a, 2800)
+    // The event is closed: the next starts an interval and an advDelay after
+    // the first PDU of this one began.
+    test.assert(adv_at_event_start(var a))
+    test.assert_eq(adv_channel(var a), 37)
+    let gap = adv_due(var a) - 1000
+    test.assert(gap >= 32 * UNIT_US)
+    test.assert(gap <= 32 * UNIT_US + ADV_DELAY_MAX_US)
+    test.assert_eq(a.events, 1)
+    test.assert_eq(a.pdus, 3)
+
+@test
+fn test_the_event_spacing_stays_inside_the_delay_bound_over_many_events()
+    var a = t_running(TYPE_NONCONN, 0)
+    var prev = -1
+    var lo = 1000000000
+    var hi = 0
+    for _ in 0..300
+        let start = adv_due(var a)
+        if prev >= 0
+            let s = start - prev
+            if s < lo
+                lo = s
+            if s > hi
+                hi = s
+        prev = start
+        for k in 0..3
+            adv_pdu_start(var a, adv_due(var a))
+            adv_pdu_end(var a, adv_due(var a) + 300)
+    test.assert(lo >= 32 * UNIT_US)
+    test.assert(hi <= 32 * UNIT_US + ADV_DELAY_MAX_US)
+    test.assert(hi - lo > 5000)
+    test.assert_eq(a.events, 300)
+
+@test
+fn test_a_channel_map_of_two_makes_events_of_two_pdus()
+    var a = t_running(TYPE_NONCONN, 0)
+    adv_set_map_policy(var a, 5, a.policy as Int)
+    adv_pdu_start(var a, 1000)
+    test.assert_eq(adv_channel(var a), 37)
+    adv_pdu_end(var a, 1400)
+    test.assert_eq(adv_channel(var a), 39)
+    adv_pdu_start(var a, 1700)
+    adv_pdu_end(var a, 2100)
+    test.assert(adv_at_event_start(var a))
+    test.assert_eq(adv_channel(var a), 37)
+
+@test
+fn test_a_late_event_is_not_scheduled_in_the_past()
+    var a = t_running(TYPE_NONCONN, 0)
+    // The program was busy: the three PDUs ended long after the interval.
+    adv_pdu_start(var a, 1000)
+    adv_pdu_end(var a, 5000)
+    adv_pdu_start(var a, 5300)
+    adv_pdu_end(var a, 9000)
+    adv_pdu_start(var a, 9300)
+    adv_pdu_end(var a, 100000)
+    test.assert(adv_due(var a) >= 100000 + PDU_GAP_US)
+
+@test
+fn test_data_set_between_events_goes_out_in_the_next_event()
+    var a = t_running(TYPE_NONCONN, 0)
+    adv_pdu_start(var a, 1000)
+    test.assert_eq(ll_pdu.pdu_len(var a.pdu), 6)
+    a.data[0] = 9
+    adv_set_data_len(var a, 1)
+    // Mid-event the PDU is the old one; the next event's first PDU is new.
+    adv_pdu_end(var a, 1400)
+    adv_pdu_start(var a, 1700)
+    adv_pdu_end(var a, 2100)
+    adv_pdu_start(var a, 2400)
+    adv_pdu_end(var a, 2800)
+    adv_pdu_start(var a, adv_due(var a))
+    test.assert_eq(ll_pdu.pdu_len(var a.pdu), 7)
+
+@test
+fn test_high_duty_directed_events_run_back_to_back_and_time_out()
+    var a = adv_new()
+    adv_set_params(var a, 0, 0, TYPE_DIRECT_HIGH, 0, 0, 7, 0)
+    var ad = t_addr(0x10)
+    adv_enable(var a, 0, var ad, 0)
+    var now = adv_due(var a)
+    var events = 0
+    var longest = 0
+    var last_start = now
+    while not adv_timed_out(var a) and events < 2000
+        let start = adv_due(var a)
+        // The shortest exchange: the PDU, then the listen window that ends
+        // 150 + 40 + 24 microseconds after the PDU.
+        for k in 0..3
+            let s = adv_due(var a)
+            adv_pdu_start(var a, s)
+            adv_pdu_end(var a, s + ll_pdu.airtime_us(14) + 214)
+            if k == 0
+                if s - last_start > longest
+                    longest = s - last_start
+                last_start = s
+        events = events + 1
+    test.assert(adv_timed_out(var a))
+    test.assert(events > 100)
+    // The same channel is used again within 3.75 ms.
+    test.assert(longest <= 3750)
+    test.assert(adv_due(var a) - a.entered >= HIGH_DUTY_TIMEOUT_US)
+    test.assert(adv_due(var a) - a.entered < HIGH_DUTY_TIMEOUT_US + 4000)
+
+@test
+fn test_scan_request_for_a_scannable_advertiser_gets_a_response()
+    var a = t_running(TYPE_IND, 0)
+    var mine = t_addr(0x10)
+    var p = t_request(ll_pdu.SCAN_REQ, var mine, 0, 0)
+    test.assert_eq(adv_rx(var a, var p, 14, false), RX_SCAN_REQ)
+    test.assert_eq(a.scan_reqs, 1)
+
+@test
+fn test_scan_request_for_another_address_is_ignored()
+    var a = t_running(TYPE_IND, 0)
+    var other = t_addr(0x11)
+    var p = t_request(ll_pdu.SCAN_REQ, var other, 0, 0)
+    test.assert_eq(adv_rx(var a, var p, 14, false), RX_NONE)
+    // The right address with the wrong type bit names another device.
+    var mine = t_addr(0x10)
+    var q = t_request(ll_pdu.SCAN_REQ, var mine, 1, 0)
+    test.assert_eq(adv_rx(var a, var q, 14, false), RX_NONE)
+
+@test
+fn test_random_advertiser_answers_a_request_with_rxadd_set()
+    var a = t_running(TYPE_SCAN, 1)
+    var mine = t_addr(0x10)
+    var p = t_request(ll_pdu.SCAN_REQ, var mine, 1, 1)
+    test.assert_eq(adv_rx(var a, var p, 14, false), RX_SCAN_REQ)
+    var q = t_request(ll_pdu.SCAN_REQ, var mine, 0, 1)
+    test.assert_eq(adv_rx(var a, var q, 14, false), RX_NONE)
+
+@test
+fn test_a_truncated_request_is_ignored()
+    var a = t_running(TYPE_IND, 0)
+    var mine = t_addr(0x10)
+    var p = t_request(ll_pdu.SCAN_REQ, var mine, 0, 0)
+    test.assert_eq(adv_rx(var a, var p, 13, false), RX_NONE)
+    test.assert_eq(adv_rx(var a, var p, 15, false), RX_NONE)
+
+@test
+fn test_non_scannable_types_ignore_a_scan_request()
+    var mine = t_addr(0x10)
+    var p = t_request(ll_pdu.SCAN_REQ, var mine, 0, 0)
+    var a = t_running(TYPE_NONCONN, 0)
+    test.assert_eq(adv_rx(var a, var p, 14, false), RX_NONE)
+    var b = t_running(TYPE_DIRECT_LOW, 0)
+    test.assert_eq(adv_rx(var b, var p, 14, false), RX_NONE)
+
+@test
+fn test_connect_request_is_counted_for_connectable_types()
+    var mine = t_addr(0x10)
+    var p = t_request(ll_pdu.CONNECT_IND, var mine, 0, 0)
+    var a = t_running(TYPE_IND, 0)
+    test.assert_eq(adv_rx(var a, var p, 36, false), RX_CONNECT_IND)
+    test.assert_eq(a.connect_inds, 1)
+    var s = t_running(TYPE_SCAN, 0)
+    test.assert_eq(adv_rx(var s, var p, 36, false), RX_NONE)
+    var n = t_running(TYPE_NONCONN, 0)
+    test.assert_eq(adv_rx(var n, var p, 36, false), RX_NONE)
+
+@test
+fn test_directed_advertising_answers_only_the_named_initiator()
+    var a = adv_new()
+    adv_set_params(var a, 0x20, 0x20, TYPE_DIRECT_LOW, 0, 0, 7, 0)
+    var peer = t_addr(0x40)
+    for i in 0..6
+        a.peer[i] = peer[i]
+    var ad = t_addr(0x10)
+    adv_enable(var a, 0, var ad, 0)
+    var mine = t_addr(0x10)
+    // The request is from 0x40..0x45 with the public type: the named one.
+    var p = t_request(ll_pdu.CONNECT_IND, var mine, 0, 0)
+    test.assert_eq(adv_rx(var a, var p, 36, false), RX_CONNECT_IND)
+    // The same address with the random type is another device.
+    var q = t_request(ll_pdu.CONNECT_IND, var mine, 0, 1)
+    test.assert_eq(adv_rx(var a, var q, 36, false), RX_NONE)
+    // The Filter Accept List does not matter for directed advertising.
+    adv_set_map_policy(var a, a.chmap as Int, 3)
+    test.assert_eq(adv_rx(var a, var p, 36, false), RX_CONNECT_IND)
+
+@test
+fn test_filter_policy_gates_scan_and_connect_requests()
+    var mine = t_addr(0x10)
+    var scan = t_request(ll_pdu.SCAN_REQ, var mine, 0, 0)
+    var conn = t_request(ll_pdu.CONNECT_IND, var mine, 0, 0)
+    var a = t_running(TYPE_IND, 0)
+    // Policy 1: scan requests only from listed devices, connections from all.
+    adv_set_map_policy(var a, a.chmap as Int, 1)
+    test.assert_eq(adv_rx(var a, var scan, 14, false), RX_NONE)
+    test.assert_eq(adv_rx(var a, var scan, 14, true), RX_SCAN_REQ)
+    test.assert_eq(adv_rx(var a, var conn, 36, false), RX_CONNECT_IND)
+    // Policy 2: the other way round.
+    adv_set_map_policy(var a, a.chmap as Int, 2)
+    test.assert_eq(adv_rx(var a, var scan, 14, false), RX_SCAN_REQ)
+    test.assert_eq(adv_rx(var a, var conn, 36, false), RX_NONE)
+    test.assert_eq(adv_rx(var a, var conn, 36, true), RX_CONNECT_IND)
+    // Policy 3: listed devices only.
+    adv_set_map_policy(var a, a.chmap as Int, 3)
+    test.assert_eq(adv_rx(var a, var scan, 14, false), RX_NONE)
+    test.assert_eq(adv_rx(var a, var conn, 36, false), RX_NONE)
+    test.assert_eq(adv_rx(var a, var scan, 14, true), RX_SCAN_REQ)
+    test.assert_eq(adv_rx(var a, var conn, 36, true), RX_CONNECT_IND)
+
+@test
+fn test_arm_for_a_scan_request_only_when_scannable()
+    var a = t_running(TYPE_IND, 0)
+    test.assert(adv_arm_for(var a, 0x03))
+    test.assert(adv_arm_for(var a, 0x43))
+    test.assert(not adv_arm_for(var a, 0x05))
+    var n = t_running(TYPE_NONCONN, 0)
+    test.assert(not adv_arm_for(var n, 0x03))
+
+@test
+fn test_reset_returns_to_the_defaults()
+    var a = t_running(TYPE_SCAN, 1)
+    adv_set_data_len(var a, 5)
+    adv_reset(var a)
+    test.assert(not a.enabled)
+    test.assert_eq(a.ty as Int, 0)
+    test.assert_eq(a.chmap as Int, 7)
+    test.assert_eq(a.int_min, DEFAULT_INTERVAL)
+    test.assert_eq(a.data_len as Int, 0)
+
+@test
+fn test_a_request_the_policy_refuses_is_counted_with_its_sender()
+    var mine = t_addr(0x10)
+    var scan = t_request(ll_pdu.SCAN_REQ, var mine, 0, 1)
+    var a = t_running(TYPE_IND, 0)
+    adv_set_map_policy(var a, 7, 1)
+    test.assert_eq(adv_rx(var a, var scan, 14, false), RX_NONE)
+    test.assert_eq(a.filtered, 1)
+    test.assert_eq(a.filt_type as Int, 1)
+    test.assert_eq(a.filt_addr[0] as Int, 0x40)
+    test.assert_eq(a.filt_addr[5] as Int, 0x45)
+    // A request for another advertiser is not counted.
+    var other = t_addr(0x11)
+    var q = t_request(ll_pdu.SCAN_REQ, var other, 0, 0)
+    test.assert_eq(adv_rx(var a, var q, 14, false), RX_NONE)
+    test.assert_eq(a.filtered, 1)
+
+@test
+fn test_connectable_advertisements_say_they_support_algorithm_2()
+    // ChSel is set in ADV_IND and ADV_DIRECT_IND, and in no other PDU.
+    var a = t_running(TYPE_IND, 0)
+    test.assert_eq(a.pdu.b[0] as Int & ll_pdu.CHSEL, ll_pdu.CHSEL)
+    var d = t_running(TYPE_DIRECT_LOW, 0)
+    test.assert_eq(d.pdu.b[0] as Int & ll_pdu.CHSEL, ll_pdu.CHSEL)
+    var h = t_running(TYPE_DIRECT_HIGH, 0)
+    test.assert_eq(h.pdu.b[0] as Int & ll_pdu.CHSEL, ll_pdu.CHSEL)
+    var n = t_running(TYPE_NONCONN, 0)
+    test.assert_eq(n.pdu.b[0] as Int & ll_pdu.CHSEL, 0)
+    var s = t_running(TYPE_SCAN, 0)
+    test.assert_eq(s.pdu.b[0] as Int & ll_pdu.CHSEL, 0)
+    test.assert_eq(a.rsp_pdu.b[0] as Int & ll_pdu.CHSEL, 0)

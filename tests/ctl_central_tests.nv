@@ -14,11 +14,9 @@
 // `airtime_us` microseconds.
 
 use std.test
-use hci_frame
 use ctl_hci
 use ctl_pool
 use ll_pdu
-use ll_adv
 use ll_arb
 use ll_data
 use ll_init
@@ -42,7 +40,7 @@ fn drain(var c: ctl_hci.Controller) -> [Int]
     out
 
 fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
-    send(c, opcode, params)
+    send(var c, opcode, params)
     let _ran = ctl_hci.ctl_step(var c)
     drain(var c)
 
@@ -57,10 +55,7 @@ fn packets_of(bytes: [Int]) -> [[Int]]
             n = 3 + bytes[i + 2]
         else
             n = 5 + bytes[i + 3] + (bytes[i + 4] << 8)
-        var e: [Int] = []
-        for k in 0..n
-            list.push(e, bytes[i + k])
-        list.push(out, e)
+        list.push(out, bytes[i:i + n])
         i = i + n
     out
 
@@ -87,7 +82,7 @@ fn acl_packets(bytes: [Int]) -> [[Int]]
 
 // The Status of the Command Complete event of a command.
 fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let done = events_coded(r, 0x0E)
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
@@ -95,7 +90,7 @@ fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
 
 // The Status of the Command Status event a command is answered with.
 fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let st = events_coded(r, 0x0F)
     test.assert_eq(list.len(st), 1)
     test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
@@ -106,8 +101,8 @@ fn fresh() -> ctl_hci.Controller
     var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
     for i in 0..6
         ctl_hci.ctl_set_public(var c, i, 0xA0 + i)
-    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
-    test.assert_eq(status_of(c, 0x2001, [0x1F, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0x1F, 0, 0, 0, 0, 0, 0, 0]), 0)
     c
 
 fn le16(v: Int) -> [Int]
@@ -349,7 +344,7 @@ fn central_event(var c: ctl_hci.Controller, slot: Int, var per: Per) -> Int
                 ctl_hci.ctl_conn_rx_slow(var c, slot, var reply)
                 t = t + ll_pdu.airtime_us(reply.n) + 150
                 n = n + 1
-                open = continues(c, slot)
+                open = continues(var c, slot)
                 tx = next
                 hdr = nh
     ctl_hci.ctl_conn_done(var c, slot, t)
@@ -366,7 +361,7 @@ fn host_read(var c: ctl_hci.Controller, var out: [Int])
 fn central_up(end_us: Int) -> ctl_hci.Controller
     var c = fresh()
     ctl_hci.ctl_set_time(var c, 1000)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     var adv = adv_ind(0x10, 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var adv, 11))
     test.assert(ctl_hci.ctl_init_sent(var c, end_us))
@@ -389,7 +384,7 @@ fn run_events(var c: ctl_hci.Controller, var per: Per, until: Int, var host: [In
 fn test_create_connection_enters_the_initiating_state_and_books_its_windows()
     var c = fresh()
     ctl_hci.ctl_set_time(var c, 1000)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     test.assert(c.init.enabled)
     test.assert(ctl_hci.ctl_init_active(var c))
     test.assert(ctl_hci.ctl_ll_on(var c))
@@ -420,26 +415,26 @@ fn test_create_connection_is_refused_in_the_states_and_with_the_values_the_comma
     test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 1, 24, 400)), 0x12)
     test.assert(not c.init.enabled)
     // A command of the wrong length.
-    let r = run(c, 0x200D, [1, 2, 3])
+    let r = run(var c, 0x200D, [1, 2, 3])
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
     // Scanning on, or initiating on, disallows it.
-    test.assert_eq(status_of(c, 0x200B, [1, 0x10, 0, 0x10, 0, 0, 0]), 0)
-    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0)
-    test.assert_eq(create(c), 0x0C)
-    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
-    test.assert_eq(create(c), 0)
-    test.assert_eq(create(c), 0x0C)
+    test.assert_eq(status_of(var c, 0x200B, [1, 0x10, 0, 0x10, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x200C, [1, 0]), 0)
+    test.assert_eq(create(var c), 0x0C)
+    test.assert_eq(status_of(var c, 0x200C, [0, 0]), 0)
+    test.assert_eq(create(var c), 0)
+    test.assert_eq(create(var c), 0x0C)
     // Scanning does not start beside the Initiating state either.
     test.assert(c.init.enabled)
-    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0x0C)
+    test.assert_eq(status_of(var c, 0x200C, [1, 0]), 0x0C)
     test.assert(not c.scan.enabled)
     // Stopping a scan that is not on is a success.
-    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x200C, [0, 0]), 0)
 
 @test
 fn test_a_random_own_address_is_used_when_the_host_set_it()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2005, [0x01, 0x02, 0x03, 0x04, 0x05, 0xC6]), 0)
+    test.assert_eq(status_of(var c, 0x2005, [0x01, 0x02, 0x03, 0x04, 0x05, 0xC6]), 0)
     test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 1, 24, 400)), 0)
     test.assert_eq(c.init.addr_type as Int, 1)
     test.assert_eq(c.init.addr[0] as Int, 0x01)
@@ -449,19 +444,19 @@ fn test_a_random_own_address_is_used_when_the_host_set_it()
 fn test_create_connection_cancel_ends_the_state_and_tells_the_host_after_its_answer()
     var c = fresh()
     // Without a pending LE Create Connection the command is disallowed.
-    test.assert_eq(status_of(c, 0x200E, []), 0x0C)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(status_of(var c, 0x200E, []), 0x0C)
+    test.assert_eq(create(var c), 0)
     ctl_hci.ctl_set_time(var c, 1000)
     let _x = ctl_hci.ctl_ll_pick(var c, false)
     test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
-    let r = run(c, 0x200E, [])
+    let r = run(var c, 0x200E, [])
     // The Command Complete is first, the LE Connection Complete follows it at the
     // next step.
     test.assert_eq(list.len(events_coded(r, 0x0E)), 1)
     test.assert_eq(list.len(meta_events(r, 0x01)), 0)
     test.assert(not c.init.enabled)
     test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
-    let s = run(c, 0x1001, [])
+    let s = run(var c, 0x1001, [])
     let ev = meta_events(s, 0x01)
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][2], 19)
@@ -469,26 +464,26 @@ fn test_create_connection_cancel_ends_the_state_and_tells_the_host_after_its_ans
     for k in 5..22
         test.assert_eq(ev[0][k], 0)
     // Only once.
-    test.assert_eq(list.len(meta_events(run(c, 0x1001, []), 0x01)), 0)
+    test.assert_eq(list.len(meta_events(run(var c, 0x1001, []), 0x01)), 0)
     test.assert_eq(c.init.cancels, 1)
     test.assert(not ctl_hci.ctl_ll_on(var c))
 
 @test
 fn test_the_event_of_a_cancel_is_enhanced_or_masked_as_the_host_chose()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
-    test.assert_eq(create(c), 0)
-    test.assert_eq(status_of(c, 0x200E, []), 0)
-    let r = run(c, 0x1001, [])
+    test.assert_eq(status_of(var c, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(create(var c), 0)
+    test.assert_eq(status_of(var c, 0x200E, []), 0)
+    let r = run(var c, 0x1001, [])
     let ev = meta_events(r, 0x0A)
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][2], 31)
     test.assert_eq(ev[0][4], 0x02)
     var d = fresh()
-    test.assert_eq(status_of(d, 0x2001, zeros(8)), 0)
-    test.assert_eq(create(d), 0)
-    test.assert_eq(status_of(d, 0x200E, []), 0)
-    let s = run(d, 0x1001, [])
+    test.assert_eq(status_of(var d, 0x2001, zeros(8)), 0)
+    test.assert_eq(create(var d), 0)
+    test.assert_eq(status_of(var d, 0x200E, []), 0)
+    let s = run(var d, 0x1001, [])
     test.assert_eq(list.len(events_coded(s, 0x3E)), 0)
     test.assert_eq(d.init_event, 0)
 
@@ -501,8 +496,8 @@ fn zeros(n: Int) -> [Int]
 @test
 fn test_the_cancel_event_waits_for_a_free_slot()
     var c = fresh()
-    test.assert_eq(create(c), 0)
-    test.assert_eq(status_of(c, 0x200E, []), 0)
+    test.assert_eq(create(var c), 0)
+    test.assert_eq(status_of(var c, 0x200E, []), 0)
     var held: [Int] = []
     for _ in 0..16
         let k = ctl_pool.pool_take(var c.pool)
@@ -522,7 +517,7 @@ fn test_the_cancel_event_waits_for_a_free_slot()
 @test
 fn test_the_initiator_connects_to_the_named_peer_only()
     var c = fresh()
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     var other = adv_ind(0x20, 0)
     test.assert(not ctl_hci.ctl_init_decide(var c, var other, 11))
     var random = adv_ind(0x10, 1)
@@ -536,19 +531,19 @@ fn test_the_initiator_connects_to_the_named_peer_only()
 fn test_the_list_policy_connects_to_a_listed_device_and_freezes_the_list()
     var c = fresh()
     var add = [0, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25]
-    test.assert_eq(status_of(c, 0x2011, add), 0)
+    test.assert_eq(status_of(var c, 0x2011, add), 0)
     test.assert_eq(cmd_status(var c, 0x200D, create_params(1, 0, 0, 24, 400)), 0)
     // The list does not change while the Initiating state reads it.
-    test.assert_eq(status_of(c, 0x2011, [0, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35]), 0x0C)
-    test.assert_eq(status_of(c, 0x2012, add), 0x0C)
-    test.assert_eq(status_of(c, 0x2010, []), 0x0C)
+    test.assert_eq(status_of(var c, 0x2011, [0, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35]), 0x0C)
+    test.assert_eq(status_of(var c, 0x2012, add), 0x0C)
+    test.assert_eq(status_of(var c, 0x2010, []), 0x0C)
     var stranger = adv_ind(0x10, 0)
     test.assert(not ctl_hci.ctl_init_decide(var c, var stranger, 11))
     var listed = adv_ind(0x20, 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var listed, 11))
     test.assert(ctl_hci.ctl_init_sent(var c, 8000))
     // The state is over, and the list can change again.
-    test.assert_eq(status_of(c, 0x2012, add), 0)
+    test.assert_eq(status_of(var c, 0x2012, add), 0)
     test.assert(has_addr(c.init.req, 6, 0x20))
 
 fn t_addr(first: Int) -> Vec[u8; 6]
@@ -560,7 +555,7 @@ fn t_addr(first: Int) -> Vec[u8; 6]
 @test
 fn test_a_connect_ind_that_did_not_go_on_air_lets_the_state_go_on()
     var c = fresh()
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     var peer = adv_ind(0x10, 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
     test.assert(not ctl_hci.ctl_init_decide(var c, var peer, 11))
@@ -590,7 +585,7 @@ fn test_the_connect_ind_opens_the_central_link_and_ends_the_initiating_state()
     test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
     test.assert_eq(c.arb.start[ll_arb.CLASS_ACL], 5000 + 1250)
     // The Host is told nothing until the Peripheral has answered.
-    test.assert_eq(list.len(events_coded(run(c, 0x1001, []), 0x3E)), 0)
+    test.assert_eq(list.len(events_coded(run(var c, 0x1001, []), 0x3E)), 0)
 
 @test
 fn test_the_host_gets_le_connection_complete_with_role_central_after_the_first_answer()
@@ -624,9 +619,9 @@ fn test_the_host_gets_le_connection_complete_with_role_central_after_the_first_a
 @test
 fn test_the_enhanced_event_replaces_the_plain_one_for_a_central()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
     ctl_hci.ctl_set_time(var c, 1000)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     var peer = adv_ind(0x10, 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
     test.assert(ctl_hci.ctl_init_sent(var c, 5000))
@@ -670,9 +665,9 @@ fn test_data_crosses_both_ways_in_order_with_flow_control()
     var msg: [Int] = []
     for i in 0..64
         list.push(msg, 0x30 + i)
-    feed(c, host_acl(1, 0, msg[0:27]))
-    feed(c, host_acl(1, 1, msg[27:54]))
-    feed(c, host_acl(1, 1, msg[54:64]))
+    feed(var c, host_acl(1, 0, msg[0:27]))
+    feed(var c, host_acl(1, 1, msg[27:54]))
+    feed(var c, host_acl(1, 1, msg[54:64]))
     per_send(var per, data_pdu(ll_data.LLID_START, 27, 0x80))
     per_send(var per, data_pdu(ll_data.LLID_CONTINUE, 13, 0xA0))
     run_events(var c, var per, 6250 + 24 * 1250 * 12, var host)
@@ -711,7 +706,7 @@ fn test_sixty_rounds_of_data_both_ways_arrive_once()
     var sent = 0
     var seen = 0
     for round in 0..60
-        feed(c, host_acl(1, 0, [round, round + 1, round + 2]))
+        feed(var c, host_acl(1, 0, [round, round + 1, round + 2]))
         per_send(var per, data_pdu(ll_data.LLID_START, 4, round))
         ctl_hci.ctl_set_time(var c, due_of(var c, 0))
         let _e = central_event(var c, 0, var per)
@@ -734,7 +729,7 @@ fn test_a_bad_answer_ends_the_event_and_the_pdu_is_sent_again()
     var per = per_new()
     var host: [Int] = []
     ctl_hci.ctl_set_time(var c, 6250)
-    feed(c, host_acl(1, 0, [1, 2, 3]))
+    feed(var c, host_acl(1, 0, [1, 2, 3]))
     // The first packet the Peripheral answers with a CRC error: the Central closes
     // the event, supervision is not reset, and the same data goes next event.
     per.bad = 1
@@ -759,7 +754,7 @@ fn test_the_central_sends_what_the_peripheral_did_not_acknowledge_again()
     var c = central_up(5000)
     var per = per_new()
     var host: [Int] = []
-    feed(c, host_acl(1, 0, [9, 8, 7]))
+    feed(var c, host_acl(1, 0, [9, 8, 7]))
     // The Peripheral hears the first event but its answer is lost.
     ctl_hci.ctl_set_time(var c, 6250)
     let _a = central_event(var c, 0, var per)
@@ -919,8 +914,8 @@ fn test_a_central_reads_the_features_and_version_of_the_peripheral()
 // CONNECT_IND from another Central is taken in slot 1 as Peripheral.
 fn two_links() -> ctl_hci.Controller
     var c = central_up(5000)
-    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(0x50655A12, 24, 400)
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 9000))
@@ -976,11 +971,11 @@ fn test_each_role_is_limited_to_one_link_and_the_slots_to_two()
     // answers Connection Already Exists.
     test.assert_eq(cmd_status(var c, 0x200D, create_params(0, 0, 0, 24, 400)), 0x0B)
     test.assert_eq(cmd_status(var c, 0x200D, create_params(1, 0, 0, 24, 400)), 0x09)
-    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0x09)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0x09)
     // Non-connectable advertising is not limited by the links.
-    test.assert_eq(status_of(c, 0x2006, adv_params(2)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(2)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
     // A second Peripheral CONNECT_IND is not taken either.
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(0x6A5A9A5A, 24, 400)
@@ -1000,29 +995,29 @@ fn test_the_initiating_state_keeps_a_slot_for_the_central_link()
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
     // One Peripheral link is on, and a free slot is left; the Initiating state
     // takes it, so a connectable advertisement has none and the limit says so.
-    test.assert_eq(create(c), 0)
-    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0x09)
-    test.assert_eq(status_of(c, 0x200E, []), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0x09)
+    test.assert_eq(create(var c), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0x09)
+    test.assert_eq(status_of(var c, 0x200E, []), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0x09)
     // The Peripheral limit holds without the Initiating state as well.
     test.assert_eq(ctl_hci.free_slots(var c), 1)
     var peer = adv_ind(0x10, 0)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
     test.assert(ctl_hci.ctl_init_sent(var c, 9000))
     test.assert(ctl_hci.slot_central(var c, 1))
     test.assert_eq(c.links[1].handle, 2)
 
 fn advertise_connectable(var c: ctl_hci.Controller)
-    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
 
 @test
 fn test_the_initiating_state_runs_beside_advertising_and_the_peripheral_link()
     var c = fresh()
     advertise_connectable(var c)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     test.assert(c.adv.enabled)
     test.assert(c.init.enabled)
     ctl_hci.ctl_set_time(var c, 1000)
@@ -1037,9 +1032,9 @@ fn test_both_links_run_their_events_against_their_own_peers_through_the_arbiter(
     var per1 = per_new()
     var host: [Int] = []
     // Data for each link goes to its own queue by handle.
-    feed(c, host_acl(1, 0, [0x11, 0x12]))
-    feed(c, host_acl(2, 0, [0x21, 0x22, 0x23]))
-    feed(c, host_acl(3, 0, [0x31]))
+    feed(var c, host_acl(1, 0, [0x11, 0x12]))
+    feed(var c, host_acl(2, 0, [0x21, 0x22, 0x23]))
+    feed(var c, host_acl(3, 0, [0x31]))
     test.assert_eq(c.dropped_acl, 1)
     per_send(var per0, data_pdu(ll_data.LLID_START, 2, 0xB0))
     per_send(var per1, data_pdu(ll_data.LLID_START, 3, 0xC0))
@@ -1082,7 +1077,7 @@ fn test_both_links_run_their_events_against_their_own_peers_through_the_arbiter(
     test.assert_eq(t_byte(per1.got[0], 0), 0x21)
     var tags: [Int] = []
     for e in acl_packets(host)
-        list.push(tags, e[1] | (e[2] << 8) & 0x0FFF)
+        list.push(tags, e[1] | ((e[2] << 8) & 0x0FFF))
         list.push(tags, e[5])
     test.assert_eq(tags[0] & 0xFFF, 1)
     test.assert_eq(tags[1], 0xB0)
@@ -1137,12 +1132,12 @@ fn test_commands_name_the_link_by_handle_and_a_handle_that_is_not_on_is_unknown(
     test.assert(not c.links[0].ver_sent)
     // Read Channel Map answers each link's own map, and Unknown Connection for a
     // handle that is not on.
-    let r2 = run(c, 0x2015, [2, 0])
+    let r2 = run(var c, 0x2015, [2, 0])
     let m = events_coded(r2, 0x0E)[0]
     test.assert_eq(m[6], 0)
     test.assert_eq(m[9], 0xFF)
     test.assert_eq(m[13], 0x1F)
-    let r3 = run(c, 0x2015, [3, 0])
+    let r3 = run(var c, 0x2015, [3, 0])
     test.assert_eq(events_coded(r3, 0x0E)[0][6], 0x02)
     // Disconnect on handle 2 leaves handle 1 alone.
     test.assert_eq(cmd_status(var c, 0x0406, [2, 0, 0x13]), 0)
@@ -1230,11 +1225,11 @@ fn test_a_new_central_access_address_differs_from_the_ones_in_use()
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(first, 24, 400)
     test.assert(ctl_hci.ctl_connect_ind(var d, var pol, var p, 5000))
-    test.assert_eq(create(d), 0)
+    test.assert_eq(create(var d), 0)
     test.assert(ll_init_aa(d.init.req) != first)
 
 fn ll_init_aa(req: Pdu) -> Int
-    (req.b[14] as Int) | ((req.b[15] as Int) << 8) | ((req.b[16] as Int) << 16) | ((req.b[17] as Int) << 24)
+    req.b[14] as Int | (req.b[15] as Int << 8) | (req.b[16] as Int << 16) | (req.b[17] as Int << 24)
 
 // ── Slots, no free link, reset ──────────────────────────────────────
 
@@ -1246,7 +1241,7 @@ fn test_a_connect_ind_sent_with_no_link_free_is_reported_as_a_limit()
         return
     var c = fresh()
     ctl_hci.ctl_set_time(var c, 1000)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     var peer = adv_ind(0x10, 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
     // Both links are taken after the Initiating state started (which a Controller
@@ -1256,7 +1251,7 @@ fn test_a_connect_ind_sent_with_no_link_free_is_reported_as_a_limit()
     test.assert(not c.init.enabled)
     test.assert_eq(c.init_event, 0x09)
     both_links_taken(var c, false)
-    let ev = meta_events(run(c, 0x1001, []), 0x01)
+    let ev = meta_events(run(var c, 0x1001, []), 0x01)
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][4], 0x09)
 
@@ -1265,14 +1260,14 @@ fn test_reset_ends_the_initiating_state_and_both_links_without_events()
     var c = two_links()
     var host: [Int] = []
     host_read(var c, var host)
-    test.assert_eq(status_of(c, 0x0C03, []), 0)
+    test.assert_eq(status_of(var c, 0x0C03, []), 0)
     test.assert(not ll_link.link_live(var c.links[0]))
     test.assert(not ll_link.link_live(var c.links[1]))
     test.assert(not ctl_hci.ctl_ll_on(var c))
     var d = fresh()
-    test.assert_eq(create(d), 0)
-    test.assert_eq(status_of(d, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF, 0x0F]), 0)
-    test.assert_eq(status_of(d, 0x0C03, []), 0)
+    test.assert_eq(create(var d), 0)
+    test.assert_eq(status_of(var d, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF, 0x0F]), 0)
+    test.assert_eq(status_of(var d, 0x0C03, []), 0)
     test.assert(not d.init.enabled)
     test.assert_eq(d.chmap, ll_init.CHMAP_ALL)
     test.assert_eq(d.init_event, 0)
@@ -1284,19 +1279,19 @@ fn test_the_host_classification_is_the_map_of_the_next_connection_as_central()
     var c = fresh()
     ctl_hci.ctl_set_time(var c, 1000)
     // The refusals: a bit past channel 36, and no channel at all.
-    test.assert_eq(status_of(c, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0x12)
-    test.assert_eq(status_of(c, 0x2014, [0, 0, 0, 0, 0]), 0x12)
-    test.assert_eq(status_of(c, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF]), 0x12)
-    test.assert_eq(status_of(c, 0x2014, [0xFF, 0x0F, 0, 0, 0x10]), 0)
+    test.assert_eq(status_of(var c, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0x12)
+    test.assert_eq(status_of(var c, 0x2014, [0, 0, 0, 0, 0]), 0x12)
+    test.assert_eq(status_of(var c, 0x2014, [0xFF, 0xFF, 0xFF, 0xFF]), 0x12)
+    test.assert_eq(status_of(var c, 0x2014, [0xFF, 0x0F, 0, 0, 0x10]), 0)
     test.assert_eq(c.chmap, 0x1000000FFF)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(create(var c), 0)
     var peer = adv_ind(0x10, 0)
     test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
     test.assert(ctl_hci.ctl_init_sent(var c, 5000))
     test.assert_eq(c.links[0].chmap, 0x1000000FFF)
     test.assert_eq(c.links[0].n_used, 13)
     // LE Read Channel Map returns it.
-    let m = events_coded(run(c, 0x2015, [1, 0]), 0x0E)[0]
+    let m = events_coded(run(var c, 0x2015, [1, 0]), 0x0E)[0]
     test.assert_eq(m[9], 0xFF)
     test.assert_eq(m[10], 0x0F)
     test.assert_eq(m[13], 0x10)
@@ -1310,14 +1305,14 @@ fn test_the_host_classification_is_the_map_of_the_next_connection_as_central()
 @test
 fn test_fewer_than_two_classified_channels_connect_with_all_37()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2014, [0x01, 0, 0, 0, 0]), 0)
-    test.assert_eq(create(c), 0)
+    test.assert_eq(status_of(var c, 0x2014, [0x01, 0, 0, 0, 0]), 0)
+    test.assert_eq(create(var c), 0)
     test.assert_eq(ll_init_chmap(c.init.req), ll_init.CHMAP_ALL)
 
 fn ll_init_chmap(req: Pdu) -> Int
     var v = 0
     for k in 0..5
-        v = v | ((req.b[30 + k] as Int) << (8 * k))
+        v = v | (req.b[30 + k] as Int << (8 * k))
     v
 
 // ── The commands the Controller lists ───────────────────────────────
@@ -1325,13 +1320,13 @@ fn ll_init_chmap(req: Pdu) -> Int
 @test
 fn test_the_supported_commands_list_the_central_commands_and_the_states_the_roles()
     var c = fresh()
-    let r = run(c, 0x1002, [])
+    let r = run(var c, 0x1002, [])
     let base = 7
     test.assert_eq(r[base + 26] & 0x30, 0x30)
     test.assert_eq(r[base + 27] & 0x08, 0x08)
     // The states: Initiating (bit 6), with advertising (16, 17, 32 to 34), with the
     // Central role (18, 19, 24, 25, 35 to 37) and with the Peripheral link (41).
-    let s = run(c, 0x201C, [])
+    let s = run(var c, 0x201C, [])
     var states = 0
     for i in 0..8
         states = states | (s[7 + i] << (8 * i))
@@ -1342,7 +1337,7 @@ fn test_the_supported_commands_list_the_central_commands_and_the_states_the_role
     // Without a Link Layer the commands are unknown.
     var bare = ctl_hci.controller_new(0)
     for op in [0x200D, 0x200E, 0x2014, 0x2043]
-        test.assert_eq(status_of(bare, op, []), 0x01)
+        test.assert_eq(status_of(var bare, op, []), 0x01)
     // LE Extended Create Connection is octet 37 bit 7 ([Vol 4] Part E, Section 6.27); octet 38 bit 0 is LE Periodic Advertising
     // Create Sync, which this Controller answers.
     test.assert_eq((r[base + 37] >>> 7) & 0x01, 0x01)
@@ -1360,7 +1355,7 @@ fn ext_params2(handle: Int, sub: Int, phys: Int, sets: [[Int]]) -> [Int]
 @test
 fn test_extended_create_connection_v2_is_the_v1_command_for_a_handle_and_a_subevent_of_0xff()
     var c = fresh()
-    send(c, 0x1002, [])
+    send(var c, 0x1002, [])
     let _s = ctl_hci.ctl_step(var c)
     let sup = drain(var c)
     test.assert_eq(sup[7 + 47] & 0x01, 0x01)
@@ -1370,12 +1365,13 @@ fn test_extended_create_connection_v2_is_the_v1_command_for_a_handle_and_a_subev
     test.assert_eq(c.init.phys, 1)
     test.assert_eq(c.init.c_max, 24)
     test.assert_eq(c.init.timeout, 400)
-    test.assert_eq(status_of(c, 0x200E, []), 0)
+    test.assert_eq(status_of(var c, 0x200E, []), 0)
     // The sets of two PHYs follow the two octets, in the order of the bits.
-    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 3, [ext_set(24, 24, 400), ext_set(40, 60, 300)])), 0)
+    test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 3, [ext_set(24, 24, 400), ext_set(40, 60, 300)])),
+        0)
     test.assert_eq(c.init.x_min, 40)
     test.assert_eq(c.init.x_timeout, 300)
-    test.assert_eq(status_of(c, 0x200E, []), 0)
+    test.assert_eq(status_of(var c, 0x200E, []), 0)
     // One of the two octets 0xFF: Invalid HCI Command Parameters; a train of PAwR: Unsupported Feature or Parameter Value.
     test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0, 0xFF, 1, [ext_set(24, 24, 400)])), 0x12)
     test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 3, 1, [ext_set(24, 24, 400)])), 0x12)
@@ -1385,7 +1381,7 @@ fn test_extended_create_connection_v2_is_the_v1_command_for_a_handle_and_a_subev
     test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 0, [])), 0x12)
     test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(5, 6, 400)])), 0x12)
     // A length that is not the sets the PHYs name is Invalid HCI Command Parameters; one command is pending at a time.
-    test.assert_eq(status_of(c, 0x2085, ext_params2(0xFF, 0xFF, 1, [])), 0x12)
+    test.assert_eq(status_of(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [])), 0x12)
     test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(24, 24, 400)])), 0)
     test.assert_eq(cmd_status(var c, 0x2085, ext_params2(0xFF, 0xFF, 1, [ext_set(24, 24, 400)])), 0x0C)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400)])), 0x0C)
@@ -1460,8 +1456,8 @@ fn test_seeding_changes_the_access_address_the_next_connection_asks_for()
     var a = fresh()
     var b = fresh()
     ctl_hci.ctl_seed(var b, 123456789)
-    test.assert_eq(create(a), 0)
-    test.assert_eq(create(b), 0)
+    test.assert_eq(create(var a), 0)
+    test.assert_eq(create(var b), 0)
     test.assert(ll_init_aa(a.init.req) != ll_init_aa(b.init.req))
 
 // ── LE Extended Create Connection ───────────────────────────────────
@@ -1502,10 +1498,11 @@ fn test_extended_create_connection_enters_the_initiating_state_with_the_sets_of_
     test.assert_eq(c.init.c_max, 24)
     test.assert_eq(c.init.timeout, 400)
     test.assert_eq(c.init.aux_phy, 0)
-    test.assert_eq((c.init.req.b[24] as Int) | ((c.init.req.b[25] as Int) << 8), 24)
+    test.assert_eq(c.init.req.b[24] as Int | (c.init.req.b[25] as Int << 8), 24)
     // The sets of LE 1M and LE 2M, in the order of the bits.
     var d = fresh()
-    test.assert_eq(cmd_status(var d, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400), ext_set(40, 60, 300)])), 0)
+    test.assert_eq(cmd_status(var d, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400), ext_set(40, 60, 300)])),
+        0)
     test.assert_eq(d.init.phys, 3)
     test.assert_eq(d.init.c_max, 24)
     test.assert_eq(d.init.x_min, 40)
@@ -1514,10 +1511,10 @@ fn test_extended_create_connection_enters_the_initiating_state_with_the_sets_of_
     test.assert_eq(d.init.y_timeout, 400)
     // The state is the same as LE Create Connection's: it takes the scan class and is ended by the cancel.
     test.assert_eq(ctl_hci.ctl_ll_pick(var d, false), ll_arb.class_scan())
-    test.assert_eq(status_of(d, 0x200E, []), 0)
+    test.assert_eq(status_of(var d, 0x200E, []), 0)
     test.assert(not d.init.enabled)
     // LE Create Connection after it is a state of its own.
-    test.assert_eq(create(d), 0)
+    test.assert_eq(create(var d), 0)
     test.assert(not d.init.ext)
 
 @test
@@ -1526,18 +1523,25 @@ fn test_extended_create_connection_checks_the_phys_the_sets_and_the_state()
     // Initiating_PHYs: none, only LE 2M, a reserved bit: invalid; LE Coded: unsupported by a radio that lacks it.
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 0, [])), 0x12)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 2, [ext_set(24, 24, 400)])), 0x12)
-    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 9, [ext_set(24, 24, 400), ext_set(24, 24, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 9, [ext_set(24, 24, 400), ext_set(24, 24, 400)])),
+        0x12)
     ctl_hci.ctl_set_coded(var c, false)
-    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 5, [ext_set(24, 24, 400), ext_set(24, 24, 400)])), 0x11)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 5, [ext_set(24, 24, 400), ext_set(24, 24, 400)])),
+        0x11)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 4, [ext_set(24, 24, 400)])), 0x11)
     ctl_hci.ctl_set_coded(var c, true)
     // The set of LE Coded is checked like the others, in the position of the set that scans.
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 4, [ext_set(5, 6, 400)])), 0x12)
-    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 5, [ext_set(24, 24, 400), ext_set(5, 6, 400)])), 0x12)
-    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 7, [ext_set(24, 24, 400), ext_set(24, 24, 400), ext_set(5, 6, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 5, [ext_set(24, 24, 400), ext_set(5, 6, 400)])),
+        0x12)
+    test.assert_eq(cmd_status(var c,
+        0x2043,
+        ext_params(0, 0, 0, 7, [ext_set(24, 24, 400), ext_set(24, 24, 400), ext_set(5, 6, 400)])),
+    0x12)
     // The values of a set, of LE 1M and of LE 2M.
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(5, 6, 400)])), 0x12)
-    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400), ext_set(5, 6, 400)])), 0x12)
+    test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400), ext_set(5, 6, 400)])),
+        0x12)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(2, 0, 0, 1, [ext_set(24, 24, 400)])), 0x12)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 4, 0, 1, [ext_set(24, 24, 400)])), 0x12)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 4, 1, [ext_set(24, 24, 400)])), 0x12)
@@ -1545,21 +1549,21 @@ fn test_extended_create_connection_checks_the_phys_the_sets_and_the_state()
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 1, 1, [ext_set(24, 24, 400)])), 0x12)
     test.assert(not c.init.enabled)
     // A set missing, a set too many, no parameters.
-    var r = run(c, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400)]))
+    var r = run(var c, 0x2043, ext_params(0, 0, 0, 3, [ext_set(24, 24, 400)]))
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
-    r = run(c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400), ext_set(24, 24, 400)]))
+    r = run(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400), ext_set(24, 24, 400)]))
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
-    r = run(c, 0x2043, [])
+    r = run(var c, 0x2043, [])
     test.assert_eq(events_coded(r, 0x0E)[0][6], 0x12)
     // Scanning on, or initiating on, disallows it, as it does LE Create Connection.
-    test.assert_eq(status_of(c, 0x200B, [1, 0x10, 0, 0x10, 0, 0, 0]), 0)
-    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0)
+    test.assert_eq(status_of(var c, 0x200B, [1, 0x10, 0, 0x10, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x200C, [1, 0]), 0)
     test.assert_eq(ext_create(var c), 0x0C)
-    test.assert_eq(status_of(c, 0x200C, [0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x200C, [0, 0]), 0)
     test.assert_eq(ext_create(var c), 0)
     test.assert_eq(ext_create(var c), 0x0C)
-    test.assert_eq(create(c), 0x0C)
-    test.assert_eq(status_of(c, 0x200C, [1, 0]), 0x0C)
+    test.assert_eq(create(var c), 0x0C)
+    test.assert_eq(status_of(var c, 0x200C, [1, 0]), 0x0C)
 
 @test
 fn test_extended_create_connection_to_a_connected_peer_answers_connection_already_exists()
@@ -1572,7 +1576,7 @@ fn test_extended_create_connection_to_a_connected_peer_answers_connection_alread
 @test
 fn test_extended_create_connection_in_the_list_policy_and_with_a_random_own_address()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2005, [0x01, 0x02, 0x03, 0x04, 0x05, 0xC6]), 0)
+    test.assert_eq(status_of(var c, 0x2005, [0x01, 0x02, 0x03, 0x04, 0x05, 0xC6]), 0)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(1, 0, 1, 1, [ext_set(24, 24, 400)])), 0)
     test.assert_eq(c.init.policy as Int, 1)
     test.assert_eq(c.init.addr_type as Int, 1)

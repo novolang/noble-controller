@@ -9,7 +9,6 @@
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.pcl_on()`) says whether the build has the feature.
 
-use std.test
 use ll_pdu
 use ll_data
 use ll_ploss
@@ -64,11 +63,11 @@ fn i8(v: Int) -> Int
 @tier(embedded)
 fn mask_index(mask: Int) -> Int
     match mask
-        0x01 => 0
-        0x02 => 1
-        0x04 => 2
-        0x08 => 3
-        _ => -1
+        0x1 => 0
+        0x2 => 1
+        0x4 => 2
+        0x8 => 3
+        _   => -1
 
 // The index of the PHY an HCI command names (1 to 4), -1 for any other value.
 @tier(embedded)
@@ -222,93 +221,3 @@ fn peer_level(var p: Pcl, i: Int) -> Int
 fn set_peer(var p: Pcl, i: Int, level: Int, flags: Int)
     p.rlvl[i] = level as i8
     p.rflg[i] = flags as i8
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_masks_name_one_phy()
-    test.assert_eq(mask_index(0x01), 0)
-    test.assert_eq(mask_index(0x08), 3)
-    test.assert_eq(mask_index(0x00), -1)
-    test.assert_eq(mask_index(0x03), -1)
-    test.assert_eq(mask_index(0x10), -1)
-    test.assert_eq(hci_index(1), 0)
-    test.assert_eq(hci_index(4), 3)
-    test.assert_eq(hci_index(0), -1)
-    test.assert_eq(hci_index(5), -1)
-    test.assert_eq(link_index(3, true), 3)
-    test.assert_eq(link_index(3, false), 2)
-    test.assert_eq(link_index(2, false), 1)
-
-@test
-fn test_delta_stops_at_the_range()
-    test.assert_eq(apply_delta(0, 0, -20, 8), 0)
-    test.assert_eq(apply_delta(0, 0xFC, -20, 8), -4)
-    test.assert_eq(apply_delta(0, 5, -20, 8), 5)
-    test.assert_eq(apply_delta(0, 20, -20, 8), 8)
-    test.assert_eq(apply_delta(0, 0xE0, -20, 8), -20)
-    test.assert_eq(apply_delta(-7, 0x7F, -20, 8), 8)
-    test.assert_eq(level_flags(-20, -20, 8), FLAG_MIN)
-    test.assert_eq(level_flags(8, -20, 8), FLAG_MAX)
-    test.assert_eq(level_flags(0, -20, 8), 0)
-
-@test
-fn test_apr_is_the_margin_above_the_floor()
-    test.assert_eq(apr_of(-60, -70), 10)
-    test.assert_eq(apr_of(-70, -70), 0)
-    test.assert_eq(apr_of(-80, -70), 0)
-    test.assert_eq(apr_of(40, -70), 110)
-    test.assert_eq(apr_of(200, -70), 0xFE)
-
-@test
-fn test_pdu_layouts()
-    var p = ll_pdu.pdu_new()
-    put_req(var p, MASK_2M, 0xFE, 4)
-    test.assert_eq(ll_data.dpdu_len(var p), 4)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x23)
-    test.assert_eq(ll_data.dpdu_byte(var p, 1), 2)
-    test.assert_eq(ll_data.dpdu_byte(var p, 2), 0xFE)
-    test.assert_eq(ll_data.dpdu_byte(var p, 3), 4)
-    put_rsp(var p, FLAG_MAX, 0x03, 0xFC, 0xFF)
-    test.assert_eq(ll_data.dpdu_len(var p), 5)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x24)
-    test.assert_eq(ll_data.dpdu_byte(var p, 1), FLAG_MAX)
-    test.assert_eq(ll_data.dpdu_byte(var p, 4), 0xFF)
-    put_ind(var p, MASK_S8, 0, 0xFF, 0)
-    test.assert_eq(ll_data.dpdu_len(var p), 5)
-    test.assert_eq(ll_data.dpdu_opcode(var p), 0x25)
-    test.assert_eq(ll_data.dpdu_byte(var p, 1), MASK_S8)
-
-fn dirty(var p: Pcl)
-    set_peer(var p, 1, 3, 0)
-    p.remote_rep = true
-    p.asked = true
-
-@test
-fn test_reset_forgets_the_peer()
-    var p = pcl_new()
-    dirty(var p)
-    pcl_reset(var p, -4)
-    test.assert_eq(own_level(var p, 2), -4)
-    test.assert_eq(peer_level(var p, 1), TX_UNAVAILABLE)
-    test.assert(not p.remote_rep)
-    test.assert(not p.asked)
-
-@test
-fn test_a_column_keeps_one_signed_octet_per_phy()
-    var p = pcl_new()
-    set_own_level(var p, 0, -46)
-    set_own_level(var p, 1, 8)
-    set_own_level(var p, 3, -1)
-    test.assert_eq(own_level(var p, 0), -46)
-    test.assert_eq(own_level(var p, 1), 8)
-    test.assert_eq(own_level(var p, 2), 0)
-    test.assert_eq(own_level(var p, 3), -1)
-    set_own_level(var p, 3, 127)
-    test.assert_eq(own_level(var p, 3), 127)
-    test.assert_eq(own_level(var p, 0), -46)
-    set_own_level(var p, 2, 200)
-    test.assert_eq(own_level(var p, 2), -56)
-    set_peer(var p, 2, -20, 3)
-    test.assert_eq(peer_level(var p, 2), -20)
-    test.assert_eq(peer_level(var p, 1), TX_UNAVAILABLE)

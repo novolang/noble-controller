@@ -13,7 +13,6 @@
 
 use ctl_limits
 use std.test
-use hci_frame
 use ctl_hci
 use ctl_pool
 use ll_pdu
@@ -42,7 +41,6 @@ fn t_len(p: Pdu) -> Int
     var w = p
     ll_data.dpdu_len(var w)
 
-
 fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
     ctl_hci.ctl_rx(var c, 0x01)
     ctl_hci.ctl_rx(var c, opcode & 0xFF)
@@ -58,12 +56,12 @@ fn drain(var c: ctl_hci.Controller) -> [Int]
     out
 
 fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
-    send(c, opcode, params)
+    send(var c, opcode, params)
     let _ran = ctl_hci.ctl_step(var c)
     drain(var c)
 
 fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let done = events_coded(r, 0x0E)
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
@@ -71,7 +69,7 @@ fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
 
 // The Status of the Command Status event a command is answered with.
 fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let st = events_coded(r, 0x0F)
     test.assert_eq(list.len(st), 1)
     test.assert_eq(st[0][2], 4)
@@ -85,8 +83,8 @@ fn fresh() -> ctl_hci.Controller
     // The Host enables every event, the LE Meta event among them, and the LE
     // events its bring-up enables, with the Connection Update Complete and Read
     // Remote Features Complete among them.
-    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
-    test.assert_eq(status_of(c, 0x2001, [0x1F, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0x1F, 0, 0, 0, 0, 0, 0, 0]), 0)
     c
 
 fn zeros(n: Int) -> [Int]
@@ -112,8 +110,8 @@ fn adv_params(ty: Int) -> [Int]
     p
 
 fn advertise(var c: ctl_hci.Controller, ty: Int)
-    test.assert_eq(status_of(c, 0x2006, adv_params(ty)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(ty)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
 
 fn data31(data: [Int]) -> [Int]
     var p: [Int] = [list.len(data)]
@@ -134,10 +132,7 @@ fn packets_of(bytes: [Int]) -> [[Int]]
             n = 3 + bytes[i + 2]
         else
             n = 5 + bytes[i + 3] + (bytes[i + 4] << 8)
-        var e: [Int] = []
-        for k in 0..n
-            list.push(e, bytes[i + k])
-        list.push(out, e)
+        list.push(out, bytes[i:i + n])
         i = i + n
     out
 
@@ -263,11 +258,12 @@ fn cen_send(var cen: Cen, p: Pdu)
 // calls the radio program makes.  The reply is the PDU the Peripheral sends, in
 // `reply`, with the header octet the answer is.  `false` when the Peripheral
 // does not answer (two bad packets).
-fn exchange(var c: ctl_hci.Controller, var cen: Cen, var pdu: Pdu, md: Int, t: Int, good: Bool, var reply: Pdu) -> Int
+fn exchange(var c: ctl_hci.Controller, var cen: Cen, var pdu: Pdu, md: Int, t: Int, good: Bool,
+            var reply: Pdu) -> Int
     ll_link.link_note_rx(var c.links[0], t, good)
     var hdr = 0
     if good
-        hdr = ll_link.link_rx_fast(var c.links[0], (pdu.b[0] as Int) | (cen.nesn << 2) | (cen.sn << 3) | (md << 4))
+        hdr = ll_link.link_rx_fast(var c.links[0], pdu.b[0] as Int | (cen.nesn << 2) | (cen.sn << 3) | (md << 4))
     else
         if not ll_link.link_answers_bad(var c.links[0])
             return -1
@@ -311,7 +307,12 @@ fn cen_take(var cen: Cen, hdr: Int, var reply: Pdu)
             if cen.dle
                 // A Controller with the Data Length Extension answers with the octets it can take
                 // and send, at the times they need on LE 1M.
-                ll_data.ctrl_length(var answer, ll_data.OP_LENGTH_RSP, cen.dle_rx, 328 + 8 * (cen.dle_rx - 27), 251, 2120)
+                ll_data.ctrl_length(var answer,
+                    ll_data.OP_LENGTH_RSP,
+                    cen.dle_rx,
+                    328 + 8 * (cen.dle_rx - 27),
+                    251,
+                    2120)
             else
                 // A Controller without it does not know the request the Peripheral makes of every new connection.
                 ll_data.ctrl_unknown_rsp(var answer, ll_data.OP_LENGTH_REQ)
@@ -351,7 +352,7 @@ fn cen_event(var c: ctl_hci.Controller, var cen: Cen) -> Int
         if cen.bad > 0
             good = false
             cen.bad = cen.bad - 1
-        let hdr = exchange(c, cen, pdu, md, t, good, reply)
+        let hdr = exchange(var c, var cen, var pdu, md, t, good, var reply)
         if hdr < 0
             open = false
         else
@@ -375,7 +376,7 @@ fn cen_next(var cen: Cen)
         step = cen.interval_us + cen.upd_offset * 1250 + 400
         cen.interval_us = cen.upd_interval * 1250
         cen.upd_instant = -1
-    cen.anchor = cen.anchor + step + (step * cen.drift) / 1000000
+    cen.anchor = cen.anchor + step + step * cen.drift / 1000000
 
 fn host_read(var c: ctl_hci.Controller, var out: [Int])
     let _ran = ctl_hci.ctl_step(var c)
@@ -451,7 +452,7 @@ fn test_connect_ind_opens_the_connection_and_stops_advertising()
     test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_adv()))
     test.assert_eq(c.links[0].interval, 24)
     // LE Connection Complete is queued at the next step, the Host's mask letting it through.
-    let r = run(c, 0x1001, [])
+    let r = run(var c, 0x1001, [])
     let events = meta_events(r, 0x01)
     test.assert_eq(list.len(events), 1)
     let e = events[0]
@@ -472,21 +473,21 @@ fn test_connect_ind_opens_the_connection_and_stops_advertising()
 @test
 fn test_connection_complete_is_not_sent_when_the_host_masked_it_and_enhanced_replaces_it()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2001, zeros(8)), 0)
+    test.assert_eq(status_of(var c, 0x2001, zeros(8)), 0)
     advertise(var c, 0)
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(24, 200, 0)
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
-    let r = run(c, 0x1001, [])
+    let r = run(var c, 0x1001, [])
     test.assert_eq(list.len(events_coded(r, 0x3E)), 0)
     test.assert(not ll_link.link_owes(var c.links[0], ll_link.EV_CONNECTED))
     // The Enhanced event replaces the plain one when the Host enabled it.
     var d = fresh()
-    test.assert_eq(status_of(d, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var d, 0x2001, [0x00, 0x02, 0, 0, 0, 0, 0, 0]), 0)
     advertise(var d, 0)
     var q = connect_ind(24, 200, 0)
     test.assert(ctl_hci.ctl_connect_ind(var d, var pol, var q, 5000))
-    let s = run(d, 0x1001, [])
+    let s = run(var d, 0x1001, [])
     test.assert_eq(list.len(meta_events(s, 0x01)), 0)
     let enhanced = meta_events(s, 0x0A)
     test.assert_eq(list.len(enhanced), 1)
@@ -545,27 +546,27 @@ fn test_connectable_advertising_is_refused_while_connected_and_the_others_are_no
     if not ctl_hci.default_caps()
         return
     var c = connected(24, 200)
-    test.assert_eq(status_of(c, 0x2006, adv_params(0)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), ctl_hci.STATUS_CONNECTION_LIMIT)
-    test.assert_eq(status_of(c, 0x2006, adv_params(1)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), ctl_hci.STATUS_CONNECTION_LIMIT)
-    test.assert_eq(status_of(c, 0x2006, adv_params(3)), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(0)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), ctl_hci.STATUS_CONNECTION_LIMIT)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(1)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), ctl_hci.STATUS_CONNECTION_LIMIT)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(3)), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
     test.assert(c.adv.enabled)
 
 @test
 fn test_the_link_layer_features_and_states_name_the_connection()
     var c = fresh()
-    let f = run(c, 0x2003, [])
+    let f = run(var c, 0x2003, [])
     test.assert_eq(f[7], 0x7F)
     test.assert_eq(f[8], ctl_limits.features_octet1())
     test.assert_eq(f[9], 0x01)
     test.assert_eq(f[10], ctl_limits.features_octet3())
-    let b = run(c, 0x2002, [])
+    let b = run(var c, 0x2002, [])
     test.assert_eq(b[7] | (b[8] << 8), 251)
     test.assert_eq(b[9], ctl_hci.ACL_BUFFERS)
     var bare = ctl_hci.controller_new(0)
-    let g = run(bare, 0x2003, [])
+    let g = run(var bare, 0x2003, [])
     test.assert_eq(g[7], 0)
 
 // ── The events of a connection ──────────────────────────────────────
@@ -660,8 +661,8 @@ fn test_acl_data_from_the_host_reaches_the_central_and_its_buffer_is_returned()
     var cen = first_central(24)
     var host: [Int] = []
     conn_run(var c, var cen, 5000, 100000, var host)
-    feed(c, host_acl(1, 0, [0x03, 0x00, 0x04, 0x00, 0xAA, 0xBB, 0xCC]))
-    feed(c, host_acl(1, 1, [0x11, 0x22]))
+    feed(var c, host_acl(1, 0, [0x03, 0x00, 0x04, 0x00, 0xAA, 0xBB, 0xCC]))
+    feed(var c, host_acl(1, 1, [0x11, 0x22]))
     conn_run(var c, var cen, 100000, 400000, var host)
     test.assert_eq(list.len(cen.got), 2)
     test.assert_eq(t_llid(cen.got[0]), ll_data.LLID_START)
@@ -713,7 +714,7 @@ fn test_data_both_ways_over_many_events_loses_nothing_and_keeps_order()
         cen_send(var cen, data_pdu(ll_data.LLID_START, 5, 0x10 + round))
         cen_send(var cen, data_pdu(ll_data.LLID_CONTINUE, 3, 0x80 + round))
         sent_up = sent_up + 2
-        feed(c, host_acl(1, 0, [round, round + 1, round + 2, round + 3, 0x42]))
+        feed(var c, host_acl(1, 0, [round, round + 1, round + 2, round + 3, 0x42]))
         sent_down = sent_down + 1
         now = now + 400000
         conn_run(var c, var cen, now - 400000, now, var host)
@@ -740,30 +741,30 @@ fn test_the_host_cannot_send_more_than_the_buffers_it_was_told()
     // No events run, so nothing is acknowledged: the fourth packet is the Host's
     // error, and the fifth, the queue holding the three buffers and one in `nxt`.
     for k in 0..6
-        feed(c, host_acl(1, 0, [k, 0, 0, 0]))
+        feed(var c, host_acl(1, 0, [k, 0, 0, 0]))
     test.assert_eq(c.dropped_acl, 2)
 
 @test
 fn test_acl_data_for_another_handle_is_dropped_and_one_over_the_buffer_loses_the_stream()
     var c = connected(24, 200)
-    feed(c, host_acl(2, 0, [1, 2]))
+    feed(var c, host_acl(2, 0, [1, 2]))
     test.assert_eq(c.dropped_acl, 1)
     // A packet of 251 octets is the longest data PDU the buffers hold, and goes on.
     var edge: [Int] = []
     for i in 0..251
         list.push(edge, i)
-    feed(c, host_acl(1, 0, edge))
+    feed(var c, host_acl(1, 0, edge))
     test.assert_eq(c.dropped_acl, 1)
     test.assert_eq(c.rx.lost, 0)
     var big: [Int] = []
     for i in 0..252
         list.push(big, i)
-    feed(c, host_acl(1, 0, big))
+    feed(var c, host_acl(1, 0, big))
     test.assert_eq(c.rx.lost, 1)
     test.assert_eq(c.dropped_acl, 1)
     // A link that is not on takes none.
     var d = fresh()
-    feed(d, host_acl(1, 0, [1, 2]))
+    feed(var d, host_acl(1, 0, [1, 2]))
     test.assert_eq(d.dropped_acl, 1)
 
 @test
@@ -837,7 +838,7 @@ fn test_the_central_terminating_reports_its_reason()
 @test
 fn test_a_disconnection_complete_the_host_masked_is_not_sent()
     var c = connected(24, 200)
-    test.assert_eq(status_of(c, 0x0C01, [0xEF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x0C01, [0xEF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
     var cen = first_central(24)
     var host: [Int] = []
     conn_run(var c, var cen, 5000, 100000, var host)
@@ -872,7 +873,7 @@ fn test_read_remote_version_runs_the_exchange_and_reports_the_central()
     test.assert_eq(n, 1)
     // A second read answers at once from what is known.
     test.assert_eq(cmd_status(var c, 0x041D, [1, 0]), 0)
-    let again = run(c, 0x1001, [])
+    let again = run(var c, 0x1001, [])
     test.assert_eq(list.len(events_coded(again, 0x0C)), 1)
     test.assert_eq(cmd_status(var c, 0x041D, [3, 0]), 0x02)
 
@@ -890,7 +891,7 @@ fn test_the_central_asking_for_the_version_is_answered_and_the_host_reads_it_at_
     test.assert_eq(n, 1)
     test.assert_eq(list.len(events_coded(host, 0x0C)), 0)
     test.assert_eq(cmd_status(var c, 0x041D, [1, 0]), 0)
-    test.assert_eq(list.len(events_coded(run(c, 0x1001, []), 0x0C)), 1)
+    test.assert_eq(list.len(events_coded(run(var c, 0x1001, []), 0x0C)), 1)
 
 @test
 fn test_le_read_remote_features_runs_the_peripheral_initiated_procedure()
@@ -944,7 +945,7 @@ fn test_the_central_reading_the_features_gets_the_common_set()
     test.assert(seen)
     // The set is known: the Host's read is answered at once.
     test.assert_eq(cmd_status(var c, 0x2016, [1, 0]), 0)
-    test.assert_eq(list.len(meta_events(run(c, 0x1001, []), 0x04)), 1)
+    test.assert_eq(list.len(meta_events(run(var c, 0x1001, []), 0x04)), 1)
     test.assert_eq(cmd_status(var c, 0x2016, [5, 0]), 0x02)
 
 @test
@@ -977,7 +978,8 @@ fn test_connection_update_changes_the_interval_and_tells_the_host()
     cen.upd_instant = instant
     cen.upd_interval = 48
     cen.upd_offset = 3
-    cen_send(var cen, ctrl_pdu(ll_data.OP_CONNECTION_UPDATE_IND, [2, 3, 0, 48, 0, 0, 0, 0x90, 0x01, instant & 0xFF, (instant >>> 8) & 0xFF]))
+    cen_send(var cen, ctrl_pdu(ll_data.OP_CONNECTION_UPDATE_IND,
+        [2, 3, 0, 48, 0, 0, 0, 0x90, 0x01, instant & 0xFF, (instant >>> 8) & 0xFF]))
     conn_run(var c, var cen, 100000, 3000000, var host)
     test.assert(ll_link.link_live(var c.links[0]))
     test.assert_eq(c.links[0].interval, 48)
@@ -999,12 +1001,13 @@ fn test_channel_map_update_and_read_channel_map()
     var cen = first_central(24)
     var host: [Int] = []
     conn_run(var c, var cen, 5000, 50000, var host)
-    let before = run(c, 0x2015, [1, 0])
+    let before = run(var c, 0x2015, [1, 0])
     test.assert_eq(before, [0x04, 0x0E, 0x0B, 0x01, 0x15, 0x20, 0x00, 1, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F])
     let instant = cen.ev + 8
-    cen_send(var cen, ctrl_pdu(ll_data.OP_CHANNEL_MAP_IND, [0x1F, 0, 0, 0, 0, instant & 0xFF, (instant >>> 8) & 0xFF]))
+    cen_send(var cen,
+        ctrl_pdu(ll_data.OP_CHANNEL_MAP_IND, [0x1F, 0, 0, 0, 0, instant & 0xFF, (instant >>> 8) & 0xFF]))
     conn_run(var c, var cen, 50000, 600000, var host)
-    let after = run(c, 0x2015, [1, 0])
+    let after = run(var c, 0x2015, [1, 0])
     test.assert_eq(after, [0x04, 0x0E, 0x0B, 0x01, 0x15, 0x20, 0x00, 1, 0, 0x1F, 0, 0, 0, 0])
     // Every event from the instant on uses channels 0 to 4, and the ones before
     // used others.
@@ -1017,7 +1020,7 @@ fn test_channel_map_update_and_read_channel_map()
             before = true
     test.assert(used)
     test.assert(before)
-    test.assert_eq(run(c, 0x2015, [2, 0]), [0x04, 0x0E, 0x0B, 0x01, 0x15, 0x20, 0x02, 2, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(run(var c, 0x2015, [2, 0]), [0x04, 0x0E, 0x0B, 0x01, 0x15, 0x20, 0x02, 2, 0, 0, 0, 0, 0, 0])
 
 // ── Errors on the air ───────────────────────────────────────────────
 
@@ -1057,9 +1060,9 @@ fn test_two_bad_packets_in_a_row_close_the_event_without_an_answer()
 @test
 fn test_non_connectable_advertising_runs_between_connection_events_and_never_into_them()
     var c = connected(24, 200)
-    test.assert_eq(status_of(c, 0x2006, adv_params(3)), 0)
-    test.assert_eq(status_of(c, 0x2008, data31([2, 1, 6])), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(3)), 0)
+    test.assert_eq(status_of(var c, 0x2008, data31([2, 1, 6])), 0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
     var cen = first_central(24)
     var host: [Int] = []
     var air = adv_air_new()
@@ -1102,7 +1105,8 @@ fn adv_event(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start: In
             more = false
     now
 
-fn conn_run_adv(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start: Int, until: Int, var host: [Int])
+fn conn_run_adv(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start: Int, until: Int,
+                var host: [Int])
     var now = start
     var guard = 0
     while now < until and guard < 200000
@@ -1132,9 +1136,9 @@ fn conn_run_adv(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start:
 @test
 fn test_a_reset_drops_the_connection_without_an_event()
     var c = connected(24, 200)
-    let r = run(c, 0x1001, [])
+    let r = run(var c, 0x1001, [])
     test.assert_eq(list.len(meta_events(r, 0x01)), 1)
-    test.assert_eq(status_of(c, 0x0C03, []), 0)
+    test.assert_eq(status_of(var c, 0x0C03, []), 0)
     test.assert(not ll_link.link_live(var c.links[0]))
     test.assert_eq(c.links[0].owed, 0)
     test.assert(not ctl_hci.ctl_ll_on(var c))
@@ -1144,12 +1148,12 @@ fn test_a_reset_drops_the_connection_without_an_event()
 fn test_the_connection_commands_are_unknown_without_a_link_layer()
     var c = ctl_hci.controller_new(0)
     for op in [0x0406, 0x041D, 0x2015, 0x2016]
-        test.assert_eq(status_of(c, op, zeros(if op == 0x0406 then 3 else 2)), 0x01)
+        test.assert_eq(status_of(var c, op, zeros((if op == 0x0406 then 3 else 2))), 0x01)
 
 @test
 fn test_the_supported_commands_name_the_connection_commands()
     var c = fresh()
-    let r = run(c, 0x1002, [])
+    let r = run(var c, 0x1002, [])
     let base = 7
     test.assert_eq(r[base + 0] & 0x20, 0x20)
     test.assert_eq(r[base + 2] & 0x80, 0x80)
@@ -1179,7 +1183,8 @@ fn test_events_wait_for_a_free_slot_and_go_out_in_the_order_they_came()
     set_owed(var c, ll_link.EV_UPDATED | ll_link.EV_VERSION | ll_link.EV_FEATURES | ll_link.EV_COMPLETED)
     set_completed(var c, 2)
     ctl_hci.ctl_flush_events(var c)
-    test.assert_eq(c.links[0].owed, ll_link.EV_UPDATED | ll_link.EV_VERSION | ll_link.EV_FEATURES | ll_link.EV_COMPLETED)
+    test.assert_eq(c.links[0].owed,
+        ll_link.EV_UPDATED | ll_link.EV_VERSION | ll_link.EV_FEATURES | ll_link.EV_COMPLETED)
     // One slot at a time: each event goes when one is free, in that order.
     ctl_pool.pool_give(var c.pool, 0)
     ctl_hci.ctl_flush_events(var c)
@@ -1215,8 +1220,8 @@ fn test_masked_events_are_dropped_not_kept()
     var c = connected(24, 200)
     // The LE mask lets only the Connection Complete through, and the event mask
     // no Read Remote Version Information Complete.
-    test.assert_eq(status_of(c, 0x2001, [0x01, 0, 0, 0, 0, 0, 0, 0]), 0)
-    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xF7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0x01, 0, 0, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x0C01, [0xFF, 0xF7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
     set_owed(var c, ll_link.EV_UPDATED | ll_link.EV_VERSION | ll_link.EV_FEATURES)
     ctl_hci.ctl_flush_events(var c)
     test.assert_eq(c.links[0].owed, 0)
@@ -1252,7 +1257,7 @@ fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
     test.assert_eq(skipped, 1)
     test.assert(not ll_link.link_live(var c.links[0]))
     test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
-    let r = run(c, 0x1001, [])
+    let r = run(var c, 0x1001, [])
     let ds = events_coded(r, 0x05)
     test.assert_eq(list.len(ds), 1)
     test.assert_eq(ds[0][6], 0x3E)
@@ -1260,7 +1265,7 @@ fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
 @test
 fn test_a_connect_ind_takes_the_free_slot_while_the_last_connection_is_unreported()
     var c = connected(24, 200)
-    test.assert_eq(status_of(c, 0x2006, adv_params(3)), 0)
+    test.assert_eq(status_of(var c, 0x2006, adv_params(3)), 0)
     link_end(var c)
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(24, 200, 0)
@@ -1268,7 +1273,7 @@ fn test_a_connect_ind_takes_the_free_slot_while_the_last_connection_is_unreporte
     // takes the other slot, as handle 2.
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 9000))
     test.assert_eq(c.links[1].handle, 2)
-    let r = run(c, 0x1001, [])
+    let r = run(var c, 0x1001, [])
     let ds = events_coded(r, 0x05)
     test.assert_eq(list.len(ds), 1)
     test.assert_eq(ds[0][4], 1)
@@ -1292,7 +1297,8 @@ fn test_a_central_that_changes_nothing_but_the_anchor_leaves_the_host_unnotified
     cen.upd_instant = instant
     cen.upd_interval = 24
     cen.upd_offset = 2
-    cen_send(var cen, ctrl_pdu(ll_data.OP_CONNECTION_UPDATE_IND, [2, 2, 0, 24, 0, 0, 0, 0x90, 0x01, instant & 0xFF, (instant >>> 8) & 0xFF]))
+    cen_send(var cen, ctrl_pdu(ll_data.OP_CONNECTION_UPDATE_IND,
+        [2, 2, 0, 24, 0, 0, 0, 0x90, 0x01, instant & 0xFF, (instant >>> 8) & 0xFF]))
     conn_run(var c, var cen, 100000, 1500000, var host)
     test.assert(ll_link.link_live(var c.links[0]))
     test.assert_eq(cen.window_miss, 0)
@@ -1301,72 +1307,72 @@ fn test_a_central_that_changes_nothing_but_the_anchor_leaves_the_host_unnotified
 
 // The Host enables the LE events through LE PHY Update Complete.
 fn enable_c7_events(var c: ctl_hci.Controller)
-    test.assert_eq(status_of(c, 0x2001, [0xFF, 0xFF, 0x0F, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0x0F, 0, 0, 0, 0, 0]), 0)
 
 @test
 fn test_the_data_length_commands_answer_with_their_defaults_and_refuse_bad_values()
     var c = fresh()
     // Supported_Max_TX_Octets, TX_Time, RX_Octets, RX_Time: 251, 17040 both ways.
-    let m = run(c, 0x202F, [])
+    let m = run(var c, 0x202F, [])
     test.assert_eq(m[2], 12)
     test.assert_eq(m[6], 0)
     test.assert_eq(m[7] | (m[8] << 8), 251)
     test.assert_eq(m[9] | (m[10] << 8), 17040)
     test.assert_eq(m[11] | (m[12] << 8), 251)
     test.assert_eq(m[13] | (m[14] << 8), 17040)
-    let s = run(c, 0x2023, [])
+    let s = run(var c, 0x2023, [])
     test.assert_eq(s[6], 0)
     test.assert_eq(s[7] | (s[8] << 8), 27)
     test.assert_eq(s[9] | (s[10] << 8), 328)
-    test.assert_eq(status_of(c, 0x2024, [26, 0, 0x48, 0x01]), 0x12)
-    test.assert_eq(status_of(c, 0x2024, [252, 0, 0x48, 0x01]), 0x12)
-    test.assert_eq(status_of(c, 0x2024, [27, 0, 0x47, 0x01]), 0x12)
-    test.assert_eq(status_of(c, 0x2024, [27, 0, 0x91, 0x42]), 0x12)
-    test.assert_eq(status_of(c, 0x2024, [100, 0, 0xE8, 0x03]), 0)
-    let t = run(c, 0x2023, [])
+    test.assert_eq(status_of(var c, 0x2024, [26, 0, 0x48, 0x01]), 0x12)
+    test.assert_eq(status_of(var c, 0x2024, [252, 0, 0x48, 0x01]), 0x12)
+    test.assert_eq(status_of(var c, 0x2024, [27, 0, 0x47, 0x01]), 0x12)
+    test.assert_eq(status_of(var c, 0x2024, [27, 0, 0x91, 0x42]), 0x12)
+    test.assert_eq(status_of(var c, 0x2024, [100, 0, 0xE8, 0x03]), 0)
+    let t = run(var c, 0x2023, [])
     test.assert_eq(t[7] | (t[8] << 8), 100)
     test.assert_eq(t[9] | (t[10] << 8), 1000)
     // A reset puts the defaults back.
-    test.assert_eq(status_of(c, 0x0C03, []), 0)
-    let u = run(c, 0x2023, [])
+    test.assert_eq(status_of(var c, 0x0C03, []), 0)
+    let u = run(var c, 0x2023, [])
     test.assert_eq(u[7] | (u[8] << 8), 27)
     test.assert(not c.dl_sugg_set)
 
 @test
 fn test_the_phy_commands_check_the_masks_and_the_handle_without_a_connection()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2031, [0, 1, 2]), 0x11)
-    test.assert_eq(status_of(c, 0x2031, [0, 8, 8]), 0x11)
-    test.assert_eq(status_of(c, 0x2031, [0, 0, 0]), 0x12)
-    test.assert_eq(status_of(c, 0x2031, [1, 0, 2]), 0)
+    test.assert_eq(status_of(var c, 0x2031, [0, 1, 2]), 0x11)
+    test.assert_eq(status_of(var c, 0x2031, [0, 8, 8]), 0x11)
+    test.assert_eq(status_of(var c, 0x2031, [0, 0, 0]), 0x12)
+    test.assert_eq(status_of(var c, 0x2031, [1, 0, 2]), 0)
     test.assert(c.phy_def_set)
     test.assert_eq(c.phy_def_tx, 7)
     test.assert_eq(c.phy_def_rx, 2)
-    test.assert_eq(status_of(c, 0x2031, [3, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x2031, [3, 0, 0]), 0)
     test.assert(not c.phy_def_set)
-    test.assert_eq(status_of(c, 0x2031, [0, 3, 3]), 0)
+    test.assert_eq(status_of(var c, 0x2031, [0, 3, 3]), 0)
     test.assert(c.phy_def_set)
     // No connection to name.
-    let r = run(c, 0x2030, [5, 0])
+    let r = run(var c, 0x2030, [5, 0])
     test.assert_eq(r[6], 0x02)
     test.assert_eq(r[7] | (r[8] << 8), 5)
     test.assert_eq(r[9], 0)
     test.assert_eq(r[10], 0)
     test.assert_eq(cmd_status(var c, 0x2032, [5, 0, 0, 2, 2, 0, 0]), 0x02)
-    let d = run(c, 0x2022, [5, 0, 100, 0, 0xE8, 0x03])
+    let d = run(var c, 0x2022, [5, 0, 100, 0, 0xE8, 0x03])
     test.assert_eq(d[6], 0x02)
     test.assert_eq(d[7] | (d[8] << 8), 5)
     // The commands are listed in Supported Commands and the features say what they serve.
-    let sc = run(c, 0x1002, [])
+    let sc = run(var c, 0x1002, [])
     test.assert_eq((sc[7 + 33] >>> 6) & 3, 3)
     test.assert_eq(sc[7 + 34] & 1, 1)
     test.assert_eq((sc[7 + 35] >>> 3) & 15, 15)
-    let f = run(c, 0x2003, [])
+    let f = run(var c, 0x2003, [])
     test.assert_eq(f[7] & 0x20, 0x20)
     test.assert_eq(f[8] & 0x09, 0x09)
     // Without the Link Layer the commands are not answered.
     var bare = ctl_hci.controller_new(0)
-    test.assert_eq(status_of(bare, 0x2031, [0, 1, 1]), 0x01)
+    test.assert_eq(status_of(var bare, 0x2031, [0, 1, 1]), 0x01)
 
 @test
 fn test_a_new_connection_asks_for_the_data_length_and_the_host_hears_the_change()
@@ -1418,7 +1424,7 @@ fn test_set_data_length_tells_the_peer_and_cuts_a_longer_packet_into_pieces_for_
     var acl: [Int] = []
     for i in 0..150
         list.push(acl, i)
-    feed(c, host_acl(1, 0, acl))
+    feed(var c, host_acl(1, 0, acl))
     conn_run(var c, var cen, 300000, 700000, var host)
     var sizes: [Int] = []
     for p in cen.got
@@ -1432,14 +1438,14 @@ fn test_set_data_length_tells_the_peer_and_cuts_a_longer_packet_into_pieces_for_
         total = total + (e[6] | (e[7] << 8))
     test.assert_eq(total, 1)
     // The Host sets 100 octets and 1000 microseconds: a Command Complete with the handle, and the request goes.
-    let r = run(c, 0x2022, [1, 0, 100, 0, 0xE8, 0x03])
+    let r = run(var c, 0x2022, [1, 0, 100, 0, 0xE8, 0x03])
     test.assert_eq(r[6], 0)
     test.assert_eq(r[7] | (r[8] << 8), 1)
     conn_run(var c, var cen, 700000, 900000, var host)
     test.assert_eq(list.len(cen.lens), 2)
     test.assert_eq(t_byte(cen.lens[1], 5) | (t_byte(cen.lens[1], 6) << 8), 100)
     test.assert_eq(t_byte(cen.lens[1], 7) | (t_byte(cen.lens[1], 8) << 8), 1000)
-    let bad = run(c, 0x2022, [1, 0, 20, 0, 0xE8, 0x03])
+    let bad = run(var c, 0x2022, [1, 0, 20, 0, 0xE8, 0x03])
     test.assert_eq(bad[6], 0x12)
 
 @test
@@ -1469,7 +1475,7 @@ fn test_set_phy_asks_the_central_and_the_host_hears_the_result_at_the_instant()
     var host: [Int] = []
     conn_run(var c, var cen, 5000, 200000, var host)
     // LE Read PHY: LE 1M both ways.
-    let r0 = run(c, 0x2030, [1, 0])
+    let r0 = run(var c, 0x2030, [1, 0])
     test.assert_eq(r0[6], 0)
     test.assert_eq(r0[9], 1)
     test.assert_eq(r0[10], 1)
@@ -1490,7 +1496,7 @@ fn test_set_phy_asks_the_central_and_the_host_hears_the_result_at_the_instant()
     test.assert_eq(ev[0][5] | (ev[0][6] << 8), 1)
     test.assert_eq(ev[0][7], 2)
     test.assert_eq(ev[0][8], 2)
-    let r1 = run(c, 0x2030, [1, 0])
+    let r1 = run(var c, 0x2030, [1, 0])
     test.assert_eq(r1[9], 2)
     test.assert_eq(r1[10], 2)
     test.assert_eq(c.links[0].phy, 2)
@@ -1515,8 +1521,8 @@ fn test_a_masked_phy_update_complete_is_not_sent_and_a_second_set_phy_is_disallo
 @test
 fn test_the_default_phy_of_the_host_is_asked_for_by_the_new_connection_itself()
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2031, [0, 2, 2]), 0)
-    test.assert_eq(status_of(c, 0x2024, [120, 0, 0xB0, 0x04]), 0)
+    test.assert_eq(status_of(var c, 0x2031, [0, 2, 2]), 0)
+    test.assert_eq(status_of(var c, 0x2024, [120, 0, 0xB0, 0x04]), 0)
     advertise(var c, 0)
     ctl_hci.ctl_set_time(var c, 1000)
     var pol = ll_policy.default_link_policy()
@@ -1534,19 +1540,19 @@ fn test_the_default_phy_of_the_host_is_asked_for_by_the_new_connection_itself()
     test.assert_eq(t_byte(cen.phys[0], 1), 2)
     test.assert(not c.links[0].phy_host)
 
-
 // ── Read Transmit Power Level, Read RSSI, LE Channel Selection Algorithm ─────
 
 // A Peripheral link in slot 0 (handle 1) beside a Host that enabled the LE events of
 // `le_low`.
 fn linked(le_low: Int, chsel: Bool) -> ctl_hci.Controller
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2001, [le_low & 0xFF, (le_low >>> 8) & 0xFF, (le_low >>> 16) & 0xFF, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [le_low & 0xFF, (le_low >>> 8) & 0xFF, (le_low >>> 16) & 0xFF, 0, 0, 0, 0, 0]),
+        0)
     advertise(var c, 0)
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(24, 200, 0)
     if chsel
-        p.b[0] = ((p.b[0] as Int) | ll_pdu.CHSEL) as u8
+        p.b[0] = (p.b[0] as Int | ll_pdu.CHSEL) as u8
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
     c
 
@@ -1557,27 +1563,27 @@ fn bytes_of_status(opcode: Int, status: Int) -> [Int]
 fn test_the_channel_selection_algorithm_event_follows_the_connection_complete()
     // The event is bit 19 of the LE event mask, which a Host sets: algorithm #1 and #2.
     var a = linked(0x08001F, false)
-    let ea = events_coded(run(a, 0x1001, []), 0x3E)
+    let ea = events_coded(run(var a, 0x1001, []), 0x3E)
     test.assert_eq(list.len(ea), 2)
     test.assert_eq(ea[0][3], 0x01)
     test.assert_eq(ea[1][3], 0x14)
     test.assert_eq(ea[1][4] | (ea[1][5] << 8), 1)
     test.assert_eq(ea[1][6], 0)
     var b = linked(0x08001F, true)
-    let eb = events_coded(run(b, 0x1001, []), 0x3E)
+    let eb = events_coded(run(var b, 0x1001, []), 0x3E)
     test.assert_eq(list.len(eb), 2)
     test.assert_eq(eb[1][3], 0x14)
     test.assert_eq(eb[1][6], 1)
     // The Enhanced event is followed by it too.
     var d = linked(0x08021F, false)
-    let ed = events_coded(run(d, 0x1001, []), 0x3E)
+    let ed = events_coded(run(var d, 0x1001, []), 0x3E)
     test.assert_eq(ed[0][3], 0x0A)
     test.assert_eq(ed[1][3], 0x14)
 
 @test
 fn test_the_channel_selection_algorithm_event_is_not_sent_when_masked()
     var c = linked(0x1F, true)
-    let e = events_coded(run(c, 0x1001, []), 0x3E)
+    let e = events_coded(run(var c, 0x1001, []), 0x3E)
     test.assert_eq(list.len(e), 1)
     test.assert_eq(e[0][3], 0x01)
     test.assert(not ll_link.link_owes(var c.links[0], ll_link.EV_CHSEL))
@@ -1585,23 +1591,25 @@ fn test_the_channel_selection_algorithm_event_is_not_sent_when_masked()
 @test
 fn test_read_transmit_power_level_answers_for_a_connection()
     var c = linked(0x1F, false)
-    let _x = run(c, 0x1001, [])
+    let _x = run(var c, 0x1001, [])
     // Type 0 is the current level, type 1 the maximum.
-    test.assert_eq(run(c, 0x0C2D, [1, 0, 0]), [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x00, 1, 0, ctl_hci.TX_POWER_DBM & 0xFF])
-    test.assert_eq(run(c, 0x0C2D, [1, 0, 1]), [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x00, 1, 0, ctl_hci.TX_POWER_MAX_DBM])
+    test.assert_eq(run(var c, 0x0C2D, [1, 0, 0]),
+        [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x00, 1, 0, ctl_hci.TX_POWER_DBM & 0xFF])
+    test.assert_eq(run(var c, 0x0C2D, [1, 0, 1]),
+        [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x00, 1, 0, ctl_hci.TX_POWER_MAX_DBM])
     // A Type outside 0 and 1 and a handle that is not a connection are refused.
-    test.assert_eq(run(c, 0x0C2D, [1, 0, 2]), [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x12, 1, 0, 0])
-    test.assert_eq(run(c, 0x0C2D, [5, 0, 0]), [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x02, 5, 0, 0])
+    test.assert_eq(run(var c, 0x0C2D, [1, 0, 2]), [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x12, 1, 0, 0])
+    test.assert_eq(run(var c, 0x0C2D, [5, 0, 0]), [0x04, 0x0E, 0x07, 0x01, 0x2D, 0x0C, 0x02, 5, 0, 0])
     // The command takes three parameters.
-    test.assert_eq(run(c, 0x0C2D, [1, 0]), bytes_of_status(0x0C2D, 0x12))
+    test.assert_eq(run(var c, 0x0C2D, [1, 0]), bytes_of_status(0x0C2D, 0x12))
 
 @test
 fn test_read_rssi_reports_the_last_packet_of_the_link()
     var c = linked(0x1F, false)
-    let _x = run(c, 0x1001, [])
+    let _x = run(var c, 0x1001, [])
     // 127 says the radio gave no reading yet.
-    test.assert_eq(run(c, 0x1405, [1, 0]), [0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x00, 1, 0, 127])
+    test.assert_eq(run(var c, 0x1405, [1, 0]), [0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x00, 1, 0, 127])
     ctl_hci.lk_note_rssi(var c, 0, -60)
-    test.assert_eq(run(c, 0x1405, [1, 0]), [0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x00, 1, 0, 0xC4])
-    test.assert_eq(run(c, 0x1405, [7, 0]), [0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x02, 7, 0, 0])
-    test.assert_eq(run(c, 0x1405, [1]), bytes_of_status(0x1405, 0x12))
+    test.assert_eq(run(var c, 0x1405, [1, 0]), [0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x00, 1, 0, 0xC4])
+    test.assert_eq(run(var c, 0x1405, [7, 0]), [0x04, 0x0E, 0x07, 0x01, 0x05, 0x14, 0x02, 7, 0, 0])
+    test.assert_eq(run(var c, 0x1405, [1]), bytes_of_status(0x1405, 0x12))

@@ -19,11 +19,9 @@
 
 use noble_controller_config
 use ctl_limits
-use std.test
 use ll_pdu
 use ll_phy
 use ll_init
-use ll_ext
 use ll_link
 use ll_xadv
 use ll_per
@@ -110,7 +108,7 @@ fn timing_find(var rx: Pdu, acad_at: Int, acad_len: Int) -> Int
 // The fields of the information whose length octet is at `at`.
 @tier(embedded)
 fn timing_aa(var rx: Pdu, at: Int) -> Int
-    (rx.b[at + 2] as Int) | ((rx.b[at + 3] as Int) << 8) | ((rx.b[at + 4] as Int) << 16) | ((rx.b[at + 5] as Int) << 24)
+    rx.b[at + 2] as Int | (rx.b[at + 3] as Int << 8) | (rx.b[at + 4] as Int << 16) | (rx.b[at + 5] as Int << 24)
 
 @tier(embedded)
 fn timing_n_sub(var rx: Pdu, at: Int) -> Int
@@ -147,7 +145,8 @@ fn timing_usable(var rx: Pdu, at: Int) -> Bool
 // the Subevent_Interval is ignored and `int_max` stands in for it; with one slot the spacing is ignored.
 @satisfies("REQ-BLE-CTL-110")
 @tier(embedded)
-fn params_status(int_min: Int, int_max: Int, n_sub: Int, si: Int, delay: Int, spacing: Int, slots: Int) -> Int
+fn params_status(int_min: Int, int_max: Int, n_sub: Int, si: Int, delay: Int, spacing: Int,
+                 slots: Int) -> Int
     if n_sub > SUBEVENTS_MAX
         return E_UNSUPPORTED
     var interval = si
@@ -178,7 +177,7 @@ struct PwBuf
     rs: Int
     rc: Int
     len: Int
-    data: Vec[u8; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then noble_controller_config.CTL_PAWR_DATA else 8]
+    data: Vec[u8; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then noble_controller_config.CTL_PAWR_DATA else 8]
 
 @tier(embedded)
 fn pb_new() -> PwBuf
@@ -216,7 +215,7 @@ struct PwAdv
     delay_us: Int
     spacing_us: Int
     slots: Int
-    bufs: Vec[PwBuf; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then noble_controller_config.CTL_PAWR_BUFS else 1]
+    bufs: Vec[PwBuf; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then noble_controller_config.CTL_PAWR_BUFS else 1]
     next_ask: Int
     air: Int
     ask_owed: Bool
@@ -227,7 +226,7 @@ struct PwAdv
     rep_tx: Int
     rn: Int
     rlen: Int
-    rdata: Vec[u8; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then 2 * noble_controller_config.CTL_PAWR_DATA + 8 else 8]
+    rdata: Vec[u8; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then 2 * noble_controller_config.CTL_PAWR_DATA + 8 else 8]
     cur_rs: Int
     cur_rc: Int
 
@@ -432,7 +431,8 @@ fn slot_at(ind_start: Int, delay_us: Int, spacing_us: Int, slot: Int) -> Int
 // report is full (25 responses, or no room for the data), which drops it.
 @satisfies("REQ-BLE-CTL-110")
 @tier(embedded)
-fn pa_response(var w: PwAdv, slot: Int, rssi: Int, txp: Int, var src: Pdu, at: Int, len: Int) -> Bool
+fn pa_response(var w: PwAdv, slot: Int, rssi: Int, txp: Int, var src: Pdu, at: Int,
+               len: Int) -> Bool
     // The report must fit an HCI event: 5 octets, and for each response 6 and its data.
     if w.rn >= RESPONSES_MAX or w.rlen + 4 + len > ctl_limits.pw_rsp() or 5 + w.rlen + 4 + len + 2 * (w.rn + 1) > 255
         return false
@@ -484,7 +484,7 @@ struct PwSync
     subs: Vec[u8; 8]
     txp: Bool
     hsub: Int
-    bufs: Vec[PwBuf; if (noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC) then noble_controller_config.CTL_PAWR_BUFS else 1]
+    bufs: Vec[PwBuf; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then noble_controller_config.CTL_PAWR_BUFS else 1]
 
 @tier(embedded)
 fn ps_new() -> PwSync
@@ -521,7 +521,7 @@ fn ps_begin(var s: PwSync, var p: PerSync, var rx: Pdu, at: Int)
     s.delay_us = timing_delay(var rx, at) * SI_UNIT_US
     s.spacing_us = timing_spacing(var rx, at) * SPACING_UNIT_US
     s.ev_start = p.due
-    p.due = s.ev_start + (s.subs[0] as Int) * s.si_us
+    p.due = s.ev_start + s.subs[0] as Int * s.si_us
 
 // The subevents the Host chose (LE Set Periodic Sync Subevent): `n` of them, in the order given; the next window is for the first.
 @satisfies("REQ-BLE-CTL-110")
@@ -632,332 +632,3 @@ fn rsp_octets(len: Int, txp: Bool) -> Int
 @tier(embedded)
 fn rsp_fits(var s: PwSync, len: Int, phy: Int) -> Bool
     ll_phy.air_us(phy, true, rsp_octets(len, s.txp)) + T_IFS_150 <= s.spacing_us
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@tier(app)
-fn t_adv(n_sub: Int) -> PwAdv
-    var w = pa_new()
-    pa_define(var w, n_sub, 12, 1, 16, 4)
-    pa_start(var w, 0x71764129)
-    w
-
-@tier(app)
-fn t_fill(var w: PwAdv, b: Int, len: Int, rs: Int, rc: Int)
-    pb_set(var w.bufs[b], B_FILLED, w.bufs[b].abs, w.bufs[b].sub, rs, rc, len)
-    for j in 0..len
-        pb_put(var w.bufs[b], j, j + 1)
-
-@tier(app)
-fn t_bfill(var s: PwSync, abs: Int, sub: Int, len: Int)
-    pb_set(var s.bufs[0], B_FILLED, abs, sub, 0, 0, len)
-
-@tier(app)
-fn t_min(a: Int, b: Int) -> Int
-    if a < b
-        return a
-    b
-
-@tier(app)
-fn t_ask_owed(var w: PwAdv, v: Bool)
-    w.ask_owed = v
-
-@tier(app)
-fn t_slots(var w: PwAdv, v: Int)
-    w.slots = v
-
-@tier(app)
-fn t_pdu_n(var p: Pdu, n: Int)
-    p.n = n
-
-@tier(app)
-fn t_sync_at(var s: PwSync, spacing: Int, n_sub: Int)
-    s.spacing_us = spacing
-    s.n_sub = n_sub
-
-@tier(app)
-fn t_psync_at(var p: PerSync, interval: Int, due: Int, counter: Int)
-    p.interval = interval
-    p.due = due
-    p.counter = counter
-    p.state = ll_per.PS_SYNCING
-
-@test
-fn test_capacities_match_the_constants()
-    let w = pa_new()
-    test.assert_eq(w.bufs.capacity(), ctl_limits.pw_bufs())
-    test.assert_eq(w.bufs[0].data.capacity(), ctl_limits.pw_data())
-    test.assert_eq(w.rdata.capacity(), ctl_limits.pw_rsp())
-    let s = ps_new()
-    test.assert_eq(s.bufs.capacity(), ctl_limits.pw_bufs())
-    test.assert_eq(s.subs.capacity(), SUBS_MAX)
-
-@test
-fn test_the_parameters_follow_the_command()
-    // A train of 10 subevents 15 units (18.75 ms) apart in an interval of 150 units, 5 slots 1.25 ms after the PDU and 0.5 ms apart.
-    test.assert_eq(params_status(150, 200, 10, 15, 1, 4, 5), OK)
-    test.assert_eq(params_status(150, 200, 129, 1, 1, 4, 5), E_UNSUPPORTED)
-    // The subevents fill the interval: 10 x 16 is above 150.
-    test.assert_eq(params_status(150, 200, 10, 16, 1, 4, 5), E_INVALID)
-    test.assert_eq(params_status(150, 200, 10, 5, 1, 4, 5), E_INVALID)
-    test.assert_eq(params_status(150, 200, 10, 15, 0, 4, 5), E_INVALID)
-    test.assert_eq(params_status(150, 200, 10, 15, 15, 4, 5), E_INVALID)
-    test.assert_eq(params_status(150, 200, 10, 15, 1, 4, 0), E_INVALID)
-    // The spacing: 10 x (15 - 1) / 5 = 28 at most, 2 at least.
-    test.assert_eq(params_status(150, 200, 10, 15, 1, 28, 5), OK)
-    test.assert_eq(params_status(150, 200, 10, 15, 1, 29, 5), E_INVALID)
-    test.assert_eq(params_status(150, 200, 10, 15, 1, 1, 5), E_INVALID)
-    // One slot: the spacing is ignored.  One subevent: the Subevent_Interval is ignored and the interval range is the bound.
-    test.assert_eq(params_status(150, 200, 10, 15, 1, 0, 1), OK)
-    test.assert_eq(params_status(150, 200, 1, 0, 100, 4, 5), OK)
-    test.assert_eq(params_status(150, 200, 1, 0, 200, 4, 5), E_INVALID)
-
-@test
-fn test_the_timing_information_round_trips_through_the_acad()
-    var t = ll_per.t_train(0, 0)
-    timing_put(var t, 0x71764129, 10, 15, 1, 4)
-    test.assert_eq(t.acad_n, TIMING_OCTETS)
-    var p = pdu_of(var t.acad, TIMING_OCTETS)
-    test.assert_eq(timing_find(var p, 0, TIMING_OCTETS), 0)
-    test.assert_eq(timing_aa(var p, 0), 0x71764129)
-    test.assert_eq(timing_n_sub(var p, 0), 10)
-    test.assert_eq(timing_si(var p, 0), 15)
-    test.assert_eq(timing_delay(var p, 0), 1)
-    test.assert_eq(timing_spacing(var p, 0), 4)
-    test.assert(timing_usable(var p, 0))
-    // Another structure first, then the information: found behind it.
-    var q = pdu_of(var t.acad, TIMING_OCTETS)
-    for k in 0..TIMING_OCTETS
-        q.b[3 + k] = t.acad[k]
-    q.b[0] = 2
-    q.b[1] = 1
-    q.b[2] = 6
-    test.assert_eq(timing_find(var q, 0, 3 + TIMING_OCTETS), 3)
-    // A structure of another length or type is not it.
-    q.b[3] = 8
-    test.assert_eq(timing_find(var q, 0, 3 + TIMING_OCTETS), -1)
-
-@tier(app)
-fn pdu_of(var src: Vec[u8; 64], n: Int) -> Pdu
-    var p = ll_pdu.pdu_new()
-    for k in 0..n
-        p.b[k] = src[k]
-    t_pdu_n(var p, n)
-    p
-
-@test
-fn test_the_controller_asks_for_the_subevents_it_has_buffers_for()
-    // With one buffer the Controller asks whenever it is free; the request names the next subevent in order and as many as there are free buffers.
-    var w = t_adv(3)
-    test.assert(pa_ask(var w))
-    let n = t_min(ctl_limits.pw_bufs(), 3)
-    test.assert_eq(w.ask_sub, 0)
-    test.assert_eq(w.ask_n, n)
-    test.assert(w.ask_owed)
-    // A request is still to be sent: no second.
-    test.assert(not pa_ask(var w))
-    t_ask_owed(var w, false)
-    test.assert_eq(pa_free(var w), ctl_limits.pw_bufs() - n)
-    test.assert_eq(pa_ask(var w), (ctl_limits.pw_bufs() - n) * 2 >= ctl_limits.pw_bufs() and ctl_limits.pw_bufs() > n)
-    t_ask_owed(var w, false)
-    // The Host gave the data of subevent 0; the radio sent it; the buffer is free again and the next request starts at subevent 1 or later.
-    let b = pa_asked(var w, 0)
-    test.assert(b >= 0)
-    test.assert_eq(w.bufs[b].state, B_ASKED)
-    t_fill(w, b, 5, 0, 2)
-    test.assert_eq(pa_due(var w), b)
-    test.assert_eq(pa_sub(var w), 0)
-    pa_pass(var w)
-    test.assert_eq(w.air, 1)
-    test.assert_eq(pa_sub(var w), 1)
-    test.assert_eq(pa_due(var w), -1)
-    t_ask_owed(var w, false)
-    test.assert(pa_ask(var w))
-    test.assert_eq(w.ask_sub, (w.next_ask - w.ask_n) % 3)
-
-@test
-fn test_a_subevent_whose_time_passed_frees_its_buffer_and_goes_without_data()
-    var w = t_adv(2)
-    test.assert(pa_ask(var w))
-    t_ask_owed(var w, false)
-    // The Host answers too late: the radio went by, the asked-for buffer is free and no longer wanted.
-    pa_pass(var w)
-    test.assert_eq(pa_asked(var w, 0), -1)
-    test.assert_eq(pa_due(var w), -1)
-    test.assert(pa_free(var w) >= 1)
-    // The next request starts after the subevents already asked about and never before the one the radio comes to.
-    t_ask_owed(var w, false)
-    test.assert(pa_ask(var w))
-    test.assert_eq(w.ask_sub, t_min(ctl_limits.pw_bufs(), 2) % 2)
-
-@test
-fn test_the_subevent_pdu_holds_the_data_and_the_tx_power_of_the_train()
-    var w = t_adv(2)
-    var p = ll_pdu.pdu_new()
-    ind_build(var w, -1, var p, true, 4)
-    // No data: the header, the extended header length and its flags, the Tx Power.
-    test.assert_eq(p.n, ind_octets(0, true))
-    test.assert_eq((p.b[0] as Int) & 0x0F, ll_init.EXT_ADV)
-    test.assert_eq((p.b[2] as Int) >>> 6, 0)
-    let x = ll_ext.ext_parse(var p)
-    test.assert(x.ok)
-    test.assert(x.txp >= 0)
-    test.assert_eq(x.adva, -1)
-    test.assert_eq(x.adi, -1)
-    test.assert_eq(x.aux, -1)
-    test.assert_eq(x.sync, -1)
-    test.assert_eq(x.data_len, 0)
-    test.assert_eq(ll_ext.tx_power(var p, x), 4)
-    // Data of buffer 0.
-    t_fill(w, 0, 6, 0, 1)
-    var q = ll_pdu.pdu_new()
-    ind_build(var w, 0, var q, true, 4)
-    test.assert_eq(q.n, ind_octets(6, true))
-    let y = ll_ext.ext_parse(var q)
-    test.assert_eq(y.data_len, 6)
-    test.assert_eq(q.b[y.data_at], 1)
-    test.assert_eq(q.b[y.data_at + 5], 6)
-    // Without the property no Tx Power.
-    var r = ll_pdu.pdu_new()
-    ind_build(var w, 0, var r, false, 4)
-    test.assert_eq(r.n, ind_octets(6, false))
-    test.assert_eq(ll_ext.ext_parse(var r).txp, -1)
-
-@test
-fn test_a_subevent_pdu_must_end_before_the_first_response_slot()
-    var w = t_adv(2)
-    // The delay is 1 unit, 1.25 ms: on the 1M PHY 8 us an octet and 8 octets of overhead, and 150 us before the slot.
-    test.assert(ind_fits(var w, 100, false, ll_phy.PHY_1M))
-    test.assert(not ind_fits(var w, 150, false, ll_phy.PHY_1M))
-    test.assert(ind_fits(var w, 150, false, ll_phy.PHY_2M))
-    t_slots(var w, 0)
-    test.assert(ind_fits(var w, 240, false, ll_phy.PHY_1M))
-
-@test
-fn test_the_channel_follows_the_event_and_the_subevent_and_the_slot_follows_the_delay_and_the_spacing()
-    // A subevent differs from the next of its event in the counter used, which is the XOR of the event counter and the subevent number.
-    var differ = 0
-    for sub in 1..8
-        if sub_channel(0x8E89BED7, 100, sub, 0x1FFFFFFFFF, 37) != sub_channel(0x8E89BED7, 100, 0, 0x1FFFFFFFFF, 37)
-            differ = differ + 1
-    test.assert(differ >= 5)
-    test.assert_eq(sub_channel(0x8E89BED7, 100, 5, 0x1FFFFFFFFF, 37), sub_channel(0x8E89BED7, 97, 0, 0x1FFFFFFFFF, 37))
-    test.assert_eq(sub_channel(0x8E89BED7, 0x10005, 5, 0x1FFFFFFFFF, 37), sub_channel(0x8E89BED7, 0, 0, 0x1FFFFFFFFF, 37) * 0 + sub_channel(0x8E89BED7, 5, 5, 0x1FFFFFFFFF, 37))
-    test.assert_eq(slot_at(10000, 2500, 500, 0), 12500)
-    test.assert_eq(slot_at(10000, 2500, 500, 3), 14000)
-
-@test
-fn test_responses_are_staged_with_their_slot_and_signal_for_one_report()
-    var w = t_adv(2)
-    var src = ll_pdu.pdu_new()
-    for k in 0..40
-        src.b[k] = (k + 1) as u8
-    test.assert(pa_response(var w, 3, 0xC8, 0x7F, var src, 10, 4))
-    test.assert_eq(w.rn, 1)
-    test.assert_eq(w.rlen, 8)
-    test.assert_eq(w.rdata[0], 3)
-    test.assert_eq(w.rdata[1], 0xC8)
-    test.assert_eq(w.rdata[3], 4)
-    test.assert_eq(w.rdata[4], 11)
-    // A subevent with a response owes a report; one with none and its PDU sent does not; one whose PDU was not sent does, with TX_Status 1.
-    pa_over(var w, 1, true)
-    test.assert(w.rep_owed)
-    test.assert_eq(w.rep_sub, 1)
-    test.assert_eq(w.rep_tx, 0)
-    pa_reported(var w)
-    test.assert(not w.rep_owed)
-    test.assert_eq(w.rn, 0)
-    pa_over(var w, 1, true)
-    test.assert(not w.rep_owed)
-    pa_over(var w, 1, false)
-    test.assert(w.rep_owed)
-    test.assert_eq(w.rep_tx, 1)
-
-@test
-fn test_a_synchronization_moves_to_the_subevents_it_listens_to_and_follows_the_clock()
-    var rx = ll_pdu.pdu_new()
-    var t = ll_per.t_train(0, 0)
-    timing_put(var t, 0x71764129, 3, 12, 2, 16)
-    for k in 0..TIMING_OCTETS
-        rx.b[k] = t.acad[k]
-    t_pdu_n(var rx, TIMING_OCTETS)
-    var p = ll_per.psync_new()
-    t_psync_at(var p, 160, 1000000, 50)
-    var s = ps_new()
-    ps_begin(var s, var p, var rx, 0)
-    test.assert(s.on)
-    test.assert_eq(s.rsp_aa, 0x71764129)
-    test.assert_eq(s.n_sub, 3)
-    test.assert_eq(s.si_us, 15000)
-    test.assert_eq(s.delay_us, 2500)
-    test.assert_eq(s.spacing_us, 2000)
-    test.assert_eq(p.due, 1000000)
-    // Subevents 0 and 2: the first window is for 0, the second for 2 of the same event, the third for 0 of the next.
-    ps_put(var s, 1, 2)
-    ps_choose(var s, var p, 2, 0, false)
-    test.assert(ps_listens(var s, 0))
-    test.assert(ps_listens(var s, 2))
-    test.assert(not ps_listens(var s, 1))
-    test.assert_eq(ps_channel(var s, var p), sub_channel(0, 0, 0, 0, 0) * 0 + ps_channel(var s, var p))
-    ll_per.psync_heard(var p, 1000010)
-    ps_pass(var s, var p, true, 1000010)
-    test.assert_eq(ps_sub(var s), 2)
-    test.assert_eq(p.counter, 50)
-    test.assert_eq(p.due, 1000010 + 30000)
-    ll_per.psync_heard(var p, 1030020)
-    ps_pass(var s, var p, true, 1030020)
-    test.assert_eq(ps_sub(var s), 0)
-    test.assert_eq(p.counter, 51)
-    test.assert_eq(p.due, 1000020 + 200000)
-    // A window with no packet: the next is where the subevents are, from the event's start.
-    ll_per.psync_missed(var p)
-    ps_pass(var s, var p, false, 0)
-    test.assert_eq(ps_sub(var s), 2)
-    test.assert_eq(p.counter, 51)
-    test.assert_eq(p.due, 1000020 + 200000 + 30000)
-
-@test
-fn test_a_response_is_for_the_event_of_the_request_or_the_next_and_expires_with_it()
-    test.assert_eq(response_event(100, 2, 3), 100)
-    test.assert_eq(response_event(100, 2, 2), 100)
-    test.assert_eq(response_event(100, 2, 1), 101)
-    test.assert_eq(response_event(0xFFFF, 2, 0), 0)
-    // The slot has passed for an earlier event, and for an earlier subevent of the window's event; not for the window's own subevent or later.
-    test.assert(response_late(99, 2, 100, 0))
-    test.assert(response_late(100, 0, 100, 1))
-    test.assert(not response_late(100, 1, 100, 1))
-    test.assert(not response_late(100, 2, 100, 1))
-    test.assert(not response_late(101, 0, 100, 1))
-    test.assert(response_late(0xFFFF, 0, 0, 0))
-    test.assert(not response_late(0, 0, 0xFFFF, 2))
-    var s = ps_new()
-    t_bfill(var s, 101, 1, 3)
-    test.assert_eq(ps_response(var s, 101, 1), 0)
-    test.assert_eq(ps_response(var s, 101, 0), -1)
-    test.assert_eq(ps_response(var s, 100, 1), -1)
-    ps_expire(var s, 101)
-    test.assert_eq(s.bufs[0].state, B_FILLED)
-    ps_expire(var s, 102)
-    test.assert_eq(s.bufs[0].state, B_FREE)
-    // Across the wrap of the counter.
-    t_bfill(var s, 0xFFFF, 0, 1)
-    ps_expire(var s, 0)
-    test.assert_eq(s.bufs[0].state, B_FREE)
-
-@test
-fn test_a_response_pdu_holds_the_data_and_fits_a_slot()
-    var s = ps_new()
-    t_sync_at(var s, 2000, 2)
-    pb_set(var s.bufs[0], B_FILLED, 0, 0, 0, 0, 4)
-    for j in 0..4
-        pb_put(var s.bufs[0], j, 0x10 + j)
-    var p = ll_pdu.pdu_new()
-    rsp_build(var s, 0, var p, 3)
-    test.assert_eq(p.n, rsp_octets(4, false))
-    let x = ll_ext.ext_parse(var p)
-    test.assert(x.ok)
-    test.assert_eq(x.adva, -1)
-    test.assert_eq(x.data_len, 4)
-    test.assert_eq(p.b[x.data_at], 0x10)
-    test.assert(rsp_fits(var s, 100, ll_phy.PHY_1M))
-    test.assert(not rsp_fits(var s, 250, ll_phy.PHY_1M))

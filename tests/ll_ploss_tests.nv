@@ -1,0 +1,151 @@
+// tests/ll_ploss_tests.nv — the unit tests of src/ll_ploss.nv.
+//
+//   novo test tests/ll_ploss_tests.nv
+
+use std.test
+use ll_ploss.{ Ploss, UNAVAILABLE, ZONE_HIGH, ZONE_LOW, ZONE_MIDDLE, avg_add, avg_dbm, cand_count, cand_of, cand_reached, cand_step, clear_cand, clear_measure, loss_of, params_ok, ploss_new, put_on, put_params, put_tried, put_zone, zone_of, zone_start, zone_step }
+
+fn sample() -> Ploss
+    // High 90 +- 4, Low 60 +- 6, Min_Time_Spent 3.
+    var p = ploss_new()
+    put_params(var p, 90, 4, 60, 6, 3)
+    p
+
+fn no_high() -> Ploss
+    var p = ploss_new()
+    put_params(var p, 255, 0, 60, 6, 0)
+    p
+
+@test
+fn test_parameters_are_checked_as_the_command_says()
+    test.assert(params_ok(90, 4, 60, 6))
+    test.assert(params_ok(0xFF, 0, 60, 6))
+    test.assert(not params_ok(0xFF, 1, 60, 6))
+    test.assert(not params_ok(90, 4, 5, 6))
+    test.assert(not params_ok(50, 0, 60, 0))
+    test.assert(not params_ok(70, 5, 60, 6))
+    test.assert(params_ok(70, 4, 60, 6))
+    test.assert(params_ok(20, 0, 10, 10))
+
+@test
+fn test_a_new_record_has_nothing_set_nothing_reported_and_no_sample()
+    let p = ploss_new()
+    test.assert(not p.params_set)
+    test.assert(not p.reporting_on)
+    test.assert(not p.peer_tried)
+    test.assert(not p.avg_has_sample)
+    test.assert_eq(zone_of(p), -1)
+    test.assert_eq(cand_of(p), -1)
+    test.assert_eq(cand_count(p), 0)
+
+@test
+fn test_the_parameters_are_kept_and_keep_the_switches()
+    var p = sample()
+    test.assert_eq(p.high_t as Int, 90)
+    test.assert_eq(p.high_h as Int, 4)
+    test.assert_eq(p.low_t as Int, 60)
+    test.assert_eq(p.low_h as Int, 6)
+    test.assert_eq(p.min_time as Int, 3)
+    test.assert(p.params_set)
+    test.assert(not p.reporting_on)
+    test.assert_eq(zone_of(p), -1)
+    put_on(var p, true)
+    put_zone(var p, ZONE_HIGH)
+    test.assert(p.reporting_on)
+    test.assert_eq(zone_of(p), ZONE_HIGH)
+    put_params(var p, 255, 0, 20, 1, 0xFFFF)
+    test.assert(p.reporting_on)
+    test.assert_eq(zone_of(p), ZONE_HIGH)
+    test.assert_eq(p.high_t as Int, 255)
+    test.assert_eq(p.low_t as Int, 20)
+    test.assert_eq(p.min_time as Int, 0xFFFF)
+    put_tried(var p, true)
+    put_on(var p, false)
+    test.assert(not p.reporting_on)
+    test.assert(not p.peer_tried)
+    test.assert_eq(zone_of(p), -1)
+    test.assert(p.params_set)
+    test.assert_eq(p.high_t as Int, 255)
+
+@test
+fn test_the_first_zone_is_taken_from_the_thresholds()
+    let p = sample()
+    test.assert_eq(zone_start(p, 10), ZONE_LOW)
+    test.assert_eq(zone_start(p, 59), ZONE_LOW)
+    test.assert_eq(zone_start(p, 60), ZONE_MIDDLE)
+    test.assert_eq(zone_start(p, 89), ZONE_MIDDLE)
+    test.assert_eq(zone_start(p, 90), ZONE_HIGH)
+    test.assert_eq(zone_start(no_high(), 200), ZONE_MIDDLE)
+
+@test
+fn test_a_boundary_has_a_hysteresis_in_each_direction()
+    let p = sample()
+    // Up from Low at 66 or more, down from Middle at 54 or less.
+    test.assert_eq(zone_step(p, ZONE_LOW, 65), ZONE_LOW)
+    test.assert_eq(zone_step(p, ZONE_LOW, 66), ZONE_MIDDLE)
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 55), ZONE_MIDDLE)
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 54), ZONE_LOW)
+    // Up from Middle at 94 or more, down from High at 86 or less.
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 93), ZONE_MIDDLE)
+    test.assert_eq(zone_step(p, ZONE_MIDDLE, 94), ZONE_HIGH)
+    test.assert_eq(zone_step(p, ZONE_HIGH, 87), ZONE_HIGH)
+    test.assert_eq(zone_step(p, ZONE_HIGH, 86), ZONE_MIDDLE)
+    // Two boundaries at once.
+    test.assert_eq(zone_step(p, ZONE_LOW, 120), ZONE_HIGH)
+    test.assert_eq(zone_step(p, ZONE_HIGH, 10), ZONE_LOW)
+    // No High zone: the path loss stays in Middle however high it goes.
+    test.assert_eq(zone_step(no_high(), ZONE_MIDDLE, 250), ZONE_MIDDLE)
+
+@test
+fn test_the_count_restarts_when_the_heading_changes()
+    var p = sample()
+    test.assert_eq(cand_of(p), -1)
+    cand_step(var p, ZONE_MIDDLE)
+    cand_step(var p, ZONE_MIDDLE)
+    test.assert_eq(cand_of(p), ZONE_MIDDLE)
+    test.assert_eq(cand_count(p), 2)
+    test.assert(not cand_reached(p))
+    cand_step(var p, ZONE_MIDDLE)
+    test.assert(cand_reached(p))
+    cand_step(var p, ZONE_LOW)
+    test.assert_eq(cand_count(p), 1)
+    test.assert(not cand_reached(p))
+    put_params(var p, 90, 4, 60, 6, 1)
+    test.assert(cand_reached(p))
+    put_params(var p, 90, 4, 60, 6, 0)
+    test.assert(cand_reached(p))
+    clear_cand(var p)
+    test.assert_eq(cand_of(p), -1)
+    test.assert_eq(cand_count(p), 0)
+
+@test
+fn test_the_average_follows_the_samples()
+    var p = ploss_new()
+    test.assert(not p.avg_has_sample)
+    avg_add(var p, -60)
+    test.assert(p.avg_has_sample)
+    test.assert_eq(avg_dbm(p), -60)
+    avg_add(var p, -80)
+    test.assert_eq(avg_dbm(p), -65)
+    for _ in 0..40
+        avg_add(var p, -80)
+    test.assert_eq(avg_dbm(p), -80)
+    avg_add(var p, -127)
+    avg_add(var p, 20)
+    test.assert(avg_dbm(p) > -127)
+    test.assert(avg_dbm(p) <= 20)
+    test.assert_eq(cand_of(p), -1)
+    cand_step(var p, ZONE_LOW)
+    clear_measure(var p)
+    test.assert(not p.avg_has_sample)
+    test.assert_eq(cand_of(p), -1)
+    test.assert_eq(cand_count(p), 0)
+
+@test
+fn test_the_path_loss_is_the_level_less_the_average()
+    test.assert_eq(loss_of(0, -60), 60)
+    test.assert_eq(loss_of(-20, -60), 40)
+    test.assert_eq(loss_of(8, -127), 135)
+    test.assert_eq(loss_of(-40, -30), 0)
+    test.assert_eq(loss_of(127, -60), UNAVAILABLE)
+    test.assert_eq(loss_of(126, -127), 253)

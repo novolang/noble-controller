@@ -1,0 +1,796 @@
+// tests/ll_big_tests.nv — the unit tests of src/ll_big.nv.
+//
+//   novo test tests/ll_big_tests.nv
+
+use std.test
+use ctl_limits
+use ll_pdu
+use ll_phy
+use ll_iso
+use ll_link
+use ll_radio
+use ll_big.{ BIS_HANDLE_BASE, B_TERM, B_UP, Big, BigPlan, CTRL_CHANNEL_MAP, CTRL_TERMINATE, E_INVALID, E_UNSUPPORTED, INFO_PLAIN, InfoView, OK, REASON_LOCAL_HOST, T_MSS_US, acad_find, arrange, big_new, bis_aa, bis_config, bis_crc, bis_dw, bis_header, bis_number, check_big_test, chmap_apply, chmap_begin, chmap_due, control_offset, cstf_of, ctrl_active, ctrl_chmap, ctrl_rx, ctrl_terminate, info_at, info_for, info_get, info_static, info_valid, instant_reached, iso_us, key_from_info, listen_nse, make_saa, mpt_us, payload_of, plan_big, plan_new, pre_events, program_at, program_len, rx_listens, rx_widen, saa_apart, saa_valid, sub_gap_us, sub_offset, sync_anchor, sync_fill, terminate_begin, tx_build, tx_done, wants }
+
+// A @value struct is changed through a `var` parameter, so the tests set fields through this function, by name.
+fn t_set(var b: Big, f: Str, v: Int)
+    if f == "state"
+        b.state = v
+    else if f == "broadcaster"
+        b.broadcaster = v != 0
+    else if f == "num_bis"
+        b.num_bis = v
+    else if f == "nse"
+        b.nse = v
+    else if f == "bn"
+        b.bn = v
+    else if f == "irc"
+        b.irc = v
+    else if f == "pto"
+        b.pto = v
+    else if f == "iso_int"
+        b.iso_int = v
+    else if f == "sub_int"
+        b.sub_int = v
+    else if f == "bis_sp"
+        b.bis_sp = v
+    else if f == "phy"
+        b.phy = v
+    else if f == "max_pdu"
+        b.max_pdu = v
+    else if f == "max_sdu"
+        b.max_sdu = v
+    else if f == "sdu_int"
+        b.sdu_int = v
+    else if f == "packed"
+        b.packed = v != 0
+    else if f == "enc"
+        b.enc = v != 0
+    else if f == "saa"
+        b.saa = v
+    else if f == "crc"
+        b.crc = v
+    else if f == "chmap"
+        b.chmap = v
+    else if f == "n_used"
+        b.n_used = v
+    else if f == "anchor"
+        b.anchor = v
+    else if f == "ev"
+        b.ev = v
+    else if f == "sync_delay"
+        b.sync_delay = v
+    else if f == "cssn"
+        b.cssn = v
+    else if f == "mse"
+        b.mse = v
+    else if f == "bis_mask"
+        b.bis_mask = v
+    else if f == "ppm"
+        b.ppm = v
+    else if f == "last_rx"
+        b.last_rx = v
+    else if f == "last_cssn"
+        b.last_cssn = v
+
+// The group of the examples: two BISes, 10 ms ISO interval, BN 1, IRC 2 (NSE 2), PDUs of 100 octets on LE 2M, sequential.
+fn t_big() -> Big
+    var b = big_new()
+    t_set(var b, "broadcaster", 1)
+    t_set(var b, "num_bis", 2)
+    t_set(var b, "nse", 2)
+    t_set(var b, "bn", 1)
+    t_set(var b, "irc", 2)
+    t_set(var b, "pto", 0)
+    t_set(var b, "iso_int", 8)
+    t_set(var b, "phy", 2)
+    t_set(var b, "max_pdu", 100)
+    t_set(var b, "max_sdu", 100)
+    t_set(var b, "sdu_int", 10000)
+    t_set(var b, "saa", 0x78E52493)
+    t_set(var b, "crc", 0xABCD)
+    t_set(var b, "chmap", 0x1FFFFFFFFF)
+    t_set(var b, "n_used", 37)
+    t_set(var b, "sub_int", 1000)
+    t_set(var b, "bis_sp", 2000)
+    t_set(var b, "anchor", 100000)
+    b
+
+fn t_pset(var p: BigPlan, f: Str, v: Int)
+    if f == "phy"
+        p.phy = v
+    else if f == "nse"
+        p.nse = v
+    else if f == "bn"
+        p.bn = v
+    else if f == "irc"
+        p.irc = v
+    else if f == "pto"
+        p.pto = v
+    else if f == "iso"
+        p.iso = v
+    else if f == "pdu"
+        p.pdu = v
+
+fn t_pdu_n(var p: Pdu, n: Int)
+    p.n = n
+
+fn t_pdu(var b: Big) -> Pdu
+    var p = ll_pdu.pdu_new()
+    for k in 0..b.info_n
+        p.b[k] = b.info[k]
+    t_pdu_n(var p, b.info_n)
+    p
+
+fn t_prof() -> ll_radio.RadioProfile
+    ll_radio.profile_new(true, 145, 45)
+
+fn t_sdu(fill: Int) -> Vec[u8; 260]
+    var d: Vec[u8; 260] = Vec.new()
+    for i in 0..260
+        let _a = d.push(((fill + i) & 0xFF) as u8)
+    d
+
+@test
+fn test_the_access_addresses_of_the_streams_follow_the_sample_data_of_the_specification()
+    // [Vol 6] Part C, Section 5: the Seed Access Address 0x78E52493 gives 0x85E32493 for BIS 1, 0x79D52493 for 2, 0x86752493 for 3,
+    // 0x87472493 for 31, and 0x7A412493 for the BIG Control logical link.
+    test.assert_eq(bis_aa(0x78E52493, 1), 0x85E32493)
+    test.assert_eq(bis_aa(0x78E52493, 2), 0x79D52493)
+    test.assert_eq(bis_aa(0x78E52493, 3), 0x86752493)
+    test.assert_eq(bis_aa(0x78E52493, 10), 0x78E12493)
+    test.assert_eq(bis_aa(0x78E52493, 28), 0x7B532493)
+    test.assert_eq(bis_aa(0x78E52493, 31), 0x87472493)
+    test.assert_eq(bis_aa(0x78E52493, 0), 0x7A412493)
+    test.assert_eq(bis_dw(1), 0xFD060000)
+
+@test
+fn test_the_crc_seed_of_a_stream_has_the_number_in_its_least_significant_octet()
+    test.assert_eq(bis_crc(0xABCD, 3), 0xABCD03)
+    test.assert_eq(bis_crc(0xABCD, 0), 0xABCD00)
+
+@test
+fn test_a_seed_access_address_meets_the_requirements_of_the_specification()
+    test.assert(saa_valid(0x78E52493, 31, false))
+    // SAA25 set, SAA23 clear, SAA22 equal to SAA15.
+    test.assert(not saa_valid(0x78E52493 | (1 << 25), 4, false))
+    test.assert(not saa_valid(0x78E52493 & (0xFFFFFFFF ^ (1 << 23)), 4, false))
+    test.assert(not saa_valid(0x78E52493 ^ (1 << 22), 4, false))
+    // The generator finds one for every size of group, and one 2 bits apart from another BIG's.
+    for n in 1..32
+        let saa = make_saa(0x12345 + n, n, false, -1)
+        test.assert(saa != 0)
+        test.assert(saa_valid(saa, n, false))
+    let first = make_saa(77, 2, false, -1)
+    let second = make_saa(77, 2, false, first)
+    test.assert(saa_apart(first, second))
+    let coded = make_saa(5, 2, true, -1)
+    test.assert(saa_valid(coded, 2, true))
+
+@test
+fn test_payloads_are_allotted_to_subevents_as_the_figures_of_the_specification_show()
+    // Figure 4.36: BN 2, IRC 2, PTO 0, NSE 4: P0 P1 P0 P1; the next event P2 P3 P2 P3.
+    var b = big_new()
+    t_set(var b, "bn", 2)
+    t_set(var b, "irc", 2)
+    t_set(var b, "pto", 0)
+    t_set(var b, "nse", 4)
+    test.assert_eq(payload_of(var b, 0, 1), 0)
+    test.assert_eq(payload_of(var b, 0, 2), 1)
+    test.assert_eq(payload_of(var b, 0, 3), 0)
+    test.assert_eq(payload_of(var b, 0, 4), 1)
+    test.assert_eq(payload_of(var b, 1, 1), 2)
+    test.assert_eq(payload_of(var b, 1, 4), 3)
+    test.assert_eq(pre_events(var b), 0)
+    // Figure 4.37: BN 1, IRC 3, PTO 2, NSE 5: p0 p0 p0 p2 p4.
+    var c = big_new()
+    t_set(var c, "bn", 1)
+    t_set(var c, "irc", 3)
+    t_set(var c, "pto", 2)
+    t_set(var c, "nse", 5)
+    test.assert_eq(payload_of(var c, 0, 1), 0)
+    test.assert_eq(payload_of(var c, 0, 3), 0)
+    test.assert_eq(payload_of(var c, 0, 4), 2)
+    test.assert_eq(payload_of(var c, 0, 5), 4)
+    test.assert_eq(pre_events(var c), 4)
+    // Figure 4.38: BN 2, IRC 2, PTO 4, NSE 6: p0 p1 p0 p1 p8 p9.
+    var d = big_new()
+    t_set(var d, "bn", 2)
+    t_set(var d, "irc", 2)
+    t_set(var d, "pto", 4)
+    t_set(var d, "nse", 6)
+    test.assert_eq(payload_of(var d, 0, 2), 1)
+    test.assert_eq(payload_of(var d, 0, 3), 0)
+    test.assert_eq(payload_of(var d, 0, 5), 8)
+    test.assert_eq(payload_of(var d, 0, 6), 9)
+    test.assert_eq(pre_events(var d), 4)
+
+@test
+fn test_subevents_run_in_time_order_sequential_and_interleaved()
+    // Two BISes of two subevents: sequential 1.1 1.2 2.1 2.2, interleaved 1.1 2.1 1.2 2.2 (bis * 64 + subevent).
+    var b = t_big()
+    test.assert_eq(program_len(var b), 4)
+    test.assert_eq(program_at(var b, 0), 1 * 64 + 1)
+    test.assert_eq(program_at(var b, 1), 1 * 64 + 2)
+    test.assert_eq(program_at(var b, 2), 2 * 64 + 1)
+    test.assert_eq(program_at(var b, 3), 2 * 64 + 2)
+    t_set(var b, "packed", 1)
+    t_set(var b, "bis_sp", 500)
+    t_set(var b, "sub_int", 1000)
+    test.assert_eq(program_at(var b, 0), 1 * 64 + 1)
+    test.assert_eq(program_at(var b, 1), 2 * 64 + 1)
+    test.assert_eq(program_at(var b, 2), 1 * 64 + 2)
+    test.assert_eq(program_at(var b, 3), 2 * 64 + 2)
+    // The offsets are (n - 1) x BIS_Spacing + (s - 1) x Sub_Interval, in order along the program.
+    test.assert_eq(sub_offset(var b, 1, 1), 0)
+    test.assert_eq(sub_offset(var b, 2, 1), 500)
+    test.assert_eq(sub_offset(var b, 1, 2), 1000)
+    test.assert_eq(sub_offset(var b, 2, 2), 1500)
+    test.assert_eq(control_offset(var b), 2000)
+
+@test
+fn test_the_arrangement_uses_the_least_spacing_the_specification_allows()
+    // 100 octets on LE 2M, unencrypted: 112 octets with the header are (112 + 9) x 4 = ... MPT is 2 + 100 octets of PDU.
+    var p = plan_new()
+    t_pset(var p, "phy", 2)
+    t_pset(var p, "nse", 2)
+    t_pset(var p, "bn", 1)
+    t_pset(var p, "irc", 2)
+    t_pset(var p, "iso", 8)
+    t_pset(var p, "pdu", 100)
+    let prof = t_prof()
+    test.assert_eq(arrange(var p, 2, false, false, 10000, false, prof), OK)
+    let mpt = mpt_us(2, 100, false)
+    test.assert_eq(mpt, (2 + 100 + 9) * 4)
+    // T_MSS 150 is the larger of the two spacings the fast radio needs (45 + 25 + 80 = 150).
+    test.assert_eq(p.sub_int, mpt + 150)
+    test.assert_eq(p.bis_sp, 2 * (mpt + 150))
+    test.assert_eq(p.sync, p.bis_sp + p.sub_int + mpt)
+    // Interleaved: BIS_Spacing is the least and Sub_Interval holds all the BISes.
+    test.assert_eq(arrange(var p, 2, true, false, 10000, false, prof), OK)
+    test.assert_eq(p.bis_sp, mpt + 150)
+    test.assert_eq(p.sub_int, 2 * (mpt + 150))
+    test.assert_eq(p.sync, p.bis_sp + p.sub_int + mpt)
+    // A radio that was not asked uses T_MSS alone; an encrypted BIG is four octets longer.
+    test.assert_eq(sub_gap_us(ll_radio.profile_assumed(), 2), 150)
+    test.assert_eq(mpt_us(2, 100, true), mpt + 16)
+
+@test
+fn test_the_transport_latency_is_the_sync_delay_the_pre_transmission_and_an_interval_less_an_sdu_interval()
+    var p = plan_new()
+    t_pset(var p, "phy", 2)
+    t_pset(var p, "nse", 2)
+    t_pset(var p, "bn", 1)
+    t_pset(var p, "irc", 2)
+    t_pset(var p, "iso", 8)
+    t_pset(var p, "pdu", 100)
+    test.assert_eq(arrange(var p, 1, false, false, 10000, false, t_prof()), OK)
+    test.assert_eq(p.latency, p.sync + 10000 - 10000)
+    // Framed adds the SDU interval where unframed takes it off; IRC under GC makes PTO x (GC - IRC) intervals early.
+    test.assert_eq(arrange(var p, 1, false, false, 10000, true, t_prof()), OK)
+    test.assert_eq(p.latency, p.sync + 10000 + 10000)
+    t_pset(var p, "nse", 4)
+    t_pset(var p, "irc", 2)
+    t_pset(var p, "pto", 1)
+    test.assert_eq(arrange(var p, 1, false, false, 10000, false, t_prof()), OK)
+    test.assert_eq(p.latency, p.sync + 2 * 10000 + 10000 - 10000)
+
+@test
+fn test_a_big_that_does_not_fit_its_interval_is_refused()
+    var p = plan_new()
+    t_pset(var p, "phy", 1)
+    t_pset(var p, "nse", 8)
+    t_pset(var p, "bn", 1)
+    t_pset(var p, "irc", 8)
+    t_pset(var p, "iso", 4)
+    t_pset(var p, "pdu", 251)
+    test.assert_eq(arrange(var p, 4, false, false, 5000, false, t_prof()), E_INVALID)
+
+@test
+fn test_create_big_derives_an_unframed_group_from_the_hosts_request()
+    // Two BISes, SDUs of 100 octets every 10 ms, 20 ms of latency, RTN 2, LE 2M preferred, sequential.
+    var p = plan_new()
+    let st = plan_big(var p, 2, 10000, 100, 20, 2, 3, 0, 0, false, true, t_prof())
+    test.assert_eq(st, OK)
+    test.assert_eq(p.phy, ll_phy.PHY_2M)
+    test.assert_eq(p.pdu, 100)
+    test.assert_eq(p.iso, 8)
+    test.assert_eq(p.bn, 1)
+    test.assert_eq(p.irc, 3)
+    test.assert_eq(p.nse, 3)
+    test.assert_eq(p.pto, 0)
+    test.assert(p.latency <= 20000)
+    // LE 1M alone is taken when LE 2M is not allowed; nothing allowed that the radio lacks is 0x11.
+    var q = plan_new()
+    test.assert_eq(plan_big(var q, 1, 10000, 100, 40, 0, 1, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(q.phy, ll_phy.PHY_1M)
+    test.assert_eq(plan_big(var q, 1, 10000, 100, 40, 0, 4, 0, 0, false, false, t_prof()), E_UNSUPPORTED)
+
+@test
+fn test_create_big_takes_a_long_sdu_in_several_payloads_and_sdu_intervals_of_other_lengths()
+    // 310-octet SDUs every 10 ms: two payloads of 251 and 59... PDUs of 251 octets, UPPS 2, BN 2.
+    var p = plan_new()
+    test.assert_eq(plan_big(var p, 1, 10000, 310, 40, 1, 2, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(p.pdu, 251)
+    test.assert_eq(p.bn, 2)
+    // 7.5 ms: the interval is 7.5 ms (6 units).
+    var q = plan_new()
+    test.assert_eq(plan_big(var q, 1, 7500, 100, 40, 1, 2, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(q.iso, 6)
+    // 2.5 ms SDUs: two in a 5 ms interval, BN 2.
+    var r = plan_new()
+    test.assert_eq(plan_big(var r, 1, 2500, 40, 40, 1, 2, 0, 0, false, true, t_prof()), OK)
+    test.assert_eq(r.iso, 4)
+    test.assert_eq(r.bn, 2)
+
+@test
+fn test_create_big_refuses_what_cannot_be_derived()
+    var p = plan_new()
+    let prof = t_prof()
+    test.assert_eq(plan_big(var p, 0, 10000, 100, 20, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 32, 10000, 100, 20, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 0, 20, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 100, 4, 2, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 100, 20, 31, 2, 0, 0, false, true, prof), E_INVALID)
+    test.assert_eq(plan_big(var p, 2, 10000, 100, 20, 2, 0, 0, 0, false, true, prof), E_INVALID)
+    // More than seven payloads in an interval.
+    test.assert_eq(plan_big(var p, 1, 10000, 2000, 40, 0, 2, 0, 0, false, true, prof), E_INVALID)
+    // A latency under what one event takes.
+    test.assert_eq(plan_big(var p, 8, 10000, 251, 5, 0, 2, 0, 0, false, true, prof), E_INVALID)
+
+@test
+fn test_create_big_test_checks_the_hosts_numbers()
+    var p = plan_new()
+    let prof = t_prof()
+    // Two BISes, ISO interval 8 units, NSE 4, 100-octet SDUs and PDUs, LE 2M, BN 1, IRC 2, PTO 2: GC is 4 so IRC < GC.
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 0, 1, 2, 0, false, true, prof), OK)
+    test.assert_eq(p.nse, 4)
+    test.assert_eq(p.irc, 2)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 0, 1, 2, 2, false, true, prof), OK)
+    test.assert_eq(p.pto, 2)
+    // NSE no multiple of BN, NSE under IRC x BN, framed PDUs in Unsegmented mode, several PHYs, a pre-transmission the ring cannot hold: 0x11.
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 3, 100, 100, 2, 0, 0, 2, 1, 0, false, true, prof),
+        E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 2, 100, 100, 2, 0, 0, 1, 3, 0, false, true, prof),
+        E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 2, 1, 2, 0, false, true, prof),
+        E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 3, 0, 0, 1, 2, 0, false, true, prof),
+        E_UNSUPPORTED)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 16, 100, 100, 2, 0, 0, 1, 1, 3, false, true, prof),
+        E_UNSUPPORTED)
+    // An ISO interval that is no multiple of the SDU interval, a BN that is not the SDUs of an interval: 0x12.
+    test.assert_eq(check_big_test(var p, 2, 10000, 6, 4, 100, 100, 2, 0, 0, 1, 2, 0, false, true, prof),
+        E_INVALID)
+    test.assert_eq(check_big_test(var p, 2, 10000, 8, 4, 100, 100, 2, 0, 0, 2, 2, 0, false, true, prof),
+        E_INVALID)
+
+@test
+fn test_create_big_derives_a_framed_group_whose_pdus_carry_the_segments_of_the_sdus_of_an_interval()
+    // SDUs of 40 octets every 10 ms in Segmentable mode: the interval is 10 ms, the octets of an interval 1.25 x 1.0001 x (5 + 40) = 57 (rounded up), PDUs of 59, BN 1.
+    var p = plan_new()
+    test.assert_eq(plan_big(var p, 1, 10000, 40, 40, 2, 2, 0, 1, false, true, t_prof()), OK)
+    test.assert_eq(p.iso, 8)
+    test.assert_eq(p.pdu, 59)
+    test.assert_eq(p.bn, 1)
+    test.assert_eq(p.irc, 3)
+    // The latency adds the interval and the SDU interval to BIG_Sync_Delay (the framing delay of Segmentable mode): 20 ms and a little more, so 20 ms is not enough.
+    test.assert(p.latency > 20000 and p.latency <= 40000)
+    test.assert_eq(p.latency, p.sync + 8 * 1250 + 10000)
+    var q = plan_new()
+    test.assert_eq(plan_big(var q, 1, 10000, 40, 20, 2, 2, 0, 1, false, true, t_prof()), E_INVALID)
+    // An SDU interval of 8 ms gets an interval of 8.75 ms: no multiple of the SDU interval is needed.
+    var r = plan_new()
+    test.assert_eq(plan_big(var r, 1, 8000, 40, 40, 1, 2, 0, 1, false, true, t_prof()), OK)
+    test.assert_eq(r.iso, 7)
+    // 310-octet SDUs every 20 ms: PDUs of 251, BN 2.
+    var u = plan_new()
+    test.assert_eq(plan_big(var u, 1, 20000, 310, 60, 1, 2, 0, 1, false, true, t_prof()), OK)
+    test.assert_eq(u.pdu, 251)
+    test.assert_eq(u.bn, 2)
+
+@test
+fn test_create_big_test_takes_framed_pdus_that_carry_the_sdus_of_an_interval()
+    var p = plan_new()
+    let prof = t_prof()
+    // 40-octet SDUs every 10 ms, ISO interval 8 units, NSE 3, PDUs of 59, BN 1, IRC 3.
+    test.assert_eq(check_big_test(var p, 1, 10000, 8, 3, 40, 59, 2, 0, 1, 1, 3, 0, false, true, prof), OK)
+    test.assert_eq(p.pdu, 59)
+    // The interval is no multiple of the SDU interval (8 ms in 7 units, 62 octets of segments an interval); PDUs too small for the segments of an interval (BN x (Max_PDU - 2) under 57 or 62): 0x12.
+    test.assert_eq(check_big_test(var p, 1, 8000, 7, 3, 40, 65, 2, 0, 1, 1, 3, 0, false, true, prof), OK)
+    test.assert_eq(check_big_test(var p, 1, 8000, 7, 3, 40, 59, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+    test.assert_eq(check_big_test(var p, 1, 10000, 8, 3, 40, 50, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+    test.assert_eq(check_big_test(var p, 1, 10000, 8, 3, 40, 5, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+    // An interval under the SDU interval is not carried either.
+    test.assert_eq(check_big_test(var p, 1, 20000, 8, 3, 40, 59, 2, 0, 1, 1, 3, 0, false, true, prof), E_INVALID)
+
+@test
+fn test_the_biginfo_round_trips_through_its_ad_structure()
+    var b = t_big()
+    t_set(var b, "chmap", 0x1FFFFFFFFE)
+    t_set(var b, "sdu_int", 10000)
+    t_set(var b, "sync_delay", 3000)
+    info_static(var b)
+    test.assert_eq(b.info_n, 35)
+    test.assert_eq(b.info[0] as Int, 34)
+    test.assert_eq(b.info[1] as Int, 0x2C)
+    info_at(var b, 12345, 4096)
+    var p = t_pdu(var b)
+    let at = acad_find(var p, 0, b.info_n)
+    test.assert_eq(at, 2 * 64 + 33)
+    let v = info_get(var p, 2, 33)
+    test.assert(v.ok)
+    test.assert(not v.enc)
+    // 12,345 microseconds in units of 30: 411 units, 12,330.
+    test.assert_eq(v.off_us, 411 * 30)
+    test.assert_eq(v.unit, 30)
+    test.assert_eq(v.iso, 8)
+    test.assert_eq(v.num_bis, 2)
+    test.assert_eq(v.nse, 2)
+    test.assert_eq(v.bn, 1)
+    test.assert_eq(v.sub_int, 1000)
+    test.assert_eq(v.pto, 0)
+    test.assert_eq(v.bis_sp, 2000)
+    test.assert_eq(v.irc, 2)
+    test.assert_eq(v.max_pdu, 100)
+    test.assert_eq(v.saa, 0x78E52493)
+    test.assert_eq(v.sdu_int, 10000)
+    test.assert_eq(v.max_sdu, 100)
+    test.assert_eq(v.crc, 0xABCD)
+    test.assert_eq(v.chmap, 0x1FFFFFFFFE)
+    test.assert_eq(v.phy, 2)
+    test.assert_eq(v.count, 4096)
+    test.assert(not v.framed)
+
+@test
+fn test_the_biginfo_of_an_encrypted_group_carries_the_giv_and_the_gskd()
+    var b = t_big()
+    t_set(var b, "enc", 1)
+    for k in 0..8
+        b.ek.iv[k] = (0x10 + k) as u8
+    for k in 0..16
+        b.gskd[k] = (0x40 + k) as u8
+    info_static(var b)
+    test.assert_eq(b.info_n, 59)
+    test.assert_eq(b.info[0] as Int, 58)
+    info_at(var b, 700, 0)
+    var p = t_pdu(var b)
+    let at = acad_find(var p, 0, b.info_n)
+    test.assert_eq(at, 2 * 64 + 57)
+    let v = info_get(var p, 2, 57)
+    test.assert(v.ok)
+    test.assert(v.enc)
+    test.assert_eq(p.b[2 + 33] as Int, 0x10)
+    test.assert_eq(p.b[2 + 40] as Int, 0x17)
+    test.assert_eq(p.b[2 + 41] as Int, 0x40)
+    test.assert_eq(p.b[2 + 56] as Int, 0x4F)
+    // A BIGInfo of any other length is none.
+    var q = t_pdu(var b)
+    test.assert(not info_get(var q, 2, 40).ok)
+
+@test
+fn test_the_offset_of_a_biginfo_is_in_units_of_300_microseconds_from_491460()
+    var b = t_big()
+    info_static(var b)
+    info_at(var b, 491459, 0)
+    var p = t_pdu(var b)
+    var v = info_get(var p, 2, 33)
+    test.assert_eq(v.unit, 30)
+    test.assert_eq(v.off_us, 491459 / 30 * 30)
+    info_at(var b, 491460, 0)
+    var q = t_pdu(var b)
+    v = info_get(var q, 2, 33)
+    test.assert_eq(v.unit, 300)
+    test.assert_eq(v.off_us, 491400)
+    // The anchor is never earlier than the offset and less than a unit later.
+    info_at(var b, 2000000, 0)
+    var r = t_pdu(var b)
+    v = info_get(var r, 2, 33)
+    test.assert(v.off_us <= 2000000)
+    test.assert(2000000 - v.off_us < v.unit)
+
+@test
+fn test_the_biginfo_names_the_next_anchor_point_and_its_payload_count()
+    // Events are 10 ms apart from 100,000; an AUX_SYNC_IND at 104,000 names the anchor at 110,000 (event 1 -> payload count BN x 1)
+    // and, when the event under way is 5, the one at 150,000 after 145,000.
+    var b = t_big()
+    t_set(var b, "bn", 2)
+    info_static(var b)
+    let a = info_for(var b, 104000, 12)
+    test.assert_eq(a, 110000)
+    var p = t_pdu(var b)
+    var v = info_get(var p, 2, 33)
+    test.assert_eq(v.count, 2)
+    test.assert(v.off_us <= 110000 - 104000 - 12)
+    test.assert(110000 - 104000 - 12 - v.off_us < 30)
+    // The lead keeps the offset over 600 microseconds: an AUX_SYNC_IND 300 microseconds before an anchor names the next.
+    let a2 = info_for(var b, 109700, 12)
+    test.assert_eq(a2, 120000)
+    t_set(var b, "anchor", 150000)
+    t_set(var b, "ev", 5)
+    let a3 = info_for(var b, 145000, 12)
+    test.assert_eq(a3, 150000)
+    var q = t_pdu(var b)
+    v = info_get(var q, 2, 33)
+    test.assert_eq(v.count, 10)
+
+@test
+fn test_the_acad_is_searched_for_the_biginfo()
+    var b = t_big()
+    info_static(var b)
+    var p = ll_pdu.pdu_new()
+    // Another AD structure first (length 3, type 0x2B, two octets), the BIGInfo behind it.
+    p.b[0] = 3
+    p.b[1] = 0x2B
+    p.b[2] = 1
+    p.b[3] = 2
+    for k in 0..b.info_n
+        p.b[4 + k] = b.info[k]
+    t_pdu_n(var p, 4 + b.info_n)
+    test.assert_eq(acad_find(var p, 0, p.n), (4 + 2) * 64 + 33)
+    // An ACAD of the other AD structure alone, and a truncated BIGInfo, hold none.
+    test.assert_eq(acad_find(var p, 0, 4), -1)
+    test.assert_eq(acad_find(var p, 0, 20), -1)
+
+@test
+fn test_the_control_pdu_of_a_termination_carries_the_reason_and_the_instant()
+    var b = t_big()
+    terminate_begin(var b, REASON_LOCAL_HOST, 7)
+    test.assert_eq(b.state, B_TERM)
+    test.assert_eq(b.term_instant, 13)
+    test.assert_eq(b.cssn, 1)
+    test.assert(ctrl_active(var b, 7))
+    test.assert(ctrl_active(var b, 12))
+    test.assert(not ctrl_active(var b, 6))
+    test.assert(not ctrl_active(var b, 13))
+    var p = ll_pdu.pdu_new()
+    ctrl_terminate(var b, var p)
+    test.assert_eq(p.n, 6)
+    test.assert_eq(p.b[0] as Int, 3 | (1 << 2))
+    test.assert_eq(p.b[1] as Int, 4)
+    test.assert_eq(p.b[2] as Int, CTRL_TERMINATE)
+    test.assert_eq(p.b[3] as Int, 0x16)
+    test.assert_eq(p.b[4] as Int, 13)
+    test.assert_eq(p.b[5] as Int, 0)
+    // The header of a data PDU of such an event has the transmission flag, and the sequence number in bits 2 to 4.
+    test.assert_eq(bis_header(1, 5, true), 1 | (5 << 2) | 0x20)
+    test.assert_eq(bis_header(0, 7, false), 0x1C)
+
+@test
+fn test_a_big_stream_is_configured_from_its_group_and_carries_sdus_in_unframed_payloads()
+    if not ctl_limits.iso_on()
+        return
+    var b = t_big()
+    t_set(var b, "bn", 1)
+    var x = ll_iso.cis_new()
+    bis_config(var x, var b, 2, 1)
+    test.assert_eq(x.handle, BIS_HANDLE_BASE + 1)
+    test.assert(x.central)
+    test.assert_eq(x.aa, bis_aa(0x78E52493, 2))
+    test.assert_eq(ll_iso.tx_bn(var x), 1)
+    test.assert_eq(ll_iso.tx_pdu(var x), 100)
+    test.assert_eq(ll_iso.tx_upps(var x), 1)
+    // An SDU of 40 octets becomes one payload of LLID 0, and the PDU built for it has the BIS header.
+    var d = t_sdu(7)
+    test.assert(ll_iso.sdu_put(var x, var d, 0, 40))
+    var p = ll_pdu.pdu_new()
+    tx_build(var x, 0, var p, 3, true)
+    test.assert_eq(p.n, 42)
+    test.assert_eq(p.b[0] as Int, 0 | (3 << 2) | 0x20)
+    test.assert_eq(p.b[1] as Int, 40)
+    test.assert_eq(p.b[2] as Int, 7)
+    test.assert_eq(p.b[41] as Int, 46)
+    // A number with no payload is an empty PDU of LLID 1.
+    tx_build(var x, 5, var p, 0, false)
+    test.assert_eq(p.n, 2)
+    test.assert_eq(p.b[0] as Int, 1)
+    test.assert_eq(p.b[1] as Int, 0)
+    // The payload is retired when its event is over; the credit of its HCI packet goes back.
+    tx_done(var x, 1)
+    test.assert_eq(x.tx_num, 1)
+
+// ── The Synchronized Receiver ───────────────────────────────────────
+
+// The BIGInfo a group of the examples makes with the numbers given (SDUs of 40 octets), read back.
+fn t_view_of(nse: Int, bn: Int, irc: Int, iso_int: Int, sub_int: Int) -> InfoView
+    var b = t_big()
+    t_set(var b, "max_sdu", 40)
+    t_set(var b, "nse", nse)
+    t_set(var b, "bn", bn)
+    t_set(var b, "irc", irc)
+    t_set(var b, "iso_int", iso_int)
+    t_set(var b, "sub_int", sub_int)
+    info_static(var b)
+    info_at(var b, 100000, 0)
+    var p = t_pdu(var b)
+    info_get(var p, 2, 33)
+
+fn t_view() -> InfoView
+    t_view_of(2, 1, 2, 8, 1000)
+
+@test
+fn test_a_biginfo_that_describes_a_group_the_receiver_cannot_follow_is_not_valid()
+    test.assert(info_valid(t_view()))
+    // NSE not a multiple of BN, IRC over NSE / BN, an interval under 5 ms, no sub-interval.
+    test.assert(not info_valid(t_view_of(3, 2, 1, 8, 1000)))
+    test.assert(not info_valid(t_view_of(2, 1, 3, 8, 1000)))
+    test.assert(not info_valid(t_view_of(2, 1, 2, 3, 1000)))
+    test.assert(not info_valid(t_view_of(2, 1, 2, 8, 0)))
+    // A BIGInfo of the wrong length is not read at all.
+    var b = t_big()
+    info_static(var b)
+    var p = t_pdu(var b)
+    test.assert(not info_valid(info_get(var p, 2, 32)))
+
+@test
+fn test_the_receiver_listens_to_the_bises_it_was_asked_for_and_to_the_subevents_of_the_event_itself()
+    var b = big_new()
+    t_set(var b, "nse", 6)
+    t_set(var b, "bn", 1)
+    t_set(var b, "irc", 2)
+    t_set(var b, "pto", 2)
+    t_set(var b, "bis_mask", 0x5)
+    test.assert(wants(var b, 1))
+    test.assert(not wants(var b, 2))
+    test.assert(wants(var b, 3))
+    test.assert(not wants(var b, 0))
+    test.assert(not wants(var b, 32))
+    test.assert_eq(bis_number(var b, 0), 1)
+    test.assert_eq(bis_number(var b, 1), 3)
+    test.assert_eq(bis_number(var b, 2), 0)
+    // IRC x BN subevents hold the payloads of the event; the pre-transmitted groups behind them are not listened to.
+    test.assert_eq(listen_nse(var b), 2)
+    test.assert(rx_listens(var b, 1, 2))
+    test.assert(not rx_listens(var b, 1, 3))
+    test.assert(not rx_listens(var b, 2, 1))
+    // MSE below that cuts it short, above it changes nothing.
+    t_set(var b, "mse", 1)
+    test.assert_eq(listen_nse(var b), 1)
+    t_set(var b, "mse", 5)
+    test.assert_eq(listen_nse(var b), 2)
+
+@test
+fn test_the_window_widening_grows_with_the_time_since_the_last_packet_and_stops_at_half_the_interval()
+    var b = big_new()
+    t_set(var b, "iso_int", 8)
+    t_set(var b, "ppm", 20)
+    t_set(var b, "last_rx", 1000)
+    // (20 + 50) ppm over 100 ms is 7 us, plus the jitter.
+    test.assert_eq(rx_widen(var b, 101000), 7 + ll_link.JITTER_US)
+    test.assert_eq(rx_widen(var b, 1000), ll_link.JITTER_US)
+    test.assert_eq(rx_widen(var b, 0), ll_link.JITTER_US)
+    // Never more than half the ISO interval less T_MSS.
+    t_set(var b, "ppm", 500)
+    test.assert_eq(rx_widen(var b, 1000 + 20000000), 5000 - T_MSS_US)
+
+@test
+fn test_an_instant_is_reached_by_the_counter_within_half_its_range_beyond_it()
+    test.assert(instant_reached(10, 10))
+    test.assert(instant_reached(11, 10))
+    test.assert(not instant_reached(9, 10))
+    test.assert(instant_reached(2, 0xFFFE))
+    test.assert(not instant_reached(0xFFFE, 2))
+
+@test
+fn test_a_group_taken_from_a_biginfo_has_the_numbers_the_broadcaster_planned()
+    let v = t_view()
+    test.assert(info_valid(v))
+    var r = big_new()
+    sync_fill(var r, v, 20)
+    let s = t_big()
+    test.assert_eq(r.nse, s.nse)
+    test.assert_eq(r.bn, s.bn)
+    test.assert_eq(r.irc, s.irc)
+    test.assert_eq(r.pto, s.pto)
+    test.assert_eq(r.iso_int, s.iso_int)
+    test.assert_eq(r.sub_int, s.sub_int)
+    test.assert_eq(r.bis_sp, s.bis_sp)
+    test.assert_eq(r.phy, s.phy)
+    test.assert_eq(r.max_pdu, s.max_pdu)
+    test.assert_eq(r.saa, s.saa)
+    test.assert_eq(r.crc, s.crc)
+    test.assert_eq(r.chmap, s.chmap)
+    test.assert_eq(r.n_used, 37)
+    test.assert_eq(r.ppm, 20)
+    test.assert(r.sync_delay > 0)
+    // The transport latency: the sync delay, one interval (no pre-transmission), less the SDU interval.
+    test.assert_eq(r.latency, r.sync_delay + iso_us(var r) - v.sdu_int)
+
+@test
+fn test_the_first_anchor_point_is_the_offset_on_and_then_whole_intervals_until_the_receiver_can_listen()
+    var r = big_new()
+    t_set(var r, "iso_int", 8)
+    t_set(var r, "bn", 1)
+    sync_anchor(var r, 200000, 4000, 30, 77, 100000, 3000)
+    test.assert_eq(r.anchor, 204000)
+    test.assert_eq(r.ev, 77)
+    test.assert_eq(r.win, 30)
+    test.assert_eq(r.last_rx, 200000)
+    // A PDU long past: whole ISO intervals (10 ms) on until the lead before `now` is met.
+    sync_anchor(var r, 200000, 4000, 30, 77, 230500, 3000)
+    test.assert_eq(r.anchor, 234000)
+    test.assert_eq(r.ev, 77 + 3)
+    test.assert_eq(r.first_us, r.anchor)
+
+@test
+fn test_the_key_material_of_an_encrypted_group_is_the_giv_and_the_gskd_of_its_biginfo()
+    var raw: Vec[u8; 64] = Vec.new()
+    for k in 0..57
+        let _x = raw.push((k + 1) as u8)
+    var r = big_new()
+    key_from_info(var r, var raw)
+    test.assert_eq(r.ek.iv[0] as Int, 34)
+    test.assert_eq(r.ek.iv[7] as Int, 41)
+    test.assert_eq(r.gskd[0] as Int, 42)
+    test.assert_eq(r.gskd[15] as Int, 57)
+
+@test
+fn test_a_receiver_takes_the_termination_and_the_channel_map_of_a_control_pdu_once()
+    var r = big_new()
+    t_set(var r, "last_cssn", -1)
+    var b = t_big()
+    terminate_begin(var b, REASON_LOCAL_HOST, 7)
+    var p = ll_pdu.pdu_new()
+    ctrl_terminate(var b, var p)
+    ctrl_rx(var r, var p)
+    test.assert(r.term_req)
+    test.assert_eq(r.term_reason, 0x16)
+    test.assert_eq(r.term_instant, 13)
+    test.assert_eq(r.last_cssn, 1)
+    // The same PDU in the next event changes nothing: the instant stays as it was.
+    ctrl_rx(var r, var p)
+    test.assert_eq(r.term_instant, 13)
+    // A channel map PDU: opcode 0, five octets of map, the instant.
+    var q = ll_pdu.pdu_new()
+    q.b[0] = (3 | (2 << 2)) as u8
+    q.b[1] = 8
+    q.b[2] = CTRL_CHANNEL_MAP as u8
+    for k in 0..5
+        q.b[3 + k] = 0xFF
+    q.b[7] = 0x1F
+    q.b[8] = 20
+    q.b[9] = 0
+    t_pdu_n(var q, 10)
+    ctrl_rx(var r, var q)
+    test.assert(r.cm_req)
+    test.assert_eq(r.cm_map, 0x1FFFFFFFFF)
+    test.assert_eq(r.cm_instant, 20)
+
+@test
+fn test_the_broadcaster_sends_a_new_channel_map_in_six_events_and_uses_it_from_the_instant()
+    var b = t_big()
+    t_set(var b, "state", B_UP)
+    info_static(var b)
+    let map = 0x1FFFFFFFFF ^ 0x1000FF
+    test.assert(chmap_due(var b, map))
+    test.assert(not chmap_due(var b, b.chmap))
+    chmap_begin(var b, map, 20)
+    test.assert_eq(b.cm_instant, 26)
+    test.assert_eq(b.cssn, 1)
+    // The PDU goes in the control subevent of the events 20 to 25, and the data PDUs of those events say so.
+    test.assert(not ctrl_active(var b, 19))
+    test.assert(ctrl_active(var b, 20))
+    test.assert(ctrl_active(var b, 25))
+    test.assert(not ctrl_active(var b, 26))
+    test.assert(not cstf_of(var b, 26))
+    // A second map waits for the instant.
+    test.assert(not chmap_due(var b, 0x1FFFFFFFFE))
+    // A receiver reads the map and the instant from the PDU.
+    var p = ll_pdu.pdu_new()
+    ctrl_chmap(var b, var p)
+    test.assert_eq(p.n, 10)
+    test.assert_eq(p.b[0] as Int, 3 | (1 << 2))
+    test.assert_eq(p.b[1] as Int, 8)
+    test.assert_eq(p.b[2] as Int, CTRL_CHANNEL_MAP)
+    var r = big_new()
+    ctrl_rx(var r, var p)
+    test.assert(r.cm_req)
+    test.assert_eq(r.cm_map, map)
+    test.assert_eq(r.cm_instant, 26)
+    // The instant: the group uses the map, names it in the BIGInfo and may begin another procedure.
+    chmap_apply(var b)
+    test.assert_eq(b.chmap, map)
+    test.assert_eq(b.n_used, ll_link.popcount(map))
+    test.assert(not b.cm_req)
+    var q = t_pdu(var b)
+    test.assert_eq(info_get(var q, 2, INFO_PLAIN).chmap, map)
+    test.assert(chmap_due(var b, 0x1FFFFFFFFE))

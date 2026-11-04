@@ -1,0 +1,176 @@
+// tests/ll_arb_tests.nv — the unit tests of src/ll_arb.nv.
+//
+//   novo test tests/ll_arb_tests.nv
+
+use std.test
+use ll_radio
+use ll_arb.{ CLASS_ACL, CLASS_ACL2, CLASS_ISO, NONE, ROOM_DUE_US, ROOM_FREE_US, arb_book, arb_booked, arb_cancel, arb_clear, arb_limit, arb_new, arb_next_start, arb_pick, arb_radio, arb_room, arb_worth_running, class_adv, class_scan, classes, lead_of }
+
+@test
+fn test_the_room_before_a_booking_stops_a_guard_short_of_its_start()
+    var a = arb_new()
+    test.assert_eq(arb_room(var a, 1000, 350), ROOM_FREE_US)
+    arb_book(var a, CLASS_ISO, 20000, 21000)
+    // The class is not due until its lead (600) before the start: the main loop has the time up to the guard.
+    test.assert_eq(arb_room(var a, 1000, 350), 18650)
+    test.assert_eq(arb_room(var a, 19000, 350), 650)
+    // Due: a few microseconds, however far the start still is.
+    test.assert_eq(arb_room(var a, 19500, 350), ROOM_DUE_US)
+    // Past its end the booking does not count.
+    test.assert_eq(arb_room(var a, 21000, 350), ROOM_FREE_US)
+
+@test
+fn test_the_room_is_the_least_of_the_bookings()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 30000, 31000)
+    arb_book(var a, class_scan(), 25000, 26000)
+    test.assert_eq(arb_room(var a, 10000, 350), 14650)
+    arb_book(var a, CLASS_ACL, 12000, 13000)
+    test.assert_eq(arb_room(var a, 10000, 350), 1650)
+
+@test
+fn test_a_stretch_is_clear_until_the_next_booking_of_a_higher_class()
+    var a = arb_new()
+    test.assert(arb_clear(var a, class_scan(), 1000, 9000))
+    arb_book(var a, CLASS_ACL, 20000, 21000)
+    test.assert(arb_clear(var a, class_scan(), 1000, 19000))
+    test.assert(not arb_clear(var a, class_scan(), 1000, 19401))
+    // A booking of a class below does not count, nor one that has ended.
+    arb_book(var a, class_scan(), 2000, 3000)
+    test.assert(arb_clear(var a, CLASS_ACL, 1000, 25000))
+    test.assert(arb_clear(var a, class_scan(), 22000, 30000))
+    // One under way does.
+    test.assert(not arb_clear(var a, class_scan(), 20500, 20600))
+
+@test
+fn test_capacities_match_the_constants()
+    let a = arb_new()
+    test.assert_eq(a.on.capacity(), classes())
+    test.assert_eq(a.start.capacity(), classes())
+    test.assert_eq(a.end.capacity(), classes())
+
+@test
+fn test_nothing_booked_picks_nothing()
+    var a = arb_new()
+    test.assert_eq(arb_pick(var a, 1000), NONE)
+    test.assert_eq(arb_next_start(var a), NONE)
+
+@test
+fn test_a_class_is_picked_inside_its_booking_and_its_lead()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 10000, 12000)
+    test.assert_eq(arb_pick(var a, 9000), NONE)
+    test.assert_eq(arb_pick(var a, 9400), class_adv())
+    test.assert_eq(arb_pick(var a, 11999), class_adv())
+    test.assert_eq(arb_pick(var a, 12000), NONE)
+    // A scan window opens at its start, with no lead.
+    arb_book(var a, class_scan(), 20000, 30000)
+    test.assert_eq(arb_pick(var a, 19999), NONE)
+    test.assert_eq(arb_pick(var a, 20000), class_scan())
+
+@test
+fn test_the_higher_priority_class_wins_when_both_are_due()
+    var a = arb_new()
+    arb_book(var a, class_scan(), 0, 100000)
+    arb_book(var a, class_adv(), 50000, 52000)
+    test.assert_eq(arb_pick(var a, 1000), class_scan())
+    test.assert_eq(arb_pick(var a, 49500), class_adv())
+    test.assert_eq(arb_pick(var a, 51000), class_adv())
+    test.assert_eq(arb_pick(var a, 53000), class_scan())
+    arb_book(var a, CLASS_ACL, 51000, 51500)
+    test.assert_eq(arb_pick(var a, 51200), CLASS_ACL)
+    arb_book(var a, CLASS_ISO, 51100, 51300)
+    test.assert_eq(arb_pick(var a, 51200), CLASS_ISO)
+
+@test
+fn test_a_scan_window_is_cut_short_by_the_next_advertising_event()
+    var a = arb_new()
+    arb_book(var a, class_scan(), 0, 100000)
+    arb_book(var a, class_adv(), 30000, 32000)
+    test.assert_eq(arb_limit(var a, class_scan(), 1000), 30000 - a.guard)
+    test.assert(arb_worth_running(var a, class_scan(), 1000))
+    // Too close to the event for the radio to be worth starting.
+    test.assert(not arb_worth_running(var a, class_scan(), 29000))
+    // After the event the window runs to its own end.
+    arb_book(var a, class_adv(), 500000, 502000)
+    test.assert_eq(arb_limit(var a, class_scan(), 40000), 100000)
+
+@test
+fn test_the_highest_class_is_never_limited()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 0, 5000)
+    arb_book(var a, class_scan(), 100, 9000)
+    test.assert_eq(arb_limit(var a, class_adv(), 0), 5000)
+
+@test
+fn test_cancel_removes_the_booking()
+    var a = arb_new()
+    arb_book(var a, class_adv(), 0, 5000)
+    test.assert(arb_booked(var a, class_adv()))
+    arb_cancel(var a, class_adv())
+    test.assert(not arb_booked(var a, class_adv()))
+    test.assert_eq(arb_pick(var a, 100), NONE)
+
+@test
+fn test_next_start_is_the_earliest_booking()
+    var a = arb_new()
+    arb_book(var a, class_scan(), 8000, 9000)
+    arb_book(var a, class_adv(), 5000, 6000)
+    test.assert_eq(arb_next_start(var a), 5000)
+    arb_cancel(var a, class_adv())
+    test.assert_eq(arb_next_start(var a), 8000)
+
+@test
+fn test_a_class_number_out_of_range_is_ignored()
+    var a = arb_new()
+    arb_book(var a, classes(), 0, 10)
+    arb_book(var a, -1, 0, 10)
+    test.assert_eq(arb_pick(var a, 5), NONE)
+    test.assert(not arb_booked(var a, classes()))
+
+@test
+fn test_a_connection_event_is_granted_the_radio_a_longer_lead_ahead()
+    var a = arb_new()
+    arb_book(var a, CLASS_ACL, 10000, 12000)
+    test.assert_eq(lead_of(var a, CLASS_ACL), 1000)
+    test.assert_eq(arb_pick(var a, 8999), NONE)
+    test.assert_eq(arb_pick(var a, 9000), CLASS_ACL)
+    // An advertising event that would run into it is cut short a guard before.
+    arb_book(var a, class_adv(), 0, 20000)
+    test.assert_eq(arb_limit(var a, class_adv(), 100), 10000 - a.guard)
+    test.assert_eq(lead_of(var a, class_adv()), 600)
+
+@test
+fn test_the_connection_event_due_first_has_the_radio()
+    var a = arb_new()
+    arb_book(var a, CLASS_ACL, 10000, 13000)
+    arb_book(var a, CLASS_ACL2, 11000, 14000)
+    // Both have begun at 11500; the first booking is the earlier.
+    test.assert_eq(arb_pick(var a, 11500), CLASS_ACL)
+    arb_book(var a, CLASS_ACL, 12000, 15000)
+    test.assert_eq(arb_pick(var a, 12500), CLASS_ACL2)
+    // The second link alone is granted at its lead.
+    arb_cancel(var a, CLASS_ACL)
+    test.assert_eq(lead_of(var a, CLASS_ACL2), 1000)
+    test.assert_eq(arb_pick(var a, 10000), CLASS_ACL2)
+    // The second booking has ended: the first is run, late as it is.
+    arb_book(var a, CLASS_ACL, 12000, 15000)
+    arb_book(var a, CLASS_ACL2, 9000, 12100)
+    test.assert_eq(arb_pick(var a, 12150), CLASS_ACL)
+
+@test
+fn test_the_lead_and_the_guards_follow_the_ramp_up_of_the_radio()
+    var a = arb_new()
+    test.assert_eq(a.lead, 600)
+    test.assert_eq(a.stream_guard, 350)
+    arb_radio(var a, ll_radio.profile_new(false, 300, 0))
+    test.assert_eq(lead_of(var a, CLASS_ISO), 755)
+    test.assert_eq(lead_of(var a, CLASS_ACL), 1155)
+    test.assert_eq(lead_of(var a, class_scan()), 0)
+    test.assert_eq(a.guard, 755)
+    test.assert_eq(a.stream_guard, 505)
+    arb_book(var a, CLASS_ISO, 20000, 21000)
+    test.assert_eq(arb_pick(var a, 19200), NONE)
+    test.assert_eq(arb_pick(var a, 19300), CLASS_ISO)
+    arb_book(var a, class_adv(), 0, 40000)
+    test.assert_eq(arb_limit(var a, class_adv(), 0), 19245)

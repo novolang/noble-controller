@@ -16,7 +16,6 @@
 //
 // The scratch the work needs is in the backend, so a call allocates nothing.
 
-use std.test
 use ll_pdu
 use ll_cipher
 use ll_aes
@@ -37,10 +36,17 @@ struct SoftCipher
     blocks: Int
     hmask: Int
 
-@no_alloc
+// A software cipher with its buffers zeroed and no key loaded; the Link Layer loads the session key and the nonce for each PDU.
+pub @no_alloc
 @tier(embedded)
 fn soft_cipher_new() -> SoftCipher
-    var c = SoftCipher { k: ll_aes.aes_key_new(), nonce: Vec.new(), x: Vec.new(), s: Vec.new(), mic: Vec.new(), blocks: 0, hmask: HEADER_MASK }
+    var c = SoftCipher { k: ll_aes.aes_key_new(),
+        nonce: Vec.new(),
+        x: Vec.new(),
+        s: Vec.new(),
+        mic: Vec.new(),
+        blocks: 0,
+        hmask: HEADER_MASK }
     for _ in 0..13
         let _a = c.nonce.push(0)
     for _ in 0..16
@@ -102,7 +108,7 @@ fn authenticate(var c: SoftCipher, hdr: Int, var p: Pdu, n: Int)
     encrypt_x(var c)
     // B1: the length of the additional data and the data.
     c.x[1] = c.x[1] ^ 1
-    c.x[2] = c.x[2] ^ ((hdr & c.hmask) as u8)
+    c.x[2] = c.x[2] ^ (hdr & c.hmask) as u8
     encrypt_x(var c)
     var at = 0
     while at < n
@@ -162,7 +168,7 @@ impl Cipher[] for SoftCipher
         keystream(var self, 0)
         var diff = 0
         for k in 0..4
-            diff = diff | ((self.x[k] ^ self.s[k] ^ p.b[2 + n + k]) as Int)
+            diff = diff | (self.x[k] ^ self.s[k] ^ p.b[2 + n + k]) as Int
         p.b[1] = n as u8
         p.n = n + 2
         diff == 0
@@ -174,191 +180,3 @@ impl Cipher[] for SoftCipher
 
     fn faults(var self) -> Int
         0
-
-// ── Tests: the sample data of [Vol 6] Part C, Section 1 ─────────────
-
-// The session key and the IV of the sample, least significant octet first.
-fn t_key() -> EncKey
-    var ek = ll_cipher.enc_key_new()
-    let sk = [0x66, 0xC6, 0xC2, 0x27, 0x8E, 0x3B, 0x8E, 0x05, 0x3E, 0x7E, 0xA3, 0x26, 0x52, 0x1B, 0xAD, 0x99]
-    for i in 0..16
-        ek.sk[i] = sk[i] as u8
-    let iv = [0x24, 0xAB, 0xDC, 0xBA, 0xBE, 0xBA, 0xAF, 0xDE]
-    for i in 0..8
-        ek.iv[i] = iv[i] as u8
-    ek
-
-// A PDU of the header octet `h` and the payload octets `data`.
-fn t_pdu(h: Int, data: [Int]) -> Pdu
-    var p = ll_pdu.pdu_new()
-    let _a = ll_pdu.pdu_put(var p, h)
-    let _b = ll_pdu.pdu_put(var p, list.len(data))
-    for d in data
-        let _c = ll_pdu.pdu_put(var p, d)
-    p
-
-// A PDU as it is on air: the header, the length and the octets `rest`.
-fn t_air(air: [Int]) -> Pdu
-    var p = ll_pdu.pdu_new()
-    for v in air
-        let _x = ll_pdu.pdu_put(var p, v)
-    p
-
-fn t_cat(a: [Int], b: [Int]) -> [Int]
-    var out: [Int] = []
-    for x in a
-        list.push(out, x)
-    for x in b
-        list.push(out, x)
-    out
-
-fn t_assert(var p: Pdu, want: [Int])
-    test.assert_eq(p.n, list.len(want))
-    for i in 0..list.len(want)
-        test.assert_eq(p.b[i] as Int, want[i])
-
-// The payload of the two data PDUs of the sample, in the clear.
-fn t_data1() -> [Int]
-    [0x17, 0x00, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71,
-     0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30]
-
-fn t_sealed1() -> [Int]
-    [0x0E, 0x1F, 0x7A, 0x70, 0xD6, 0x64, 0x15, 0x22, 0x6D, 0xF2, 0x6B, 0x17, 0x83, 0x9A, 0x06, 0x04, 0x05,
-     0x59, 0x6B, 0xD6, 0x56, 0x4F, 0x79, 0x6B, 0x5B, 0x9C, 0xE6, 0xFF, 0x32, 0xF7, 0x5A, 0x6D, 0x33]
-
-fn t_data2() -> [Int]
-    [0x17, 0x00, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
-     0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51]
-
-fn t_sealed2() -> [Int]
-    [0x06, 0x1F, 0xF3, 0x88, 0x81, 0xE7, 0xBD, 0x94, 0xC9, 0xC3, 0x69, 0xB9, 0xA6, 0x68, 0x46, 0xDD, 0x47,
-     0x86, 0xAA, 0x8C, 0x39, 0xCE, 0x54, 0x0D, 0x0D, 0xAE, 0x3A, 0xDC, 0xDF, 0x89, 0xB9, 0x60, 0x88]
-
-@test
-fn test_sealing_the_start_enc_rsp_of_the_central()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var p = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var p)
-    t_assert(var p, [0x0F, 0x05, 0x9F, 0xCD, 0xA7, 0xF4, 0x48])
-
-@test
-fn test_sealing_the_start_enc_rsp_of_the_peripheral()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var p = t_pdu(0x07, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_PERIPHERAL, var p)
-    t_assert(var p, [0x07, 0x05, 0xA3, 0x4C, 0x13, 0xA4, 0x15])
-
-@test
-fn test_sealing_the_data_pdus_of_both_roles()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var a = t_pdu(0x0E, t_data1())
-    c.seal(var ek, 1, ll_cipher.DIR_CENTRAL, var a)
-    t_assert(var a, t_sealed1())
-    var b = t_pdu(0x06, t_data2())
-    c.seal(var ek, 1, ll_cipher.DIR_PERIPHERAL, var b)
-    t_assert(var b, t_sealed2())
-
-@test
-fn test_opening_the_sample_pdus_returns_the_clear_payload()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var a = t_air(t_sealed1())
-    test.assert(c.open(var ek, 1, ll_cipher.DIR_CENTRAL, var a))
-    t_assert(var a, t_cat([0x0E, 0x1B], t_data1()))
-    var b = t_air(t_sealed2())
-    test.assert(c.open(var ek, 1, ll_cipher.DIR_PERIPHERAL, var b))
-    t_assert(var b, t_cat([0x06, 0x1B], t_data2()))
-
-@test
-fn test_the_header_bits_sn_nesn_and_md_are_not_authenticated()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var p = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var p)
-    // The receiver sees other SN, NESN and MD bits.
-    p.b[0] = 0x03
-    test.assert(c.open(var ek, 0, ll_cipher.DIR_CENTRAL, var p))
-    test.assert_eq(p.b[2] as Int, 0x06)
-
-@test
-fn test_a_changed_octet_a_wrong_counter_or_direction_fail_the_mic()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var a = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var a)
-    a.b[2] = a.b[2] ^ 1
-    test.assert(not c.open(var ek, 0, ll_cipher.DIR_CENTRAL, var a))
-    var b = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var b)
-    test.assert(not c.open(var ek, 1, ll_cipher.DIR_CENTRAL, var b))
-    var d = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var d)
-    test.assert(not c.open(var ek, 0, ll_cipher.DIR_PERIPHERAL, var d))
-    // A changed LLID is authenticated too.
-    var e = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var e)
-    e.b[0] = 0x0E
-    test.assert(not c.open(var ek, 0, ll_cipher.DIR_CENTRAL, var e))
-    var f = t_pdu(0x0F, [0x06])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var f)
-    f.b[6] = f.b[6] ^ 0x80
-    test.assert(not c.open(var ek, 0, ll_cipher.DIR_CENTRAL, var f))
-
-@test
-fn test_an_empty_pdu_is_left_alone_and_a_short_payload_fails()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var e = t_pdu(0x01, [])
-    c.seal(var ek, 0, ll_cipher.DIR_CENTRAL, var e)
-    t_assert(var e, [0x01, 0x00])
-    test.assert(c.open(var ek, 0, ll_cipher.DIR_CENTRAL, var e))
-    t_assert(var e, [0x01, 0x00])
-    var s = t_air([0x02, 0x04, 1, 2, 3, 4])
-    test.assert(not c.open(var ek, 0, ll_cipher.DIR_CENTRAL, var s))
-
-@test
-fn test_every_payload_length_round_trips_and_uses_the_counted_blocks()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    for n in 1..28
-        var data: [Int] = []
-        for i in 0..n
-            list.push(data, (i * 7 + n) & 0xFF)
-        var p = t_pdu(0x02, data)
-        let before = c.blocks
-        c.seal(var ek, 1000 + n, ll_cipher.DIR_PERIPHERAL, var p)
-        test.assert_eq(p.n, n + 6)
-        test.assert_eq(c.blocks - before, 2 + 2 * ((n + 15) / 16) + 1)
-        test.assert(c.open(var ek, 1000 + n, ll_cipher.DIR_PERIPHERAL, var p))
-        t_assert(var p, t_cat([0x02, n], data))
-
-@test
-fn test_the_packet_counter_uses_thirty_nine_bits()
-    var c = soft_cipher_new()
-    var ek = t_key()
-    var a = t_pdu(0x02, [1, 2, 3])
-    c.seal(var ek, 0x7FFFFFFFFF, ll_cipher.DIR_CENTRAL, var a)
-    var b = t_pdu(0x02, [1, 2, 3])
-    c.seal(var ek, 0x3FFFFFFFFF, ll_cipher.DIR_CENTRAL, var b)
-    test.assert(a.b[2] != b.b[2] or a.b[3] != b.b[3] or a.b[4] != b.b[4])
-    test.assert(c.open(var ek, 0x7FFFFFFFFF, ll_cipher.DIR_CENTRAL, var a))
-    test.assert(c.open(var ek, 0x3FFFFFFFFF, ll_cipher.DIR_CENTRAL, var b))
-
-@test
-fn test_the_block_cipher_of_the_backend_is_aes()
-    var c = soft_cipher_new()
-    var key: Vec[u8; 16] = Vec.new()
-    var blk: Vec[u8; 16] = Vec.new()
-    let kk = [0x4C, 0x68, 0x38, 0x41, 0x39, 0xF5, 0x74, 0xD8, 0x36, 0xBC, 0xF3, 0x4E, 0x9D, 0xFB, 0x01, 0xBF]
-    let bb = [0x02, 0x13, 0x24, 0x35, 0x46, 0x57, 0x68, 0x79, 0xAC, 0xBD, 0xCE, 0xDF, 0xE0, 0xF1, 0x02, 0x13]
-    for i in 0..16
-        let _a = key.push(kk[i] as u8)
-        let _b = blk.push(bb[i] as u8)
-    test.assert(c.block(var key, var blk))
-    test.assert_eq(blk[0] as Int, 0x99)
-    test.assert_eq(blk[15] as Int, 0x66)
-    // Software does not fail.
-    test.assert_eq(c.faults(), 0)

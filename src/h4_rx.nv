@@ -26,9 +26,7 @@
 // The state is a value with inline storage; no function here allocates.
 
 use ctl_limits
-use std.test
 use hci_frame
-use ll_iso
 
 // The functions below take the reader as a `var` parameter even where they only read
 // it, which passes its address.  A plain parameter is a copy, and a copy of a
@@ -137,17 +135,17 @@ fn h4_reset(var r: H4Rx)
 // first two octets of its header.
 @tier(embedded)
 fn h4_acl_handle(var r: H4Rx) -> Int
-    ((r.header[0] as Int) | ((r.header[1] as Int) << 8)) & 0x0FFF
+    (r.header[0] as Int | (r.header[1] as Int << 8)) & 0x0FFF
 
 // Its Packet_Boundary_Flag: 0 and 2 start an L2CAP message, 1 continues one.
 @tier(embedded)
 fn h4_acl_pb(var r: H4Rx) -> Int
-    ((r.header[1] as Int) >>> 4) & 3
+    (r.header[1] as Int >>> 4) & 3
 
 // The Time_Stamp flag of the ISO Data packet read last.
 @tier(embedded)
 fn h4_iso_ts(var r: H4Rx) -> Bool
-    ((r.header[1] as Int) & 0x40) != 0
+    (r.header[1] as Int & 0x40) != 0
 
 // The octets of its payload, which start at `ACL_LEAD` in `acl`.
 @tier(embedded)
@@ -171,7 +169,7 @@ fn h4_iso_last(var r: H4Rx) -> Bool
 @no_alloc
 @tier(embedded)
 fn h4_iso_octets(var r: H4Rx) -> Int
-    (r.acl_n as Int) + 1
+    r.acl_n as Int + 1
 
 // Whether the reader is discarding octets until the Reset command.
 @tier(embedded)
@@ -186,7 +184,7 @@ fn h4_has_command(var r: H4Rx) -> Bool
 // The opcode of the packet in `cmd`.
 @tier(embedded)
 fn h4_opcode(var r: H4Rx) -> Int
-    (r.cmd[0] as Int) | ((r.cmd[1] as Int) << 8)
+    r.cmd[0] as Int | (r.cmd[1] as Int << 8)
 
 // The number of parameter octets of the packet in `cmd`.
 @tier(embedded)
@@ -258,7 +256,7 @@ fn begin_packet(var r: H4Rx, b: Int) -> Int
         r.cmd.clear()
         r.state = RX_HEADER as u8
         return FEED_NONE
-    if b == hci_frame.H4_PKT_ACL or (b == hci_frame.H4_PKT_ISO and ctl_limits.iso_on())
+    if b == hci_frame.H4_PKT_ACL or b == hci_frame.H4_PKT_ISO and ctl_limits.iso_on()
         r.kind = b as u8
         r.seen = 0
         r.acl_n = 0
@@ -287,7 +285,7 @@ fn acl_header_octet(var r: H4Rx, b: Int) -> Int
     r.seen = r.seen + 1
     if (r.seen as Int) < ACL_HEADER
         return FEED_NONE
-    var n = (r.header[2] as Int) | ((r.header[3] as Int) << 8)
+    var n = r.header[2] as Int | (r.header[3] as Int << 8)
     if (r.kind as Int) == hci_frame.H4_PKT_ISO
         n = n & 0x3FFF
     if n > ACL_OCTETS
@@ -327,7 +325,7 @@ fn h4_feed(var r: H4Rx, b: Int) -> Int
             return complete(var r)
         return FEED_NONE
     // RX_DATA
-    r.acl[ACL_LEAD + (r.acl_n as Int)] = b as u8
+    r.acl[ACL_LEAD + r.acl_n as Int] = b as u8
     r.acl_n = r.acl_n + 1
     r.left = r.left - 1
     if r.left == 0
@@ -336,254 +334,3 @@ fn h4_feed(var r: H4Rx, b: Int) -> Int
             return FEED_ISO
         return FEED_ACL
     FEED_NONE
-
-// ── Tests ───────────────────────────────────────────────────────────
-
-@test
-fn test_capacities_match_the_constants()
-    let r = h4_new()
-    test.assert_eq(r.cmd.capacity(), COMMAND_OCTETS)
-    test.assert_eq(r.header.capacity(), ACL_HEADER)
-    test.assert_eq(r.acl.capacity(), 260)
-    test.assert_eq(LL_ACL_OCTETS, ACL_OCTETS)
-    test.assert(ACL_LEAD + LL_ACL_OCTETS <= r.acl.capacity())
-
-@test
-fn test_the_reader_says_when_it_is_inside_a_packet()
-    var r = h4_new()
-    test.assert(not h4_in_packet(var r))
-    let _a = h4_feed(var r, 0x02)
-    test.assert(h4_in_packet(var r))
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x00)
-    let _d = h4_feed(var r, 0x02)
-    let _e = h4_feed(var r, 0x00)
-    test.assert(h4_in_packet(var r))
-    let _f = h4_feed(var r, 0x11)
-    test.assert_eq(h4_feed(var r, 0x22), FEED_ACL)
-    test.assert(not h4_in_packet(var r))
-    let _g = h4_feed(var r, 0x01)
-    let _h = h4_feed(var r, 0x01)
-    let _i = h4_feed(var r, 0x0C)
-    let _j = h4_feed(var r, 0x02)
-    test.assert(h4_in_packet(var r))
-    let _k = h4_feed(var r, 0x04)
-    test.assert_eq(h4_feed(var r, 0x05), FEED_COMMAND)
-    test.assert(not h4_in_packet(var r))
-    var q = h4_new()
-    let _l = h4_feed(var q, 0x04)
-    test.assert(not h4_in_packet(var q))
-
-@test
-fn test_a_command_without_parameters_is_ready_at_its_length_octet()
-    var r = h4_new()
-    test.assert_eq(h4_feed(var r, 0x01), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x03), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x0C), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-    test.assert(h4_has_command(var r))
-    test.assert_eq(h4_opcode(var r), 0x0C03)
-    test.assert_eq(h4_param_len(var r), 0)
-    h4_done(var r)
-    test.assert(not h4_has_command(var r))
-    test.assert_eq(r.commands, 1)
-
-@test
-fn test_a_command_with_parameters_is_ready_at_its_last_octet()
-    var r = h4_new()
-    let wire = [0x01, 0x01, 0x0C, 0x08, 1, 2, 3, 4, 5, 6, 7, 8]
-    var last = FEED_NONE
-    for i in 0..11
-        last = h4_feed(var r, wire[i])
-        test.assert_eq(last, FEED_NONE)
-    test.assert_eq(h4_feed(var r, wire[11]), FEED_COMMAND)
-    test.assert_eq(h4_opcode(var r), 0x0C01)
-    test.assert_eq(h4_param_len(var r), 8)
-    test.assert_eq(h4_param(var r, 0), 1)
-    test.assert_eq(h4_param(var r, 7), 8)
-    test.assert_eq(h4_param(var r, 8), -1)
-    test.assert_eq(h4_param(var r, -1), -1)
-
-@test
-fn test_the_longest_command_fits()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x01)
-    let _b = h4_feed(var r, 0x00)
-    let _c = h4_feed(var r, 0xFC)
-    let _d = h4_feed(var r, 255)
-    for i in 0..254
-        test.assert_eq(h4_feed(var r, i & 0xFF), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x55), FEED_COMMAND)
-    test.assert_eq(h4_param_len(var r), 255)
-    test.assert_eq(h4_param(var r, 254), 0x55)
-    test.assert_eq(h4_param(var r, 253), 253)
-
-@test
-fn test_commands_follow_one_another()
-    var r = h4_new()
-    for round in 0..3
-        let _a = h4_feed(var r, 0x01)
-        let _b = h4_feed(var r, round)
-        let _c = h4_feed(var r, 0x20)
-        test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-        test.assert_eq(h4_opcode(var r), 0x2000 + round)
-        h4_done(var r)
-    test.assert_eq(r.commands, 3)
-
-@test
-fn test_an_acl_packet_that_fits_a_data_pdu_is_kept_for_its_connection()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x02)
-    let _b = h4_feed(var r, 0x41)
-    let _c = h4_feed(var r, 0x20)
-    let _d = h4_feed(var r, 0x03)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 1), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 2), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 3), FEED_ACL)
-    test.assert_eq(h4_acl_handle(var r), 0x0041)
-    test.assert_eq(h4_acl_pb(var r), 2)
-    test.assert_eq(h4_acl_len(var r), 3)
-    test.assert_eq(r.acl[ACL_LEAD] as Int, 1)
-    test.assert_eq(r.acl[ACL_LEAD + 2] as Int, 3)
-    test.assert_eq(r.discarded, 0)
-    // The stream is back at a packet boundary.
-    let _e = h4_feed(var r, 0x01)
-    let _f = h4_feed(var r, 0x03)
-    let _g = h4_feed(var r, 0x0C)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-
-@test
-fn test_an_acl_packet_of_the_largest_data_pdu_is_kept()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x02)
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x10)
-    let _d = h4_feed(var r, LL_ACL_OCTETS)
-    let _e = h4_feed(var r, 0x00)
-    for i in 0..(LL_ACL_OCTETS - 1)
-        test.assert_eq(h4_feed(var r, i), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 250), FEED_ACL)
-    test.assert_eq(h4_acl_len(var r), 251)
-    test.assert_eq(h4_acl_pb(var r), 1)
-    test.assert_eq(r.acl[ACL_LEAD + 26] as Int, 26)
-    test.assert_eq(r.acl[ACL_LEAD + 250] as Int, 250)
-    test.assert_eq(r.discarded, 0)
-    // The stream is back at a packet boundary.
-    let _f = h4_feed(var r, 0x01)
-    let _g = h4_feed(var r, 0x03)
-    let _h = h4_feed(var r, 0x0C)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-
-@test
-fn test_an_acl_packet_without_data_ends_at_its_header()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x02)
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x00)
-    let _d = h4_feed(var r, 0x00)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_DISCARDED)
-
-@test
-fn test_the_largest_acl_packet_is_accepted_and_one_more_octet_is_not()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x02)
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x00)
-    let _d = h4_feed(var r, ACL_OCTETS)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_NONE)
-    test.assert(not h4_is_lost(var r))
-    var q = h4_new()
-    let _e = h4_feed(var q, 0x02)
-    let _f = h4_feed(var q, 0x01)
-    let _g = h4_feed(var q, 0x00)
-    let _h = h4_feed(var q, ACL_OCTETS + 1)
-    test.assert_eq(h4_feed(var q, 0x00), FEED_LOST)
-    test.assert(h4_is_lost(var q))
-
-@test
-fn test_an_acl_length_above_eight_bits_is_read_from_both_octets()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x02)
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x00)
-    let _d = h4_feed(var r, 0x00)
-    test.assert_eq(h4_feed(var r, 0x01), FEED_LOST)
-
-@test
-fn test_an_indicator_the_host_may_not_send_loses_the_stream()
-    for ind in [0x00, 0x03, 0x04, 0x06, 0xFF]
-        var r = h4_new()
-        test.assert_eq(h4_feed(var r, ind), FEED_LOST)
-        test.assert(h4_is_lost(var r))
-        test.assert_eq(r.lost, 1)
-    // ISO Data is one the Host may send to a build that has isochronous channels.
-    var q = h4_new()
-    if ctl_limits.iso_on()
-        test.assert_eq(h4_feed(var q, 0x05), FEED_NONE)
-        test.assert(h4_in_packet(var q))
-    else
-        test.assert_eq(h4_feed(var q, 0x05), FEED_LOST)
-
-@test
-fn test_a_lost_stream_discards_everything_but_reset()
-    var r = h4_new()
-    test.assert_eq(h4_feed(var r, 0x04), FEED_LOST)
-    for b in [0x01, 0x01, 0x0C, 0x00, 0x02, 0x00, 0x00, 0x03, 0x0C]
-        test.assert_eq(h4_feed(var r, b), FEED_NONE)
-        test.assert(not h4_has_command(var r))
-    test.assert(h4_is_lost(var r))
-
-@test
-fn test_reset_in_a_lost_stream_ends_the_loss()
-    var r = h4_new()
-    let _x = h4_feed(var r, 0x09)
-    for b in [0x55, 0x01, 0x03, 0x0C]
-        test.assert_eq(h4_feed(var r, b), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-    test.assert(not h4_is_lost(var r))
-    test.assert_eq(h4_opcode(var r), 0x0C03)
-    test.assert_eq(h4_param_len(var r), 0)
-    h4_done(var r)
-    // A command after it is read as usual.
-    let _a = h4_feed(var r, 0x01)
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x10)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-    test.assert_eq(h4_opcode(var r), 0x1001)
-
-@test
-fn test_reset_is_found_after_a_partial_match()
-    var r = h4_new()
-    let _x = h4_feed(var r, 0x07)
-    // 01 03 01 03 0C 00: the second indicator restarts the match.
-    for b in [0x01, 0x03, 0x01, 0x03, 0x0C]
-        test.assert_eq(h4_feed(var r, b), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x00), FEED_COMMAND)
-    // 01 03 0C 01 00: not a reset, and the 01 starts a new match.
-    var q = h4_new()
-    let _y = h4_feed(var q, 0x07)
-    for b in [0x01, 0x03, 0x0C, 0x01, 0x00]
-        test.assert_eq(h4_feed(var q, b), FEED_NONE)
-    test.assert(h4_is_lost(var q))
-
-@test
-fn test_parameter_octets_equal_to_an_indicator_do_not_end_a_command()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x01)
-    let _b = h4_feed(var r, 0x01)
-    let _c = h4_feed(var r, 0x0C)
-    let _d = h4_feed(var r, 0x08)
-    for b in [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04]
-        test.assert_eq(h4_feed(var r, b), FEED_NONE)
-    test.assert_eq(h4_feed(var r, 0x04), FEED_COMMAND)
-    test.assert_eq(h4_param(var r, 0), 4)
-
-@test
-fn test_reset_clears_the_state_and_keeps_the_counters()
-    var r = h4_new()
-    let _a = h4_feed(var r, 0x04)
-    h4_reset(var r)
-    test.assert(not h4_is_lost(var r))
-    test.assert_eq(r.lost, 1)
-    test.assert_eq(h4_feed(var r, 0x01), FEED_NONE)

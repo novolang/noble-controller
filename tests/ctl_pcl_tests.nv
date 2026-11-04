@@ -9,16 +9,17 @@
 
 use ctl_limits
 use std.test
-use hci_frame
 use ctl_hci
-use ctl_pool
 use ll_pdu
 use ll_data
 use ll_link
 use ll_pcl
-use ll_ploss
 use ll_policy
-use h4_rx
+
+// The peer told its feature octet `i` is `v` (a test sets what LL_FEATURE_RSP would).
+fn t_peer_features(var l: ll_link.Link, i: Int, v: Int)
+    l.have_feat = true
+    l.peer_feat[i] = v as u8
 
 // ── The Host's side ─────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ fn drain(var c: ctl_hci.Controller) -> [Int]
     out
 
 fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
-    send(c, opcode, params)
+    send(var c, opcode, params)
     let _ran = ctl_hci.ctl_step(var c)
     drain(var c)
 
@@ -50,10 +51,7 @@ fn packets_of(bytes: [Int]) -> [[Int]]
             n = 3 + bytes[i + 2]
         else
             n = 5 + bytes[i + 3] + ((bytes[i + 4] & 0x3F) << 8)
-        var e: [Int] = []
-        for k in 0..n
-            list.push(e, bytes[i + k])
-        list.push(out, e)
+        list.push(out, bytes[i:i + n])
         i = i + n
     out
 
@@ -73,7 +71,7 @@ fn meta_events(bytes: [Int], sub: Int) -> [[Int]]
 
 // The Status of the Command Complete event of a command.
 fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let done = events_coded(r, 0x0E)
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
@@ -81,7 +79,7 @@ fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
 
 // The Status of the Command Status event of a command.
 fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let st = events_coded(r, 0x0F)
     test.assert_eq(list.len(st), 1)
     test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
@@ -89,7 +87,7 @@ fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
 
 // The Command Complete event of a command.
 fn complete_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
-    let r = run(c, opcode, params)
+    let r = run(var c, opcode, params)
     let done = events_coded(r, 0x0E)
     test.assert_eq(list.len(done), 1)
     done[0]
@@ -116,8 +114,8 @@ fn fresh() -> ctl_hci.Controller
     var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
     for i in 0..6
         ctl_hci.ctl_set_public(var c, i, 0x10 + i)
-    test.assert_eq(status_of(c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
-    test.assert_eq(status_of(c, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
+    test.assert_eq(status_of(var c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
     c
 
 fn connect_ind(interval: Int, timeout: Int) -> Pdu
@@ -140,13 +138,14 @@ fn connect_ind(interval: Int, timeout: Int) -> Pdu
 // A Controller with the Host support bit set and a Peripheral connection of 30 ms taken at 5000.
 fn connected() -> ctl_hci.Controller
     var c = fresh()
-    test.assert_eq(status_of(c, 0x2006, [0x20, 0, 0x20, 0, 0, 0, 0, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 7, 0]), 0)
-    test.assert_eq(status_of(c, 0x200A, [1]), 0)
+    test.assert_eq(status_of(var c, 0x2006, [0x20, 0, 0x20, 0, 0, 0, 0, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 7, 0]),
+        0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
     ctl_hci.ctl_set_time(var c, 1000)
     var pol = ll_policy.default_link_policy()
     var p = connect_ind(24, 100)
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
-    let _r = run(c, 0x1001, [])
+    let _r = run(var c, 0x1001, [])
     c
 
 fn on() -> Bool
@@ -230,7 +229,7 @@ fn test_a_build_without_power_control_answers_none_of_its_commands_and_the_pdus_
         return
     var c = connected()
     for op in [0x2076, 0x2077, 0x207A]
-        let r = run(c, op, [0, 0, 1, 0])
+        let r = run(var c, op, [0, 0, 1, 0])
         let done = events_coded(r, 0x0E)
         test.assert_eq(done[0][6], ctl_hci.STATUS_UNKNOWN_COMMAND)
     test.assert_eq(ctl_limits.features_octet4() & ll_link.FEAT4_PCL, 0)
@@ -284,7 +283,7 @@ fn test_read_remote_sends_a_request_and_reports_the_answer_with_reason_read()
     // A second request while the first waits is Command Disallowed.
     test.assert_eq(cmd_status(var c, 0x2077, [hh[0], hh[1], 1]), 0x0C)
     var a = rsp(0x01, 0, -10)
-    deliver(c, a)
+    deliver(var c, var a)
     let ev = reports(var c)
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][4], 0)
@@ -306,7 +305,7 @@ fn test_read_remote_refuses_what_it_cannot_send()
     test.assert_eq(cmd_status(var c, 0x2077, [hh[0], hh[1], 5]), 0x12)
     test.assert_eq(cmd_status(var c, 0x2077, [0x30, 0, 1]), 0x02)
     // A peer that said it lacks the feature is Unsupported Remote Feature.
-    ll_link.t_peer_features(var c.links[0], 4, 0)
+    t_peer_features(var c.links[0], 4, 0)
     test.assert_eq(cmd_status(var c, 0x2077, [hh[0], hh[1], 1]), 0x1A)
 
 @test
@@ -318,7 +317,7 @@ fn test_a_refusal_of_the_request_is_reported_with_its_status_and_a_silent_peer_t
     test.assert_eq(cmd_status(var c, 0x2077, [hh[0], hh[1], 1]), 0)
     var j = ll_pdu.pdu_new()
     ll_data.ctrl_reject_ext(var j, 0x23, 0x20)
-    deliver(c, j)
+    deliver(var c, var j)
     let e1 = reports(var c)
     test.assert_eq(list.len(e1), 1)
     test.assert_eq(e1[0][4], 0x20)
@@ -327,7 +326,7 @@ fn test_a_refusal_of_the_request_is_reported_with_its_status_and_a_silent_peer_t
     test.assert_eq(cmd_status(var c, 0x2077, [hh[0], hh[1], 1]), 0)
     var u = ll_pdu.pdu_new()
     ll_data.ctrl_unknown_rsp(var u, 0x23)
-    deliver(c, u)
+    deliver(var c, var u)
     let e2 = reports(var c)
     test.assert_eq(list.len(e2), 1)
     test.assert_eq(e2[0][4], 0x1A)
@@ -346,23 +345,23 @@ fn test_reporting_enable_validates_and_remote_reporting_asks_the_peer_once()
         return
     var c = connected()
     let hh = hd(var c)
-    test.assert_eq(status_of(c, 0x207A, [hh[0], hh[1], 2, 0]), 0x12)
-    test.assert_eq(status_of(c, 0x207A, [hh[0], hh[1], 0, 2]), 0x12)
-    test.assert_eq(status_of(c, 0x207A, [0x30, 0, 1, 1]), 0x02)
+    test.assert_eq(status_of(var c, 0x207A, [hh[0], hh[1], 2, 0]), 0x12)
+    test.assert_eq(status_of(var c, 0x207A, [hh[0], hh[1], 0, 2]), 0x12)
+    test.assert_eq(status_of(var c, 0x207A, [0x30, 0, 1, 1]), 0x02)
     let r = complete_of(var c, 0x207A, [hh[0], hh[1], 1, 1])
     test.assert_eq(r[6], 0)
     let _s = ctl_hci.ctl_step(var c)
     test.assert_eq(queued_op(var c), ll_data.OP_POWER_CONTROL_REQ)
     // The peer's answer is a remote report (reason 1) as the Host enabled them.
     var a = rsp(0x00, 0, 5)
-    deliver(c, a)
+    deliver(var c, var a)
     let ev = reports(var c)
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][7], 1)
     test.assert_eq(ev[0][9], 5)
     // A change indication is a remote report on each PHY the mask names.
     var i = ind(0x03, 0x02, 3, 8)
-    deliver(c, i)
+    deliver(var c, var i)
     let e2 = reports(var c)
     test.assert_eq(list.len(e2), 2)
     test.assert_eq(e2[0][8], 1)
@@ -370,9 +369,9 @@ fn test_reporting_enable_validates_and_remote_reporting_asks_the_peer_once()
     test.assert_eq(e2[0][10], 0x02)
     test.assert_eq(e2[0][11], 3)
     // With the reports off, an indication is kept and not reported.
-    test.assert_eq(status_of(c, 0x207A, [hh[0], hh[1], 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x207A, [hh[0], hh[1], 0, 0]), 0)
     var i2 = ind(0x01, 0x00, 0, 4)
-    deliver(c, i2)
+    deliver(var c, var i2)
     test.assert_eq(list.len(reports(var c)), 0)
 
 // ── The procedures ──────────────────────────────────────────────────
@@ -383,9 +382,9 @@ fn test_a_request_moves_the_level_and_the_answer_carries_the_change()
         return
     var c = connected()
     let hh = hd(var c)
-    test.assert_eq(status_of(c, 0x207A, [hh[0], hh[1], 1, 0]), 0)
+    test.assert_eq(status_of(var c, 0x207A, [hh[0], hh[1], 1, 0]), 0)
     var p = req(0x01, -4, 126 - 1)
-    deliver(c, p)
+    deliver(var c, var p)
     test.assert_eq(queued_op(var c), ll_data.OP_POWER_CONTROL_RSP)
     test.assert_eq(queued_byte(var c, 1), 0)
     test.assert_eq(queued_byte(var c, 2), 0xFC)
@@ -402,16 +401,16 @@ fn test_a_request_moves_the_level_and_the_answer_carries_the_change()
     // A step that does not move reports nothing, and the delta stops at the range of the radio.
     pop_queued(var c)
     var q = req(0x01, 0x7F, 0)
-    deliver(c, q)
+    deliver(var c, var q)
     test.assert_eq(queued_byte(var c, 1), 0x02)
     test.assert_eq(queued_byte(var c, 3), 8)
     pop_queued(var c)
     var z = req(0x01, 0, 0)
-    deliver(c, z)
+    deliver(var c, var z)
     test.assert_eq(list.len(reports(var c)), 1)
     pop_queued(var c)
     var lo = req(0x02, -100, 0)
-    deliver(c, lo)
+    deliver(var c, var lo)
     test.assert_eq(queued_byte(var c, 1), 0x01)
     test.assert_eq(queued_byte(var c, 3), 0xD2)
 
@@ -421,18 +420,18 @@ fn test_a_request_naming_no_phy_or_the_unmanaged_level_is_rejected()
         return
     var c = connected()
     var a = req(0x03, 0, 0)
-    deliver(c, a)
+    deliver(var c, var a)
     test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
     test.assert_eq(queued_byte(var c, 1), 0x23)
     test.assert_eq(queued_byte(var c, 2), 0x20)
     pop_queued(var c)
     var b = req(0x01, 0, ll_pcl.TX_UNMANAGED)
-    deliver(c, b)
+    deliver(var c, var b)
     test.assert_eq(queued_byte(var c, 2), 0x1E)
     pop_queued(var c)
     ctl_hci.ctl_set_coded(var c, false)
     var d = req(0x04, 0, 0)
-    deliver(c, d)
+    deliver(var c, var d)
     test.assert_eq(queued_byte(var c, 2), 0x20)
 
 @test
@@ -444,7 +443,7 @@ fn test_a_request_that_crosses_this_ends_own_changes_nothing()
     test.assert_eq(cmd_status(var c, 0x2077, [hh[0], hh[1], 1]), 0)
     pop_queued(var c)
     var p = req(0x01, -6, 0)
-    deliver(c, p)
+    deliver(var c, var p)
     test.assert_eq(queued_op(var c), ll_data.OP_POWER_CONTROL_RSP)
     test.assert_eq(queued_byte(var c, 2), 0)
     test.assert_eq(c.links[0].txp[0] as Int, 0)
@@ -455,9 +454,9 @@ fn test_a_new_connection_starts_at_the_default_level_with_nothing_enabled()
         return
     var c = connected()
     let hh = hd(var c)
-    test.assert_eq(status_of(c, 0x207A, [hh[0], hh[1], 1, 0]), 0)
+    test.assert_eq(status_of(var c, 0x207A, [hh[0], hh[1], 1, 0]), 0)
     var p = req(0x01, -4, 0)
-    deliver(c, p)
+    deliver(var c, var p)
     test.assert_eq(c.links[0].txp[0] as Int, -4)
     ctl_hci.apply_defaults(var c, 0)
     test.assert_eq(c.links[0].txp[0] as Int, 0)

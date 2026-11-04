@@ -1,0 +1,169 @@
+// tests/ll_ext_tests.nv — the unit tests of src/ll_ext.nv.
+//
+//   novo test tests/ll_ext_tests.nv
+
+use std.test
+use ll_pdu
+use ll_init
+use ll_ext.{ MODE_CONN, MODE_NONE, MODE_SCAN, TX_NONE, adi_did, adi_sid, event_type, ext_parse, legacy_event_type, legacy_view, periodic_interval, tx_power, xpri_new, xpri_set }
+
+// An extended PDU: the header with TxAdd `tx_add`, the AdvMode, the flags, and the fields in the order of the
+// flags (the caller lays out `fields` as the flags say), followed by `data_len` octets of data counting up from 1.
+@tier(app)
+fn t_ext(mode: Int, flags: Int, fields: [Int], data_len: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    t_fill(var p, mode, flags, fields, data_len)
+    p
+
+@tier(app)
+fn t_fill(var p: Pdu, mode: Int, flags: Int, fields: [Int], data_len: Int)
+    var hl = 1
+    if flags == 0
+        hl = 0
+    else
+        hl = 1 + list.len(fields)
+    p.b[0] = (ll_init.EXT_ADV | ll_pdu.TXADD) as u8
+    p.b[2] = (hl | (mode << 6)) as u8
+    var at = 3
+    if hl > 0
+        p.b[3] = flags as u8
+        at = 4
+    for k in 0..list.len(fields)
+        p.b[at + k] = fields[k] as u8
+    at = at + list.len(fields)
+    for k in 0..data_len
+        p.b[at + k] = (k + 1) as u8
+    p.n = at + data_len
+    p.b[1] = (p.n - 2) as u8
+
+@tier(app)
+fn t_adva() -> [Int]
+    [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6]
+
+@tier(app)
+fn t_grow(var p: Pdu)
+    p.n = p.n + 1
+
+@test
+fn test_a_connectable_pdu_with_adva_adi_aux_and_txpower_is_laid_out_in_flag_order()
+    var f: [Int] = t_adva()
+    // ADI: DID 0x123, SID 5; AuxPtr; TxPower -20.
+    for b in [0x23, 0x51, 12, 100, 0x00, 0xEC]
+        list.push(f, b)
+    var p = t_ext(MODE_CONN, 0x59, f, 3)
+    let x = ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.mode, MODE_CONN)
+    test.assert_eq(x.adva, 4)
+    test.assert_eq(x.targeta, -1)
+    test.assert_eq(x.adi, 10)
+    test.assert_eq(x.aux, 12)
+    test.assert_eq(x.txp, 15)
+    test.assert_eq(x.sync, -1)
+    test.assert_eq(x.data_at, 3 + 13)
+    test.assert_eq(x.data_len, 3)
+    test.assert_eq(adi_did(var p, x.adi), 0x123)
+    test.assert_eq(adi_sid(var p, x.adi), 5)
+    test.assert_eq(tx_power(var p, x), 0xEC)
+
+@test
+fn test_a_pdu_without_an_extended_header_has_all_its_payload_as_data()
+    var p = t_ext(MODE_NONE, 0, [], 4)
+    let x = ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.adva, -1)
+    test.assert_eq(x.data_at, 3)
+    test.assert_eq(x.data_len, 4)
+    test.assert_eq(tx_power(var p, x), TX_NONE)
+
+@test
+fn test_a_field_past_the_extended_header_or_a_reserved_mode_is_refused()
+    // The flags announce AdvA and the Extended Header holds only the flags and 4 octets.
+    var p = t_ext(MODE_NONE, 0x01, [1, 2, 3, 4], 0)
+    test.assert(not ext_parse(var p).ok)
+    var q = t_ext(3, 0x01, t_adva(), 0)
+    test.assert(not ext_parse(var q).ok)
+    // The length octet disagrees with the octets received.
+    var r = t_ext(MODE_NONE, 0x01, t_adva(), 0)
+    t_grow(var r)
+    test.assert(not ext_parse(var r).ok)
+    // Another PDU type.
+    var s = t_ext(MODE_NONE, 0x01, t_adva(), 0)
+    s.b[0] = ll_pdu.ADV_IND as u8
+    test.assert(not ext_parse(var s).ok)
+
+@test
+fn test_the_periodic_interval_is_the_interval_of_the_sync_info()
+    var f: [Int] = t_adva()
+    for k in 0..18
+        list.push(f, 0)
+    f[6 + 2] = 0x40
+    f[6 + 3] = 0x01
+    var p = t_ext(MODE_NONE, 0x21, f, 0)
+    let x = ext_parse(var p)
+    test.assert(x.ok)
+    test.assert_eq(x.sync, 10)
+    test.assert_eq(periodic_interval(var p, x), 0x140)
+
+@test
+fn test_the_legacy_view_decides_whether_a_request_may_follow()
+    var v = ll_pdu.pdu_new()
+    var pri = xpri_new()
+    var s = t_ext(MODE_SCAN, 0x09, [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0x10, 0x00], 2)
+    test.assert(legacy_view(var s, ext_parse(var s), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_SCAN_IND)
+    test.assert_eq(ll_pdu.pdu_tx_add(var v), 1)
+    test.assert_eq(v.n, 8)
+    test.assert_eq(v.b[2] as Int, 0xA1)
+    test.assert(ll_pdu.pdu_well_formed(var v, 8))
+    var c = t_ext(MODE_CONN, 0x09, [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0x10, 0x00], 0)
+    test.assert(legacy_view(var c, ext_parse(var c), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_NONCONN_IND)
+    // A directed PDU names its target.
+    var d = t_ext(MODE_CONN,
+        0x0B,
+        [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0x10, 0x00],
+        0)
+    test.assert(legacy_view(var d, ext_parse(var d), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_DIRECT_IND)
+    test.assert_eq(v.b[8] as Int, 0xB1)
+    test.assert(ll_pdu.pdu_well_formed(var v, 14))
+    // An anonymous advertisement has no view.
+    var a = t_ext(MODE_NONE, 0x08, [0x10, 0x00], 2)
+    test.assert(not legacy_view(var a, ext_parse(var a), var pri, var v))
+
+@test
+fn test_event_types_follow_the_report_of_the_core_specification()
+    test.assert_eq(event_type(MODE_CONN, false), 0x0001)
+    test.assert_eq(event_type(MODE_SCAN, false), 0x0002)
+    test.assert_eq(event_type(MODE_CONN, true), 0x0005)
+    test.assert_eq(event_type(MODE_NONE, false), 0)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_IND), 0x0013)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_DIRECT_IND), 0x0015)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_SCAN_IND), 0x0012)
+    test.assert_eq(legacy_event_type(ll_pdu.ADV_NONCONN_IND), 0x0010)
+    test.assert_eq(legacy_event_type(ll_pdu.SCAN_RSP), 0x0018)
+    test.assert_eq(legacy_event_type(ll_pdu.SCAN_REQ), -1)
+
+@test
+fn test_an_aux_adv_ind_without_an_adva_takes_the_address_the_adv_ext_ind_named()
+    var v = ll_pdu.pdu_new()
+    var pri = xpri_new()
+    // The ADV_EXT_IND of a non-connectable advertiser: AdvA 0xA1.., ADI, pointer; TxAdd set in its header.
+    var f: [Int] = t_adva()
+    for b in [0x23, 0x51, 12, 100, 0x00]
+        list.push(f, b)
+    var prim = t_ext(MODE_NONE, 0x19, f, 0)
+    xpri_set(var pri, var prim, ext_parse(var prim))
+    test.assert(pri.adva_ok)
+    test.assert(not pri.target_ok)
+    // The AUX_ADV_IND has an ADI and data only.
+    var aux = t_ext(MODE_NONE, 0x08, [0x23, 0x51], 4)
+    test.assert(legacy_view(var aux, ext_parse(var aux), var pri, var v))
+    test.assert_eq(ll_pdu.pdu_type(var v), ll_pdu.ADV_NONCONN_IND)
+    test.assert_eq(ll_pdu.pdu_tx_add(var v), 1)
+    test.assert_eq(v.b[2] as Int, 0xA1)
+    test.assert_eq(v.b[7] as Int, 0xA6)
+    // With nothing named on the primary channel it is anonymous.
+    var none = xpri_new()
+    test.assert(not legacy_view(var aux, ext_parse(var aux), var none, var v))
