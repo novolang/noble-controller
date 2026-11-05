@@ -46,6 +46,14 @@ fn t_interval(var t: PerAdv, v: Int)
 fn t_counter(var t: PerAdv, v: Int)
     t.counter = v
 
+// An address of six octets, `first` to `first + 5`.
+@tier(app)
+fn t_addr(first: Int) -> Vec[u8; 6]
+    var a: Vec[u8; 6] = Vec.new()
+    for i in 0..6
+        let _x = a.push((first + i) as u8)
+    a
+
 @tier(app)
 fn t_req(var q: PerReq, sid: Int, kind: Int, use_list: Bool, var a: Vec[u8; 6])
     q.pending = true
@@ -259,8 +267,8 @@ fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
 @test
 fn test_the_periodic_advertiser_list_adds_finds_and_removes()
     var l = pal_new()
-    var a = ll_pdu.test_addr(0x10)
-    var b = ll_pdu.test_addr(0x20)
+    var a = t_addr(0x10)
+    var b = t_addr(0x20)
     test.assert_eq(pal_add(var l, 1, var a, 3), OK)
     test.assert_eq(pal_add(var l, 1, var a, 3), E_INVALID)
     test.assert_eq(pal_add(var l, 1, var a, 4), OK)
@@ -283,8 +291,8 @@ fn test_the_periodic_advertiser_list_adds_finds_and_removes()
 @test
 fn test_a_request_accepts_the_train_it_names_or_the_list()
     var q = preq_new()
-    var a = ll_pdu.test_addr(0x30)
-    var other = ll_pdu.test_addr(0x40)
+    var a = t_addr(0x30)
+    var other = t_addr(0x40)
     var l = pal_new()
     test.assert(not preq_accepts(var q, var l, 1, var a, 2))
     t_req(var q, 2, 1, false, var a)
@@ -315,7 +323,7 @@ fn t_syncinfo_pdu(offset: Int, interval: Int) -> Pdu
 @tier(app)
 fn t_psync(var rx: Pdu, t_first: Int) -> PerSync
     var s = psync_new()
-    var a = ll_pdu.test_addr(0x50)
+    var a = t_addr(0x50)
     psync_begin(var s, 1, var rx, 0, 1, var a, 6, ll_phy.PHY_1M, t_first, 100, true)
     s
 
