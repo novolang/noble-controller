@@ -64,6 +64,15 @@ fn test_capacities_match_the_constants()
     test.assert_eq(c.links.capacity(), noble_controller_config.CTL_LINKS)
     test.assert_eq(c.links.len(), noble_controller_config.CTL_LINKS)
 
+// A slot the build does not have holds no connection: a build with one link asks for the access address of its second slot when it starts
+// an initiator, and the answer is 0, the address no connection has.
+@test
+fn test_a_slot_beyond_the_links_has_no_access_address()
+    var c = ctl_hci.controller_new(0)
+    test.assert_eq(ctl_hci.slot_aa(var c, noble_controller_config.CTL_LINKS), 0)
+    test.assert_eq(ctl_hci.slot_aa(var c, noble_controller_config.CTL_LINKS + 3), 0)
+    test.assert_eq(ctl_hci.slot_aa(var c, 0), 0)
+
 @test
 fn test_opcodes_match_the_hosts()
     test.assert_eq(ctl_hci.OP_RESET, hci_commands.opcode_hci_reset())

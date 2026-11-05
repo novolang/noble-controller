@@ -3451,10 +3451,11 @@ fn slot_class(slot: Int) -> Int
     ll_arb.CLASS_ACL + slot
 
 // The access address of the connection in `slot`, 0 for a link that is not on
-// (which no connection has).
+// (which no connection has) and for a slot the build does not have: a build with
+// `ctl_links = 1` asks for the second slot when it picks the address of a new connection.
 @tier(embedded)
 fn slot_aa(var c: Controller, slot: Int) -> Int
-    if not slot_live(var c, slot)
+    if slot >= noble_controller_config.CTL_LINKS or not slot_live(var c, slot)
         return 0
     c.links[slot].aa
 
