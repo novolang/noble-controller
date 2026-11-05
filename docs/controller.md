@@ -82,3 +82,9 @@ the whole Controller: `ctl_hci_tests` (the command layer), `ctl_ll_tests`,
 (the connection, the Central role, the control procedures, encryption),
 `ctl_iso_tests`, `ctl_pcl_tests`, `ctl_air_tests` (the radio program on a
 scripted `Radio` with no registers), and `ll_privacy_tests`.
+
+`novo pkg publish` runs every suite under the minimum configuration, the maximum configuration and each file of
+`configs/`.  A test whose subject a configuration leaves out does not exist there: it carries `@when` on the keys it
+needs, for example `@when(noble_controller_config.CTL_CENTRAL > 0)` above a test that opens a connection as Central, and the
+build under `ctl_central = 0` does not compile it.  A test that reads a limit computes the figure it expects from the
+configuration key (`ctl_limits.data_max()`, `noble_controller_config.CTL_ADV_SETS`) and not from the default.

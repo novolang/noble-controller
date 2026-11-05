@@ -161,8 +161,13 @@ fn test_the_controller_asks_for_the_subevents_it_has_buffers_for()
     test.assert_eq(pa_sub(var w), 1)
     test.assert_eq(pa_due(var w), -1)
     t_ask_owed(var w, false)
-    test.assert(pa_ask(var w))
-    test.assert_eq(w.ask_sub, (w.next_ask - w.ask_n) % 3)
+    // The request is made when at least half of the buffers are free, as above: with 4 buffers the two that are free are enough, with 8 the
+    // three that are free are not.
+    let free = pa_free(var w)
+    let asked = pa_ask(var w)
+    test.assert_eq(asked, free * 2 >= ctl_limits.pw_bufs() and free > 0)
+    if asked
+        test.assert_eq(w.ask_sub, (w.next_ask - w.ask_n) % 3)
 
 @test
 fn test_a_subevent_whose_time_passed_frees_its_buffer_and_goes_without_data()

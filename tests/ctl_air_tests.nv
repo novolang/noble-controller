@@ -1178,6 +1178,7 @@ fn test_an_advertising_event_starts_each_pdu_at_the_time_the_link_layer_planned(
     test.assert(air.holds >= 1)
     test.assert_eq(air.holds, air.releases)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_scan_request_is_answered_t_ifs_after_it_and_the_event_goes_on()
     var c = fresh()
@@ -1320,6 +1321,7 @@ fn connect_ind() -> Pdu
 
 // An advertiser that listens after a scannable PDU has its scan response armed; a CONNECT_IND is not answered with it, so the
 // response is taken back before the CONNECT_IND is read and judged.
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_the_scan_response_is_taken_back_before_a_connect_ind_is_read()
     var c = fresh()
@@ -1332,6 +1334,7 @@ fn test_the_scan_response_is_taken_back_before_a_connect_ind_is_read()
     test.assert_eq(rf.conn_open, 1)
     test.assert_eq(air.needless_reads, 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_peripheral_connection_runs_its_events_with_the_answer_t_ifs_after_each_packet()
     var c = fresh()
@@ -1437,6 +1440,7 @@ fn length_req(octets: Int, us: Int) -> Pdu
     ll_data.ctrl_length(var p, ll_data.OP_LENGTH_REQ, octets, us, octets, us)
     p
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_the_program_changes_the_phy_at_the_instant_and_keeps_t_ifs_on_the_new_phy()
     var c = fresh()
@@ -1472,12 +1476,14 @@ fn test_the_program_changes_the_phy_at_the_instant_and_keeps_t_ifs_on_the_new_ph
     // After the advertising access address is back, the radio is on LE 1M again.
     test.assert_eq(air.phy, 1)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_the_program_runs_events_on_the_coded_phy_with_the_leads_and_waits_of_its_packets()
     var c = peripheral_run([phy_update(4, 4, 10)], 800000)
     test.assert_eq(c.links[0].phy, 3)
     test.assert(c.links[0].dl_ev_tx_time >= 328)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_the_program_sends_and_receives_the_longest_pdus_after_the_length_procedure()
     var c = fresh()
@@ -1591,6 +1597,7 @@ fn central_run(var air: SimAir, pdus: [Pdu], until: Int) -> ctl_hci.Controller
 
 // The radio answers a Central's packet T_IFS after it by itself, so the header of the answer is set before the work that
 // is not needed for it (reading the clock for the anchor point) and the answer that is not wanted is taken back at once.
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_the_central_sets_the_header_of_its_answer_before_it_reads_the_clock_of_the_packet()
     var air = sim_new()
@@ -1600,12 +1607,14 @@ fn test_the_central_sets_the_header_of_its_answer_before_it_reads_the_clock_of_t
 // The radio sends the CONNECT_IND from the answer buffer in the order of the packet (header, InitA, AdvA) while the
 // Controller patches the advertiser's address and the own one into it: each octet is written once and behind the one
 // that goes on air before it, so the address that leaves first is final first.
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_the_connect_ind_is_patched_in_the_order_it_goes_on_air()
     var air = sim_new()
     let _c = central_run(var air, [], 300000)
     test.assert_eq(air.ans_disorder, 0)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_the_central_runs_its_events_and_changes_the_phy_with_the_peripheral_in_the_script()
     var air = sim_new()
@@ -1641,6 +1650,7 @@ fn test_the_central_runs_its_events_and_changes_the_phy_with_the_peripheral_in_t
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][7], 2)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_packet_with_a_crc_error_ends_the_peripherals_event_without_a_second_answer()
     var c = fresh()
@@ -1738,7 +1748,7 @@ fn test_three_peripheral_links_run_their_events_in_three_slots()
     test.assert_eq(c.links[1].handle, 2)
     test.assert_eq(c.links[2].handle, 3)
     test.assert_eq(ctl_hci.role_count(var c, false), 3)
-    test.assert_eq(ctl_hci.free_slots(var c), 0)
+    test.assert_eq(ctl_hci.free_slots(var c), noble_controller_config.CTL_LINKS - 3)
     // The Host's data for the handle 3.
     var host_acl_packet: [Int] = [0x02, 0x03, 0x00, 7, 0]
     for i in 0..7
@@ -2846,6 +2856,7 @@ fn test_the_receiver_test_versions_count_and_the_end_ends_the_test_once()
         let _t = ctl_hci.ctl_step(var c)
         test.assert_eq(drain(var c), [0x04, 0x0E, 0x06, 0x01, 0x1F, 0x20, 0x0C, 0, 0])
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_a_test_does_not_start_while_scanning_or_connected_and_starts_again_after_the_end()
     var c = fresh()
@@ -3847,6 +3858,7 @@ fn first_data_tx(var air: SimAir) -> Int
             return i
     -1
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_connects_to_a_legacy_advertiser_with_the_set_of_le_1m()
     var c = fresh()
@@ -3874,6 +3886,7 @@ fn test_extended_create_connection_connects_to_a_legacy_advertiser_with_the_set_
     test.assert_eq(air.tx_t[d], air.tx_t[k] + (36 + 8) * 8 + 1250)
     test.assert_eq(list.len(meta_events(air.host, 0x0A)), 1)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_follows_an_adv_ext_ind_and_connects_through_the_aux_packets()
     var c = fresh()
@@ -3920,6 +3933,7 @@ fn test_extended_create_connection_follows_an_adv_ext_ind_and_connects_through_t
     test.assert_eq(ev[0][9], 0x30)
     test.assert_eq(air.holds, air.releases)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_uses_the_set_and_the_phy_of_a_secondary_channel_on_le_2m()
     var c = fresh()
@@ -3945,6 +3959,7 @@ fn test_extended_create_connection_uses_the_set_and_the_phy_of_a_secondary_chann
     test.assert_eq(rf.cen_aborts, 0)
     test.assert_eq(rf.ramp_timeouts, 0)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_a_pointer_to_a_phy_the_command_left_out_is_not_followed()
     var c = fresh()
@@ -3959,6 +3974,7 @@ fn test_a_pointer_to_a_phy_the_command_left_out_is_not_followed()
     test.assert(c.init.enabled)
     test.assert(not c.links[0].live)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_an_aux_adv_ind_of_another_advertiser_or_a_scannable_one_is_not_answered()
     // An AUX_ADV_IND from a device the Host did not name: followed, judged, not answered.
@@ -4000,6 +4016,7 @@ fn test_an_aux_adv_ind_of_another_advertiser_or_a_scannable_one_is_not_answered(
     test.assert_eq(count_tx(var air4, 5), 0)
     test.assert(not f.links[0].live)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_an_aux_adv_ind_that_does_not_come_is_counted_and_the_initiator_goes_on()
     var c = fresh()
@@ -4019,6 +4036,7 @@ fn test_an_aux_adv_ind_that_does_not_come_is_counted_and_the_initiator_goes_on()
     run(var c, var rf, var air, 300000)
     test.assert(c.links[0].live)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_a_request_without_a_connect_rsp_makes_no_connection_and_the_parameters_of_le_1m_come_back()
     var c = fresh()
@@ -4043,6 +4061,7 @@ fn test_a_request_without_a_connect_rsp_makes_no_connection_and_the_parameters_o
     test.assert_eq(c.links[0].phy, 1)
     test.assert_eq(c.init.aux_connects, 0)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_a_connect_rsp_that_comes_later_than_t_ifs_is_taken()
     // The SoftDevice Controller answers 308 to 470 microseconds after the request. The request ends at
@@ -4073,6 +4092,7 @@ fn test_a_connect_rsp_that_comes_later_than_t_ifs_is_taken()
 
 // An initiator armed its CONNECT_IND for the packet it is receiving; an ADV_EXT_IND is not answered with it, so the CONNECT_IND is
 // taken back before the ADV_EXT_IND is read.
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_the_connect_ind_is_taken_back_before_an_adv_ext_ind_is_read()
     var c = fresh()
@@ -4084,6 +4104,7 @@ fn test_the_connect_ind_is_taken_back_before_an_adv_ext_ind_is_read()
     test.assert(rf.init_pkts >= 1)
     test.assert_eq(air.needless_reads, 0)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_an_adv_ext_ind_is_left_alone_by_an_initiator_of_le_create_connection()
     var c = fresh()
@@ -4100,6 +4121,7 @@ fn test_an_adv_ext_ind_is_left_alone_by_an_initiator_of_le_create_connection()
     test.assert_eq(count_tx(var air, 5), 0)
     test.assert(c.init.enabled)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_create_connection_cancel_ends_the_extended_state_too()
     var c = fresh()
@@ -4505,8 +4527,11 @@ fn test_the_supported_commands_name_the_extended_scan_commands_by_their_bits_in_
     // The event: indicator, code, length, credits, opcode (2), status, then the 64 octets.
     let base = 7
     test.assert_eq((r[base + 37] >>> 5) & 7, 7)
-    // Octet 38 bit 0 is LE Periodic Advertising Create Sync, which the Controller answers.
-    test.assert_eq(r[base + 38] & 1, 1)
+    // Octet 38 bit 0 is LE Periodic Advertising Create Sync, which a build with periodic advertising answers and one without leaves out.
+    var sync_bit = 0
+    if ctl_limits.per_on()
+        sync_bit = 1
+    test.assert_eq(r[base + 38] & 1, sync_bit)
 
 @test
 fn test_an_extended_scan_with_a_duration_ends_with_the_scan_timeout_event_and_one_with_a_period_goes_on()
@@ -4608,6 +4633,7 @@ fn tx_of(var air: SimAir, ty: Int) -> [Int]
             list.push(out, i)
     out
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_an_extended_event_sends_an_adv_ext_ind_on_each_channel_and_the_aux_adv_ind_where_they_point()
     var c = fresh()
@@ -4665,6 +4691,7 @@ fn test_an_extended_event_sends_an_adv_ext_ind_on_each_channel_and_the_aux_adv_i
     test.assert_eq(air.holds, air.releases)
     test.assert_eq(air.cfg_aa, ll_radio.ADV_ACCESS_ADDRESS)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_an_advertising_data_of_251_octets_goes_in_an_aux_adv_ind_and_a_chain_pdu_where_the_pointer_says()
     var c = fresh()
@@ -4700,6 +4727,7 @@ fn test_an_advertising_data_of_251_octets_goes_in_an_aux_adv_ind_and_a_chain_pdu
     test.assert_eq(aux.b[xa.data_at + 228] as Int, 228)
     test.assert_eq(rf.x_adv_chain, 1)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_scannable_set_answers_a_scan_request_with_the_scan_response_and_its_chain_and_tells_the_host()
     var c = fresh()
@@ -4744,6 +4772,7 @@ fn test_a_scannable_set_answers_a_scan_request_with_the_scan_response_and_its_ch
     test.assert_eq(ev[0][5], 0)
     test.assert_eq(ev[0][6], 0x40)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_connectable_set_answers_a_connection_request_and_the_connection_opens_with_the_extended_window()
     var c = fresh()
@@ -4787,6 +4816,7 @@ fn test_a_connectable_set_answers_a_connection_request_and_the_connection_opens_
     // The set is off: no PDU of it is sent after the connection began.
     test.assert(not c.xsets[0].on)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_set_ends_after_its_events_or_its_duration_with_advertising_set_terminated()
     var c = fresh()
@@ -4818,6 +4848,7 @@ fn test_a_set_ends_after_its_events_or_its_duration_with_advertising_set_termina
     let last = air2.tx_t[list.len(air2.tx_t) - 1]
     test.assert(last < 100000 + 1000)
 
+@when(noble_controller_config.CTL_ADV_SETS >= 2)
 @test
 fn test_two_sets_take_turns_and_each_event_is_whole()
     var c = fresh()
@@ -4849,6 +4880,7 @@ fn test_two_sets_take_turns_and_each_event_is_whole()
     test.assert(seen9 >= 1)
     test.assert_eq(rf.x_adv_err_max_us, 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_set_of_legacy_pdus_runs_on_the_legacy_advertiser_and_ends_with_a_set_event()
     var c = fresh()
@@ -4872,6 +4904,7 @@ fn test_a_set_of_legacy_pdus_runs_on_the_legacy_advertiser_and_ends_with_a_set_e
     test.assert_eq(air.tx_body[0][13], 0x41)
     test.assert_eq(rf.rsp_sent, 1)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_extended_advertising_commands_check_their_parameters_and_the_state()
     var c = fresh()
@@ -4880,11 +4913,11 @@ fn test_the_extended_advertising_commands_check_their_parameters_and_the_state()
     let _a = ctl_hci.ctl_step(var c)
     let r = drain(var c)
     test.assert_eq(r[6], 0)
-    test.assert_eq(r[7], 2)
+    test.assert_eq(r[7], noble_controller_config.CTL_ADV_SETS)
     send(var c, 0x203A, [])
     let _b = ctl_hci.ctl_step(var c)
     let m = drain(var c)
-    test.assert_eq(m[7] | (m[8] << 8), 251)
+    test.assert_eq(m[7] | (m[8] << 8), noble_controller_config.CTL_ADV_DATA)
     // Parameters: the Selected_Tx_Power comes back; a bad value is Invalid HCI Command Parameters, LE Coded Unsupported Feature.
     send(var c, 0x2036, xa_params(1, 0, 0x20, 7, 0, 1, 5, 0))
     let _c = ctl_hci.ctl_step(var c)
@@ -4900,9 +4933,10 @@ fn test_the_extended_advertising_commands_check_their_parameters_and_the_state()
     ctl_hci.ctl_set_coded(var c, true)
     test.assert_eq(status_of(var c, 0x2036, xa_params(0xF0, 0, 0x20, 7, 0, 1, 5, 0)), 0x12)
     test.assert_eq(status_of(var c, 0x2036, xa_params(1, 0, 0x20, 7, 0, 1, 5, 2)), 0x12)
-    // A third handle does not fit.
-    test.assert_eq(status_of(var c, 0x2036, xa_params(2, 0, 0x20, 7, 0, 1, 6, 0)), 0)
-    test.assert_eq(status_of(var c, 0x2036, xa_params(3, 0, 0x20, 7, 0, 1, 7, 0)), 0x07)
+    // Every set the build holds takes its handle (ctl_adv_sets, 2 by default); one more does not fit.
+    for h in 2..noble_controller_config.CTL_ADV_SETS + 1
+        test.assert_eq(status_of(var c, 0x2036, xa_params(h, 0, 0x20, 7, 0, 1, 6, 0)), 0)
+    test.assert_eq(status_of(var c, 0x2036, xa_params(noble_controller_config.CTL_ADV_SETS + 1, 0, 0x20, 7, 0, 1, 7, 0)), 0x07)
     // Data: an unknown handle, an Operation out of order, a length that does not fit the command.
     test.assert_eq(status_of(var c, 0x2037, xa_data(9, 3, [1])), 0x42)
     test.assert_eq(status_of(var c, 0x2037, xa_data(1, 2, [1])), 0x0C)
@@ -4951,6 +4985,7 @@ fn test_the_extended_advertising_commands_check_their_parameters_and_the_state()
     test.assert_eq(status_of(var d, 0x2036, xa_params(1, 0, 0x20, 7, 0, 1, 5, 0)), 0x0C)
     test.assert_eq(status_of(var d, 0x203D, []), 0x0C)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_supported_commands_name_the_extended_advertising_commands_by_their_bits_in_octets_36_and_37()
     var c = fresh()
@@ -4967,6 +5002,21 @@ fn test_the_supported_commands_name_the_extended_advertising_commands_by_their_b
     let _b = ctl_hci.ctl_step(var bare)
     let u = drain(var bare)
     test.assert_eq(u[6], 0x01)
+
+// A build without advertising sets leaves the extended advertising commands out: they are not in the Supported Commands and the Controller answers
+// them with Unknown HCI Command.
+@when(noble_controller_config.CTL_ADV_SETS == 0)
+@test
+fn test_a_build_without_advertising_sets_leaves_the_extended_advertising_commands_out()
+    var c = fresh()
+    send(var c, 0x1002, [])
+    let _ran = ctl_hci.ctl_step(var c)
+    let r = drain(var c)
+    let base = 7
+    test.assert_eq(r[base + 36] & 0xFE, 0)
+    test.assert_eq(r[base + 37] & 0x03, 0)
+    for op in [0x2036, 0x2037, 0x2038, 0x2039, 0x203A, 0x203B, 0x203C, 0x203D]
+        test.assert_eq(status_of(var c, op, []), 0x01)
 
 // ── LE Coded ────────────────────────────────────────────────────────
 //
@@ -5038,6 +5088,7 @@ fn test_a_scanner_of_le_1m_and_le_coded_takes_turns_in_each_interval()
     test.assert_eq(x_len(ev[1]), 2)
     test.assert(rf.rx_phy == 1 or rf.rx_phy == 3)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_radio_without_le_coded_refuses_it_in_every_command_that_names_it()
     var c = fresh()
@@ -5072,6 +5123,7 @@ fn test_a_radio_without_le_coded_refuses_it_in_every_command_that_names_it()
     test.assert_eq(g[8] & 0x08, 0x08)
     test.assert_eq(status_of(var d, 0x2031, [0, 4, 4]), 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_set_on_le_coded_sends_every_pdu_on_it_in_the_coding_asked_and_a_connection_on_it_starts_3_75_ms_later()
     var c = fresh()
@@ -5115,6 +5167,7 @@ fn test_a_set_on_le_coded_sends_every_pdu_on_it_in_the_coding_asked_and_a_connec
     test.assert(air.tx_t[d] < req_end + 3750 + 3000)
     test.assert_eq(rf.ramp_timeouts, 0)
 
+@when(noble_controller_config.CTL_ADV_SETS >= 2)
 @test
 fn test_the_parameters_of_a_set_on_le_coded_and_its_options_are_checked()
     var c = fresh()
@@ -5156,6 +5209,7 @@ fn ext_create_phys(phys: Int) -> [Int]
                 list.push(p, b)
     p
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_the_initiator_follows_a_connectable_adv_ext_ind_on_le_coded_and_connects_on_it()
     var c = fresh()
@@ -5184,6 +5238,7 @@ fn test_the_initiator_follows_a_connectable_adv_ext_ind_on_le_coded_and_connects
     let d = first_data_tx(var air)
     test.assert_eq(air.tx_t[d], air.tx_t[k] + ll_phy.air_us(3, true, 36) + 3750)
 
+@when(noble_controller_config.CTL_CENTRAL > 0)
 @test
 fn test_an_initiator_of_le_1m_and_le_coded_scans_on_both_and_connects_on_the_one_it_hears()
     var c = fresh()
@@ -5560,6 +5615,7 @@ fn pa_sent_with(var air: SimAir, aa: Int) -> [Int]
             list.push(out, i)
     out
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_train_is_announced_in_the_syncinfo_and_its_events_follow_the_interval_and_the_channels()
     var c = fresh()
@@ -5624,6 +5680,7 @@ fn test_a_train_is_announced_in_the_syncinfo_and_its_events_follow_the_interval_
     test.assert_eq(rf.x_adv_err_max_us, 0)
     test.assert_eq(air.holds, air.releases)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_train_goes_on_when_the_set_is_disabled_and_stops_when_it_is_disabled()
     var c = fresh()
@@ -5658,6 +5715,7 @@ fn test_the_train_goes_on_when_the_set_is_disabled_and_stops_when_it_is_disabled
     test.assert(aa2 != aa)
     test.assert(list.len(pa_sent_with(var air, aa2)) >= 3)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_train_of_251_octets_goes_in_an_aux_sync_ind_and_a_chain_pdu_where_the_pointer_says()
     var c = fresh()
@@ -5692,6 +5750,7 @@ fn test_a_train_of_251_octets_goes_in_an_aux_sync_ind_and_a_chain_pdu_where_the_
     // The next event is an interval later.
     test.assert_eq(air.tx_t[sy[2]] - air.tx_t[sy[0]], 80000)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_periodic_advertising_commands_check_their_parameters_and_the_state()
     var c = fresh()
@@ -5773,6 +5832,7 @@ fn test_the_periodic_advertising_commands_check_their_parameters_and_the_state()
     test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0x3F, 0, 0, 0, 0, 0]), 0)
     test.assert_eq(status_of(var c, 0x203F, pa_data(1, 3, [1])), 0x42)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_periodic_advertiser_list_and_the_requests_check_their_state()
     var c = fresh()
@@ -5888,6 +5948,7 @@ fn pa_aa() -> Int
 fn pa_reports(bytes: [Int]) -> [[Int]]
     meta_events(bytes, 0x0F)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_synchronization_follows_the_syncinfo_and_reports_each_event()
     var c = fresh()
@@ -5926,6 +5987,7 @@ fn test_a_synchronization_follows_the_syncinfo_and_reports_each_event()
     test.assert_eq(air.cfg_aa, ll_radio.ADV_ACCESS_ADDRESS)
     test.assert(not c.preq.pending)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_events_that_do_not_come_are_missed_until_the_sync_timeout_and_then_the_sync_is_lost()
     var c = fresh()
@@ -5954,6 +6016,7 @@ fn test_events_that_do_not_come_are_missed_until_the_sync_timeout_and_then_the_s
     // The handle is gone: Terminate Sync names none.
     test.assert_eq(status_of(var c2, 0x2046, [0, 0]), 0x42)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_syncinfo_whose_train_is_not_heard_in_six_events_fails_with_synchronization_timeout()
     var c = fresh()
@@ -5973,6 +6036,7 @@ fn test_a_syncinfo_whose_train_is_not_heard_in_six_events_fails_with_synchroniza
     // Another request is taken, and the slot is free.
     test.assert_eq(pa_create(var c, 0, 400), 0)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_chain_is_followed_and_reported_in_pieces_and_a_cut_chain_is_closed_as_truncated()
     var c = fresh()
@@ -6010,6 +6074,7 @@ fn test_a_chain_is_followed_and_reported_in_pieces_and_a_cut_chain_is_closed_as_
     test.assert_eq(rs[7][9], 0)
     test.assert_eq(rf.ramp_timeouts, 0)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_reports_off_and_on_terminate_and_a_second_request_for_the_same_train()
     var c = fresh()
@@ -6118,6 +6183,7 @@ fn aux_count(var air: SimAir) -> Int
 fn is_rpa_octets(a: [Int]) -> Bool
     list.len(a) == 7 and (a[5] & 0xC0) == 0x40 and a[6] == 1
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_set_with_own_address_type_2_waits_for_its_rpa_advertises_it_and_renews_it_at_the_timeout()
     var c = fresh()
@@ -6144,6 +6210,7 @@ fn test_a_set_with_own_address_type_2_waits_for_its_rpa_advertises_it_and_renews
     test.assert(last != first)
     test.assert_eq(rf.ramp_timeouts, 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_directed_set_names_its_peer_with_an_rpa_made_with_the_peers_irk()
     var c = fresh()
@@ -6166,6 +6233,7 @@ fn test_a_directed_set_names_its_peer_with_an_rpa_made_with_the_peers_irk()
     var cc = ll_ccm.soft_cipher_new()
     test.assert_eq(ll_privacy.rl_resolve(var c.rl, var cc, var tv), 0)
 
+@when(noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_own_address_type_2_with_no_entry_is_the_public_address_and_3_the_random_one()
     var c = fresh()
@@ -6247,6 +6315,7 @@ fn big_info_view(var air: SimAir, i: Int) -> ll_big.InfoView
 fn big_sent(var air: SimAir, saa: Int, n: Int) -> [Int]
     pa_sent_with(var air, ll_big.bis_aa(saa, n))
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_create_big_sends_the_subevents_of_the_bises_at_the_times_and_on_the_channels_of_the_biginfo()
     if not ctl_limits.big_on()
@@ -6425,36 +6494,42 @@ fn big_data(max_sdu: Int)
     test.assert_eq(rf.big_late, 0)
     test.assert_eq(rf.ramp_timeouts, 0)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_two_bis_big_at_10_ms_sends_sdus_of_120_octets_whole_on_both_bises()
     if not ctl_limits.big_on()
         return
     big_data(120)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_two_bis_big_at_10_ms_sends_sdus_of_100_octets_whole_on_both_bises()
     if not ctl_limits.big_on()
         return
     big_data(100)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_two_bis_big_with_a_100_ms_train_keeps_its_events_regular_at_7500_us_and_75_octets()
     if not ctl_limits.big_on()
         return
     big_regular(7500, 75, 8)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_two_bis_big_with_a_100_ms_train_keeps_its_events_regular_at_10000_us_and_100_octets()
     if not ctl_limits.big_on()
         return
     big_regular(10000, 100, 10)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_two_bis_big_with_a_100_ms_train_keeps_its_events_regular_at_7500_us_and_90_octets()
     if not ctl_limits.big_on()
         return
     big_regular(7500, 90, 8)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_two_bis_big_with_a_100_ms_train_keeps_its_events_regular_at_10000_us_and_120_octets()
     if not ctl_limits.big_on()
@@ -6509,6 +6584,7 @@ fn test_the_train_carries_the_biginfo_in_its_acad_and_the_offset_leads_to_an_anc
     // The train keeps its interval: the events are 40 ms apart, none lost to the group's events.
     test.assert_eq(c.pads[0].late, 0)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_an_sdu_from_the_host_is_sent_in_irc_subevents_of_the_event_it_belongs_to()
     if not ctl_limits.big_on()
@@ -6652,6 +6728,7 @@ fn test_an_encrypted_group_seals_its_payloads_with_the_key_the_biginfo_and_the_b
             test.assert_eq(air.tx_body[k][1], 0)
     test.assert_eq(opened, 6)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_terminating_a_big_sends_the_control_pdu_for_six_events_and_ends_it_at_the_instant()
     if not ctl_limits.big_on()
@@ -6706,6 +6783,7 @@ fn test_terminating_a_big_sends_the_control_pdu_for_six_events_and_ends_it_at_th
     test.assert_eq(later, 0)
     test.assert_eq(c.pads[0].big, -1)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_terminating_a_big_before_its_first_event_cancels_the_creation()
     if not ctl_limits.big_on()
@@ -6736,6 +6814,7 @@ fn host_map(map: Int) -> [Int]
 fn big_event_of(var air: SimAir, first_t: Int, i: Int) -> Int
     (air.tx_t[i] - first_t) / 10000
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_new_channel_classification_reaches_the_receivers_by_the_big_channel_map_update_procedure()
     if not ctl_limits.big_on()
@@ -6803,6 +6882,7 @@ fn test_a_new_channel_classification_reaches_the_receivers_by_the_big_channel_ma
     run(var c, var rf, var air, 1000000)
     test.assert_eq(list.len(pa_sent_with(var air, ll_big.bis_aa(v.saa, 0))), 6)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_second_classification_waits_for_the_instant_and_a_termination_follows_the_map_update()
     if not ctl_limits.big_on()
@@ -6856,8 +6936,12 @@ fn test_create_big_answers_the_errors_of_the_specification()
     test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 1, 10000, 40, 20, 0, 2, 0, 2)), 0x12)
     test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 1, 10000, 40, 20, 0, 0x0A, 0, 0)), 0x11)
     // More BISes than the Controller holds.
+    // (Num_BIS is 1 to 31: a build that holds 31 has no larger number to ask for, and 32 is Invalid HCI Command Parameters.)
+    var beyond = 0x0D
+    if ctl_limits.bis_slots() + 1 > 31
+        beyond = 0x12
     test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, ctl_limits.bis_slots() + 1, 10000, 40, 20, 0, 2, 0, 0)),
-        0x0D)
+        beyond)
     // Success; then the same BIG_Handle, and the same train for another BIG.
     test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 1, 10000, 40, 20, 0, 2, 0, 0)), 0)
     test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 1, 10000, 40, 20, 0, 2, 0, 0)), 0x0C)
@@ -6909,6 +6993,7 @@ fn test_a_periodic_advertising_data_too_long_for_the_biginfo_is_refused()
     // The data of a train that carries a BIG is held to the same limit.
     test.assert_eq(status_of(var c, 0x203F, pa_data(1, 3, count_from(1, 170))), 0x45)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_interleaved_bises_send_their_first_subevents_adjacent_and_the_second_ones_after()
     if not ctl_limits.big_on()
@@ -7067,12 +7152,17 @@ fn big_sync_params(sh: Int, code: Int, mse: Int, timeout: Int, bis: [Int]) -> [I
 fn big_out_path(var c: ctl_hci.Controller, h: Int) -> Int
     status_of(var c, 0x206E, [h & 0xFF, h >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
+// The event mask of a Host that reads the [v1] synchronization events: every event on but the [v2] Periodic Advertising Sync Established and
+// Report (events 0x24 and 0x25, bits 35 and 36), which a Controller that synchronizes to trains with responses sends in their place.
+fn v1_sync_mask() -> [Int]
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xE7, 0xFF, 0xFF, 0xFF]
+
 // The receiver's Controller: all events on, scanning, synchronized to the train, the BIGInfo reported, and the group asked for with LE BIG
 // Create Sync (`code` the first octet of the Broadcast_Code, 0 for an unencrypted BIG); run to `until`.
 fn big_sink(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAir, bis: [Int], code: Int,
             mse: Int, timeout: Int, until: Int)
     xscan_on(var c, 0, 0)
-    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
+    test.assert_eq(status_of(var c, 0x2001, v1_sync_mask()), 0)
     test.assert_eq(big_psync(var c, 400), 0)
     run(var c, var rf, var air, 150000)
     let est = meta_events(air.host, 0x0E)
@@ -7143,6 +7233,7 @@ fn big_pair(num: Int, packing: Int, enc: Int, until: Int, term_at: Int, drop_bis
     big_sink(var d, var rf2, var air2, bis, code, mse, timeout, until)
     rf2
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_synchronized_receiver_follows_a_broadcaster_and_hands_the_host_its_sdus()
     if not ctl_limits.big_on()
@@ -7216,6 +7307,7 @@ fn test_a_synchronized_receiver_follows_a_broadcaster_and_hands_the_host_its_sdu
     test.assert_eq(rf2.big_late, 0)
     test.assert(air2.holds - air2.releases <= 1 and air2.holds >= air2.releases)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_receiver_follows_the_broadcasters_channel_map_update_without_losing_an_sdu()
     if not ctl_limits.big_on()
@@ -7339,6 +7431,7 @@ fn test_a_receiver_of_a_framed_big_hands_the_host_every_sdu_and_a_lost_event_is_
     test.assert(valid >= 30)
     test.assert(lost >= 1 and lost <= 3)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_an_event_lost_on_air_is_one_lost_sdu_and_a_repeated_packet_is_none()
     if not ctl_limits.big_on()
@@ -7394,6 +7487,7 @@ fn test_an_event_lost_on_air_is_one_lost_sdu_and_a_repeated_packet_is_none()
     let a4 = big_got(var air4, 0x200)
     test.assert(big_count(a4, 2) >= 20)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_a_receiver_that_wants_one_bis_listens_to_that_bis_alone()
     if not ctl_limits.big_on()
@@ -7519,6 +7613,7 @@ fn test_a_receiver_that_hears_nothing_fails_after_six_events_and_one_that_stops_
     test.assert_eq(list.len(lost), 1)
     test.assert_eq(lost[0][5], 0x08)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_le_big_create_sync_and_terminate_sync_answer_the_errors_of_the_specification()
     if not ctl_limits.big_on()
@@ -7534,7 +7629,7 @@ fn test_le_big_create_sync_and_terminate_sync_answer_the_errors_of_the_specifica
     // No synchronization: Unknown Advertising Identifier.
     test.assert_eq(cmd_status(var d, 0x206B, big_sync_params(0, 0, 0, 0x64, [1])), 0x42)
     xscan_on(var d, 0, 0)
-    test.assert_eq(status_of(var d, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
+    test.assert_eq(status_of(var d, 0x2001, v1_sync_mask()), 0)
     test.assert_eq(big_psync(var d, 400), 0)
     run(var d, var rf2, var air2, 150000)
     let h = meta_events(air2.host, 0x0E)[0][5]
@@ -7549,7 +7644,11 @@ fn test_le_big_create_sync_and_terminate_sync_answer_the_errors_of_the_specifica
     var many: [Int] = []
     for k in 1..ctl_limits.bis_slots() + 2
         list.push(many, k)
-    test.assert_eq(cmd_status(var d, 0x206B, big_sync_params(h, 0, 0, 0x64, many)), 0x0D)
+    // (Num_BIS is 1 to 31: with 31 slots the list is 32 long and the command is Invalid HCI Command Parameters.)
+    var beyond = 0x0D
+    if ctl_limits.bis_slots() + 1 > 31
+        beyond = 0x12
+    test.assert_eq(cmd_status(var d, 0x206B, big_sync_params(h, 0, 0, 0x64, many)), beyond)
     // The right request; then a second while the first waits, and the same BIG_Handle.
     run(var d, var rf2, var air2, 250000)
     test.assert_eq(cmd_status(var d, 0x206B, big_sync_params(h, 0, 0, 0x64, [1])), 0)
@@ -7618,6 +7717,7 @@ fn handle_cmd(var c: ctl_hci.Controller, opcode: Int, h: Int) -> [Int]
     let _a = ctl_hci.ctl_step(var c)
     drain(var c)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_le_read_iso_tx_sync_of_a_bis_names_the_last_sdu_and_the_anchor_point_of_its_event()
     if not ctl_limits.big_on()
@@ -7687,6 +7787,7 @@ fn test_counters(var c: ctl_hci.Controller, opcode: Int, h: Int) -> [Int]
 fn pdu_counter(body: [Int]) -> Int
     body[2] | (body[3] << 8) | (body[4] << 16) | (body[5] << 24)
 
+@when(noble_controller_config.CTL_BIS >= 2)
 @test
 fn test_iso_transmit_test_of_a_bis_sends_counted_sdus_and_asks_the_host_for_nothing()
     if not ctl_limits.big_on()
@@ -7795,7 +7896,7 @@ fn test_iso_receive_test_of_a_bis_counts_received_missed_and_failed_sdus()
         first + 61 * 10000 - 50,
         -1)
     xscan_on(var d, 0, 0)
-    test.assert_eq(status_of(var d, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
+    test.assert_eq(status_of(var d, 0x2001, v1_sync_mask()), 0)
     test.assert_eq(big_psync(var d, 400), 0)
     run(var d, var rf2, var air2, 150000)
     let handle = meta_events(air2.host, 0x0E)[0][5] | (meta_events(air2.host, 0x0E)[0][6] << 8)
@@ -8295,7 +8396,10 @@ fn test_the_supported_commands_and_the_le_features_say_whether_the_build_has_the
     // LE features 24 and 25 are octet 3 bits 0 and 1; feature 13 (Periodic Advertising) is octet 1 bit 5.
     let f = complete_of_ctl(var c, 0x2003, [])
     test.assert_eq(f[7 + 3] & 3, 3 * on)
-    test.assert_eq((f[7 + 1] >>> 5) & 1, 1)
+    var periodic = 0
+    if ctl_limits.per_on()
+        periodic = 1
+    test.assert_eq((f[7 + 1] >>> 5) & 1, periodic)
     // The features the Controller sends its peer say the same.
     test.assert_eq(ctl_limits.features_octet3() & 3, 3 * on)
 
@@ -8366,6 +8470,7 @@ fn pw_sent(var air: SimAir, aa: Int, n: Int) -> [Int]
             list.push(out, i)
     out
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_a_build_without_the_advertiser_refuses_subevents_and_its_commands()
     if ctl_limits.pawr_adv_on()
@@ -8945,6 +9050,7 @@ fn test_a_peer_without_the_feature_is_not_asked()
     test.assert_eq(pcl_sent(var air, ll_data.OP_POWER_CONTROL_REQ), 0)
 
 // A build without the feature answers the peer's request with LL_UNKNOWN_RSP naming the opcode.
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_build_without_power_control_answers_the_request_with_unknown_response()
     if ctl_limits.pcl_on()
@@ -9039,6 +9145,7 @@ fn sub_tx(var air: SimAir) -> Int
     list.len(air.tx_t)
 
 // Without the feature the commands are unknown and LL_SUBRATE_IND is answered with LL_UNKNOWN_RSP.
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_build_without_subrating_answers_neither_command_nor_pdu()
     if ctl_limits.sub_on()
@@ -9302,6 +9409,7 @@ fn featext_read_all(var c: ctl_hci.Controller, pages: Int) -> Int
     cmd_status(var c, 0x2088, [h & 0xFF, h >>> 8, pages])
 
 // A build without the Feature Page Exchange: the commands are unknown and the PDUs are answered with LL_UNKNOWN_RSP.
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_build_without_feature_pages_answers_neither_command_nor_pdu()
     if ctl_limits.feat_on()
@@ -9666,6 +9774,7 @@ fn rate_cen_connect(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAi
     test.assert(c.links[0].central)
 
 // A build without Connection Rate: its four commands are unknown, its two PDUs are answered with LL_UNKNOWN_RSP, and LE feature 72 is clear.
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_build_without_connection_rate_answers_neither_commands_nor_pdus()
     if ctl_limits.rate_on()
@@ -10092,6 +10201,7 @@ fn fs_cen_connect(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAir)
     ll_link.fx_put(var c.links[0], ll_link.FX_HAVE, 1, 1)
 
 // A build without Frame Space Update: its command is unknown, its two PDUs are answered with LL_UNKNOWN_RSP, and bit 65 is clear.
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_build_without_frame_space_update_answers_neither_command_nor_pdus()
     if ctl_limits.fs_on()

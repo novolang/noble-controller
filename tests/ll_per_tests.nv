@@ -4,6 +4,7 @@
 
 use std.test
 use ctl_limits
+use noble_controller_config
 use ll_pdu
 use ll_phy
 use ll_init
@@ -92,12 +93,21 @@ fn test_the_parameters_are_checked_against_the_set_and_the_interval()
     test.assert_eq(padv_params_status(ll_xadv.P_LEGACY, 16, 40), E_INVALID)
     test.assert_eq(padv_params_status(ll_xadv.P_ANON, 16, 40), E_INVALID)
 
+// The status a fragment of `len` octets after `have` octets gets: the buffer holds `ctl_limits.data_max()` octets (251 by default,
+// so that 252 octets in one Complete fragment are too many; a build with 1650 holds them).
+fn t_room(have: Int, len: Int) -> Int
+    if have + len > ctl_limits.data_max()
+        E_MEMORY
+    else
+        OK
+
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_data_commands_follow_the_operations()
     var t = t_train(0, 0)
     t_dhave(var t, false)
     test.assert_eq(pdata_status(var t, OP_COMPLETE, 0), OK)
-    test.assert_eq(pdata_status(var t, OP_COMPLETE, 252), E_MEMORY)
+    test.assert_eq(pdata_status(var t, OP_COMPLETE, 252), t_room(0, 252))
     test.assert_eq(pdata_status(var t, OP_COMPLETE, 253), E_INVALID)
     test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 0), E_INVALID)
     test.assert_eq(pdata_status(var t, ll_xadv.OP_FIRST, 100), OK)
@@ -111,8 +121,8 @@ fn test_the_data_commands_follow_the_operations()
     pdata_end(var t, ll_xadv.OP_FIRST)
     test.assert(t.dasm)
     test.assert(not t.dhave)
-    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 152), E_MEMORY)
-    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 151), OK)
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 152), t_room(100, 152))
+    test.assert_eq(pdata_status(var t, ll_xadv.OP_LAST, 151), t_room(100, 151))
     pdata_begin(var t, ll_xadv.OP_LAST)
     for i in 0..50
         pdata_put(var t, i)
@@ -127,6 +137,7 @@ fn test_the_data_commands_follow_the_operations()
     test.assert_eq(pdata_status(var t, OP_UNCHANGED, 0), OK)
     test.assert_eq(pdata_status(var t, OP_UNCHANGED, 1), E_INVALID)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_interval_is_the_shortest_that_holds_an_event()
     var t = t_train(0, 20)
@@ -173,6 +184,7 @@ fn test_syncinfo_holds_the_fields_of_the_train()
         let _z = ll_pdu.pdu_put_data(var r, si[k] as Int)
     test.assert_eq(si_offset_us(var r, 0), 0)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_next_event_and_the_shift_put_the_offset_in_its_unit()
     var t = t_train(0, 10)
@@ -230,6 +242,7 @@ fn test_an_event_advances_the_due_time_and_the_counter()
     test.assert_eq(intervals_to(var t, 130001), 1)
     test.assert_eq(intervals_to(var t, 255001), 2)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
 @test
 fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
     var t = t_train(ll_xadv.P_TXP, 251)
@@ -264,6 +277,7 @@ fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
     test.assert_eq(r.n, sync_octets(var e, 0, false))
     test.assert_eq(ll_ext.ext_parse(var r).data_len, 0)
 
+@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 and noble_controller_config.CTL_PER_LIST >= 3)
 @test
 fn test_the_periodic_advertiser_list_adds_finds_and_removes()
     var l = pal_new()
@@ -280,7 +294,11 @@ fn test_the_periodic_advertiser_list_adds_finds_and_removes()
     // The type is the low bit: an identity address of the type 3 is a random one.
     test.assert(pal_find(var l, 3, var a, 3) >= 0)
     test.assert(pal_find(var l, 0, var a, 3) < 0)
-    test.assert_eq(pal_add(var l, 1, var b, 7), OK)
+    // Entries of other addresses fill the list up to its capacity (`ctl_per_list`, 4 by default); the next one is refused.
+    for k in 3..ctl_limits.pal_n()
+        var f = t_addr(0x30 + k)
+        test.assert_eq(pal_add(var l, 1, var f, 7), OK)
+    test.assert_eq(pal_count(var l), ctl_limits.pal_n())
     test.assert_eq(pal_add(var l, 1, var b, 8), E_MEMORY)
     test.assert_eq(pal_remove(var l, 1, var b, 8), E_UNKNOWN)
     test.assert_eq(pal_remove(var l, 1, var a, 3), OK)

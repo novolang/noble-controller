@@ -14,6 +14,7 @@
 
 use ctl_limits
 use std.test
+use noble_controller_config
 use ctl_hci
 use ctl_pool
 use ll_pdu
@@ -949,6 +950,7 @@ fn update_params_for(handle: Int, i_min: Int, i_max: Int, latency: Int, timeout:
 fn set_owed(var l: ll_link.Link, bits: Int)
     l.owed = l.owed | bits
 
+@when(noble_controller_config.CTL_LINKS >= 2)
 @test
 fn test_the_commands_of_the_procedures_reach_the_link_of_their_handle()
     // The Central is link 2 and a Peripheral link 1 beside it.

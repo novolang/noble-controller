@@ -10,6 +10,7 @@
 // microseconds, the PHY is LE 1M, and a PDU takes `airtime_us` microseconds.
 
 use std.test
+use noble_controller_config
 use ctl_hci
 use ctl_pool
 use ll_pdu
@@ -413,6 +414,7 @@ fn test_advertising_data_is_kept_with_its_length()
     // A parameter block of the wrong size is refused.
     test.assert_eq(status_of(var c, 0x2008, [1, 2, 3]), 0x12)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_advertising_enable_needs_an_address_of_the_own_type()
     var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
@@ -429,6 +431,7 @@ fn test_advertising_enable_needs_an_address_of_the_own_type()
     test.assert(c.adv.enabled)
     test.assert_eq(c.adv.addr_type as Int, 1)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_advertising_enable_value_is_checked_and_repeats_are_harmless()
     var c = fresh()
@@ -639,6 +642,7 @@ fn test_data_changed_while_advertising_goes_out_in_a_later_event()
     sim_run(var c, var air, 2000000)
     test.assert_eq(ll_pdu.pdu_len(var c.adv.pdu), 9)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_scan_request_is_answered_t_ifs_after_it_and_the_event_goes_on()
     var c = fresh()
@@ -676,6 +680,7 @@ fn test_a_request_for_a_non_scannable_advertiser_gets_no_response()
     test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)
     test.assert_eq(c.adv.scan_reqs, 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_request_for_another_address_gets_no_response()
     var c = fresh()
@@ -688,6 +693,7 @@ fn test_a_request_for_another_address_gets_no_response()
     sim_run(var c, var air, 200000)
     test.assert_eq(count_tx(var air, ll_pdu.SCAN_RSP), 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_the_filter_policy_gates_scan_requests_by_the_accept_list()
     var c = fresh()
@@ -706,6 +712,7 @@ fn test_the_filter_policy_gates_scan_requests_by_the_accept_list()
     sim_run(var c, var air, 600000)
     test.assert(count_tx(var air, ll_pdu.SCAN_RSP) > 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_connection_request_is_counted_and_advertising_goes_on()
     var c = fresh()
@@ -722,6 +729,7 @@ fn test_a_connection_request_is_counted_and_advertising_goes_on()
     // No event reports a connection.
     test.assert_eq(list.len(events_of(heard(var c, var air))), 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_high_duty_directed_advertising_times_out_and_tells_the_host()
     var c = fresh()
@@ -750,6 +758,7 @@ fn test_high_duty_directed_advertising_times_out_and_tells_the_host()
     test.assert_eq(evs[0][3], 0x01)
     test.assert_eq(evs[0][4], 0x3C)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_low_duty_directed_advertising_names_the_target_and_has_no_timeout()
     var c = fresh()
@@ -1024,6 +1033,7 @@ fn test_a_scan_window_too_short_to_use_before_an_event_is_skipped()
     for i in 1..list.len(air.tx_t)
         test.assert(air.tx_t[i] > air.tx_t[i - 1])
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_the_filter_accept_list_cannot_change_while_advertising_uses_it()
     var c = fresh()
@@ -1041,6 +1051,7 @@ fn test_the_filter_accept_list_cannot_change_while_advertising_uses_it()
     test.assert_eq(status_of(var c, 0x2012, [0, 1, 2, 3, 4, 5, 6]), 0)
     test.assert_eq(status_of(var c, 0x2010, []), 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_directed_advertising_ignores_the_policy_so_the_list_stays_free()
     var c = fresh()
@@ -1059,6 +1070,7 @@ fn test_the_filter_accept_list_cannot_change_while_scanning_uses_it()
     test.assert_eq(status_of(var c, 0x200C, [0, 0]), 0)
     test.assert_eq(status_of(var c, 0x2010, []), 0)
 
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
 fn test_a_scan_request_the_policy_refused_is_counted_with_its_sender()
     var c = fresh()

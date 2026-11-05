@@ -303,7 +303,11 @@ fn test_a_build_without_isochronous_channels_answers_none_of_the_commands()
     test.assert(h4_rx.h4_is_lost(var c.rx))
     let g = run(var c, 0x0C03, [])
     let f = run(var c, 0x2003, [])
-    test.assert_eq(f[7 + 3], 0)
+    // Octet 3 holds the sync transfer bits 24 and 25 (0x03) of a build with Periodic Advertising Sync Transfer, and nothing of the streams.
+    var past3 = 0
+    if ctl_limits.past_on()
+        past3 = 0x03
+    test.assert_eq(f[7 + 3], past3)
 
 @test
 fn test_the_features_the_buffers_and_the_commands_of_the_streams_are_reported()
@@ -317,6 +321,9 @@ fn test_the_features_the_buffers_and_the_commands_of_the_streams_are_reported()
     var want3 = 0x34
     if ctl_limits.big_on()
         want3 = 0xF4
+    // Periodic Advertising Sync Transfer - Sender and - Recipient, bits 24 and 25, are in octet 3 as well (ctl_limits.past_on()).
+    if ctl_limits.past_on()
+        want3 = want3 | 0x03
     test.assert_eq(f[7 + 3], want3)
     // With LE Power Control (ctl_limits.pcl_on()) the Power Control Request and Power Change Indication bits, 33 and 34, are set as well.
     var base4 = 0
@@ -369,6 +376,8 @@ fn test_the_host_support_bit_cannot_be_set_while_a_connection_is_on_and_goes_to_
     var want3 = 0x34
     if ctl_limits.big_on()
         want3 = 0xF4
+    if ctl_limits.past_on()
+        want3 = want3 | 0x03
     test.assert_eq(ll_data.dpdu_byte(var c.links[0].nxt, 4), want3)
     var want4 = 0x01
     if ctl_limits.pcl_on()
@@ -1432,6 +1441,8 @@ fn test_slots_and_literals_match_the_profile()
         feat = 0x34
     if noble_controller_config.CTL_BIGS > 0
         feat = 0xF4
+    if ctl_limits.past_on()
+        feat = feat | 0x03
     test.assert_eq(ctl_limits.features_octet3(), feat)
     test.assert_eq(ctl_limits.big_slots(), max_one(noble_controller_config.CTL_BIGS))
     test.assert_eq(ctl_limits.bis_slots(), max_one(noble_controller_config.CTL_BIS))
@@ -1612,7 +1623,19 @@ fn test_a_request_for_a_stream_the_central_gave_up_replaces_the_earlier_attempt(
     test.assert_eq(c.cis_log.rejected, 0)
     test.assert_eq(c.cis[0].state, ll_iso.S_CLOSING)
     test.assert_eq(c.cis[1].state, ll_iso.S_REQUESTED)
-    // A third request finds the second still waiting for the Host, and the first slot not yet free: no duplicate is left.
+
+// A third request finds the second still waiting for the Host, and the first slot not yet free: no duplicate is left.  The
+// replacement takes a third slot, so a build with two streams refuses the third request for want of one.
+@when(noble_controller_config.CTL_CIS >= 3)
+@test
+fn test_a_third_request_for_the_stream_the_central_gave_up_leaves_no_duplicate()
+    var c = connected()
+    pop_queued(var c)
+    var first = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    deliver(var c, var first)
+    pop_queued(var c)
+    var again = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
+    deliver(var c, var again)
     pop_queued(var c)
     var third = sink_req(2, 8, 100, false, 3, 1500, 1, 0)
     deliver(var c, var third)
