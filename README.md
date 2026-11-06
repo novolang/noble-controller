@@ -31,7 +31,7 @@ effects of the backend and no call goes through a table.
 use ctl_hci
 use ll_air
 
-// The main loop of a Controller image, abridged from orbit/ble/rig/hci_uart_main.nv: the
+// The main loop of a Controller image, abridged from controller/hci_uart_main.nv of the package noble-examples: the
 // HCI layer takes the commands the Host sent, then the Link Layer runs the next radio event
 // on whatever `Radio`, `Timebase` and `Cipher` the image gives it.
 ctl_hci.ctl_set_time(var c, air.now_us())
