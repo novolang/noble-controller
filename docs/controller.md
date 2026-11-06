@@ -58,18 +58,16 @@ Channel Sounding has one count, `ctl_cs` (the connections that run it at once,
 switches on: `ctl_cs_configs`, `ctl_cs_steps`, `ctl_cs_roles` and `ctl_cs_ant`
 are 0 exactly when `ctl_cs` is, and `ctl_cs_mode3`, `ctl_cs_rtt_seq`,
 `ctl_cs_3c`, `ctl_cs_ipt` and `ctl_cs_test` choose among its options and need
-it.  `ctl_cs` needs `ctl_pcl`, and `ctl_cs_ipt` needs `ctl_featpages`.  Two keys
-state storage: `ctl_cs` the generator of each connection that runs the feature
-(`CsGen` of `ll_cs_plan`, 712 bytes) and `ctl_cs_steps` the plan of one subevent
-(`CsSubevent`, 40 bytes and 56 for each step); `CsState` holds both.  A build
-without the feature makes none of it and links neither `ll_cs_drbg` nor
-`ll_cs_plan`, so the keys have no floor.  With `ctl_cs` at 0 the 18 commands are answered with Unknown HCI
-Command and LE features 46, 47, 48 and 75 stay clear; with it on, `ll_cs` lists
-the commands in Supported Commands and answers each with Unsupported Feature or
-Parameter Value, and the 14 Link Layer opcodes are still answered with
-LL_UNKNOWN_RSP.  The radio's side of the feature is `CsRadio` in `noble-radio`,
-which no module of the radio program calls yet; `ll_cs_plan.plan_arm` is the
-function that hands a `CsSubevent` to one.
+it.  `ctl_cs` needs `ctl_pcl`, and `ctl_cs_ipt` needs `ctl_featpages`.  Three keys state storage.  `ctl_cs`: for each connection that runs the
+feature, the generator of the planning (`CsGen` of `ll_cs_plan`, 712 bytes) and one record of the procedures (`ll_cs_proc`) kept in two tables of the Controller,
+34 words and a store of 224 B; `ctl_cs_configs`: 32 B more of store for each configuration a connection holds; `ctl_cs_steps`: the plan of one subevent
+(`CsSubevent`, 40 bytes and 56 for each step).  `CsState` holds the generators and the plan.  A build without the feature keeps the two tables of the
+procedures at one element each and makes nothing else; the modules of the feature are not part of it.  The control queue of a link holds 76 octets a slot
+in a build with the feature, 40 in one without it, for the 75 octets of LL_CS_FAE_RSP.  With `ctl_cs` at 0 the 18 commands are answered with Unknown HCI
+Command, the 14 Link Layer opcodes (0x2D to 0x3A) with LL_UNKNOWN_RSP, and LE features 46, 47, 48 and 75 stay clear; with it on, `ll_cs` lists the commands in
+Supported Commands and answers each with Unsupported Feature or Parameter Value, and the 14 opcodes go to the seven procedures of `ll_cs_proc`, which answer
+them over the record of the link.  The radio's side of the feature is `CsRadio` in `noble-radio`, which no module of this package calls yet;
+`ll_cs_plan.plan_arm` is the function that hands a `CsSubevent` to one.
 
 The plan of a subevent is a function of the generator's key, the configuration
 and the step counter, so two Controllers that hold the same key make the same

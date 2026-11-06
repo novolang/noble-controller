@@ -245,6 +245,11 @@ const fn pcl_slots() -> Int
     else
         1
 
+// The records of Channel Sounding (ll_cs_proc.nv): one for each connection that runs it (`ctl_cs`), or one when the feature is out.
+@tier(embedded)
+const fn cs_slots() -> Int
+    max1(noble_controller_config.CTL_CS)
+
 // The classes of the arbiter of ll_arb.nv that belong to a connection: one for each link.  The arbiter holds
 // four more (the isochronous events, the periodic trains, the advertising events and the scan windows), so its columns have
 // `noble_controller_config.CTL_LINKS + 4` elements.

@@ -8,10 +8,10 @@
 //
 // A build with `ctl_cs` 0 (`ctl_limits.cs_on()` false) answers none of the eighteen commands, leaves LE features 46, 47, 48 and 75 clear
 // and answers the fourteen Link Layer PDUs (opcodes 0x2D to 0x3A) with LL_UNKNOWN_RSP.  A build with it lists the commands in Supported
-// Commands and answers each with `STUB_STATUS`; the PDUs are still answered with LL_UNKNOWN_RSP.
+// Commands and answers each with `STUB_STATUS`; the PDUs go to the procedures of `ll_cs_proc`, which write and read them with `ll_cs_pdu`.
 //
-// NOT IMPLEMENTED: the control PDUs and the procedures over them, the HCI results, and the radio's measurements.  The random bit generator is
-// `ll_cs_drbg.nv`; the channel and access address selection and the step timeline are `ll_cs_plan.nv`.
+// NOT IMPLEMENTED: the HCI results and the radio's measurements.  The random bit generator is `ll_cs_drbg.nv`; the channel and access address selection
+// and the step timeline are `ll_cs_plan.nv`; the control PDUs and the procedures over them are `ll_cs_pdu.nv` and `ll_cs_proc.nv`.
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
 
@@ -189,6 +189,41 @@ const OP_CS_TERMINATE_RSP = 0x3A
 @tier(embedded)
 fn is_pdu(op: Int) -> Bool
     op >= 0x2D and op <= 0x3A
+
+// The payload of a control PDU of the feature, the opcode included, in octets; -1 for an opcode that is no PDU of the feature.  The two capabilities
+// PDUs have two lengths, those of the [v1] record (25 octets of CtrData) and the [v2] one (31); this gives the first.
+@tier(embedded)
+fn pdu_payload_len(op: Int) -> Int
+    match op
+        0x39 => 21
+        0x2d => 21
+        0x2e => 26
+        0x2f => 26
+        0x30 => 28
+        0x31 => 2
+        0x32 => 29
+        0x33 => 22
+        0x34 => 19
+        0x35 => 5
+        0x3a => 5
+        0x36 => 1
+        0x37 => 73
+        0x38 => 13
+        _    => -1
+
+// Whether a PDU of `op` with a payload of `n` octets has a length the specification gives it.
+@tier(embedded)
+fn pdu_len_ok(op: Int, n: Int) -> Bool
+    if op == OP_CS_CAPABILITIES_REQ or op == OP_CS_CAPABILITIES_RSP
+        return n == 26 or n == 32
+    n == pdu_payload_len(op)
+
+// Whether `op` is one of the requests that LL_REJECT_EXT_IND and LL_UNKNOWN_RSP name when the peer refuses one: the opcodes of the requests of Security Start,
+// the Capabilities Exchange, the Configuration, the Start (LL_CS_REQ and the LL_CS_RSP the Central may refuse), the termination and the FAE table.
+@tier(embedded)
+fn refusable(op: Int) -> Bool
+    op == OP_CS_SEC_REQ or op == OP_CS_CAPABILITIES_REQ or op == OP_CS_CONFIG_REQ or op == OP_CS_REQ or op == OP_CS_RSP or op == OP_CS_TERMINATE_REQ
+        or op == OP_CS_FAE_REQ
 
 // ── The limits of a procedure ───────────────────────────────────────
 // [Vol 6] Part B, Sections 4.1.4 and 4.5.18.1, and Part H, Section 4.3.

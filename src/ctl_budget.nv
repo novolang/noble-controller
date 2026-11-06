@@ -33,6 +33,9 @@ const CTL_PAWR_BUF_RECORD = 56
 const CTL_CS_GEN_RECORD = 712
 const CTL_CS_PLAN_FIXED = 32
 const CTL_CS_STEP_RECORD = 56
+const CTL_CS_WORDS = 272
+const CTL_CS_STORE = 224
+const CTL_CS_CONFIG = 32
 
 // The larger of `n` and 1: a table of an absent feature keeps one record.  A `const fn` of another module cannot take part in
 // the `assert_const` below, so this module keeps its own copy of the one in ctl_limits.nv.
@@ -108,14 +111,15 @@ const fn controller_pawr_bytes() -> Int
     let sync = (if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1) * (CTL_PAWR_SYNC_RECORD + bufs * one)
     adv + sync
 
-// Channel Sounding (`CsState` of ll_cs_plan.nv): a generator for each connection that runs it and the plan of one subevent, which holds as many
-// steps as `ctl_cs_steps`.  A build without the feature makes none of it.
+// Channel Sounding: for each connection that runs it, the generator of the planning (`CsState` of ll_cs_plan.nv), and the two tables of the records of the
+// procedures, 272 B of words and 224 B of store with 32 B of store more for each configuration; and the plan of one subevent, which holds as many steps as
+// `ctl_cs_steps`.  With the feature out the two tables of the procedures stay at one element each and the rest is not made.
 @tier(embedded)
 const fn controller_cs_bytes() -> Int
     if noble_controller_config.CTL_CS > 0
-        vec_bytes(noble_controller_config.CTL_CS, CTL_CS_GEN_RECORD) + CTL_CS_PLAN_FIXED + vec_bytes(noble_controller_config.CTL_CS_STEPS, CTL_CS_STEP_RECORD)
+        vec_bytes(noble_controller_config.CTL_CS, CTL_CS_GEN_RECORD) + vec_bytes(noble_controller_config.CTL_CS, CTL_CS_WORDS) + vec_bytes(noble_controller_config.CTL_CS, CTL_CS_STORE + CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS) + CTL_CS_PLAN_FIXED + vec_bytes(noble_controller_config.CTL_CS_STEPS, CTL_CS_STEP_RECORD)
     else
-        0
+        vec_bytes(1, 8) + vec_bytes(1, 1)
 
 // The Controller's storage, in bytes.
 @tier(embedded)

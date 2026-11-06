@@ -78,6 +78,7 @@
 //
 // The state is a value with inline storage; no function here allocates.
 
+use noble_controller_config
 use ctl_limits
 use ll_pdu
 use ll_data
@@ -89,6 +90,7 @@ use ll_rate
 use ll_fs
 use ll_feat
 use ll_sca
+use ll_cs
 
 // The functions below take the link as a `var` parameter even where they only read
 // it, which passes its address.  A plain parameter is a copy, and a copy of a
@@ -286,15 +288,23 @@ const DLE_RX_OCTETS = 251
 const DLE_RX_TIME = 2120
 const DLE_TIME_UNCODED_PEER = 2128
 
-// The queues of PDUs.  An LL Control PDU waits in a slot of `CTRL_SLOT_OCTETS`
-// octets, the header and at most 38 of CtrData (LL_CIS_REQ has 35).  The Host gets `ACL_SLOTS` buffers,
+// The queues of PDUs.  An LL Control PDU waits in a slot of `ctrl_slot()`
+// octets, the header and at most 38 of CtrData (LL_CIS_REQ has 35); in a build with Channel Sounding the slot is 76 octets, which holds
+// LL_CS_FAE_RSP, 75 octets with its header.  The Host gets `ACL_SLOTS` buffers,
 // each of `SLOT_OCTETS` octets: the header octets and an HCI ACL Data packet of at
 // most 251 octets, which goes out as one data PDU or, when the data length in force
 // is shorter, as several.
 const SLOT_OCTETS = 260
-const CTRL_SLOT_OCTETS = 40
 const ACL_SLOTS = 3
 const CTRL_SLOTS = 4
+
+// The octets of a slot of the LL Control queue: 76 in a build with Channel Sounding, 40 otherwise.
+@tier(embedded)
+const fn ctrl_slot() -> Int
+    if noble_controller_config.CTL_CS > 0
+        76
+    else
+        40
 
 // The most connection events a catch-up skips in one call.
 const CATCH_UP_MAX = 64
@@ -426,7 +436,7 @@ struct Link
     txq2: Vec[u8; 260]
     txq_head: Int
     txq_count: Int
-    cq: Vec[u8; 160]
+    cq: Vec[u8; if noble_controller_config.CTL_CS > 0 then 304 else 160]
     cq_head: Int
     cq_count: Int
     completed: Int
@@ -628,7 +638,7 @@ fn link_new() -> Link
         let _d = l.txq0.push(0)
         let _d1 = l.txq1.push(0)
         let _d2 = l.txq2.push(0)
-    for _ in 0..CTRL_SLOTS * CTRL_SLOT_OCTETS
+    for _ in 0..CTRL_SLOTS * ctrl_slot()
         let _e = l.cq.push(0)
     l
 
@@ -1050,15 +1060,15 @@ fn link_released(var l: Link)
 @tier(embedded)
 fn slot_put_cq(var l: Link, slot: Int, var p: Pdu)
     for i in 0..p.n
-        l.cq[slot * CTRL_SLOT_OCTETS + i] = p.b[i]
+        l.cq[slot * ctrl_slot() + i] = p.b[i]
 
 // Read slot `slot` of the LL Control queue into `p`.
 @tier(embedded)
 fn slot_get_cq(var l: Link, slot: Int, var p: Pdu)
-    let n = l.cq[slot * CTRL_SLOT_OCTETS + 1] as Int + 2
+    let n = l.cq[slot * ctrl_slot() + 1] as Int + 2
     p.n = n
     for i in 0..n
-        p.b[i] = l.cq[slot * CTRL_SLOT_OCTETS + i]
+        p.b[i] = l.cq[slot * ctrl_slot() + i]
 
 // Queue an LL Control PDU for the link.  False when the queue is full.  A
 // procedure that waits for the peer starts its response timer again with every
@@ -1066,6 +1076,8 @@ fn slot_get_cq(var l: Link, slot: Int, var p: Pdu)
 @tier(embedded)
 fn ctrl_queue(var l: Link, var p: Pdu) -> Bool
     if l.cq_count >= CTRL_SLOTS
+        return false
+    if ctl_limits.cs_on() and p.n > ctrl_slot()
         return false
     slot_put_cq(var l, (l.cq_head + l.cq_count) % CTRL_SLOTS, var p)
     l.cq_count = l.cq_count + 1
@@ -1755,6 +1767,13 @@ fn ctrl_rx(var l: Link, var rx: Pdu)
     if ctl_limits.fs_on() and (op == ll_data.OP_FRAME_SPACE_REQ or op == ll_data.OP_FRAME_SPACE_RSP)
         fs_rx(var l, var rx, op)
         return
+    // The Channel Sounding PDUs belong to a build with the feature (feature 46); the Controller answers them, and the refusals of its own requests
+    // (`ll_cs.refusable`).  A PDU of a length the specification does not give it is dropped.
+    if ctl_limits.cs_on() and (ll_cs.is_pdu(op) and ll_cs.pdu_len_ok(op, ll_data.dpdu_len(var rx)) or cs_refusal(var rx, op))
+        l.ctl_in = true
+        return
+    if ctl_limits.cs_on() and ll_cs.is_pdu(op)
+        return
     let want = ll_data.ctrl_payload_len(op)
     if want < 0
         answer_unknown(var l, op)
@@ -1869,6 +1888,12 @@ fn ctrl_rx(var l: Link, var rx: Pdu)
         0x2b => ctrl_feature_ext_request(var l, var rx)
         0x2c => ctrl_feature_ext_response(var l, var rx)
         _    => answer_unknown(var l, op)
+
+// Whether the PDU is LL_REJECT_EXT_IND or LL_UNKNOWN_RSP naming a request of Channel Sounding.
+@tier(embedded)
+fn cs_refusal(var rx: Pdu, op: Int) -> Bool
+    let n = ll_data.dpdu_len(var rx)
+    (op == ll_data.OP_REJECT_EXT_IND and n == 3 or op == ll_data.OP_UNKNOWN_RSP and n == 2) and ll_cs.refusable(ll_data.dpdu_byte(var rx, 1))
 
 // The sleep clock accuracy class of this Controller's clock (Table 2.1 of Section 2.3.3.1): the 32 MHz
 // crystal's `OWN_PPM` of 50 is class 5, 31 to 50 ppm.

@@ -1,0 +1,774 @@
+// src/ll_cs_pdu.nv — the fourteen Link Layer control PDUs of Channel Sounding: their lengths, the records that hold their fields, and the
+// functions that write each PDU into a `Pdu` and read it back.
+//
+// [Vol 6] Part B, Sections 2.4.2.42 to 2.4.2.53 and Table 2.22; [Vol 6] Part H, Section 4.3.  Opcode, CtrData length and sender of each
+// PDU:
+//
+//   0x39 LL_CS_SEC_REQ                    20   Central
+//   0x2D LL_CS_SEC_RSP                    20   Peripheral
+//   0x2E LL_CS_CAPABILITIES_REQ           25 ([v1]) or 31 ([v2])
+//   0x2F LL_CS_CAPABILITIES_RSP           25 or 31
+//   0x30 LL_CS_CONFIG_REQ                 27
+//   0x31 LL_CS_CONFIG_RSP                  1
+//   0x32 LL_CS_REQ                        28
+//   0x33 LL_CS_RSP                        21   Peripheral
+//   0x34 LL_CS_IND                        18   Central
+//   0x35 LL_CS_TERMINATE_REQ               4
+//   0x3A LL_CS_TERMINATE_RSP               4
+//   0x36 LL_CS_FAE_REQ                     0
+//   0x37 LL_CS_FAE_RSP                    72
+//   0x38 LL_CS_CHANNEL_MAP_IND            12
+//
+// A field is written least significant octet first.  Fields that share an octet go in the order the figures give, the first field in the
+// least significant bits.  A reserved field is written as 0 and not read.
+//
+// Four of the PDUs have more than 26 octets of CtrData, which is as many as the shortest control PDU buffer of the Link Layer holds:
+// LL_CS_CAPABILITIES_REQ and LL_CS_CAPABILITIES_RSP of the [v2] records (31), LL_CS_REQ (28), LL_CS_CONFIG_REQ (27) and LL_CS_FAE_RSP, whose 72
+// octets give a PDU of 75 octets with its header.  The octets are appended with `ll_pdu.pdu_put_data`, which holds 257, and not with
+// `ll_pdu.pdu_put`, which stops at the 39 octets of an advertising PDU.  The queue of a Link in a build with the feature holds a PDU of
+// `PDU_OCTETS_MAX` octets (`ll_link.ctrl_slot`).
+//
+// This module holds no state and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
+
+use ll_pdu
+use ll_data
+use ll_cs
+
+// ── The lengths ─────────────────────────────────────────────────────
+
+// The octets of the longest of the PDUs with their header: the header, the opcode and the 72 octets of LL_CS_FAE_RSP.
+const PDU_OCTETS_MAX = 75
+
+// The octets of CtrData of the capabilities records.
+const CAPS_V1_OCTETS = 25
+const CAPS_V2_OCTETS = 31
+
+// ── Octets ──────────────────────────────────────────────────────────
+
+// CtrData octet `k` of the PDU in `p`, counted from 0.
+@tier(embedded)
+fn ct(var p: Pdu, k: Int) -> Int
+    p.b[3 + k] as Int
+
+@tier(embedded)
+fn ct16(var p: Pdu, k: Int) -> Int
+    ct(var p, k) | (ct(var p, k + 1) << 8)
+
+@tier(embedded)
+fn ct24(var p: Pdu, k: Int) -> Int
+    ct(var p, k) | (ct(var p, k + 1) << 8) | (ct(var p, k + 2) << 16)
+
+// CtrData octets `k` to `k + 4` as a 40-bit value.
+@tier(embedded)
+fn ct40(var p: Pdu, k: Int) -> Int
+    ct(var p, k) | (ct(var p, k + 1) << 8) | (ct(var p, k + 2) << 16) | (ct(var p, k + 3) << 24) | (ct(var p, k + 4) << 32)
+
+// A CtrData octet read as a signed value.
+@tier(embedded)
+fn ct_signed(var p: Pdu, k: Int) -> Int
+    let v = ct(var p, k)
+    if v >= 0x80
+        v - 0x100
+    else
+        v
+
+@tier(embedded)
+fn put8(var p: Pdu, v: Int)
+    let _a = ll_pdu.pdu_put_data(var p, v & 0xFF)
+
+@tier(embedded)
+fn put16(var p: Pdu, v: Int)
+    put8(var p, v)
+    put8(var p, v >>> 8)
+
+@tier(embedded)
+fn put24(var p: Pdu, v: Int)
+    put8(var p, v)
+    put8(var p, v >>> 8)
+    put8(var p, v >>> 16)
+
+// `v` as five octets.
+@tier(embedded)
+fn put40(var p: Pdu, v: Int)
+    put8(var p, v)
+    put8(var p, v >>> 8)
+    put8(var p, v >>> 16)
+    put8(var p, v >>> 24)
+    put8(var p, v >>> 32)
+
+// ── The channel map ─────────────────────────────────────────────────
+// The ChM field is 10 octets, 80 bits; bit `n` is CS channel index `n`, so the map of an allowed channel set is held as two values of 40 bits: `lo` has
+// the channels 0 to 39 and `hi` the channels 40 to 79.
+
+// The channels a procedure may use as a map: 2 to 22 and 26 to 76 (`ll_cs.channel_ok`), 21 and 14 of the channels 0 to 39 and 37 of the channels
+// 40 to 79.
+const CHM_LO_ALLOWED = 0xFFFC7FFFFC
+const CHM_HI_ALLOWED = 0x1FFFFFFFFF
+
+// Whether the bit of channel `ch` is set in the map (`lo`, `hi`).
+@tier(embedded)
+fn chm_has(lo: Int, hi: Int, ch: Int) -> Bool
+    if ch < 40
+        ((lo >>> ch) & 1) == 1
+    else
+        ((hi >>> (ch - 40)) & 1) == 1
+
+// The number of channels the map names.
+@tier(embedded)
+fn chm_count(lo: Int, hi: Int) -> Int
+    var n = 0
+    for ch in 0..80
+        if chm_has(lo, hi, ch)
+            n = n + 1
+    n
+
+// ── The records ─────────────────────────────────────────────────────
+
+// The fields of LL_CS_CAPABILITIES_REQ and LL_CS_CAPABILITIES_RSP ([Vol 6] Part B, Section 2.4.2.44).  `v2` says the record is the [v2] one, whose last
+// six fields (`t_ip2_ipt`, `t_sw_ipt`, `n2_aa`, `n2_sound`, `n2_rand`) are then in the PDU; in a [v1] record they are 0.  The names follow the figure:
+// `mode_types` bit 0 is mode 3; `rtt_cap`, `nadm_sound`, `nadm_rand`, `sync_phy` (bit 1 LE 2M, bit 2 LE 2M 2BT), `role` (bit 0 initiator, bit 1
+// reflector); `t_ip1`, `t_ip2`, `t_fcs`, `t_pm` are masks of the optional timings, the least significant bit for index 0; `rtt_phy` and `tx_snr`
+// share an octet.  `ipt`, `no_fae`, `ch3c` and `sounding_pct` are 0 or 1.
+@value
+struct CapPdu
+    v2: Bool
+    mode_types: Int
+    rtt_cap: Int
+    n_aa: Int
+    n_sound: Int
+    n_rand: Int
+    nadm_sound: Int
+    nadm_rand: Int
+    sync_phy: Int
+    num_ant: Int
+    max_path: Int
+    role: Int
+    ipt: Int
+    no_fae: Int
+    ch3c: Int
+    sounding_pct: Int
+    num_configs: Int
+    max_procs: Int
+    t_sw: Int
+    t_ip1: Int
+    t_ip2: Int
+    t_fcs: Int
+    t_pm: Int
+    rtt_phy: Int
+    tx_snr: Int
+    t_ip2_ipt: Int
+    t_sw_ipt: Int
+    n2_aa: Int
+    n2_sound: Int
+    n2_rand: Int
+
+// Set whether the record is the [v2] one.
+@tier(embedded)
+fn cap_version(var c: CapPdu, v2: Bool)
+    c.v2 = v2
+
+// A [v1] record with every field 0.
+@tier(embedded)
+fn cap_new() -> CapPdu
+    CapPdu { v2: false, mode_types: 0, rtt_cap: 0, n_aa: 0, n_sound: 0, n_rand: 0, nadm_sound: 0, nadm_rand: 0, sync_phy: 0, num_ant: 0, max_path: 0,
+             role: 0, ipt: 0, no_fae: 0, ch3c: 0, sounding_pct: 0, num_configs: 0, max_procs: 0, t_sw: 0, t_ip1: 0, t_ip2: 0, t_fcs: 0, t_pm: 0,
+             rtt_phy: 0, tx_snr: 0, t_ip2_ipt: 0, t_sw_ipt: 0, n2_aa: 0, n2_sound: 0, n2_rand: 0 }
+
+// The fields of LL_CS_CONFIG_REQ ([Vol 6] Part B, Section 2.4.2.45).  `action` is 0 to remove the configuration and 1 to create it; a PDU that removes
+// carries every other field as reserved (written as 0, not read).  `chm_lo` and `chm_hi` are the ChM field (`chm_has`).  `sync_phy` has one bit:
+// 0 LE 1M, 1 LE 2M, 2 LE Coded, 3 LE 2M 2BT.  `t_ip1`, `t_ip2`, `t_fcs` and `t_pm` are the indices of Tables 4.3, 4.5, 4.8 and 4.9 of [Vol 6] Part H
+// (`ll_cs.t_ip_us` and the others).  `role` is 0 for the initiator and 1 for the reflector, the role of the device that sends the PDU.
+@value
+struct CfgPdu
+    config_id: Int
+    action: Int
+    chm_lo: Int
+    chm_hi: Int
+    chm_rep: Int
+    main_mode: Int
+    sub_mode: Int
+    main_min: Int
+    main_max: Int
+    main_rep: Int
+    mode0_steps: Int
+    sync_phy: Int
+    rtt_type: Int
+    role: Int
+    ipt: Int
+    chsel: Int
+    c3_shape: Int
+    c3_jump: Int
+    t_ip1: Int
+    t_ip2: Int
+    t_fcs: Int
+    t_pm: Int
+
+@tier(embedded)
+fn cfg_new() -> CfgPdu
+    CfgPdu { config_id: 0, action: 0, chm_lo: 0, chm_hi: 0, chm_rep: 0, main_mode: 0, sub_mode: 0, main_min: 0, main_max: 0, main_rep: 0, mode0_steps: 0,
+             sync_phy: 0, rtt_type: 0, role: 0, ipt: 0, chsel: 0, c3_shape: 0, c3_jump: 0, t_ip1: 0, t_ip2: 0, t_fcs: 0, t_pm: 0 }
+
+// The fields of LL_CS_REQ, LL_CS_RSP and LL_CS_IND ([Vol 6] Part B, Sections 2.4.2.47 to 2.4.2.49).  LL_CS_REQ has all of them; LL_CS_RSP has no
+// `max_proc_len`, `proc_interval`, `proc_count`, `pref_ant`, `snr_i` and `snr_r`, which read 0; LL_CS_IND has `offset` instead of `offset_min` and
+// `offset_max` (`offset_min` carries it in the record) and no `max_proc_len`, `proc_interval`, `proc_count`, `pref_ant`, `snr_i` and `snr_r`.
+//
+//   conn_event         the connection event the first CS event is offset from
+//   offset_min, offset_max   the window for the start of the first CS subevent, in microseconds from the anchor point; 3 octets each
+//   max_proc_len       the extent of a procedure, in units of 625 microseconds
+//   event_interval     connection intervals between two CS events
+//   subevents          subevents in a CS event
+//   subevent_interval  units of 625 microseconds
+//   subevent_len       microseconds, 3 octets
+//   proc_interval      connection intervals between procedures, 0 for one procedure
+//   proc_count         procedures, 0 for no end
+//   aci                the antenna configuration index
+//   pref_ant           the preferred antenna elements of the peer, one bit each
+//   phy                the PHY the power delta applies to, one bit of the octet: bit 0 LE 1M, bit 1 LE 2M, bit 2 LE Coded S=8, bit 3 LE Coded S=2
+//   pwr_delta          dB, signed
+//   snr_i, snr_r       the SNR output indices of the initiator and the reflector, 0xF for none
+@value
+struct StartPdu
+    config_id: Int
+    conn_event: Int
+    offset_min: Int
+    offset_max: Int
+    max_proc_len: Int
+    event_interval: Int
+    subevents: Int
+    subevent_interval: Int
+    subevent_len: Int
+    proc_interval: Int
+    proc_count: Int
+    aci: Int
+    pref_ant: Int
+    phy: Int
+    pwr_delta: Int
+    snr_i: Int
+    snr_r: Int
+
+@tier(embedded)
+fn start_new() -> StartPdu
+    StartPdu { config_id: 0, conn_event: 0, offset_min: 0, offset_max: 0, max_proc_len: 0, event_interval: 0, subevents: 0, subevent_interval: 0,
+               subevent_len: 0, proc_interval: 0, proc_count: 0, aci: 0, pref_ant: 0, phy: 0, pwr_delta: 0, snr_i: 0xF, snr_r: 0xF }
+
+// Set the connEventCount, the PHY and the power delta of the answer in `s`, the fields a Start answer chooses itself.
+@tier(embedded)
+fn start_answer(var s: StartPdu, conn_event: Int, phy: Int, pwr_delta: Int)
+    s.conn_event = conn_event
+    s.phy = phy
+    s.pwr_delta = pwr_delta
+
+// The fields of LL_CS_TERMINATE_REQ and LL_CS_TERMINATE_RSP ([Vol 6] Part B, Section 2.4.2.50).
+@value
+struct TermPdu
+    config_id: Int
+    proc_count: Int
+    error: Int
+
+@tier(embedded)
+fn term_new(config_id: Int, proc_count: Int, error: Int) -> TermPdu
+    TermPdu { config_id: config_id, proc_count: proc_count, error: error }
+
+// The fields of LL_CS_CHANNEL_MAP_IND ([Vol 6] Part B, Section 2.4.2.53).
+@value
+struct ChmPdu
+    lo: Int
+    hi: Int
+    instant: Int
+
+@tier(embedded)
+fn chm_new(lo: Int, hi: Int, instant: Int) -> ChmPdu
+    ChmPdu { lo: lo, hi: hi, instant: instant }
+
+// The three parts one side puts in LL_CS_SEC_REQ or LL_CS_SEC_RSP ([Vol 6] Part B, Sections 2.4.2.42 and 2.4.2.43): CS_IV 8 octets, CS_IN 4 and CS_PV 8.
+@value
+struct SecPdu
+    iv: Vec[u8; 8]
+    inn: Vec[u8; 4]
+    pv: Vec[u8; 8]
+
+@tier(embedded)
+fn sec_new() -> SecPdu
+    var s = SecPdu { iv: Vec.new(), inn: Vec.new(), pv: Vec.new() }
+    for _ in 0..8
+        let _a = s.iv.push(0)
+        let _b = s.pv.push(0)
+    for _ in 0..4
+        let _c = s.inn.push(0)
+    s
+
+// ── LL_CS_SEC_REQ and LL_CS_SEC_RSP ─────────────────────────────────
+
+// LL_CS_SEC_REQ (`op` is `ll_cs.OP_CS_SEC_REQ`) or LL_CS_SEC_RSP (`ll_cs.OP_CS_SEC_RSP`) with the parts in `s`.
+@tier(embedded)
+fn put_sec(var p: Pdu, op: Int, var s: SecPdu)
+    ll_data.ctrl_begin(var p, op)
+    for i in 0..8
+        put8(var p, s.iv[i] as Int)
+    for i in 0..4
+        put8(var p, s.inn[i] as Int)
+    for i in 0..8
+        put8(var p, s.pv[i] as Int)
+    ll_data.dpdu_finish(var p)
+
+// Read the parts of LL_CS_SEC_REQ or LL_CS_SEC_RSP into `s`; false when the length is not that of the PDU.
+@tier(embedded)
+fn get_sec(var p: Pdu, var s: SecPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 21
+        return false
+    for i in 0..8
+        s.iv[i] = ct(var p, i) as u8
+    for i in 0..4
+        s.inn[i] = ct(var p, 8 + i) as u8
+    for i in 0..8
+        s.pv[i] = ct(var p, 12 + i) as u8
+    true
+
+// ── LL_CS_CAPABILITIES_REQ and LL_CS_CAPABILITIES_RSP ───────────────
+
+// LL_CS_CAPABILITIES_REQ (`op` is `ll_cs.OP_CS_CAPABILITIES_REQ`) or LL_CS_CAPABILITIES_RSP (`ll_cs.OP_CS_CAPABILITIES_RSP`) with the record `c`: 25 octets
+// of CtrData, 31 when `c.v2`.
+@tier(embedded)
+fn put_caps(var p: Pdu, op: Int, var c: CapPdu)
+    ll_data.ctrl_begin(var p, op)
+    put8(var p, c.mode_types)
+    put8(var p, c.rtt_cap)
+    put8(var p, c.n_aa)
+    put8(var p, c.n_sound)
+    put8(var p, c.n_rand)
+    put16(var p, c.nadm_sound)
+    put16(var p, c.nadm_rand)
+    put8(var p, c.sync_phy)
+    put8(var p, (c.num_ant & 0xF) | ((c.max_path & 0xF) << 4))
+    put8(var p, (c.role & 3) | ((c.ipt & 1) << 2) | ((c.no_fae & 1) << 3) | ((c.ch3c & 1) << 4) | ((c.sounding_pct & 1) << 5))
+    put8(var p, c.num_configs)
+    put16(var p, c.max_procs)
+    put8(var p, c.t_sw)
+    put16(var p, c.t_ip1)
+    put16(var p, c.t_ip2)
+    put16(var p, c.t_fcs)
+    put16(var p, c.t_pm)
+    put8(var p, (c.rtt_phy & 1) | ((c.tx_snr & 0x7F) << 1))
+    if c.v2
+        put16(var p, c.t_ip2_ipt)
+        put8(var p, c.t_sw_ipt)
+        put8(var p, c.n2_aa)
+        put8(var p, c.n2_sound)
+        put8(var p, c.n2_rand)
+    ll_data.dpdu_finish(var p)
+
+// Read the record of a capabilities PDU into `c`: false when the PDU is neither the [v1] length nor the [v2] one.  The fields a [v1] PDU lacks read 0.
+@tier(embedded)
+fn get_caps(var p: Pdu, var c: CapPdu) -> Bool
+    let n = ll_data.dpdu_len(var p)
+    if n != CAPS_V1_OCTETS + 1 and n != CAPS_V2_OCTETS + 1
+        return false
+    c.v2 = n == CAPS_V2_OCTETS + 1
+    c.mode_types = ct(var p, 0)
+    c.rtt_cap = ct(var p, 1)
+    c.n_aa = ct(var p, 2)
+    c.n_sound = ct(var p, 3)
+    c.n_rand = ct(var p, 4)
+    c.nadm_sound = ct16(var p, 5)
+    c.nadm_rand = ct16(var p, 7)
+    c.sync_phy = ct(var p, 9)
+    c.num_ant = ct(var p, 10) & 0xF
+    c.max_path = (ct(var p, 10) >>> 4) & 0xF
+    let flags = ct(var p, 11)
+    c.role = flags & 3
+    c.ipt = (flags >>> 2) & 1
+    c.no_fae = (flags >>> 3) & 1
+    c.ch3c = (flags >>> 4) & 1
+    c.sounding_pct = (flags >>> 5) & 1
+    c.num_configs = ct(var p, 12)
+    c.max_procs = ct16(var p, 13)
+    c.t_sw = ct(var p, 15)
+    c.t_ip1 = ct16(var p, 16)
+    c.t_ip2 = ct16(var p, 18)
+    c.t_fcs = ct16(var p, 20)
+    c.t_pm = ct16(var p, 22)
+    c.rtt_phy = ct(var p, 24) & 1
+    c.tx_snr = (ct(var p, 24) >>> 1) & 0x7F
+    c.t_ip2_ipt = 0
+    c.t_sw_ipt = 0
+    c.n2_aa = 0
+    c.n2_sound = 0
+    c.n2_rand = 0
+    if c.v2
+        c.t_ip2_ipt = ct16(var p, 25)
+        c.t_sw_ipt = ct(var p, 27)
+        c.n2_aa = ct(var p, 28)
+        c.n2_sound = ct(var p, 29)
+        c.n2_rand = ct(var p, 30)
+    true
+
+// ── LL_CS_CONFIG_REQ and LL_CS_CONFIG_RSP ───────────────────────────
+
+// LL_CS_CONFIG_REQ with the fields of `c`.  A PDU that removes a configuration (`c.action` 0) carries 0 in every field but Config_ID and Action.
+@tier(embedded)
+fn put_config_req(var p: Pdu, var c: CfgPdu)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_CONFIG_REQ)
+    put8(var p, (c.config_id & 0x3F) | ((c.action & 3) << 6))
+    if c.action == 0
+        for _ in 0..26
+            put8(var p, 0)
+        ll_data.dpdu_finish(var p)
+        return
+    put40(var p, c.chm_lo)
+    put40(var p, c.chm_hi)
+    put8(var p, c.chm_rep)
+    put8(var p, c.main_mode)
+    put8(var p, c.sub_mode)
+    put8(var p, c.main_min)
+    put8(var p, c.main_max)
+    put8(var p, c.main_rep)
+    put8(var p, c.mode0_steps)
+    put8(var p, c.sync_phy)
+    put8(var p, (c.rtt_type & 0xF) | ((c.role & 3) << 4) | ((c.ipt & 1) << 6))
+    put8(var p, (c.chsel & 0xF) | ((c.c3_shape & 0xF) << 4))
+    put8(var p, c.c3_jump)
+    put8(var p, c.t_ip1)
+    put8(var p, c.t_ip2)
+    put8(var p, c.t_fcs)
+    put8(var p, c.t_pm)
+    put8(var p, 0)
+    ll_data.dpdu_finish(var p)
+
+// Read LL_CS_CONFIG_REQ into `c`; false for a PDU of another length.  The fields of a PDU that removes read 0.
+@tier(embedded)
+fn get_config_req(var p: Pdu, var c: CfgPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 28
+        return false
+    c.config_id = ct(var p, 0) & 0x3F
+    c.action = (ct(var p, 0) >>> 6) & 3
+    c.chm_lo = 0
+    c.chm_hi = 0
+    c.chm_rep = 0
+    c.main_mode = 0
+    c.sub_mode = 0
+    c.main_min = 0
+    c.main_max = 0
+    c.main_rep = 0
+    c.mode0_steps = 0
+    c.sync_phy = 0
+    c.rtt_type = 0
+    c.role = 0
+    c.ipt = 0
+    c.chsel = 0
+    c.c3_shape = 0
+    c.c3_jump = 0
+    c.t_ip1 = 0
+    c.t_ip2 = 0
+    c.t_fcs = 0
+    c.t_pm = 0
+    if c.action == 0
+        return true
+    c.chm_lo = ct40(var p, 1)
+    c.chm_hi = ct40(var p, 6)
+    c.chm_rep = ct(var p, 11)
+    c.main_mode = ct(var p, 12)
+    c.sub_mode = ct(var p, 13)
+    c.main_min = ct(var p, 14)
+    c.main_max = ct(var p, 15)
+    c.main_rep = ct(var p, 16)
+    c.mode0_steps = ct(var p, 17)
+    c.sync_phy = ct(var p, 18)
+    c.rtt_type = ct(var p, 19) & 0xF
+    c.role = (ct(var p, 19) >>> 4) & 3
+    c.ipt = (ct(var p, 19) >>> 6) & 1
+    c.chsel = ct(var p, 20) & 0xF
+    c.c3_shape = (ct(var p, 20) >>> 4) & 0xF
+    c.c3_jump = ct(var p, 21)
+    c.t_ip1 = ct(var p, 22)
+    c.t_ip2 = ct(var p, 23)
+    c.t_fcs = ct(var p, 24)
+    c.t_pm = ct(var p, 25)
+    true
+
+// LL_CS_CONFIG_RSP for the configuration `config_id`.
+@tier(embedded)
+fn put_config_rsp(var p: Pdu, config_id: Int)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_CONFIG_RSP)
+    put8(var p, config_id & 0x3F)
+    ll_data.dpdu_finish(var p)
+
+// The Config_ID of LL_CS_CONFIG_RSP, -1 for a PDU of another length.
+@tier(embedded)
+fn get_config_rsp(var p: Pdu) -> Int
+    if ll_data.dpdu_len(var p) != 2
+        return -1
+    ct(var p, 0) & 0x3F
+
+// ── LL_CS_REQ, LL_CS_RSP and LL_CS_IND ──────────────────────────────
+
+// LL_CS_REQ with the fields of `s`.
+@tier(embedded)
+fn put_req(var p: Pdu, var s: StartPdu)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_REQ)
+    put8(var p, s.config_id & 0x3F)
+    put16(var p, s.conn_event)
+    put24(var p, s.offset_min)
+    put24(var p, s.offset_max)
+    put16(var p, s.max_proc_len)
+    put16(var p, s.event_interval)
+    put8(var p, s.subevents)
+    put16(var p, s.subevent_interval)
+    put24(var p, s.subevent_len)
+    put16(var p, s.proc_interval)
+    put16(var p, s.proc_count)
+    put8(var p, s.aci)
+    put8(var p, s.pref_ant)
+    put8(var p, s.phy)
+    put8(var p, s.pwr_delta)
+    put8(var p, (s.snr_i & 0xF) | ((s.snr_r & 0xF) << 4))
+    ll_data.dpdu_finish(var p)
+
+// LL_CS_RSP with the fields of `s` that it has.
+@tier(embedded)
+fn put_rsp(var p: Pdu, var s: StartPdu)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_RSP)
+    put8(var p, s.config_id & 0x3F)
+    put16(var p, s.conn_event)
+    put24(var p, s.offset_min)
+    put24(var p, s.offset_max)
+    put16(var p, s.event_interval)
+    put8(var p, s.subevents)
+    put16(var p, s.subevent_interval)
+    put24(var p, s.subevent_len)
+    put8(var p, s.aci)
+    put8(var p, s.phy)
+    put8(var p, s.pwr_delta)
+    put8(var p, 0)
+    ll_data.dpdu_finish(var p)
+
+// LL_CS_IND with the fields of `s` that it has; `s.offset_min` is its Offset.
+@tier(embedded)
+fn put_ind(var p: Pdu, var s: StartPdu)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_IND)
+    put8(var p, s.config_id & 0x3F)
+    put16(var p, s.conn_event)
+    put24(var p, s.offset_min)
+    put16(var p, s.event_interval)
+    put8(var p, s.subevents)
+    put16(var p, s.subevent_interval)
+    put24(var p, s.subevent_len)
+    put8(var p, s.aci)
+    put8(var p, s.phy)
+    put8(var p, s.pwr_delta)
+    put8(var p, 0)
+    ll_data.dpdu_finish(var p)
+
+// A start record with every field 0 and the SNR indices at 0xF.
+@tier(embedded)
+fn start_clear(var s: StartPdu)
+    s.config_id = 0
+    s.conn_event = 0
+    s.offset_min = 0
+    s.offset_max = 0
+    s.max_proc_len = 0
+    s.event_interval = 0
+    s.subevents = 0
+    s.subevent_interval = 0
+    s.subevent_len = 0
+    s.proc_interval = 0
+    s.proc_count = 0
+    s.aci = 0
+    s.pref_ant = 0
+    s.phy = 0
+    s.pwr_delta = 0
+    s.snr_i = 0xF
+    s.snr_r = 0xF
+
+// Read LL_CS_REQ into `s`; false for a PDU of another length.
+@tier(embedded)
+fn get_req(var p: Pdu, var s: StartPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 29
+        return false
+    s.config_id = ct(var p, 0) & 0x3F
+    s.conn_event = ct16(var p, 1)
+    s.offset_min = ct24(var p, 3)
+    s.offset_max = ct24(var p, 6)
+    s.max_proc_len = ct16(var p, 9)
+    s.event_interval = ct16(var p, 11)
+    s.subevents = ct(var p, 13)
+    s.subevent_interval = ct16(var p, 14)
+    s.subevent_len = ct24(var p, 16)
+    s.proc_interval = ct16(var p, 19)
+    s.proc_count = ct16(var p, 21)
+    s.aci = ct(var p, 23)
+    s.pref_ant = ct(var p, 24)
+    s.phy = ct(var p, 25)
+    s.pwr_delta = ct_signed(var p, 26)
+    s.snr_i = ct(var p, 27) & 0xF
+    s.snr_r = (ct(var p, 27) >>> 4) & 0xF
+    true
+
+// Read LL_CS_RSP into `s`, whose other fields are set to 0; false for a PDU of another length.
+@tier(embedded)
+fn get_rsp(var p: Pdu, var s: StartPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 22
+        return false
+    start_clear(var s)
+    s.config_id = ct(var p, 0) & 0x3F
+    s.conn_event = ct16(var p, 1)
+    s.offset_min = ct24(var p, 3)
+    s.offset_max = ct24(var p, 6)
+    s.event_interval = ct16(var p, 9)
+    s.subevents = ct(var p, 11)
+    s.subevent_interval = ct16(var p, 12)
+    s.subevent_len = ct24(var p, 14)
+    s.aci = ct(var p, 17)
+    s.phy = ct(var p, 18)
+    s.pwr_delta = ct_signed(var p, 19)
+    true
+
+// Read LL_CS_IND into `s`, whose other fields are set to 0 and whose `offset_min` takes the Offset; false for a PDU of another length.
+@tier(embedded)
+fn get_ind(var p: Pdu, var s: StartPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 19
+        return false
+    start_clear(var s)
+    s.config_id = ct(var p, 0) & 0x3F
+    s.conn_event = ct16(var p, 1)
+    s.offset_min = ct24(var p, 3)
+    s.event_interval = ct16(var p, 6)
+    s.subevents = ct(var p, 8)
+    s.subevent_interval = ct16(var p, 9)
+    s.subevent_len = ct24(var p, 11)
+    s.aci = ct(var p, 14)
+    s.phy = ct(var p, 15)
+    s.pwr_delta = ct_signed(var p, 16)
+    true
+
+// ── LL_CS_TERMINATE_REQ and LL_CS_TERMINATE_RSP ─────────────────────
+
+// LL_CS_TERMINATE_REQ (`op` is `ll_cs.OP_CS_TERMINATE_REQ`) or LL_CS_TERMINATE_RSP (`ll_cs.OP_CS_TERMINATE_RSP`) with the fields of `t`.
+@tier(embedded)
+fn put_terminate(var p: Pdu, op: Int, var t: TermPdu)
+    ll_data.ctrl_begin(var p, op)
+    put8(var p, t.config_id & 0x3F)
+    put16(var p, t.proc_count)
+    put8(var p, t.error)
+    ll_data.dpdu_finish(var p)
+
+// Read either terminate PDU into `t`; false for a PDU of another length.
+@tier(embedded)
+fn get_terminate(var p: Pdu, var t: TermPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 5
+        return false
+    t.config_id = ct(var p, 0) & 0x3F
+    t.proc_count = ct16(var p, 1)
+    t.error = ct(var p, 3)
+    true
+
+// ── LL_CS_FAE_REQ and LL_CS_FAE_RSP ─────────────────────────────────
+
+// LL_CS_FAE_REQ: no CtrData.
+@tier(embedded)
+fn put_fae_req(var p: Pdu)
+    ll_data.ctrl_bare(var p, ll_cs.OP_CS_FAE_REQ)
+
+// The start of LL_CS_FAE_RSP: `put_fae_value` appends the 72 octets of the table, one for each allowed channel in index order, and `put_fae_end`
+// writes the length.
+@tier(embedded)
+fn put_fae_begin(var p: Pdu)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_FAE_RSP)
+
+// One value of the table, in units of 1/32 ppm, -128 to 127.
+@tier(embedded)
+fn put_fae_value(var p: Pdu, v: Int)
+    put8(var p, v)
+
+@tier(embedded)
+fn put_fae_end(var p: Pdu)
+    ll_data.dpdu_finish(var p)
+
+// Value `i` (0 to 71) of the table in LL_CS_FAE_RSP, signed, units of 1/32 ppm.
+@tier(embedded)
+fn fae_value(var p: Pdu, i: Int) -> Int
+    ct_signed(var p, i)
+
+// ── LL_CS_CHANNEL_MAP_IND ───────────────────────────────────────────
+
+// LL_CS_CHANNEL_MAP_IND with the map and the instant of `m`.
+@tier(embedded)
+fn put_channel_map(var p: Pdu, var m: ChmPdu)
+    ll_data.ctrl_begin(var p, ll_cs.OP_CS_CHANNEL_MAP_IND)
+    put40(var p, m.lo)
+    put40(var p, m.hi)
+    put16(var p, m.instant)
+    ll_data.dpdu_finish(var p)
+
+// Read LL_CS_CHANNEL_MAP_IND into `m`; false for a PDU of another length.
+@tier(embedded)
+fn get_channel_map(var p: Pdu, var m: ChmPdu) -> Bool
+    if ll_data.dpdu_len(var p) != 13
+        return false
+    m.lo = ct40(var p, 0)
+    m.hi = ct40(var p, 5)
+    m.instant = ct16(var p, 10)
+    true
+
+// ── The PHY encodings ───────────────────────────────────────────────
+// Five encodings name a PHY ([Vol 4] Part E, Sections 7.8.130, 7.8.137 and 7.8.140; [Vol 6] Part B, Sections 2.4.2.44, 2.4.2.45 and 2.4.2.47).  Each
+// function converts one to another and answers -1 for a value the target lacks.
+//
+//   the HCI CS_SYNC_PHY of LE CS Create Config and LE CS Test          1 LE 1M, 2 LE 2M, 3 LE 2M 2BT
+//   the CS_SYNC_PHY of LL_CS_CONFIG_REQ, one bit                       0 LE 1M, 1 LE 2M, 2 LE Coded, 3 LE 2M 2BT
+//   CS_SYNC_PHY_Capability of the capabilities, bit mask               bit 1 LE 2M, bit 2 LE 2M 2BT (LE 1M is implicit)
+//   the HCI PHY of LE CS Set Procedure Parameters                      1 LE 1M, 2 LE 2M, 3 LE Coded S=8, 4 LE Coded S=2
+//   the PHY of LL_CS_REQ, one bit                                      bit 0 LE 1M, 1 LE 2M, 2 LE Coded S=8, 3 LE Coded S=2
+
+// The value of the CS_SYNC_PHY field of LL_CS_CONFIG_REQ for the HCI CS_SYNC_PHY `hci`: the bit of the PHY, -1 for a value that names none.
+@tier(embedded)
+fn sync_phy_to_pdu(hci: Int) -> Int
+    match hci
+        1 => 0x01
+        2 => 0x02
+        3 => 0x08
+        _ => -1
+
+// The HCI CS_SYNC_PHY for the CS_SYNC_PHY field of LL_CS_CONFIG_REQ; -1 for no bit, more than one bit, LE Coded (which Channel Sounding does not use) and
+// a reserved bit.
+@tier(embedded)
+fn sync_phy_to_hci(bit: Int) -> Int
+    match bit
+        0x01 => 1
+        0x02 => 2
+        0x08 => 3
+        _    => -1
+
+// The bit of CS_SYNC_PHY_Capability for the HCI CS_SYNC_PHY `hci`: 0 for LE 1M, which is implicit and has no bit, -1 for a value that names none.
+@tier(embedded)
+fn sync_phy_cap_bit(hci: Int) -> Int
+    match hci
+        1 => 0
+        2 => 0x02
+        3 => 0x04
+        _ => -1
+
+// Whether the capability mask `caps` allows the PDU's CS_SYNC_PHY `bit`: LE 1M always, LE 2M and LE 2M 2BT by their bits, LE Coded never.
+@tier(embedded)
+fn sync_phy_allowed(caps: Int, bit: Int) -> Bool
+    match bit
+        0x01 => true
+        0x02 => (caps & 0x02) != 0
+        0x08 => (caps & 0x04) != 0
+        _    => false
+
+// The PHY of LL_CS_REQ for the HCI PHY of LE CS Set Procedure Parameters: the bit of it, -1 for a value that names none.
+@tier(embedded)
+fn proc_phy_to_pdu(hci: Int) -> Int
+    if hci >= 1 and hci <= 4
+        return 1 << (hci - 1)
+    -1
+
+// The HCI PHY for the PHY of LL_CS_REQ: 1 to 4, -1 for no bit, more than one bit and a reserved bit.
+@tier(embedded)
+fn proc_phy_to_hci(bit: Int) -> Int
+    match bit
+        0x01 => 1
+        0x02 => 2
+        0x04 => 3
+        0x08 => 4
+        _    => -1

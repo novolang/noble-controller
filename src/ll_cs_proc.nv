@@ -1,0 +1,1777 @@
+// src/ll_cs_proc.nv — the Link Layer procedures of Channel Sounding, kept in one record for each connection that runs it: Security Start, the
+// Capabilities Exchange, the Configuration, the Start, the Procedure Repeat Termination, the Channel Map Update and the Mode-0 FAE Table Request.
+//
+// [Vol 6] Part B, Sections 4.5.18, 5.1.23 to 5.1.29 and 5.3.  The Host's side of a procedure is a `begin_` function that checks what the command of
+// the Host checks, fills the PDU that goes out and answers the status the command carries.  The peer's side is `receive`, which reads the PDU the peer sent
+// and, when the procedure has an answer, fills it; the answer to a procedure of this end that ends is kept in `owed`, one bit for each event of the
+// Host, and in the status of the procedure.  Nothing here reads a clock, a link or a queue: what the procedures need to know of the connection is
+// in an `Env` that the caller fills, and the PDUs are `Pdu` values the caller queues.
+//
+//   Security Start (5.1.23)       the Central sends LL_CS_SEC_REQ with its parts of CS_IV, CS_IN and CS_PV and the Peripheral answers with its own
+//                                 in LL_CS_SEC_RSP; each side joins the parts (Peripheral part as the most significant octets) and
+//                                 starts CSProcCount at 0.  The random octets of a side come from `feed_random`.
+//   Capabilities Exchange (5.1.24) LL_CS_CAPABILITIES_REQ and LL_CS_CAPABILITIES_RSP, either side; the record of the peer is kept
+//   Configuration (5.1.25)        LL_CS_CONFIG_REQ creates or removes the configuration `Config_ID` in both ends and LL_CS_CONFIG_RSP accepts it; the
+//                                 side that sends the request takes the role in the PDU and the other side the other role
+//   Mode-0 FAE Table Request (5.1.29)  LL_CS_FAE_REQ and LL_CS_FAE_RSP with the 72 values of the reflector's table
+//   Start (5.1.26)                LL_CS_REQ from either side; the Peripheral answers LL_CS_RSP, the Central answers LL_CS_REQ or LL_CS_RSP with
+//                                 LL_CS_IND, which starts the procedures
+//   Procedure Repeat Termination (5.1.27)  LL_CS_TERMINATE_REQ and LL_CS_TERMINATE_RSP stop the instances that follow
+//   Channel Map Update (5.1.28)   LL_CS_CHANNEL_MAP_IND from the side that starts the next procedure, applied at its instant
+//
+// Every request of the peer is answered, with the PDU of the procedure or with LL_REJECT_EXT_IND and an error code: Unsupported Remote Feature (0x1A)
+// when the Host has not set Channel Sounding (Host Support), Insufficient Security (0x2F) on a link that is not encrypted, Unsupported LL
+// Parameter Value (0x20) for parameters this end cannot take, Invalid LL Parameters (0x1E) for a configuration that does not exist, Command Disallowed
+// (0x0C) for a procedure that is in progress, Rejected due to Security Reasons (0x0E), Unsupported Feature or Parameter Value (0x11) for a FAE table
+// request while No_FAE is set, and LL Procedure Collision (0x23) or Different Transaction Collision (0x2A) for a request that crosses one of this end
+// (Section 5.3).  A procedure of this end that waits for the peer ends the connection after 40 seconds (Section 5.2): `poll` says so.
+//
+// The record of a connection (`Cs`) holds, besides its numbers, the octets of the peer's capabilities, the peer's FAE table, the security parts,
+// the configurations and the Start in flight in one store, `bulk`; `load_caps`, `load_config` and `load_run` give them back as the records of
+// `ll_cs_pdu`.  The Controller keeps the records of its connections as numbers and octets in two tables, which `load` and `store` copy a record from and
+// to, so that a build without the feature has no type of this module; `ctl_hci.nv` and the test files name the module behind a `@when` on `ctl_cs`, and a
+// build without the feature does not load it.
+//
+// Every event the Host is owed is one bit of `owed` with its status; the Controller turns them into events (they are `OWED_`, `st_`).  A bit that the
+// Controller has not taken when the next of its kind arrives is overwritten.
+//
+// This module holds no radio, no clock and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
+
+use ll_pdu
+use ll_data
+use ll_cs
+use ll_cs_pdu
+use ctl_limits
+use noble_controller_config
+
+// ── Numbers ─────────────────────────────────────────────────────────
+
+// What `receive` and `feed_random` answer: nothing to send, the PDU in `out` to queue, and an opcode this end does not know in its role.
+const R_NONE = 0
+const R_SEND = 1
+const R_UNKNOWN = 2
+
+// What the procedure of this end waits for (`Cs.wait`).
+const W_NONE = 0
+const W_SEC = 1
+const W_CAP = 2
+const W_CFG = 3
+const W_START = 4
+const W_TERM = 5
+const W_FAE = 6
+const W_RND_C = 7
+const W_RND_P = 8
+
+// The events the Host is owed (`Cs.owed`): the Read Remote Supported Capabilities Complete, Read Remote FAE Table Complete, Security Enable
+// Complete and Config Complete events, the answer of a Start (Procedure Enable Complete), and the end of a Procedure Repeat Termination.
+const OWED_CAPS = 1
+const OWED_FAE = 2
+const OWED_SEC = 4
+const OWED_CFG = 8
+const OWED_PROC = 16
+const OWED_TERM = 32
+
+// The error codes of the HCI and of LL_REJECT_EXT_IND the procedures use ([Vol 1] Part F).
+const E_DISALLOWED = 0x0C
+const E_LIMITED = 0x0D
+const E_SECURITY_REASONS = 0x0E
+const E_UNSUPPORTED_FEATURE = 0x11
+const E_INVALID_PARAMS = 0x12
+const E_UNSUPPORTED_REMOTE = 0x1A
+const E_INVALID_LL = 0x1E
+const E_UNSUPPORTED_LL = 0x20
+const E_RESPONSE_TIMEOUT = 0x22
+const E_COLLISION = 0x23
+const E_INSTANT_PASSED = 0x28
+const E_DIFFERENT_COLLISION = 0x2A
+const E_INSUFFICIENT_SECURITY = 0x2F
+const E_INSUFFICIENT_CHANNELS = 0x48
+
+// What `Cs.wait` allows a peer to leave unanswered, in microseconds ([Vol 6] Part B, Section 5.2).
+const WAIT_US = 40000000
+
+// The fewest channels a procedure needs after the filtering, and the CSProcCount modulus.
+const CHANNELS_MIN = 15
+const COUNT_MOD = 65536
+
+// Connection events: how far from the current event the connEventCount of LL_CS_REQ and the Instant of LL_CS_CHANNEL_MAP_IND may lie (2^14), the
+// events a connEventCount this end picks is ahead of the current one, and the span that tells a past event from a future one.
+const EVENT_SPAN = 16384
+const EVENT_AHEAD = 6
+const EVENT_HALF = 32768
+
+// The limits of LL_CS_REQ ([Vol 6] Part B, Section 2.4.2.47): the least Offset_Min and Subevent_Len and the 4 seconds that bound the offsets and the
+// length, in microseconds, and the unit of the lengths in 625 microseconds.
+const OFFSET_MIN_US = 500
+const SUBEVENT_LEN_MIN_US = 1250
+const FOUR_SECONDS_US = 4000000
+const UNIT_US = 625
+
+// ── The store ───────────────────────────────────────────────────────
+// The octets of a connection's store, by offset.  The capabilities of the peer: the version (0 none, 1 [v1], 2 [v2]) and 31 octets of CtrData; the FAE
+// table of the peer: 72 signed octets; the security parts: CS_IV 16 octets, CS_IN 8 and CS_PV 16, the Central's part in the least significant half;
+// the CtrData of the LL_CS_REQ of the Start in flight (28) and of its LL_CS_IND (18); the CtrData of the LL_CS_CONFIG_REQ in flight with a flag octet
+// (28); and the configurations, 32 octets each: a flag octet (bit 0 the configuration exists, bit 1 this end sent the request that created it), the
+// 27 octets of the PDU and 4 octets that keep the size a multiple of 8.
+const OFF_CAPS = 0
+const OFF_FAE = 32
+const OFF_SEC = 104
+const OFF_REQ = 144
+const OFF_IND = 172
+const OFF_PCFG = 192
+const OFF_CFG = 224
+const CFG_OCT = 32
+
+// The configurations a connection holds: `ctl_cs_configs`, and 1 in a build without the feature.
+@tier(embedded)
+const fn cfg_slots() -> Int
+    if noble_controller_config.CTL_CS > 0
+        noble_controller_config.CTL_CS_CONFIGS
+    // cov: skip — the build without the feature, which the tests of the feature do not run
+    else
+        1
+
+// The octets of a store: its fixed part and the configurations; 1 in a build without the feature.
+@tier(embedded)
+const fn bulk_octets() -> Int
+    if noble_controller_config.CTL_CS > 0
+        OFF_CFG + CFG_OCT * noble_controller_config.CTL_CS_CONFIGS
+    // cov: skip — the build without the feature, which the tests of the feature do not run
+    else
+        1
+
+// ── The environment ─────────────────────────────────────────────────
+
+// What the procedures need to know of the connection and the Controller, which the caller sets before each call.
+//
+//   central, encrypted   this end is the Central; the link is encrypted
+//   peer_cs, peer_v2     the peer's feature set has Channel Sounding (46) and Channel Sounding Enhancement #1 (75)
+//   ev_count, interval_us, now   the connection event counter, the connection interval and the time, in microseconds
+//   busy                 a procedure of the ACL that the Start and the Channel Map Update exclude is out: a connection update, a PHY update, a power
+//                        control or subrate request (Sections 5.1.26 and 5.3)
+//   phy, managed         the PHY of the ACL and the PHYs whose power the Link Layer manages, as bits as LL_CS_REQ has them (1 LE 1M, 2 LE 2M, 4 LE Coded
+//                        S=8, 8 LE Coded S=2)
+//   sec_ok               the security requirements of the Host are met
+//   max_tx               the most octets of payload a PDU sent now may carry
+@value
+struct Env
+    central: Bool
+    encrypted: Bool
+    peer_cs: Bool
+    peer_v2: Bool
+    ev_count: Int
+    interval_us: Int
+    now: Int
+    busy: Bool
+    phy: Int
+    managed: Int
+    sec_ok: Bool
+    max_tx: Int
+
+// An environment for a Peripheral of 30 ms on an encrypted link, at time 0, whose peer has the feature; the PHY of the ACL is LE 1M.
+@tier(embedded)
+fn env_new() -> Env
+    Env { central: false, encrypted: true, peer_cs: true, peer_v2: false, ev_count: 0, interval_us: 30000, now: 0, busy: false, phy: 1, managed: 0,
+          sec_ok: true, max_tx: 251 }
+
+// An environment that carries the time alone, for the calls that read nothing else (`poll`, `feed_random`).
+@tier(embedded)
+fn env_at(now: Int) -> Env
+    Env { central: false, encrypted: true, peer_cs: true, peer_v2: false, ev_count: 0, interval_us: 30000, now: now, busy: false, phy: 1, managed: 0,
+          sec_ok: true, max_tx: 251 }
+
+// ── The record of a connection ──────────────────────────────────────
+
+// The state of the procedures of one connection.
+//
+//   owner                the slot of the link that has the record, -1 for none
+//   host                 the Host set Channel Sounding (Host Support)
+//   secured, fresh       the Security Start procedure completed; no procedure has run since (CSProcCount is not incremented for the first)
+//   caps_air, fae_air    the peer's capabilities, the peer's FAE table, came from the peer and not from the Host
+//   fae_known            the FAE table of the peer is in the store
+//   run_open             a Start completed and its procedures are not all done; `series_cfg`, `series_n` (N_PROCEDURE_COUNT) and `series_start`
+//                        (the CSProcCount of the first instance) describe it
+//   start_host           the Start in flight is the Host's
+//   wait, wait_cfg, t0, rnd_n   what the procedure of this end waits for, the Config_ID it concerns, the time of the last PDU queued for it, and the
+//                        random octets collected for Security Start
+//   yield_op             the opcode of a request of this end that the Central rejected because the peer's crossed it: the rejection is not an answer
+//   owed, st_*, ev_cfg, ev_act   the events the Host is owed and the status of each; the configuration and the action of the Config Complete
+//   proc_count, term_error   CSProcCount; the ErrorCode of the last Procedure Repeat Termination
+//   chm_lo, chm_hi       the channel map of the Channel Map Update procedure in force (all allowed channels at first), `pend_*` the one waiting for its
+//                        instant
+//   bulk                 the store
+@value
+struct Cs
+    owner: Int
+    host: Bool
+    secured: Bool
+    fresh: Bool
+    caps_air: Bool
+    fae_known: Bool
+    fae_air: Bool
+    run_open: Bool
+    start_host: Bool
+    pend_chm: Bool
+    wait: Int
+    wait_cfg: Int
+    t0: Int
+    rnd_n: Int
+    yield_op: Int
+    owed: Int
+    st_caps: Int
+    st_fae: Int
+    st_sec: Int
+    st_cfg: Int
+    st_proc: Int
+    st_term: Int
+    ev_cfg: Int
+    ev_act: Int
+    proc_count: Int
+    series_cfg: Int
+    series_n: Int
+    series_start: Int
+    term_error: Int
+    chm_lo: Int
+    chm_hi: Int
+    pend_lo: Int
+    pend_hi: Int
+    pend_instant: Int
+    bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then 224 + 32 * noble_controller_config.CTL_CS_CONFIGS else 1]
+
+// ── The records in the Controller ───────────────────────────────────
+// The Controller keeps the records of its connections as numbers and octets in two tables, which are `Vec` values and so need no type of their own in a
+// build without the feature: a record of `CS_WORDS` words in `words`, the fields of `Cs` from `owner` to `pend_instant` in the order of the `WD_` indices, and
+// `bulk_octets()` octets in `bulk`, the store.  `load` copies the record of a slot into a `Cs`, `store` copies it back; the procedures run over the `Cs`.
+
+const WD_OWNER = 0
+const WD_HOST = 1
+const WD_SECURED = 2
+const WD_FRESH = 3
+const WD_CAPS_AIR = 4
+const WD_FAE_KNOWN = 5
+const WD_FAE_AIR = 6
+const WD_RUN_OPEN = 7
+const WD_START_HOST = 8
+const WD_PEND_CHM = 9
+const WD_WAIT = 10
+const WD_WAIT_CFG = 11
+const WD_T0 = 12
+const WD_RND_N = 13
+const WD_YIELD_OP = 14
+const WD_OWED = 15
+const WD_ST_CAPS = 16
+const WD_ST_FAE = 17
+const WD_ST_SEC = 18
+const WD_ST_CFG = 19
+const WD_ST_PROC = 20
+const WD_ST_TERM = 21
+const WD_EV_CFG = 22
+const WD_EV_ACT = 23
+const WD_PROC_COUNT = 24
+const WD_SERIES_CFG = 25
+const WD_SERIES_N = 26
+const WD_SERIES_START = 27
+const WD_TERM_ERROR = 28
+const WD_CHM_LO = 29
+const WD_CHM_HI = 30
+const WD_PEND_LO = 31
+const WD_PEND_HI = 32
+const WD_PEND_INSTANT = 33
+const CS_WORDS = 34
+
+@tier(embedded)
+fn b2i(v: Bool) -> Int
+    if v
+        1
+    else
+        0
+
+// Copy the record of `slot` into `cs`.
+@tier(embedded)
+fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1],
+        var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1],
+        slot: Int, var cs: Cs)
+    let w = slot * CS_WORDS
+    cs.owner = words[w + WD_OWNER]
+    cs.host = words[w + WD_HOST] != 0
+    cs.secured = words[w + WD_SECURED] != 0
+    cs.fresh = words[w + WD_FRESH] != 0
+    cs.caps_air = words[w + WD_CAPS_AIR] != 0
+    cs.fae_known = words[w + WD_FAE_KNOWN] != 0
+    cs.fae_air = words[w + WD_FAE_AIR] != 0
+    cs.run_open = words[w + WD_RUN_OPEN] != 0
+    cs.start_host = words[w + WD_START_HOST] != 0
+    cs.pend_chm = words[w + WD_PEND_CHM] != 0
+    cs.wait = words[w + WD_WAIT]
+    cs.wait_cfg = words[w + WD_WAIT_CFG]
+    cs.t0 = words[w + WD_T0]
+    cs.rnd_n = words[w + WD_RND_N]
+    cs.yield_op = words[w + WD_YIELD_OP]
+    cs.owed = words[w + WD_OWED]
+    cs.st_caps = words[w + WD_ST_CAPS]
+    cs.st_fae = words[w + WD_ST_FAE]
+    cs.st_sec = words[w + WD_ST_SEC]
+    cs.st_cfg = words[w + WD_ST_CFG]
+    cs.st_proc = words[w + WD_ST_PROC]
+    cs.st_term = words[w + WD_ST_TERM]
+    cs.ev_cfg = words[w + WD_EV_CFG]
+    cs.ev_act = words[w + WD_EV_ACT]
+    cs.proc_count = words[w + WD_PROC_COUNT]
+    cs.series_cfg = words[w + WD_SERIES_CFG]
+    cs.series_n = words[w + WD_SERIES_N]
+    cs.series_start = words[w + WD_SERIES_START]
+    cs.term_error = words[w + WD_TERM_ERROR]
+    cs.chm_lo = words[w + WD_CHM_LO]
+    cs.chm_hi = words[w + WD_CHM_HI]
+    cs.pend_lo = words[w + WD_PEND_LO]
+    cs.pend_hi = words[w + WD_PEND_HI]
+    cs.pend_instant = words[w + WD_PEND_INSTANT]
+    let b = slot * bulk_octets()
+    for i in 0..bulk_octets()
+        cs.bulk[i] = bulk[b + i]
+
+// Copy `cs` into the record of `slot`.
+@tier(embedded)
+fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1],
+         var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1],
+         slot: Int, var cs: Cs)
+    let w = slot * CS_WORDS
+    words[w + WD_OWNER] = cs.owner
+    words[w + WD_HOST] = b2i(cs.host)
+    words[w + WD_SECURED] = b2i(cs.secured)
+    words[w + WD_FRESH] = b2i(cs.fresh)
+    words[w + WD_CAPS_AIR] = b2i(cs.caps_air)
+    words[w + WD_FAE_KNOWN] = b2i(cs.fae_known)
+    words[w + WD_FAE_AIR] = b2i(cs.fae_air)
+    words[w + WD_RUN_OPEN] = b2i(cs.run_open)
+    words[w + WD_START_HOST] = b2i(cs.start_host)
+    words[w + WD_PEND_CHM] = b2i(cs.pend_chm)
+    words[w + WD_WAIT] = cs.wait
+    words[w + WD_WAIT_CFG] = cs.wait_cfg
+    words[w + WD_T0] = cs.t0
+    words[w + WD_RND_N] = cs.rnd_n
+    words[w + WD_YIELD_OP] = cs.yield_op
+    words[w + WD_OWED] = cs.owed
+    words[w + WD_ST_CAPS] = cs.st_caps
+    words[w + WD_ST_FAE] = cs.st_fae
+    words[w + WD_ST_SEC] = cs.st_sec
+    words[w + WD_ST_CFG] = cs.st_cfg
+    words[w + WD_ST_PROC] = cs.st_proc
+    words[w + WD_ST_TERM] = cs.st_term
+    words[w + WD_EV_CFG] = cs.ev_cfg
+    words[w + WD_EV_ACT] = cs.ev_act
+    words[w + WD_PROC_COUNT] = cs.proc_count
+    words[w + WD_SERIES_CFG] = cs.series_cfg
+    words[w + WD_SERIES_N] = cs.series_n
+    words[w + WD_SERIES_START] = cs.series_start
+    words[w + WD_TERM_ERROR] = cs.term_error
+    words[w + WD_CHM_LO] = cs.chm_lo
+    words[w + WD_CHM_HI] = cs.chm_hi
+    words[w + WD_PEND_LO] = cs.pend_lo
+    words[w + WD_PEND_HI] = cs.pend_hi
+    words[w + WD_PEND_INSTANT] = cs.pend_instant
+    let b = slot * bulk_octets()
+    for i in 0..bulk_octets()
+        bulk[b + i] = cs.bulk[i]
+
+// The tables of a Controller with `slots` records, each a new record that no connection owns.  `Vec.new()` has no elements; this fills them.
+@tier(embedded)
+fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1],
+               var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1])
+    var cs = cs_new()
+    for slot in 0..noble_controller_config.CTL_CS
+        for _ in 0..CS_WORDS
+            let _w = words.push(0)
+        for _ in 0..bulk_octets()
+            let _b = bulk.push(0)
+        store(var words, var bulk, slot, var cs)
+
+// A record for the connection of the link in slot `owner`, as new, with the Host Support bit as the Host set it.
+@tier(embedded)
+fn claim(var cs: Cs, owner: Int, host: Bool)
+    cs_reset(var cs)
+    cs.owner = owner
+    cs.host = host
+
+// A record that no connection owns.
+@tier(embedded)
+fn free(var cs: Cs)
+    cs_reset(var cs)
+    cs.owner = -1
+
+// The Host sets or clears Channel Sounding (Host Support) for the connection.
+@tier(embedded)
+fn set_host(var cs: Cs, on: Bool)
+    cs.host = on
+
+@tier(embedded)
+fn cs_new() -> Cs
+    var cs = Cs { owner: -1, host: false, secured: false, fresh: false, caps_air: false, fae_known: false, fae_air: false, run_open: false, start_host: false, pend_chm: false, wait: W_NONE,
+                  wait_cfg: 0, t0: 0, rnd_n: 0, yield_op: 0, owed: 0, st_caps: 0, st_fae: 0, st_sec: 0, st_cfg: 0, st_proc: 0, st_term: 0, ev_cfg: 0,
+                  ev_act: 0, proc_count: 0, series_cfg: 0, series_n: 0, series_start: 0, term_error: 0, chm_lo: ll_cs_pdu.CHM_LO_ALLOWED,
+                  chm_hi: ll_cs_pdu.CHM_HI_ALLOWED, pend_lo: 0, pend_hi: 0, pend_instant: 0, bulk: Vec.new() }
+    for _ in 0..bulk_octets()
+        let _a = cs.bulk.push(0)
+    cs
+
+// A record for a new connection: nothing known of the peer, no configuration, no procedure.  `owner` is kept and `host` is kept, since the Host sets it
+// before the connection.
+@tier(embedded)
+fn cs_reset(var cs: Cs)
+    cs.secured = false
+    cs.fresh = false
+    cs.caps_air = false
+    cs.fae_known = false
+    cs.fae_air = false
+    cs.run_open = false
+    cs.start_host = false
+    cs.pend_chm = false
+    cs.wait = W_NONE
+    cs.wait_cfg = 0
+    cs.t0 = 0
+    cs.rnd_n = 0
+    cs.yield_op = 0
+    cs.owed = 0
+    cs.st_caps = 0
+    cs.st_fae = 0
+    cs.st_sec = 0
+    cs.st_cfg = 0
+    cs.st_proc = 0
+    cs.st_term = 0
+    cs.ev_cfg = 0
+    cs.ev_act = 0
+    cs.proc_count = 0
+    cs.series_cfg = 0
+    cs.series_n = 0
+    cs.series_start = 0
+    cs.term_error = 0
+    cs.chm_lo = ll_cs_pdu.CHM_LO_ALLOWED
+    cs.chm_hi = ll_cs_pdu.CHM_HI_ALLOWED
+    cs.pend_lo = 0
+    cs.pend_hi = 0
+    cs.pend_instant = 0
+    for i in 0..bulk_octets()
+        cs.bulk[i] = 0
+
+// ── The store ───────────────────────────────────────────────────────
+
+@tier(embedded)
+fn bg(var cs: Cs, i: Int) -> Int
+    cs.bulk[i] as Int
+
+@tier(embedded)
+fn bs(var cs: Cs, i: Int, v: Int)
+    cs.bulk[i] = (v & 0xFF) as u8
+
+// Keep the `n` octets of CtrData of `p` at `off` of the store.
+@tier(embedded)
+fn keep(var cs: Cs, off: Int, var p: Pdu, n: Int)
+    for i in 0..n
+        bs(var cs, off + i, ll_cs_pdu.ct(var p, i))
+
+// Fill `p` with a control PDU of `op` whose CtrData is the `n` octets at `off` of the store, so that a `ll_cs_pdu.get_` function can read it.
+@tier(embedded)
+fn stage(var cs: Cs, off: Int, op: Int, n: Int, var p: Pdu)
+    ll_data.ctrl_begin(var p, op)
+    for i in 0..n
+        ll_cs_pdu.put8(var p, bg(var cs, off + i))
+    ll_data.dpdu_finish(var p)
+
+// Copy `n` octets inside the store.
+@tier(embedded)
+fn copy_within(var cs: Cs, from: Int, to: Int, n: Int)
+    for i in 0..n
+        bs(var cs, to + i, bg(var cs, from + i))
+
+// The Link Layer's own FAE table, in units of 1/32 ppm, for the allowed channel `i` (0 to 71, in index order): the table of a build with no radio
+// that has one.
+@tier(embedded)
+fn local_fae(i: Int) -> Int
+    0
+
+// ── The capabilities ────────────────────────────────────────────────
+
+// The capabilities of a device with the roles `roles` (1 initiator, 2 reflector, 3 both), `ant` antennas, `configs` configurations and the options that
+// the flags switch: mode 3, the sounding and random sequences (the round-trip time of them, N 255, and the phase of the sounding sequence), the initiator
+// phase tone of Enhancement #1 (the [v2] record) and Channel Selection Algorithm #3c.  The round trip time of the access address is mandatory (N 255), the table
+// of frequency actuation errors is absent (No_FAE), the optional step timings and the SNR levels and PHYs are not offered.
+@tier(embedded)
+fn caps_with(var c: CapPdu, roles: Int, ant: Int, configs: Int, mode3: Bool, rtt_seq: Bool, ipt: Bool, ch3c: Bool)
+    c.v2 = ipt
+    c.mode_types = 0
+    if mode3
+        c.mode_types = 1
+    c.rtt_cap = 0
+    c.n_aa = 255
+    c.n_sound = 0
+    c.n_rand = 0
+    c.sounding_pct = 0
+    if rtt_seq
+        c.n_sound = 255
+        c.n_rand = 255
+        c.sounding_pct = 1
+    c.nadm_sound = 0
+    c.nadm_rand = 0
+    c.sync_phy = 0
+    c.num_ant = ant
+    c.max_path = ant
+    c.role = roles
+    c.ipt = 0
+    if ipt
+        c.ipt = 1
+    c.no_fae = 1
+    c.ch3c = 0
+    if ch3c
+        c.ch3c = 1
+    c.num_configs = configs
+    c.max_procs = 0
+    c.t_sw = 0
+    c.t_ip1 = 0
+    c.t_ip2 = 0
+    c.t_fcs = 0
+    c.t_pm = 0
+    c.rtt_phy = 0
+    c.tx_snr = 0
+    c.t_ip2_ipt = 0
+    c.t_sw_ipt = 0
+    c.n2_aa = 0
+    c.n2_sound = 0
+    c.n2_rand = 0
+
+// The capabilities this build reports, from its keys alone (`caps_with`).  The Controller cuts it down with what the radio of the port runs.
+@tier(embedded)
+fn local_caps(var c: CapPdu)
+    caps_with(var c, noble_controller_config.CTL_CS_ROLES, noble_controller_config.CTL_CS_ANT, noble_controller_config.CTL_CS_CONFIGS, ctl_limits.cs_mode3_on(),
+        ctl_limits.cs_rtt_seq_on(), ctl_limits.cs_ipt_on(), ctl_limits.cs_3c_on())
+
+// Whether the peer's capabilities are in the store.
+@tier(embedded)
+fn caps_known(var cs: Cs) -> Bool
+    bg(var cs, OFF_CAPS) != 0
+
+// Keep the capabilities of the PDU `p`, a LL_CS_CAPABILITIES_REQ or LL_CS_CAPABILITIES_RSP of the length the specification gives it.
+@tier(embedded)
+fn keep_caps(var cs: Cs, var p: Pdu)
+    let n = ll_data.dpdu_len(var p) - 1
+    var v = 2
+    if n == ll_cs_pdu.CAPS_V1_OCTETS
+        v = 1
+    bs(var cs, OFF_CAPS, v)
+    for i in 0..31
+        var o = 0
+        if i < n
+            o = ll_cs_pdu.ct(var p, i)
+        bs(var cs, OFF_CAPS + 1 + i, o)
+
+// Read the peer's capabilities into `c`; false when none are in the store.  `scratch` is overwritten.
+@tier(embedded)
+fn load_caps(var cs: Cs, var c: CapPdu, var scratch: Pdu) -> Bool
+    let v = bg(var cs, OFF_CAPS)
+    if v == 0
+        return false
+    var n = ll_cs_pdu.CAPS_V2_OCTETS
+    if v == 1
+        n = ll_cs_pdu.CAPS_V1_OCTETS
+    stage(var cs, OFF_CAPS + 1, ll_cs.OP_CS_CAPABILITIES_RSP, n, var scratch)
+    ll_cs_pdu.get_caps(var scratch, var c)
+
+// Whether the fields of a capabilities record are ones the specification allows: 1 to 4 configurations and antennas, at least as many paths as
+// antennas and at most 4, and a role.
+@tier(embedded)
+fn caps_valid(var c: CapPdu) -> Bool
+    c.num_configs >= 1 and c.num_configs <= 4 and c.num_ant >= 1 and c.num_ant <= 4 and c.max_path >= c.num_ant and c.max_path <= 4 and c.role >= 1 and c.role <= 3
+
+// The capabilities of the peer that the Host knows from an earlier connection (LE CS Write Cached Remote Supported Capabilities): kept when no
+// LL_CS_CAPABILITIES_REQ or LL_CS_CAPABILITIES_RSP has been received and no configuration exists, otherwise Command Disallowed.  `scratch` is
+// overwritten.
+@tier(embedded)
+fn cache_caps(var cs: Cs, var c: CapPdu, var scratch: Pdu) -> Int
+    if cs.caps_air or any_config(var cs)
+        return E_DISALLOWED
+    ll_cs_pdu.put_caps(var scratch, ll_cs.OP_CS_CAPABILITIES_RSP, var c)
+    keep_caps(var cs, var scratch)
+    0
+
+// ── The FAE table ───────────────────────────────────────────────────
+
+// Value `i` (0 to 71) of the peer's FAE table, signed, in units of 1/32 ppm.
+@tier(embedded)
+fn peer_fae(var cs: Cs, i: Int) -> Int
+    let v = bg(var cs, OFF_FAE + i)
+    if v >= 0x80
+        v - 0x100
+    else
+        v
+
+// Keep value `i` of a table the Host knows from an earlier connection (LE CS Write Cached Remote FAE Table), `done` with the last (72nd) value:
+// kept while no LL_CS_FAE_RSP has been received and no configuration exists, otherwise Command Disallowed.
+@tier(embedded)
+fn cache_fae(var cs: Cs, i: Int, v: Int, done: Bool) -> Int
+    if cs.fae_air or any_config(var cs)
+        return E_DISALLOWED
+    bs(var cs, OFF_FAE + i, v)
+    if done
+        cs.fae_known = true
+    0
+
+// ── The configurations ──────────────────────────────────────────────
+
+@tier(embedded)
+fn cfg_base(id: Int) -> Int
+    OFF_CFG + CFG_OCT * id
+
+// Whether the configuration `id` exists.
+@tier(embedded)
+fn cfg_used(var cs: Cs, id: Int) -> Bool
+    id >= 0 and id < cfg_slots() and (bg(var cs, cfg_base(id)) & 1) != 0
+
+// Whether any configuration exists.
+@tier(embedded)
+fn any_config(var cs: Cs) -> Bool
+    for id in 0..cfg_slots()
+        if cfg_used(var cs, id)
+            return true
+    false
+
+// Read the configuration `id` into `c`; false when it does not exist.  `scratch` is overwritten.
+@tier(embedded)
+fn load_config(var cs: Cs, id: Int, var c: CfgPdu, var scratch: Pdu) -> Bool
+    if not cfg_used(var cs, id)
+        return false
+    stage(var cs, cfg_base(id) + 1, ll_cs.OP_CS_CONFIG_REQ, 27, var scratch)
+    ll_cs_pdu.get_config_req(var scratch, var c)
+
+// Whether this end sent the request that created the configuration `id`.
+@tier(embedded)
+fn cfg_mine(var cs: Cs, id: Int) -> Bool
+    (bg(var cs, cfg_base(id)) & 2) != 0
+
+// The role this end has in the configuration `id`, 0 the initiator and 1 the reflector: the role in the PDU when this end sent it, the other when it
+// received it.
+@tier(embedded)
+fn cfg_role(var cs: Cs, id: Int) -> Int
+    let role = (bg(var cs, cfg_base(id) + 20) >>> 4) & 3
+    if cfg_mine(var cs, id)
+        role
+    else
+        1 - role
+
+// The channel map of the configuration `id`: `lo` and `hi` as `ll_cs_pdu.chm_has` reads them.
+@tier(embedded)
+fn cfg_map_lo(var cs: Cs, id: Int) -> Int
+    let b = cfg_base(id) + 2
+    bg(var cs, b) | (bg(var cs, b + 1) << 8) | (bg(var cs, b + 2) << 16) | (bg(var cs, b + 3) << 24) | (bg(var cs, b + 4) << 32)
+
+@tier(embedded)
+fn cfg_map_hi(var cs: Cs, id: Int) -> Int
+    let b = cfg_base(id) + 7
+    bg(var cs, b) | (bg(var cs, b + 1) << 8) | (bg(var cs, b + 2) << 16) | (bg(var cs, b + 3) << 24) | (bg(var cs, b + 4) << 32)
+
+// Keep the CtrData of LL_CS_CONFIG_REQ in `p` as the configuration `id`; `mine` says this end sent it.
+@tier(embedded)
+fn store_config(var cs: Cs, id: Int, var p: Pdu, mine: Bool)
+    var flags = 1
+    if mine
+        flags = 3
+    bs(var cs, cfg_base(id), flags)
+    keep(var cs, cfg_base(id) + 1, var p, 27)
+
+@tier(embedded)
+fn remove_config(var cs: Cs, id: Int)
+    bs(var cs, cfg_base(id), 0)
+
+// ── The tables of the specification ─────────────────────────────────
+
+// The antenna configuration index (Table 5.3 of [Vol 6] Part A): the antennas of the initiator, of the reflector, and the paths.
+@tier(embedded)
+fn aci_initiator(aci: Int) -> Int
+    match aci
+        0 => 1
+        1 => 2
+        2 => 3
+        3 => 4
+        4 => 1
+        5 => 1
+        6 => 1
+        7 => 2
+        _ => 0
+
+@tier(embedded)
+fn aci_reflector(aci: Int) -> Int
+    match aci
+        0 => 1
+        1 => 1
+        2 => 1
+        3 => 1
+        4 => 2
+        5 => 3
+        6 => 4
+        7 => 2
+        _ => 0
+
+@tier(embedded)
+fn aci_paths(aci: Int) -> Int
+    match aci
+        0 => 1
+        1 => 2
+        2 => 3
+        3 => 4
+        4 => 2
+        5 => 3
+        6 => 4
+        7 => 4
+        _ => 0
+
+// Whether the pair of modes is one of Table 4.11 of [Vol 6] Part H: Main_Mode alone (1, 2 or 3), or 2 with 1, 2 with 3, and 3 with 2.
+@tier(embedded)
+fn modes_ok(main: Int, sub: Int) -> Bool
+    if sub == 0xFF
+        return main >= 1 and main <= 3
+    main == 2 and (sub == 1 or sub == 3) or main == 3 and sub == 2
+
+// The number of bits set in `v`.
+@tier(embedded)
+fn bits(v: Int) -> Int
+    var n = 0
+    for i in 0..16
+        if ((v >>> i) & 1) == 1
+            n = n + 1
+    n
+
+// ── The configuration of the PDU ────────────────────────────────────
+
+// Whether a step timing `index` of the table `kind` (0 T_IP, 1 T_FCS, 2 T_PM) is one a device with the capability mask `mask` takes: the mandatory
+// timing (the last of the table) always, the others by their bit.  False for an index beyond the table.
+@tier(embedded)
+fn timing_ok(kind: Int, index: Int, mask: Int) -> Bool
+    var last = 7
+    var size = 8
+    if kind == 1
+        last = 9
+        size = 10
+    if kind == 2
+        last = 2
+        size = 3
+    if index < 0 or index >= size
+        return false
+    index == last or ((mask >>> index) & 1) == 1
+
+// The verdict on the parameters of a configuration: 0 when they are ones the specification allows and both devices run, 1 when a field is outside what the
+// specification allows, 2 when it is a value that the capabilities of a device lack.  `c` is the configuration, `local` and `peer` the capabilities
+// (`have_peer` says `peer` holds the peer's), `mine` that this end sent the request.  Removing a configuration (`c.action` 0) has no parameters
+// to check.
+@tier(embedded)
+fn config_check(var c: CfgPdu, var local: CapPdu, var peer: CapPdu, have_peer: Bool, mine: Bool) -> Int
+    if c.config_id > 3 or c.action > 1
+        return 1
+    if c.config_id >= cfg_slots() or c.config_id >= local.num_configs or have_peer and c.config_id >= peer.num_configs
+        return 2
+    if c.action == 0
+        return 0
+    if (c.chm_lo & ~ll_cs_pdu.CHM_LO_ALLOWED) != 0 or (c.chm_hi & ~ll_cs_pdu.CHM_HI_ALLOWED) != 0 or ll_cs_pdu.chm_count(c.chm_lo, c.chm_hi) < CHANNELS_MIN
+        return 1
+    if c.chm_rep < 1 or not modes_ok(c.main_mode, c.sub_mode) or c.main_rep > 3 or c.mode0_steps < 1 or c.mode0_steps > 3
+        return 1
+    if c.sub_mode != 0xFF and (c.main_min < 1 or c.main_min > 255 or c.main_max < c.main_min or c.main_max > 255)
+        return 1
+    if c.rtt_type > 6 or c.role > 1 or c.ipt > 1 or c.chsel > 1
+        return 1
+    if c.chsel == 1 and (c.c3_shape > 1 or c.c3_jump < 2 or c.c3_jump > 8)
+        return 1
+    if c.sync_phy != 1 and c.sync_phy != 2 and c.sync_phy != 4 and c.sync_phy != 8
+        return 1
+    if c.t_ip1 > 7 or c.t_ip2 > 7 or c.t_fcs > 9 or c.t_pm > 2
+        return 1
+    // What the devices run.
+    var lr = 1 - c.role
+    if mine
+        lr = c.role
+    if ((local.role >>> lr) & 1) == 0 or have_peer and ((peer.role >>> (1 - lr)) & 1) == 0
+        return 2
+    if c.sync_phy == 4 or not ll_cs_pdu.sync_phy_allowed(local.sync_phy, c.sync_phy) or have_peer and not ll_cs_pdu.sync_phy_allowed(peer.sync_phy, c.sync_phy)
+        return 2
+    if (c.main_mode == 3 or c.sub_mode == 3) and ((local.mode_types & 1) == 0 or have_peer and (peer.mode_types & 1) == 0)
+        return 2
+    if c.rtt_type == 1 or c.rtt_type == 2
+        if local.n_sound == 0 or have_peer and peer.n_sound == 0
+            return 2
+    if c.rtt_type >= 3
+        if local.n_rand == 0 or have_peer and peer.n_rand == 0
+            return 2
+    if c.ipt == 1
+        if lr == 1
+            if local.ipt == 0
+                return 2
+        else if have_peer and peer.ipt == 0
+            return 2
+    if c.chsel == 1 and (local.ch3c == 0 or have_peer and peer.ch3c == 0)
+        return 2
+    if not timing_ok(0, c.t_ip1, local.t_ip1) or not timing_ok(0, c.t_ip2, local.t_ip2) or not timing_ok(1, c.t_fcs, local.t_fcs) or not timing_ok(2, c.t_pm, local.t_pm)
+        return 2
+    if have_peer
+        if not timing_ok(0, c.t_ip1, peer.t_ip1) or not timing_ok(0, c.t_ip2, peer.t_ip2) or not timing_ok(1, c.t_fcs, peer.t_fcs) or not timing_ok(2, c.t_pm, peer.t_pm)
+            return 2
+    0
+
+// ── The Start's parameters ──────────────────────────────────────────
+
+// Whether `a` is a connection event counter within 2^14 of the current one `now`, modulo 65536.
+@tier(embedded)
+fn event_near(a: Int, now: Int) -> Bool
+    let d = (a - now) & 0xFFFF
+    d < EVENT_SPAN or d > COUNT_MOD - EVENT_SPAN
+
+// Whether `a` is a connection event no sooner than `base`, modulo 65536.
+@tier(embedded)
+fn event_not_before(a: Int, base: Int) -> Bool
+    ((a - base) & 0xFFFF) < EVENT_HALF
+
+// Whether the event counter `a` is in the past, `now` being the current one ((a - now) mod 65535 at least 32767).
+@tier(embedded)
+fn event_past(a: Int, now: Int) -> Bool
+    ((a - now) & 0xFFFF) >= EVENT_HALF - 1
+
+// The connEventCount an answer to a Start PDU names: the one the PDU named when it is at least `EVENT_AHEAD` events ahead of the current one, otherwise
+// the event `EVENT_AHEAD` after the current one, which is no sooner than the PDU named.
+@tier(embedded)
+fn pick_event(a: Int, now: Int) -> Int
+    let d = (a - now) & 0xFFFF
+    if d < EVENT_AHEAD or d >= EVENT_HALF - 1
+        return (now + EVENT_AHEAD) & 0xFFFF
+    a
+
+// What the scheduling of the Controller leaves of a Start: whether the Link Layer finds room for the subevents `s` asks for among the connection
+// events and the other bookings, so that the Start may go on.  The answer of a build that has not the scheduling is yes.
+@tier(embedded)
+fn schedule_ok(var s: StartPdu, var en: Env) -> Bool
+    true
+
+// The verdict on the parameters of an LL_CS_REQ: 0 when they are ones the specification allows and both devices run, 1 when a field is outside what the
+// specification allows, 2 when a device lacks what it names.  `local_init` says this end is the initiator of the configuration, `local_sends` that
+// this end sends the request; `local` and `peer` are the capabilities.
+@tier(embedded)
+fn start_check(var s: StartPdu, local_init: Bool, local_sends: Bool, var local: CapPdu, var peer: CapPdu, var en: Env) -> Int
+    if not event_near(s.conn_event, en.ev_count)
+        return 1
+    if s.offset_min < OFFSET_MIN_US or s.offset_min >= FOUR_SECONDS_US or s.offset_max < s.offset_min or s.offset_max >= en.interval_us
+        return 1
+    if s.max_proc_len < 1 or s.event_interval < 1 or s.subevents < 1 or s.subevents > ll_cs.SUBEVENTS_MAX
+        return 1
+    if s.subevent_len < SUBEVENT_LEN_MIN_US or s.subevent_len >= FOUR_SECONDS_US
+        return 1
+    if s.subevents == 1 and s.subevent_interval != 0
+        return 1
+    if s.subevents > 1 and s.subevent_interval * UNIT_US < s.subevent_len + ll_cs.T_MES_US
+        return 1
+    if s.proc_interval != 0 and s.proc_interval * en.interval_us <= s.max_proc_len * UNIT_US + s.offset_max + ll_cs.T_MES_US
+        return 1
+    if s.aci > 7 or s.phy != 1 and s.phy != 2 and s.phy != 4 and s.phy != 8
+        return 1
+    // The antennas: each side supplies the elements and paths of its role.
+    var init_ant = local.num_ant
+    var init_path = local.max_path
+    var refl_ant = peer.num_ant
+    var refl_path = peer.max_path
+    if not local_init
+        init_ant = peer.num_ant
+        init_path = peer.max_path
+        refl_ant = local.num_ant
+        refl_path = local.max_path
+    if aci_initiator(s.aci) > init_ant or aci_reflector(s.aci) > refl_ant or aci_paths(s.aci) > init_path or aci_paths(s.aci) > refl_path
+        return 2
+    // The antennas the receiver prefers: as many as it has at most, and at least as many as its role of the configuration uses.
+    var recv_ant = peer.num_ant
+    var recv_init = not local_init
+    if not local_sends
+        recv_ant = local.num_ant
+        recv_init = local_init
+    var need = aci_reflector(s.aci)
+    if recv_init
+        need = aci_initiator(s.aci)
+    let n = bits(s.pref_ant)
+    if (s.pref_ant & ~0xF) != 0 or n > recv_ant or n < need
+        return 1
+    // The SNR indices: 0xF for none, otherwise a level the transmitting side supplies.
+    var snr_i_mask = peer.tx_snr
+    var snr_r_mask = local.tx_snr
+    if local_init
+        snr_i_mask = local.tx_snr
+        snr_r_mask = peer.tx_snr
+    if s.snr_i != 0xF and (s.snr_i >= 7 or ((snr_i_mask >>> s.snr_i) & 1) == 0) or s.snr_r != 0xF and (s.snr_r >= 7 or ((snr_r_mask >>> s.snr_r) & 1) == 0)
+        return 2
+    0
+
+// Whether an LL_CS_RSP or LL_CS_IND `a` is an answer the LL_CS_REQ `req` it answers allows (Section 5.1.26): the same configuration, a connEventCount no
+// sooner than the request's, the window of offsets inside the request's (`ind` says the answer is the LL_CS_IND, which names one Offset in it),
+// a subevent interval no smaller and a subevent length no larger, and a number of subevents and an interval of events that are in range.
+@tier(embedded)
+fn answer_ok(var a: StartPdu, var req: StartPdu, ind: Bool) -> Bool
+    if a.config_id != req.config_id or not event_not_before(a.conn_event, req.conn_event)
+        return false
+    if ind
+        if a.offset_min < req.offset_min or a.offset_min > req.offset_max
+            return false
+    else if a.offset_min < req.offset_min or a.offset_max > req.offset_max or a.offset_max < a.offset_min
+        return false
+    if a.subevent_interval < req.subevent_interval or a.subevent_len > req.subevent_len or a.subevent_len < SUBEVENT_LEN_MIN_US
+        return false
+    a.event_interval >= 1 and a.subevents >= 1 and a.subevents <= ll_cs.SUBEVENTS_MAX and a.aci <= 7
+
+// ── The PDUs the procedures send ────────────────────────────────────
+
+// LL_REJECT_EXT_IND for the opcode `rejected` with `code`.
+@tier(embedded)
+fn reject(var out: Pdu, rejected: Int, code: Int) -> Int
+    ll_data.ctrl_reject_ext(var out, rejected, code)
+    R_SEND
+
+// Whether the PDU in `out` fits what the link can send now.
+@tier(embedded)
+fn fits(var en: Env, var out: Pdu) -> Bool
+    ll_data.dpdu_len(var out) <= en.max_tx
+
+// The error code a request the Link Layer cannot answer, because the answer does not fit one packet of the link, is rejected with.
+@tier(embedded)
+fn no_room(var out: Pdu, rejected: Int) -> Int
+    reject(var out, rejected, E_LIMITED)
+
+// The verdict of the checks every request of the peer meets: LL_REJECT_EXT_IND in `out` and `R_SEND`, or -1.  `gated` says the PDU is one that the
+// Host's Channel Sounding (Host Support) bit gates.
+@tier(embedded)
+fn guard(var cs: Cs, var en: Env, op: Int, gated: Bool, var out: Pdu) -> Int
+    if gated and not cs.host
+        return reject(var out, op, E_UNSUPPORTED_REMOTE)
+    if not en.encrypted
+        return reject(var out, op, E_INSUFFICIENT_SECURITY)
+    -1
+
+// The status a Host command gets for the checks every procedure of the Host meets: 0, or the error code.
+@tier(embedded)
+fn begin_guard(var cs: Cs, var en: Env) -> Int
+    if not cs.host
+        return E_DISALLOWED
+    if not en.peer_cs
+        return E_UNSUPPORTED_REMOTE
+    if not en.encrypted
+        return E_INSUFFICIENT_SECURITY
+    0
+
+// ── Waiting ─────────────────────────────────────────────────────────
+
+// The procedure of this end ended with `code`: the event it owes the Host carries it.  A Start the Host did not ask for tells the Host nothing.
+@tier(embedded)
+fn fail_wait(var cs: Cs, code: Int)
+    let w = cs.wait
+    cs.wait = W_NONE
+    if w == W_SEC
+        cs.st_sec = code
+        cs.owed = cs.owed | OWED_SEC
+    else if w == W_CAP
+        cs.st_caps = code
+        cs.owed = cs.owed | OWED_CAPS
+    else if w == W_CFG
+        cs.st_cfg = code
+        cs.ev_cfg = cs.wait_cfg
+        cs.owed = cs.owed | OWED_CFG
+    else if w == W_START
+        if cs.start_host
+            cs.st_proc = code
+            cs.owed = cs.owed | OWED_PROC
+        cs.start_host = false
+    else if w == W_TERM
+        cs.st_term = code
+        cs.owed = cs.owed | OWED_TERM
+    else if w == W_FAE
+        cs.st_fae = code
+        cs.owed = cs.owed | OWED_FAE
+
+// The 40 seconds of the procedure response timeout: `E_RESPONSE_TIMEOUT` when the procedure of this end has waited that long since the last PDU queued for
+// it, and then the event it owes carries Response Timeout; the connection ends.  Waiting for random octets has no limit.
+@tier(embedded)
+fn poll(var cs: Cs, var en: Env) -> Int
+    if cs.wait == W_NONE or cs.wait == W_RND_C or cs.wait == W_RND_P
+        return 0
+    if en.now - cs.t0 <= WAIT_US
+        return 0
+    fail_wait(var cs, E_RESPONSE_TIMEOUT)
+    E_RESPONSE_TIMEOUT
+
+// A procedure of this end that crosses a request of the peer (Section 5.3): in the Central the peer's request is rejected with LL Procedure
+// Collision and the procedure goes on; in the Peripheral the peer's request is taken and the procedure waits for the Central's rejection of it, which
+// ends it with that error.  A Start (`yielding`) uses the record that the peer's request needs, so the Peripheral's own ends at once with the error and
+// the rejection that follows is not an answer (`yield_op`).  True when the request is the one to reject.
+@tier(embedded)
+fn collides(var cs: Cs, var en: Env, wait: Int, op: Int, yielding: Bool, var out: Pdu) -> Bool
+    if cs.wait != wait
+        return false
+    if en.central
+        let _r = reject(var out, op, E_COLLISION)
+        return true
+    if yielding
+        fail_wait(var cs, E_COLLISION)
+        cs.yield_op = op
+    false
+
+// ── Security Start ──────────────────────────────────────────────────
+
+// The octet of the store that receives the random octet `k` (0 to 19) of this end's part: CS_IV (8 octets), CS_IN (4) and CS_PV (8), in the
+// least significant half of each value for the Central and the most significant half for the Peripheral.
+@tier(embedded)
+fn sec_octet(k: Int, central: Bool) -> Int
+    var part = 8
+    if central
+        part = 0
+    if k < 8
+        return OFF_SEC + part + k
+    if k < 12
+        return OFF_SEC + 16 + part / 2 + k - 8
+    OFF_SEC + 24 + part + k - 12
+
+// The parts this end puts in its PDU, read from the store.
+@tier(embedded)
+fn sec_parts(var cs: Cs, central: Bool, var s: SecPdu)
+    for k in 0..8
+        s.iv[k] = bg(var cs, sec_octet(k, central)) as u8
+    for k in 0..4
+        s.inn[k] = bg(var cs, sec_octet(8 + k, central)) as u8
+    for k in 0..8
+        s.pv[k] = bg(var cs, sec_octet(12 + k, central)) as u8
+
+// The peer's parts of the PDU `s` into the store.
+@tier(embedded)
+fn keep_sec(var cs: Cs, central: Bool, var s: SecPdu)
+    for k in 0..8
+        bs(var cs, sec_octet(k, not central), s.iv[k] as Int)
+    for k in 0..4
+        bs(var cs, sec_octet(8 + k, not central), s.inn[k] as Int)
+    for k in 0..8
+        bs(var cs, sec_octet(12 + k, not central), s.pv[k] as Int)
+
+// The octet `k` (0 to 15) of CS_IV, `k` (0 to 7) of CS_IN and `k` (0 to 15) of CS_PV the Security Start procedure produced.
+@tier(embedded)
+fn cs_iv(var cs: Cs, k: Int) -> Int
+    bg(var cs, OFF_SEC + k)
+
+@tier(embedded)
+fn cs_in(var cs: Cs, k: Int) -> Int
+    bg(var cs, OFF_SEC + 16 + k)
+
+@tier(embedded)
+fn cs_pv(var cs: Cs, k: Int) -> Int
+    bg(var cs, OFF_SEC + 24 + k)
+
+// The procedure completed: CS security is on and CSProcCount starts at 0.
+@tier(embedded)
+fn secured_now(var cs: Cs)
+    cs.secured = true
+    cs.fresh = true
+    cs.proc_count = 0
+    cs.st_sec = 0
+    cs.owed = cs.owed | OWED_SEC
+
+// The Host asks for CS security on a link this end is the Central of (LE CS Security Enable): the answer is the status; the 20 random octets of the
+// Central's parts are then collected (`wants_random`, `feed_random`) and LL_CS_SEC_REQ goes out with the last.  Command Disallowed for a
+// Peripheral, while another procedure of this end is out, and while CS procedures are outstanding.
+@tier(embedded)
+fn begin_security(var cs: Cs, var en: Env) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if not en.central or cs.wait != W_NONE or cs.run_open
+        return E_DISALLOWED
+    cs.wait = W_RND_C
+    cs.rnd_n = 0
+    0
+
+// Whether the procedure of this end waits for random octets.
+@tier(embedded)
+fn wants_random(var cs: Cs) -> Bool
+    cs.wait == W_RND_C or cs.wait == W_RND_P
+
+// Give the procedure up to 12 random octets, `rnd`, of the 20 it needs: R_SEND when they are all there and the PDU is in `out`, R_NONE otherwise.
+// The Central sends LL_CS_SEC_REQ; the Peripheral completes with LL_CS_SEC_RSP.
+@tier(embedded)
+fn feed_random(var cs: Cs, var en: Env, rnd: Vec[u8; 12], var out: Pdu) -> Int
+    if not wants_random(var cs)
+        return R_NONE
+    let central = cs.wait == W_RND_C
+    for k in 0..12
+        if cs.rnd_n < 20
+            bs(var cs, sec_octet(cs.rnd_n, central), rnd[k] as Int)
+            cs.rnd_n = cs.rnd_n + 1
+    if cs.rnd_n < 20
+        return R_NONE
+    var s = ll_cs_pdu.sec_new()
+    sec_parts(var cs, central, var s)
+    if central
+        ll_cs_pdu.put_sec(var out, ll_cs.OP_CS_SEC_REQ, var s)
+        cs.wait = W_SEC
+        cs.t0 = en.now
+    else
+        ll_cs_pdu.put_sec(var out, ll_cs.OP_CS_SEC_RSP, var s)
+        cs.wait = W_NONE
+        secured_now(var cs)
+    R_SEND
+
+// LL_CS_SEC_REQ from the Central: the Peripheral collects its parts and answers.  Rejected when the Host has not set the feature, when the
+// link is not encrypted, and while a Security Start is under way.
+@tier(embedded)
+fn rx_sec_req(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
+    if en.central
+        return R_UNKNOWN
+    let g = guard(var cs, var en, ll_cs.OP_CS_SEC_REQ, true, var out)
+    if g >= 0
+        return g
+    var s = ll_cs_pdu.sec_new()
+    if not ll_cs_pdu.get_sec(var rx, var s)
+        return R_NONE
+    if cs.wait == W_RND_P
+        return reject(var out, ll_cs.OP_CS_SEC_REQ, E_DISALLOWED)
+    keep_sec(var cs, false, var s)
+    cs.wait = W_RND_P
+    cs.rnd_n = 0
+    R_NONE
+
+// LL_CS_SEC_RSP from the Peripheral: the parts are joined and the procedure completes.
+@tier(embedded)
+fn rx_sec_rsp(var cs: Cs, var en: Env, var rx: Pdu) -> Int
+    if not en.central
+        return R_UNKNOWN
+    var s = ll_cs_pdu.sec_new()
+    if cs.wait != W_SEC or not ll_cs_pdu.get_sec(var rx, var s)
+        return R_NONE
+    keep_sec(var cs, true, var s)
+    cs.wait = W_NONE
+    secured_now(var cs)
+    R_NONE
+
+// ── Capabilities Exchange ───────────────────────────────────────────
+
+// The Host asks for the peer's capabilities (LE CS Read Remote Supported Capabilities): LL_CS_CAPABILITIES_REQ with `local` goes out in `out`, the
+// [v2] record when both ends have Enhancement #1.  The answer is the status of the command.
+@tier(embedded)
+fn begin_capabilities(var cs: Cs, var en: Env, var local: CapPdu, var out: Pdu) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE
+        return E_DISALLOWED
+    var c = local
+    ll_cs_pdu.cap_version(var c, local.v2 and en.peer_v2)
+    ll_cs_pdu.put_caps(var out, ll_cs.OP_CS_CAPABILITIES_REQ, var c)
+    if not fits(var en, var out)
+        return E_DISALLOWED
+    cs.wait = W_CAP
+    cs.t0 = en.now
+    0
+
+// LL_CS_CAPABILITIES_REQ: the peer's record is kept and LL_CS_CAPABILITIES_RSP with `local` answers, in the version of the request.  A request from a
+// peer whose record is out of range is rejected with Invalid LL Parameters.
+@tier(embedded)
+fn rx_caps_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu) -> Int
+    let g = guard(var cs, var en, ll_cs.OP_CS_CAPABILITIES_REQ, true, var out)
+    if g >= 0
+        return g
+    var c = ll_cs_pdu.cap_new()
+    if not ll_cs_pdu.get_caps(var rx, var c)
+        return R_NONE
+    if not caps_valid(var c)
+        return reject(var out, ll_cs.OP_CS_CAPABILITIES_REQ, E_INVALID_LL)
+    keep_caps(var cs, var rx)
+    cs.caps_air = true
+    var r = local
+    ll_cs_pdu.cap_version(var r, local.v2 and c.v2)
+    ll_cs_pdu.put_caps(var out, ll_cs.OP_CS_CAPABILITIES_RSP, var r)
+    if not fits(var en, var out)
+        return no_room(var out, ll_cs.OP_CS_CAPABILITIES_REQ)
+    R_SEND
+
+// LL_CS_CAPABILITIES_RSP: the exchange the Host asked for completes.
+@tier(embedded)
+fn rx_caps_rsp(var cs: Cs, var rx: Pdu) -> Int
+    if cs.wait != W_CAP
+        return R_NONE
+    var c = ll_cs_pdu.cap_new()
+    if not ll_cs_pdu.get_caps(var rx, var c)
+        return R_NONE
+    if not caps_valid(var c)
+        fail_wait(var cs, E_INVALID_LL)
+        return R_NONE
+    keep_caps(var cs, var rx)
+    cs.caps_air = true
+    cs.wait = W_NONE
+    cs.st_caps = 0
+    cs.owed = cs.owed | OWED_CAPS
+    R_NONE
+
+// ── Configuration ───────────────────────────────────────────────────
+
+// The configuration `c` is to be created, or removed (`c.action` 0): the Host's command, `local_only` for a configuration kept without the peer
+// (LE CS Create Config with no context for the peer).  The status is Command Disallowed for a procedure in flight, a configuration the Start is
+// using and a peer whose capabilities are not known (unless `local_only`), Invalid HCI Command Parameters for a field the specification
+// forbids and a configuration to remove that does not exist, and Unsupported Feature or Parameter Value for a field a device lacks.  The PDU is in `out`
+// unless `local_only`, which completes at once.
+@tier(embedded)
+fn begin_config(var cs: Cs, var en: Env, var local: CapPdu, var c: CfgPdu, local_only: Bool, var out: Pdu) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE or c.config_id <= 3 and cs.run_open and cs.series_cfg == c.config_id
+        return E_DISALLOWED
+    var peer = ll_cs_pdu.cap_new()
+    let have = load_caps(var cs, var peer, var out)
+    if not have and not local_only
+        return E_DISALLOWED
+    let k = config_check(var c, var local, var peer, have, true)
+    if k == 1
+        return E_INVALID_PARAMS
+    if k == 2
+        return E_UNSUPPORTED_FEATURE
+    if c.action == 0 and not cfg_used(var cs, c.config_id)
+        return E_INVALID_PARAMS
+    ll_cs_pdu.put_config_req(var out, var c)
+    if local_only
+        if c.action == 0
+            remove_config(var cs, c.config_id)
+        else
+            store_config(var cs, c.config_id, var out, true)
+        cs.ev_cfg = c.config_id
+        cs.ev_act = c.action
+        cs.st_cfg = 0
+        cs.owed = cs.owed | OWED_CFG
+        return 0
+    if not fits(var en, var out)
+        return E_DISALLOWED
+    bs(var cs, OFF_PCFG, 3)
+    keep(var cs, OFF_PCFG + 1, var out, 27)
+    cs.wait = W_CFG
+    cs.wait_cfg = c.config_id
+    cs.ev_act = c.action
+    cs.t0 = en.now
+    0
+
+// LL_CS_CONFIG_REQ: the configuration is created or removed and LL_CS_CONFIG_RSP answers.  Rejected with the error codes of Section 5.1.25:
+// Unsupported LL Parameter Value for parameters this end does not take, Command Disallowed for a configuration a Start is using, and LL Procedure
+// Collision for a request that crosses one of this end's.  A request for a configuration that does not exist, to remove it, is also refused with
+// Unsupported LL Parameter Value.
+@tier(embedded)
+fn rx_config_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu) -> Int
+    let g = guard(var cs, var en, ll_cs.OP_CS_CONFIG_REQ, true, var out)
+    if g >= 0
+        return g
+    var c = ll_cs_pdu.cfg_new()
+    if not ll_cs_pdu.get_config_req(var rx, var c)
+        return R_NONE
+    if collides(var cs, var en, W_CFG, ll_cs.OP_CS_CONFIG_REQ, false, var out)
+        return R_SEND
+    if c.config_id <= 3 and cs.run_open and cs.series_cfg == c.config_id
+        return reject(var out, ll_cs.OP_CS_CONFIG_REQ, E_DISALLOWED)
+    var peer = ll_cs_pdu.cap_new()
+    let have = load_caps(var cs, var peer, var out)
+    if config_check(var c, var local, var peer, have, false) != 0
+        return reject(var out, ll_cs.OP_CS_CONFIG_REQ, E_UNSUPPORTED_LL)
+    if c.action == 0
+        if not cfg_used(var cs, c.config_id)
+            return reject(var out, ll_cs.OP_CS_CONFIG_REQ, E_UNSUPPORTED_LL)
+        remove_config(var cs, c.config_id)
+    else
+        store_config(var cs, c.config_id, var rx, false)
+    cs.ev_cfg = c.config_id
+    cs.ev_act = c.action
+    cs.st_cfg = 0
+    cs.owed = cs.owed | OWED_CFG
+    ll_cs_pdu.put_config_rsp(var out, c.config_id)
+    R_SEND
+
+// LL_CS_CONFIG_RSP: the configuration this end asked for is in force.
+@tier(embedded)
+fn rx_config_rsp(var cs: Cs, var rx: Pdu) -> Int
+    if cs.wait != W_CFG or ll_cs_pdu.get_config_rsp(var rx) != cs.wait_cfg
+        return R_NONE
+    if cs.ev_act == 0
+        remove_config(var cs, cs.wait_cfg)
+    else
+        copy_within(var cs, OFF_PCFG, cfg_base(cs.wait_cfg), CFG_OCT)
+    cs.wait = W_NONE
+    cs.st_cfg = 0
+    cs.ev_cfg = cs.wait_cfg
+    cs.owed = cs.owed | OWED_CFG
+    R_NONE
+
+// ── Mode-0 FAE Table Request ────────────────────────────────────────
+
+// The Host asks for the peer's FAE table (LE CS Read Remote FAE Table): LL_CS_FAE_REQ goes out in `out`.  The peer's capabilities must be known and have
+// No_FAE clear, otherwise Unsupported Feature or Parameter Value.
+@tier(embedded)
+fn begin_fae(var cs: Cs, var en: Env, var out: Pdu) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE
+        return E_DISALLOWED
+    var peer = ll_cs_pdu.cap_new()
+    if not load_caps(var cs, var peer, var out) or peer.no_fae == 1
+        return E_UNSUPPORTED_FEATURE
+    ll_cs_pdu.put_fae_req(var out)
+    cs.wait = W_FAE
+    cs.t0 = en.now
+    0
+
+// LL_CS_FAE_REQ: the answer is LL_CS_FAE_RSP with this end's table, or LL_REJECT_EXT_IND Unsupported Feature or Parameter Value when `local` has No_FAE.
+@tier(embedded)
+fn rx_fae_req(var cs: Cs, var en: Env, var local: CapPdu, var out: Pdu) -> Int
+    let g = guard(var cs, var en, ll_cs.OP_CS_FAE_REQ, true, var out)
+    if g >= 0
+        return g
+    if local.no_fae == 1
+        return reject(var out, ll_cs.OP_CS_FAE_REQ, E_UNSUPPORTED_FEATURE)
+    ll_cs_pdu.put_fae_begin(var out)
+    for i in 0..ll_cs.CHANNEL_COUNT
+        ll_cs_pdu.put_fae_value(var out, local_fae(i))
+    ll_cs_pdu.put_fae_end(var out)
+    if not fits(var en, var out)
+        return no_room(var out, ll_cs.OP_CS_FAE_REQ)
+    R_SEND
+
+// LL_CS_FAE_RSP: the peer's table is kept and the procedure the Host asked for completes.
+@tier(embedded)
+fn rx_fae_rsp(var cs: Cs, var rx: Pdu) -> Int
+    if cs.wait != W_FAE
+        return R_NONE
+    for i in 0..ll_cs.CHANNEL_COUNT
+        bs(var cs, OFF_FAE + i, ll_cs_pdu.fae_value(var rx, i))
+    cs.fae_known = true
+    cs.fae_air = true
+    cs.wait = W_NONE
+    cs.st_fae = 0
+    cs.owed = cs.owed | OWED_FAE
+    R_NONE
+
+// ── Start ───────────────────────────────────────────────────────────
+
+// The Start completed with the LL_CS_IND in `p`: the procedures run.  The record keeps the parameters; CSProcCount starts the series at its own value
+// after a Security Start and at the next after that; `series_n` is Procedure_Count of the request.
+@tier(embedded)
+fn start_done(var cs: Cs, var p: Pdu, var ind: StartPdu, var req: StartPdu)
+    keep(var cs, OFF_IND, var p, 18)
+    cs.run_open = true
+    cs.series_cfg = ind.config_id
+    cs.series_n = req.proc_count
+    if cs.fresh
+        cs.series_start = cs.proc_count
+    else
+        cs.series_start = (cs.proc_count + 1) % COUNT_MOD
+    cs.wait = W_NONE
+    cs.st_proc = 0
+    cs.owed = cs.owed | OWED_PROC
+    cs.start_host = false
+
+// Read the LL_CS_REQ of the Start in flight into `s`.  `scratch` is overwritten.
+@tier(embedded)
+fn load_req(var cs: Cs, var s: StartPdu, var scratch: Pdu) -> Bool
+    stage(var cs, OFF_REQ, ll_cs.OP_CS_REQ, 28, var scratch)
+    ll_cs_pdu.get_req(var scratch, var s)
+
+// The parameters of the procedures that were started, into `s`: those of the request with those of the LL_CS_IND over them, whose Offset is in both
+// `offset_min` and `offset_max`.  False when no Start completed.  `scratch` is overwritten.
+@tier(embedded)
+fn load_run(var cs: Cs, var s: StartPdu, var scratch: Pdu) -> Bool
+    if not cs.run_open
+        return false
+    let _r = load_req(var cs, var s, var scratch)
+    var i = ll_cs_pdu.start_new()
+    stage(var cs, OFF_IND, ll_cs.OP_CS_IND, 18, var scratch)
+    let _i = ll_cs_pdu.get_ind(var scratch, var i)
+    s.config_id = i.config_id
+    s.conn_event = i.conn_event
+    s.offset_min = i.offset_min
+    s.offset_max = i.offset_min
+    s.event_interval = i.event_interval
+    s.subevents = i.subevents
+    s.subevent_interval = i.subevent_interval
+    s.subevent_len = i.subevent_len
+    s.aci = i.aci
+    s.phy = i.phy
+    s.pwr_delta = i.pwr_delta
+    true
+
+// The Host asks to start the procedures of the configuration `s.config_id` with the parameters `s` (LE CS Procedure Enable, after LE CS Set
+// Procedure Parameters): LL_CS_REQ goes out in `out`.  The status is Command Disallowed when security has not been started, the peer's
+// capabilities are not known, the configuration does not exist or is not complete (the FAE table of the reflector is not known), a procedure of the
+// Link Layer that the Start excludes is out, or another procedure of this end waits; Invalid HCI Command Parameters for a field the specification
+// forbids and Rejected Due To Limited Resources for a value beyond the capabilities.
+@tier(embedded)
+fn begin_start(var cs: Cs, var en: Env, var local: CapPdu, var s: StartPdu, var out: Pdu) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE or en.busy or not cs.secured
+        return E_DISALLOWED
+    var peer = ll_cs_pdu.cap_new()
+    if not load_caps(var cs, var peer, var out)
+        return E_DISALLOWED
+    if not cfg_used(var cs, s.config_id)
+        return E_INVALID_PARAMS
+    let initiator = cfg_role(var cs, s.config_id) == 0
+    if initiator and peer.no_fae == 0 and not cs.fae_known
+        return E_DISALLOWED
+    let k = start_check(var s, initiator, true, var local, var peer, var en)
+    if k == 1
+        return E_INVALID_PARAMS
+    if k == 2
+        return E_LIMITED
+    // cov: skip — `schedule_ok` answers yes until the scheduling of the arbiter joins it
+    if not schedule_ok(var s, var en)
+        return E_LIMITED
+    ll_cs_pdu.put_req(var out, var s)
+    if not fits(var en, var out)
+        return E_DISALLOWED
+    keep(var cs, OFF_REQ, var out, 28)
+    cs.wait = W_START
+    cs.wait_cfg = s.config_id
+    cs.start_host = true
+    cs.t0 = en.now
+    0
+
+// LL_CS_REQ: the Central answers with LL_CS_IND and the procedures start; the Peripheral answers LL_CS_RSP and waits for the Central's LL_CS_IND.  Rejected
+// with Unsupported Remote Feature (the Host has not set the feature), Insufficient Security, Command Disallowed (a Security Start under way), Invalid LL
+// Parameters (the configuration was not created), Rejected due to Security Reasons (the Host's requirements are not met), Unsupported LL Parameter Value
+// (the PHY of the power delta is not the ACL's and not managed, or the parameters or the scheduling are not acceptable), LL Procedure Collision (a request of
+// this end is out or the Central's own is, Section 5.3) and Different Transaction Collision (an ACL procedure that the Start excludes is out).
+@tier(embedded)
+fn rx_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu) -> Int
+    let g = guard(var cs, var en, ll_cs.OP_CS_REQ, true, var out)
+    if g >= 0
+        return g
+    var s = ll_cs_pdu.start_new()
+    if not ll_cs_pdu.get_req(var rx, var s)
+        return R_NONE
+    if cs.wait == W_RND_C or cs.wait == W_RND_P or cs.wait == W_SEC or not cs.secured
+        return reject(var out, ll_cs.OP_CS_REQ, E_DISALLOWED)
+    if collides(var cs, var en, W_START, ll_cs.OP_CS_REQ, true, var out)
+        return R_SEND
+    if not cfg_used(var cs, s.config_id)
+        return reject(var out, ll_cs.OP_CS_REQ, E_INVALID_LL)
+    if not en.sec_ok
+        return reject(var out, ll_cs.OP_CS_REQ, E_SECURITY_REASONS)
+    if en.busy
+        return reject(var out, ll_cs.OP_CS_REQ, E_DIFFERENT_COLLISION)
+    if s.phy != en.phy and (s.phy & en.managed) == 0
+        return reject(var out, ll_cs.OP_CS_REQ, E_UNSUPPORTED_LL)
+    var peer = ll_cs_pdu.cap_new()
+    let have = load_caps(var cs, var peer, var out)
+    if not have
+        return reject(var out, ll_cs.OP_CS_REQ, E_DISALLOWED)
+    let initiator = cfg_role(var cs, s.config_id) == 0
+    if start_check(var s, initiator, false, var local, var peer, var en) != 0 or not schedule_ok(var s, var en)
+        return reject(var out, ll_cs.OP_CS_REQ, E_UNSUPPORTED_LL)
+    keep(var cs, OFF_REQ, var rx, 28)
+    cs.start_host = false
+    if en.central
+        var ind = s
+        ll_cs_pdu.start_answer(var ind, pick_event(s.conn_event, en.ev_count), en.phy, 0)
+        ll_cs_pdu.put_ind(var out, var ind)
+        if not fits(var en, var out)
+            return no_room(var out, ll_cs.OP_CS_REQ)
+        start_done(var cs, var out, var ind, var s)
+        return R_SEND
+    var r = s
+    ll_cs_pdu.start_answer(var r, s.conn_event, en.phy, 0)
+    ll_cs_pdu.put_rsp(var out, var r)
+    if not fits(var en, var out)
+        return no_room(var out, ll_cs.OP_CS_REQ)
+    cs.wait = W_START
+    cs.wait_cfg = s.config_id
+    cs.t0 = en.now
+    R_SEND
+
+// LL_CS_RSP, which the Central of a Start that it began receives: the Central answers with LL_CS_IND and the procedures start.  An answer that
+// the request does not allow is refused with LL_REJECT_EXT_IND Unsupported LL Parameter Value and ends the Start.
+@tier(embedded)
+fn rx_rsp(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
+    if not en.central
+        return R_UNKNOWN
+    var a = ll_cs_pdu.start_new()
+    if cs.wait != W_START or not ll_cs_pdu.get_rsp(var rx, var a)
+        return R_NONE
+    var req = ll_cs_pdu.start_new()
+    if not load_req(var cs, var req, var out) or not answer_ok(var a, var req, false)
+        fail_wait(var cs, E_UNSUPPORTED_LL)
+        return reject(var out, ll_cs.OP_CS_RSP, E_UNSUPPORTED_LL)
+    var ind = a
+    ll_cs_pdu.start_answer(var ind, pick_event(a.conn_event, en.ev_count), req.phy, req.pwr_delta)
+    ll_cs_pdu.put_ind(var out, var ind)
+    if not fits(var en, var out)
+        fail_wait(var cs, E_LIMITED)
+        return no_room(var out, ll_cs.OP_CS_RSP)
+    start_done(var cs, var out, var ind, var req)
+    R_SEND
+
+// LL_CS_IND, which a Peripheral of a Start receives: the procedures start.  An answer the request does not allow ends the Start without an answer, since
+// LL_REJECT_EXT_IND is never sent in response to LL_CS_IND (Section 5.1.26).
+@tier(embedded)
+fn rx_ind(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
+    if en.central
+        return R_UNKNOWN
+    var ind = ll_cs_pdu.start_new()
+    if cs.wait != W_START or not ll_cs_pdu.get_ind(var rx, var ind)
+        return R_NONE
+    var req = ll_cs_pdu.start_new()
+    if not load_req(var cs, var req, var out) or not answer_ok(var ind, var req, true)
+        fail_wait(var cs, E_UNSUPPORTED_LL)
+        return R_NONE
+    start_done(var cs, var rx, var ind, var req)
+    R_NONE
+
+// ── The procedures that run ─────────────────────────────────────────
+
+// The channel map the procedure instance that starts in event `ev` uses, as `lo` and `hi` (`ll_cs_pdu.chm_has`).
+@tier(embedded)
+fn filtered_lo(var cs: Cs, id: Int, ev: Int) -> Int
+    var lo = cs.chm_lo
+    if cs.pend_chm and event_not_before(ev, cs.pend_instant)
+        lo = cs.pend_lo
+    cfg_map_lo(var cs, id) & lo
+
+@tier(embedded)
+fn filtered_hi(var cs: Cs, id: Int, ev: Int) -> Int
+    var hi = cs.chm_hi
+    if cs.pend_chm and event_not_before(ev, cs.pend_instant)
+        hi = cs.pend_hi
+    cfg_map_hi(var cs, id) & hi
+
+// The number of channels of that map.
+@tier(embedded)
+fn filtered_count(var cs: Cs, id: Int, ev: Int) -> Int
+    ll_cs_pdu.chm_count(filtered_lo(var cs, id, ev), filtered_hi(var cs, id, ev))
+
+// A procedure instance of the series starts in event `ev`: the map of a pending Channel Map Update whose instant has come takes effect, and CSProcCount
+// is incremented, except for the instance that follows the Security Start.  The answer is 0, Command Disallowed when no series is open, or Insufficient
+// Channels when the filtered map has fewer than 15 channels, and then the series ends.
+@tier(embedded)
+fn instance_begin(var cs: Cs, ev: Int) -> Int
+    if not cs.run_open
+        return E_DISALLOWED
+    if cs.pend_chm and event_not_before(ev, cs.pend_instant)
+        cs.chm_lo = cs.pend_lo
+        cs.chm_hi = cs.pend_hi
+        cs.pend_chm = false
+    if ll_cs_pdu.chm_count(cfg_map_lo(var cs, cs.series_cfg) & cs.chm_lo, cfg_map_hi(var cs, cs.series_cfg) & cs.chm_hi) < CHANNELS_MIN
+        cs.run_open = false
+        return E_INSUFFICIENT_CHANNELS
+    if cs.fresh
+        cs.fresh = false
+    else
+        cs.proc_count = (cs.proc_count + 1) % COUNT_MOD
+    0
+
+// The last instance of the series is over.
+@tier(embedded)
+fn series_done(var cs: Cs)
+    cs.run_open = false
+
+// ── Procedure Repeat Termination ────────────────────────────────────
+
+// The CSProcCount two ends agree on after a termination: the higher of the one sent and the one received, the difference taken modulo 65536 and
+// 32767 or more meaning the received one is the lower.
+@tier(embedded)
+fn higher_count(sent: Int, received: Int) -> Int
+    if ((received - sent) & 0xFFFF) >= EVENT_HALF - 1
+        return sent
+    received
+
+// The termination is complete: the instances that follow do not start.
+@tier(embedded)
+fn terminated(var cs: Cs, error: Int, agreed: Int)
+    cs.proc_count = agreed
+    cs.term_error = error
+    cs.run_open = false
+
+// The Host asks to stop the repeats of the series that is open (LE CS Procedure Enable with Enable 0), or the Link Layer does, for `error`:
+// LL_CS_TERMINATE_REQ goes out in `out`.  Command Disallowed when no series is open, when the series is a single procedure, when the configuration is not the series'
+// and while another procedure of this end waits.
+@tier(embedded)
+fn begin_terminate(var cs: Cs, var en: Env, config_id: Int, error: Int, var out: Pdu) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE or not cs.run_open or cs.series_n == 1 or cs.series_cfg != config_id
+        return E_DISALLOWED
+    var t = ll_cs_pdu.term_new(config_id, cs.proc_count, error)
+    ll_cs_pdu.put_terminate(var out, ll_cs.OP_CS_TERMINATE_REQ, var t)
+    if not fits(var en, var out)
+        return E_DISALLOWED
+    cs.wait = W_TERM
+    cs.wait_cfg = config_id
+    cs.term_error = error
+    cs.t0 = en.now
+    0
+
+// Whether a ProcCount the peer sent is one of the series that is open: the configuration is the series' and, for a series of more than one procedure,
+// ((ProcCount - StartCSProcCount + 1) mod 65536) is within N_PROCEDURE_COUNT.
+@tier(embedded)
+fn series_has(var cs: Cs, config_id: Int, proc_count: Int) -> Bool
+    if not cs.run_open or cs.series_n == 1 or cs.series_cfg != config_id
+        return false
+    cs.series_n == 0 or ((proc_count - cs.series_start + 1) & 0xFFFF) <= cs.series_n
+
+// LL_CS_TERMINATE_REQ: LL_CS_TERMINATE_RSP answers and the series ends; LL_REJECT_EXT_IND Command Disallowed answers a ProcCount or a configuration that the
+// series does not have, and LL Procedure Collision one that crosses a termination of this end (Section 5.3).
+@tier(embedded)
+fn rx_terminate_req(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
+    let g = guard(var cs, var en, ll_cs.OP_CS_TERMINATE_REQ, false, var out)
+    if g >= 0
+        return g
+    var t = ll_cs_pdu.term_new(0, 0, 0)
+    if not ll_cs_pdu.get_terminate(var rx, var t)
+        return R_NONE
+    if collides(var cs, var en, W_TERM, ll_cs.OP_CS_TERMINATE_REQ, false, var out)
+        return R_SEND
+    if not series_has(var cs, t.config_id, t.proc_count)
+        return reject(var out, ll_cs.OP_CS_TERMINATE_REQ, E_DISALLOWED)
+    var r = ll_cs_pdu.term_new(t.config_id, cs.proc_count, t.error)
+    ll_cs_pdu.put_terminate(var out, ll_cs.OP_CS_TERMINATE_RSP, var r)
+    terminated(var cs, t.error, higher_count(cs.proc_count, t.proc_count))
+    R_SEND
+
+// LL_CS_TERMINATE_RSP: the termination the Host asked for completes.
+@tier(embedded)
+fn rx_terminate_rsp(var cs: Cs, var rx: Pdu) -> Int
+    if cs.wait != W_TERM
+        return R_NONE
+    var t = ll_cs_pdu.term_new(0, 0, 0)
+    if not ll_cs_pdu.get_terminate(var rx, var t) or t.config_id != cs.wait_cfg
+        return R_NONE
+    terminated(var cs, cs.term_error, higher_count(cs.proc_count, t.proc_count))
+    cs.wait = W_NONE
+    cs.st_term = 0
+    cs.owed = cs.owed | OWED_TERM
+    R_NONE
+
+// ── Channel Map Update ──────────────────────────────────────────────
+
+// The map `lo` and `hi` is to take effect: at once when no procedure runs and none is pending, otherwise at the first procedure that starts in the event
+// `instant` or after it.
+@tier(embedded)
+fn map_set(var cs: Cs, lo: Int, hi: Int, instant: Int)
+    let lo2 = lo & ll_cs_pdu.CHM_LO_ALLOWED
+    let hi2 = hi & ll_cs_pdu.CHM_HI_ALLOWED
+    if cs.run_open
+        cs.pend_chm = true
+        cs.pend_lo = lo2
+        cs.pend_hi = hi2
+        cs.pend_instant = instant
+    else
+        cs.chm_lo = lo2
+        cs.chm_hi = hi2
+        cs.pend_chm = false
+
+// The Host classifies the channels (LE CS Set Channel Classification) and this end starts the next procedure: LL_CS_CHANNEL_MAP_IND with the map and
+// `instant` goes out in `out` and the map takes effect as the specification says.  Invalid HCI Command Parameters for fewer than 15 channels or a channel
+// that is not allowed; Command Disallowed while an ACL procedure with an instant is out.
+@tier(embedded)
+fn begin_channel_map(var cs: Cs, var en: Env, lo: Int, hi: Int, instant: Int, var out: Pdu) -> Int
+    let g = begin_guard(var cs, var en)
+    if g != 0
+        return g
+    if (lo & ~ll_cs_pdu.CHM_LO_ALLOWED) != 0 or (hi & ~ll_cs_pdu.CHM_HI_ALLOWED) != 0 or ll_cs_pdu.chm_count(lo, hi) < CHANNELS_MIN
+        return E_INVALID_PARAMS
+    if en.busy
+        return E_DISALLOWED
+    var m = ll_cs_pdu.chm_new(lo, hi, instant & 0xFFFF)
+    ll_cs_pdu.put_channel_map(var out, var m)
+    if not fits(var en, var out)
+        return E_DISALLOWED
+    map_set(var cs, lo, hi, instant & 0xFFFF)
+    0
+
+// LL_CS_CHANNEL_MAP_IND: the map takes effect as the specification says.  An instant in the past ends the series that is pending with Instant Passed
+// (LL_CS_TERMINATE_REQ in `out`), and the map applies to the procedures that follow.  There is no answer otherwise.
+@tier(embedded)
+fn rx_channel_map(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
+    if not en.encrypted
+        return R_NONE
+    var m = ll_cs_pdu.chm_new(0, 0, 0)
+    if not ll_cs_pdu.get_channel_map(var rx, var m)
+        return R_NONE
+    let past = cs.run_open and event_past(m.instant, en.ev_count)
+    if past
+        map_set(var cs, m.lo, m.hi, en.ev_count)
+    else
+        map_set(var cs, m.lo, m.hi, m.instant)
+    if not past or cs.wait != W_NONE or cs.series_n == 1
+        return R_NONE
+    var t = ll_cs_pdu.term_new(cs.series_cfg, cs.proc_count, E_INSTANT_PASSED)
+    ll_cs_pdu.put_terminate(var out, ll_cs.OP_CS_TERMINATE_REQ, var t)
+    if not fits(var en, var out)
+        return R_NONE
+    cs.wait = W_TERM
+    cs.wait_cfg = cs.series_cfg
+    cs.term_error = E_INSTANT_PASSED
+    cs.t0 = en.now
+    R_SEND
+
+// ── What the peer sent ──────────────────────────────────────────────
+
+// The peer refused the request `op` with `code` (LL_UNKNOWN_RSP gives Unsupported Remote Feature): the procedure of this end that sent it ends with that
+// code.  The refusal of a request this end gave up for a colliding one of the Central (`yield_op`) is not an answer.
+@tier(embedded)
+fn rx_refusal(var cs: Cs, op: Int, code: Int)
+    if cs.yield_op == op and code == E_COLLISION
+        cs.yield_op = 0
+        return
+    var w = W_NONE
+    if op == ll_cs.OP_CS_SEC_REQ
+        w = W_SEC
+    else if op == ll_cs.OP_CS_CAPABILITIES_REQ
+        w = W_CAP
+    else if op == ll_cs.OP_CS_CONFIG_REQ
+        w = W_CFG
+    else if op == ll_cs.OP_CS_REQ or op == ll_cs.OP_CS_RSP
+        w = W_START
+    else if op == ll_cs.OP_CS_TERMINATE_REQ
+        w = W_TERM
+    else if op == ll_cs.OP_CS_FAE_REQ
+        w = W_FAE
+    if cs.wait == w and w != W_NONE
+        fail_wait(var cs, code)
+
+// A control PDU of the peer: LL_CS_ opcodes, and LL_REJECT_EXT_IND and LL_UNKNOWN_RSP naming one of this end's requests.  `local` is the capabilities
+// of this end.  The answer is `R_SEND` with the PDU to queue in `out`, `R_NONE`, `R_UNKNOWN` for an opcode that does not exist in the role of this end
+// (it is answered with LL_UNKNOWN_RSP), or `R_CLOSE`.  `out` is also used as scratch.
+@tier(embedded)
+fn receive(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu) -> Int
+    let op = ll_data.dpdu_opcode(var rx)
+    if op == ll_data.OP_REJECT_EXT_IND
+        rx_refusal(var cs, ll_data.dpdu_byte(var rx, 1), ll_data.dpdu_byte(var rx, 2))
+        return R_NONE
+    if op == ll_data.OP_UNKNOWN_RSP
+        rx_refusal(var cs, ll_data.dpdu_byte(var rx, 1), E_UNSUPPORTED_REMOTE)
+        return R_NONE
+    if not ll_cs.pdu_len_ok(op, ll_data.dpdu_len(var rx))
+        return R_NONE
+    match op
+        0x39 => rx_sec_req(var cs, var en, var rx, var out)
+        0x2d => rx_sec_rsp(var cs, var en, var rx)
+        0x2e => rx_caps_req(var cs, var en, var local, var rx, var out)
+        0x2f => rx_caps_rsp(var cs, var rx)
+        0x30 => rx_config_req(var cs, var en, var local, var rx, var out)
+        0x31 => rx_config_rsp(var cs, var rx)
+        0x32 => rx_req(var cs, var en, var local, var rx, var out)
+        0x33 => rx_rsp(var cs, var en, var rx, var out)
+        0x34 => rx_ind(var cs, var en, var rx, var out)
+        0x35 => rx_terminate_req(var cs, var en, var rx, var out)
+        0x3a => rx_terminate_rsp(var cs, var rx)
+        0x36 => rx_fae_req(var cs, var en, var local, var out)
+        0x37 => rx_fae_rsp(var cs, var rx)
+        0x38 => rx_channel_map(var cs, var en, var rx, var out)
+        // cov: skip — reached only by an opcode that is no PDU of the feature, which `len_ok` has refused before
+        _    => R_UNKNOWN
+
+// Take the event `bit` the Host is owed: true, and the bit is cleared, when it was set.
+@tier(embedded)
+fn take_owed(var cs: Cs, bit: Int) -> Bool
+    if (cs.owed & bit) == 0
+        return false
+    cs.owed = cs.owed & ~bit
+    true

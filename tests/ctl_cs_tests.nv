@@ -5,7 +5,8 @@
 // its bits clear.  A build with it lists its commands in Supported Commands and answers each with `ll_cs.STUB_STATUS`: with a Command
 // Status event for the commands whose result follows in an event of its own and a Command Complete event for the others.  The two commands
 // of Enhancement #1 with the two of the security requirements need `ctl_cs_ipt` and the two test commands need `ctl_cs_test`.  The Link
-// Layer opcodes are answered with LL_UNKNOWN_RSP in both builds.
+// Layer opcodes are answered with LL_UNKNOWN_RSP in a build without the feature; a build with it answers them with the procedures of
+// tests/ctl_cs_proc_tests.nv.
 //
 // The cases run under every configuration of the package; each reads the keys it depends on.
 
@@ -294,7 +295,9 @@ fn pdu_lengths() -> [Int]
 
 @when(noble_controller_config.CTL_PERIPHERAL > 0)
 @test
-fn test_the_fourteen_control_opcodes_are_answered_with_unknown_response_whether_the_feature_is_in_or_not()
+fn test_the_fourteen_control_opcodes_are_answered_with_unknown_response_when_the_feature_is_out()
+    if ctl_limits.cs_on()
+        return
     var c = connected()
     let lens = pdu_lengths()
     for i in 0..14

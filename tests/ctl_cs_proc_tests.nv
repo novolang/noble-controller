@@ -1,0 +1,766 @@
+// tests/ctl_cs_proc_tests.nv — the procedures of Channel Sounding in the Controller: the PDUs of the peer reach the record of their link and are answered, the
+// Host's requests go out as PDUs, a procedure that the peer leaves unanswered ends the connection, the random octets of the security procedure come from the
+// program, and the queue of a link holds the longest PDU.
+//
+// The peer is scripted: the test writes the PDUs a Central sends to the Peripheral link of the Controller, in the order of Part D of [Vol 6] (security,
+// capabilities, configuration, start), and reads the answers from the link's queue.  A build without the feature answers the same PDUs with
+// LL_UNKNOWN_RSP (tests/ctl_cs_tests.nv).  The cases that need the feature return at once in a build without it, and those that need the reflector role, a
+// second link or the second configuration return when the build lacks them.
+//
+//   novo test tests/ctl_cs_proc_tests.nv
+
+use ctl_limits
+use std.test
+use noble_controller_config
+use ctl_hci
+use ll_pdu
+use ll_data
+use ll_link
+use ll_policy
+use ll_phy
+use ll_cs
+use ll_cs_pdu
+use ll_cs_proc
+
+// ── The Host's side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(var c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+fn fresh() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    let _a = run(var c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F])
+    let _b = run(var c, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    c
+
+fn connect_ind(interval: Int, timeout: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0x10 + i)
+    for b in [0x12, 0x5A, 0x65, 0x50, 0x11, 0x22, 0x33, 2]
+        let _c = ll_pdu.pdu_put(var p, b)
+    for v in [0, interval, 0, timeout]
+        let _d = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _e = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _f = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A Controller with a Peripheral connection of 30 ms taken at 5000, in the slot 0.
+fn connected() -> ctl_hci.Controller
+    var c = fresh()
+    let _a = run(var c, 0x2006, [0x20, 0, 0x20, 0, 0, 0, 0, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 7, 0])
+    let _b = run(var c, 0x200A, [1])
+    ctl_hci.ctl_set_time(var c, 1000)
+    var pol = ll_policy.default_link_policy()
+    var p = connect_ind(24, 100)
+    test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
+    let _r = run(var c, 0x1001, [])
+    c
+
+// ── The link ────────────────────────────────────────────────────────
+
+fn encrypt(var c: ctl_hci.Controller)
+    c.links[0].enc_tx = true
+    c.links[0].enc_rx = true
+
+fn peer_has_cs(var c: ctl_hci.Controller)
+    c.links[0].have_feat = true
+    feat_set(var c.links[0], 0, 0x04)
+    feat_set(var c.links[0], 5, 0x40)
+
+fn feat_set(var l: ll_link.Link, i: Int, v: Int)
+    l.peer_feat[i] = v as u8
+
+fn set_n(var p: Pdu, n: Int)
+    p.n = n
+
+fn set_len(var p: Pdu, n: Int)
+    p.b[1] = n as u8
+
+// The state of the link that the environment of a procedure reads.
+fn set_upd_pending(var c: ctl_hci.Controller, on: Bool)
+    c.links[0].upd_pending = on
+
+fn set_proc(var c: ctl_hci.Controller, proc: Int)
+    c.links[0].proc = proc
+
+fn set_phy(var c: ctl_hci.Controller, phy: Int, opt: Int)
+    c.links[0].phy = phy
+    c.links[0].phy_opt = opt
+
+fn set_rem_rx(var c: ctl_hci.Controller, octets: Int)
+    c.links[0].dl_rem_rx_octets = octets
+
+fn signed8(v: Int) -> Int
+    let b = v & 0xFF
+    if b >= 128
+        b - 256
+    else
+        b
+
+// The peer's data length is the one of a Controller that took the length procedure: it takes PDUs of 251 octets.
+fn long_packets(var c: ctl_hci.Controller)
+    c.links[0].dl_rem_rx_octets = 251
+    c.links[0].dl_rem_rx_time = 2120
+
+// A Controller with the Host Support bit set, the link encrypted, the peer known to have the feature and long packets.
+@when(noble_controller_config.CTL_CS > 0)
+fn ready_link() -> ctl_hci.Controller
+    var c = connected()
+    ctl_hci.ctl_cs_set_host(var c, true)
+    encrypt(var c)
+    peer_has_cs(var c)
+    long_packets(var c)
+    c
+
+// The PDU as the peer sends it and the Controller reads it (`Link.ctl_in`, then the Controller's procedure).
+fn peer_sends(var c: ctl_hci.Controller, var p: Pdu)
+    ll_link.ctrl_rx(var c.links[0], var p)
+    if c.links[0].ctl_in
+        ctl_hci.ctl_iso_ctrl(var c, 0, var p)
+    ll_link.link_prepare(var c.links[0])
+
+fn queued_op(var c: ctl_hci.Controller) -> Int
+    if c.links[0].nxt_kind == ll_link.K_EMPTY
+        return -1
+    ll_data.dpdu_opcode(var c.links[0].nxt)
+
+fn queued_len(var c: ctl_hci.Controller) -> Int
+    ll_data.dpdu_len(var c.links[0].nxt)
+
+fn queued_byte(var c: ctl_hci.Controller, i: Int) -> Int
+    ll_data.dpdu_byte(var c.links[0].nxt, i)
+
+fn pop_queued(var c: ctl_hci.Controller)
+    c.links[0].nxt_kind = ll_link.K_EMPTY
+    ll_data.dpdu_empty(var c.links[0].nxt)
+    ll_link.link_prepare(var c.links[0])
+
+// The record of slot `rec` of the Controller's tables, copied.
+@when(noble_controller_config.CTL_CS > 0)
+fn snap(var c: ctl_hci.Controller, rec: Int) -> ll_cs_proc.Cs
+    var cs = ll_cs_proc.cs_new()
+    ctl_hci.cs_get(var c, rec, var cs)
+    cs
+
+fn rejected(var c: ctl_hci.Controller, op: Int, code: Int) -> Bool
+    queued_op(var c) == ll_data.OP_REJECT_EXT_IND and queued_byte(var c, 1) == op and queued_byte(var c, 2) == code
+
+fn control_pdu(op: Int, n: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var p, op)
+    for _ in 0..n
+        ll_cs_pdu.put8(var p, 0)
+    ll_data.dpdu_finish(var p)
+    p
+
+fn rnd12(seed: Int) -> Vec[u8; 12]
+    var v: Vec[u8; 12] = Vec.new()
+    for i in 0..12
+        let _a = v.push(((seed + i) & 0xFF) as u8)
+    v
+
+// ── The capabilities of the scripted peer ───────────────────────────
+
+fn peer_caps() -> CapPdu
+    ll_cs_pdu.CapPdu { v2: false, mode_types: 0, rtt_cap: 0, n_aa: 255, n_sound: 0, n_rand: 0, nadm_sound: 0, nadm_rand: 0, sync_phy: 0, num_ant: 1, max_path: 1,
+                       role: 3, ipt: 0, no_fae: 0, ch3c: 0, sounding_pct: 0, num_configs: 1, max_procs: 0, t_sw: 0, t_ip1: 0, t_ip2: 0, t_fcs: 0, t_pm: 0, rtt_phy: 0,
+                       tx_snr: 0, t_ip2_ipt: 0, t_sw_ipt: 0, n2_aa: 0, n2_sound: 0, n2_rand: 0 }
+
+fn caps_pdu(op: Int) -> Pdu
+    var c = peer_caps()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var p, op, var c)
+    p
+
+fn config_pdu(role: Int) -> Pdu
+    var c = ll_cs_pdu.CfgPdu { config_id: 0, action: 1, chm_lo: ll_cs_pdu.CHM_LO_ALLOWED, chm_hi: ll_cs_pdu.CHM_HI_ALLOWED, chm_rep: 3, main_mode: 2, sub_mode: 0xFF,
+                               main_min: 0, main_max: 0, main_rep: 1, mode0_steps: 1, sync_phy: 1, rtt_type: 0, role: role, ipt: 0, chsel: 0, c3_shape: 0, c3_jump: 0,
+                               t_ip1: 7, t_ip2: 7, t_fcs: 9, t_pm: 2 }
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_req(var p, var c)
+    p
+
+// The Start of one procedure in the event `ev` that the peer asks for.
+fn start_req_pdu(ev: Int) -> Pdu
+    var s = ll_cs_pdu.StartPdu { config_id: 0, conn_event: ev, offset_min: 1000, offset_max: 2000, max_proc_len: 100, event_interval: 1, subevents: 1,
+                                 subevent_interval: 0, subevent_len: 2500, proc_interval: 0, proc_count: 1, aci: 0, pref_ant: 1, phy: 1, pwr_delta: 0, snr_i: 0xF, snr_r: 0xF }
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_req(var p, var s)
+    p
+
+fn sec_req_pdu() -> Pdu
+    var p = ll_pdu.pdu_new()
+    var s = ll_cs_pdu.sec_new()
+    for i in 0..8
+        s.iv[i] = (0x30 + i) as u8
+        s.pv[i] = (0x50 + i) as u8
+    for i in 0..4
+        s.inn[i] = (0x40 + i) as u8
+    ll_cs_pdu.put_sec(var p, ll_cs.OP_CS_SEC_REQ, var s)
+    p
+
+// ── The PDUs of the peer ────────────────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_capabilities_request_is_answered_with_this_controllers_capabilities()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    var req = caps_pdu(ll_cs.OP_CS_CAPABILITIES_REQ)
+    peer_sends(var c, var req)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_RSP)
+    test.assert_eq(queued_len(var c), 26)
+    var got = ll_cs_pdu.cap_new()
+    test.assert(ll_cs_pdu.get_caps(var c.links[0].nxt, var got))
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    test.assert_eq(got.num_ant, local.num_ant)
+    test.assert_eq(got.role, local.role)
+    test.assert_eq(got.num_configs, local.num_configs)
+    test.assert_eq(got.no_fae, 1)
+    test.assert(ctl_hci.cs_find(var c, 0) >= 0)
+    var rec = ctl_hci.cs_find(var c, 0)
+    var snap1 = snap(var c, rec)
+    test.assert(ll_cs_proc.caps_known(var snap1))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_request_is_refused_while_the_host_has_not_set_the_feature_or_the_link_is_not_encrypted()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    encrypt(var c)
+    peer_has_cs(var c)
+    var req = caps_pdu(ll_cs.OP_CS_CAPABILITIES_REQ)
+    peer_sends(var c, var req)
+    test.assert(rejected(var c, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE))
+    pop_queued(var c)
+    ctl_hci.ctl_cs_set_host(var c, true)
+    var rec = ctl_hci.cs_find(var c, 0)
+    test.assert(rec >= 0)
+    test.assert(snap(var c, rec).host)
+    var d = connected()
+    ctl_hci.ctl_cs_set_host(var d, true)
+    peer_has_cs(var d)
+    var req2 = caps_pdu(ll_cs.OP_CS_CAPABILITIES_REQ)
+    peer_sends(var d, var req2)
+    test.assert(rejected(var d, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_host_support_bit_the_host_set_reaches_the_record_a_connection_claims_later()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    ctl_hci.ctl_cs_set_host(var c, true)
+    test.assert(c.cs_host)
+    var rec = ctl_hci.cs_claim(var c, 0)
+    test.assert(rec >= 0)
+    test.assert(snap(var c, rec).host)
+    ctl_hci.ctl_cs_set_host(var c, false)
+    test.assert(not snap(var c, rec).host)
+    test.assert(not c.cs_host)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_pdu_of_the_wrong_length_is_dropped_and_a_pdu_of_the_wrong_role_is_not_known()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    var short = control_pdu(ll_cs.OP_CS_CONFIG_REQ, 5)
+    peer_sends(var c, var short)
+    test.assert_eq(queued_op(var c), -1)
+    test.assert(not c.links[0].ctl_in)
+    test.assert_eq(ctl_hci.cs_find(var c, 0), -1)
+    // LL_CS_RSP and LL_CS_SEC_RSP go from the Peripheral to the Central.
+    var rsp = control_pdu(ll_cs.OP_CS_RSP, 21)
+    peer_sends(var c, var rsp)
+    test.assert_eq(queued_op(var c), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(queued_byte(var c, 1), ll_cs.OP_CS_RSP)
+    pop_queued(var c)
+    var sec = control_pdu(ll_cs.OP_CS_SEC_RSP, 20)
+    peer_sends(var c, var sec)
+    test.assert_eq(queued_op(var c), ll_data.OP_UNKNOWN_RSP)
+    test.assert_eq(queued_byte(var c, 1), ll_cs.OP_CS_SEC_RSP)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_fae_table_request_is_refused_because_this_build_has_no_table()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    var req = control_pdu(ll_cs.OP_CS_FAE_REQ, 0)
+    peer_sends(var c, var req)
+    test.assert(rejected(var c, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_UNSUPPORTED_FEATURE))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_refusal_of_a_request_this_controller_sent_ends_its_procedure()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 0), 0)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_REQ)
+    var r = ll_pdu.pdu_new()
+    ll_data.ctrl_reject_ext(var r, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    peer_sends(var c, var r)
+    var rec = ctl_hci.cs_find(var c, 0)
+    test.assert_eq(snap(var c, rec).wait, ll_cs_proc.W_NONE)
+    test.assert_eq(snap(var c, rec).st_caps, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    var snap2 = snap(var c, rec)
+    test.assert(ll_cs_proc.take_owed(var snap2, ll_cs_proc.OWED_CAPS))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_refusal_of_something_else_is_not_a_channel_sounding_matter_and_a_link_without_a_record_ignores_it()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    var r = ll_pdu.pdu_new()
+    ll_data.ctrl_reject_ext(var r, ll_cs.OP_CS_REQ, 0x0C)
+    peer_sends(var c, var r)
+    test.assert_eq(ctl_hci.cs_find(var c, 0), -1)
+    test.assert_eq(queued_op(var c), -1)
+    var u = ll_pdu.pdu_new()
+    ll_data.ctrl_unknown_rsp(var u, ll_cs.OP_CS_FAE_REQ)
+    peer_sends(var c, var u)
+    test.assert_eq(ctl_hci.cs_find(var c, 0), -1)
+
+// ── The whole sequence ──────────────────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_scripted_central_takes_the_controller_through_security_capabilities_configuration_and_start()
+    if not ctl_limits.cs_reflector_on()
+        return
+    var c = ready_link()
+    // Security: the Controller collects its random octets before it answers.
+    var sec = sec_req_pdu()
+    peer_sends(var c, var sec)
+    test.assert_eq(queued_op(var c), -1)
+    test.assert(ctl_hci.ctl_secure_wanted(var c))
+    test.assert(ctl_hci.ctl_wants_random(var c))
+    test.assert(ctl_hci.cs_feed(var c, rnd12(1)))
+    test.assert_eq(queued_op(var c), -1)
+    test.assert(ctl_hci.ctl_wants_random(var c))
+    test.assert(ctl_hci.cs_feed(var c, rnd12(2)))
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_SEC_RSP)
+    test.assert_eq(queued_len(var c), 21)
+    for k in 0..8
+        test.assert_eq(queued_byte(var c, 1 + k), 1 + k)
+        test.assert_eq(queued_byte(var c, 13 + k), 2 + k)
+    test.assert(not ctl_hci.ctl_wants_random(var c))
+    test.assert(not ctl_hci.ctl_secure_wanted(var c))
+    var rec = ctl_hci.cs_find(var c, 0)
+    test.assert(snap(var c, rec).secured)
+    // The three parts of CS_IV, CS_IN and CS_PV are the peer's below and this Controller's above.
+    var snap3 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cs_iv(var snap3, 0), 0x30)
+    var snap4 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cs_iv(var snap4, 8), 1)
+    var snap5 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cs_in(var snap5, 0), 0x40)
+    var snap6 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cs_in(var snap6, 4), 9)
+    var snap7 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cs_pv(var snap7, 0), 0x50)
+    var snap8 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cs_pv(var snap8, 8), 2)
+    pop_queued(var c)
+    // Capabilities.
+    var caps = caps_pdu(ll_cs.OP_CS_CAPABILITIES_REQ)
+    peer_sends(var c, var caps)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_RSP)
+    pop_queued(var c)
+    // Configuration 0, the peer the initiator.
+    var cfg = config_pdu(0)
+    peer_sends(var c, var cfg)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CONFIG_RSP)
+    test.assert_eq(queued_byte(var c, 1), 0)
+    var snap9 = snap(var c, rec)
+    test.assert(ll_cs_proc.cfg_used(var snap9, 0))
+    var snap10 = snap(var c, rec)
+    test.assert_eq(ll_cs_proc.cfg_role(var snap10, 0), 1)
+    pop_queued(var c)
+    // Start: the request names an event ten ahead, the Controller answers, the indication starts the procedures.
+    let ev = c.links[0].ev_count + 10
+    var req = start_req_pdu(ev)
+    peer_sends(var c, var req)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_RSP)
+    test.assert_eq(queued_len(var c), 22)
+    var rsp = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_rsp(var c.links[0].nxt, var rsp))
+    test.assert_eq(rsp.conn_event, ev)
+    test.assert_eq(rsp.phy, 1)
+    pop_queued(var c)
+    test.assert_eq(snap(var c, rec).wait, ll_cs_proc.W_START)
+    var ind = ll_pdu.pdu_new()
+    ll_cs_pdu.put_ind(var ind, var rsp)
+    peer_sends(var c, var ind)
+    test.assert_eq(queued_op(var c), -1)
+    test.assert(snap(var c, rec).run_open)
+    var snap11 = snap(var c, rec)
+    test.assert(ll_cs_proc.take_owed(var snap11, ll_cs_proc.OWED_PROC))
+    var run = ll_cs_pdu.start_new()
+    var scratch = ll_pdu.pdu_new()
+    var snap12 = snap(var c, rec)
+    test.assert(ll_cs_proc.load_run(var snap12, var run, var scratch))
+    test.assert_eq(run.conn_event, ev)
+    test.assert_eq(run.subevent_len, 2500)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_security_request_before_the_encryption_is_refused()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    ctl_hci.ctl_cs_set_host(var c, true)
+    peer_has_cs(var c)
+    var sec = sec_req_pdu()
+    peer_sends(var c, var sec)
+    test.assert(rejected(var c, ll_cs.OP_CS_SEC_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    test.assert(not ctl_hci.ctl_wants_random(var c))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_central_only_request_to_a_peripheral_cannot_be_started_by_the_host()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    test.assert_eq(ctl_hci.ctl_cs_security(var c, 0), ll_cs_proc.E_DISALLOWED)
+
+// ── The Host's requests ─────────────────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_hosts_request_for_capabilities_goes_out_as_a_pdu_and_its_answer_completes_it()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 0), 0)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_REQ)
+    test.assert_eq(queued_len(var c), 26)
+    pop_queued(var c)
+    var rsp = caps_pdu(ll_cs.OP_CS_CAPABILITIES_RSP)
+    peer_sends(var c, var rsp)
+    var rec = ctl_hci.cs_find(var c, 0)
+    var snap13 = snap(var c, rec)
+    test.assert(ll_cs_proc.take_owed(var snap13, ll_cs_proc.OWED_CAPS))
+    test.assert_eq(snap(var c, rec).st_caps, 0)
+    var snap14 = snap(var c, rec)
+    test.assert(ll_cs_proc.caps_known(var snap14))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_hosts_request_for_a_configuration_a_table_and_a_start_wait_for_what_they_need()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    var cfg = ll_cs_pdu.cfg_new()
+    test.assert_eq(ctl_hci.ctl_cs_config(var c, 0, var cfg, false), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(ctl_hci.ctl_cs_fae(var c, 0), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    var s = ll_cs_pdu.start_new()
+    test.assert_eq(ctl_hci.ctl_cs_start(var c, 0, var s), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(ctl_hci.ctl_cs_terminate(var c, 0, 0, 0x13), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(ctl_hci.ctl_cs_channel_map(var c, 0, 0x7FFFFC, 0, 100), 0)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CHANNEL_MAP_IND)
+    test.assert_eq(queued_len(var c), 13)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CHANNEL_MAP_IND)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_request_on_a_link_that_is_not_on_or_whose_queue_is_full_is_refused_with_its_own_status()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 1), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, -1), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    // Three PDUs wait in the queue: one slot stays free for the answers to the peer.
+    var p1 = control_pdu(ll_data.OP_PING_REQ, 0)
+    ll_data.ctrl_bare(var p1, ll_data.OP_PING_REQ)
+    for _ in 0..3
+        let _q = ll_link.ctrl_queue(var c.links[0], var p1)
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 0), ctl_hci.STATUS_COMMAND_DISALLOWED)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_every_record_taken_by_other_links_leaves_none_for_this_one()
+    if not ctl_limits.cs_on()
+        return
+    if ctl_limits.cs_slots() != 1 or noble_controller_config.CTL_LINKS < 2
+        return
+    var c = ready_link()
+    test.assert_eq(ctl_hci.cs_claim(var c, 1), 0)
+    test.assert_eq(ctl_hci.cs_claim(var c, 0), -1)
+    test.assert_eq(ctl_hci.cs_request(var c, 0), -3)
+    test.assert_eq(ctl_hci.cs_request_status(-3), ll_cs_proc.E_LIMITED)
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 0), ll_cs_proc.E_LIMITED)
+    // The peer's request is refused with the same code.
+    var req = caps_pdu(ll_cs.OP_CS_CAPABILITIES_REQ)
+    peer_sends(var c, var req)
+    test.assert(rejected(var c, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_LIMITED))
+    pop_queued(var c)
+    // A response, which asks for nothing, is ignored.
+    var rsp = caps_pdu(ll_cs.OP_CS_CAPABILITIES_RSP)
+    peer_sends(var c, var rsp)
+    test.assert_eq(queued_op(var c), -1)
+    ctl_hci.cs_release(var c, 1)
+    test.assert_eq(ctl_hci.cs_claim(var c, 0), 0)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_status_of_a_request_that_found_no_record_names_the_reason()
+    test.assert_eq(ctl_hci.cs_request_status(-1), ctl_hci.STATUS_UNKNOWN_CONNECTION)
+    test.assert_eq(ctl_hci.cs_request_status(-2), ctl_hci.STATUS_COMMAND_DISALLOWED)
+    test.assert_eq(ctl_hci.cs_request_status(-3), ll_cs_proc.E_LIMITED)
+
+// ── The record follows the connection ───────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_record_is_given_back_when_the_connection_ends_and_when_the_controller_resets()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    test.assert(ctl_hci.cs_claim(var c, 0) >= 0)
+    ll_link.link_close(var c.links[0], 0x13)
+    ctl_hci.release_ended(var c, 0)
+    test.assert_eq(ctl_hci.cs_find(var c, 0), -1)
+    var d = ready_link()
+    test.assert(ctl_hci.cs_claim(var d, 0) >= 0)
+    let _r = run(var d, 0x0C03, [])
+    test.assert_eq(ctl_hci.cs_find(var d, 0), -1)
+    test.assert(not d.cs_host)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_new_connection_in_a_slot_starts_with_a_clean_record_that_takes_the_hosts_support_bit()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    var rec = ctl_hci.cs_claim(var c, 0)
+    var snap15 = snap(var c, rec)
+    ll_cs_proc.set_host(var snap15, false)
+    ctl_hci.cs_put(var c, rec, var snap15)
+    ctl_hci.apply_defaults(var c, 0)
+    test.assert_eq(ctl_hci.cs_find(var c, 0), -1)
+    var again = ctl_hci.cs_claim(var c, 0)
+    test.assert(snap(var c, again).host)
+
+// ── Time ────────────────────────────────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_request_the_peer_leaves_unanswered_for_40_seconds_ends_the_connection_with_response_timeout()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    ctl_hci.ctl_set_time(var c, 2000000)
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 0), 0)
+    pop_queued(var c)
+    ctl_hci.ctl_set_time(var c, 2000000 + 40000000)
+    test.assert(not ctl_hci.ctl_cs_poll(var c))
+    test.assert(not c.links[0].closing)
+    ctl_hci.ctl_set_time(var c, 2000000 + 40000001)
+    test.assert(ctl_hci.ctl_cs_poll(var c))
+    test.assert(c.links[0].closing)
+    test.assert_eq(c.links[0].reason, ll_link.REASON_RESPONSE_TIMEOUT)
+    // The step of the Controller runs the poll as well.
+    var d = ready_link()
+    ctl_hci.ctl_set_time(var d, 2000000)
+    test.assert_eq(ctl_hci.ctl_cs_capabilities(var d, 0), 0)
+    ctl_hci.ctl_set_time(var d, 2000000 + 40000001)
+    let _s = ctl_hci.ctl_step(var d)
+    test.assert(d.links[0].closing)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_an_idle_connection_is_not_polled_into_a_timeout()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    test.assert(ctl_hci.cs_claim(var c, 0) >= 0)
+    ctl_hci.ctl_set_time(var c, 900000000)
+    test.assert(not ctl_hci.ctl_cs_poll(var c))
+    test.assert(not c.links[0].closing)
+
+// ── What the procedures read of the link ────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_environment_of_a_link_is_what_the_link_and_the_controller_say()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    var en = ll_cs_proc.env_new()
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(not en.central)
+    test.assert(not en.encrypted)
+    test.assert(not en.peer_cs)
+    test.assert(not en.peer_v2)
+    test.assert_eq(en.interval_us, 30000)
+    test.assert_eq(en.now, c.now)
+    test.assert_eq(en.phy, 1)
+    test.assert_eq(en.managed, 0xF)
+    test.assert(en.sec_ok)
+    test.assert(not en.busy)
+    test.assert_eq(en.max_tx, ll_link.tx_limit(var c.links[0]))
+    encrypt(var c)
+    peer_has_cs(var c)
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(en.encrypted)
+    test.assert(en.peer_cs)
+    // A procedure with an instant is out, or a connection parameters request.
+    set_upd_pending(var c, true)
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(en.busy)
+    set_upd_pending(var c, false)
+    set_proc(var c, ll_link.PROC_PARAM)
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(en.busy)
+    set_proc(var c, ll_link.PROC_NONE)
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(not en.busy)
+    // The PHY of the link as LL_CS_REQ names it.
+    test.assert_eq(ctl_hci.cs_phy_bit(var c, 0), 1)
+    set_phy(var c, ll_phy.PHY_2M, ll_phy.OPT_NONE)
+    test.assert_eq(ctl_hci.cs_phy_bit(var c, 0), 2)
+    set_phy(var c, ll_phy.PHY_CODED, ll_phy.OPT_S2)
+    test.assert_eq(ctl_hci.cs_phy_bit(var c, 0), 8)
+    set_phy(var c, ll_phy.PHY_CODED, ll_phy.OPT_S8)
+    test.assert_eq(ctl_hci.cs_phy_bit(var c, 0), 4)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_peers_enhancement_1_bit_in_its_second_feature_page_is_read_from_the_link()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    var en = ll_cs_proc.env_new()
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(not en.peer_v2)
+    ll_link.fx_put(var c.links[0], ll_link.FX_HAVE, 1, 1)
+    ll_link.fx_put(var c.links[0], ll_link.FX_PEER, 0xFFFFFF, ll_cs.PAGE1_CS_ENHANCEMENT_1)
+    ctl_hci.cs_env(var c, 0, var en)
+    test.assert(en.peer_v2)
+
+// ── The longest PDU ─────────────────────────────────────────────────
+
+fn fae_req_pdu() -> Pdu
+    control_pdu(ll_cs.OP_CS_FAE_REQ, 0)
+
+@test
+fn test_the_slot_of_the_control_queue_holds_the_longest_pdu_of_the_build()
+    // A build with no Peripheral connection (the minimum of the schema) has no link to read the queue of.
+    if noble_controller_config.CTL_PERIPHERAL == 0
+        return
+    var c = connected()
+    if ctl_limits.cs_on()
+        test.assert_eq(ll_link.ctrl_slot(), 76)
+        test.assert_eq(c.links[0].cq.len(), 4 * 76)
+        test.assert(ll_link.ctrl_slot() >= ll_cs_pdu.PDU_OCTETS_MAX)
+    else
+        test.assert_eq(ll_link.ctrl_slot(), 40)
+        test.assert_eq(c.links[0].cq.len(), 160)
+
+@test
+fn test_four_pdus_of_75_octets_wait_in_their_slots_and_come_out_whole_and_in_order()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    for k in 0..4
+        var p = ll_pdu.pdu_new()
+        ll_cs_pdu.put_fae_begin(var p)
+        for i in 0..72
+            ll_cs_pdu.put_fae_value(var p, k * 16 + i)
+        ll_cs_pdu.put_fae_end(var p)
+        test.assert_eq(p.n, 75)
+        test.assert(ll_link.ctrl_queue(var c.links[0], var p))
+    var p5 = control_pdu(ll_data.OP_PING_REQ, 0)
+    ll_data.ctrl_bare(var p5, ll_data.OP_PING_REQ)
+    test.assert(not ll_link.ctrl_queue(var c.links[0], var p5))
+    for k in 0..4
+        ll_link.link_prepare(var c.links[0])
+        test.assert_eq(c.links[0].nxt.n, 75)
+        test.assert_eq(queued_op(var c), ll_cs.OP_CS_FAE_RSP)
+        for i in 0..72
+            test.assert_eq(ll_cs_pdu.fae_value(var c.links[0].nxt, i), signed8(k * 16 + i))
+        pop_queued(var c)
+
+@test
+fn test_a_pdu_longer_than_the_slot_is_not_queued()
+    if not ctl_limits.cs_on()
+        return
+    var c = connected()
+    var p = ll_pdu.pdu_new()
+    set_n(var p, 77)
+    test.assert(not ll_link.ctrl_queue(var c.links[0], var p))
+    test.assert_eq(c.links[0].cq_count, 0)
+    set_n(var p, 76)
+    set_len(var p, 74)
+    test.assert(ll_link.ctrl_queue(var c.links[0], var p))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_peer_that_takes_only_27_octets_gets_the_longest_answer_refused_as_limited_resources()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready_link()
+    set_rem_rx(var c, 27)
+    // The [v2] record of a build with Enhancement #1 is 32 octets, one packet more than 27 allows.
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    if not local.v2
+        return
+    var v2 = peer_caps()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.cap_version(var v2, true)
+    ll_cs_pdu.put_caps(var p, ll_cs.OP_CS_CAPABILITIES_REQ, var v2)
+    peer_sends(var c, var p)
+    test.assert(rejected(var c, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_LIMITED))

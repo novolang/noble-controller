@@ -1,0 +1,4113 @@
+// tests/ll_cs_proc_tests.nv — the unit tests of src/ll_cs_proc.nv: the seven Link Layer procedures of Channel Sounding, run between two records, one in the
+// Central role and one in the Peripheral role, and against a scripted peer that sends the PDUs the specification allows and the ones it forbids.
+//
+// A test runs a procedure by handing the PDU one end wrote (`begin_`, `receive`) to the other and the answer back.  Nothing in these tests reads a radio, a
+// link or a clock: the environment of the procedures (`ll_cs_proc.Env`) is a value the test builds, and the time in it is the test's.  The cases that need the
+// feature return at once in a build without it (`ctl_cs` 0), whose record has no store; the cases that need more than one configuration return when
+// `ctl_cs_configs` is 1.
+//
+//   novo test tests/ll_cs_proc_tests.nv
+
+use std.test
+use ctl_limits
+use noble_controller_config
+use ll_pdu
+use ll_data
+use ll_cs
+use ll_cs_pdu
+use ll_cs_proc
+use ctl_budget
+
+// ── Fixtures ────────────────────────────────────────────────────────
+
+fn skip() -> Bool
+    not ctl_limits.cs_on()
+
+fn fresh() -> Cs
+    var cs = ll_cs_proc.cs_new()
+    ll_cs_proc.set_host(var cs, true)
+    cs
+
+fn fresh_no_host() -> Cs
+    ll_cs_proc.cs_new()
+
+// The flags of an environment.
+const E_PLAIN = 1
+const E_NOPEER = 2
+const E_BUSY = 4
+const E_NOSEC = 8
+const E_SMALL = 16
+const E_V1 = 32
+
+// The environment of an end at `now`: encrypted, the peer with the feature and Enhancement #1, event 100, an interval of 30 ms, the ACL on LE 1M, every PHY's
+// power managed, no procedure out and room for any PDU; `flags` take one of these away or add one.
+fn envf(central: Bool, flags: Int, now: Int) -> ll_cs_proc.Env
+    var max_tx = 251
+    if (flags & E_SMALL) != 0
+        max_tx = 27
+    ll_cs_proc.Env { central: central, encrypted: (flags & E_PLAIN) == 0, peer_cs: (flags & E_NOPEER) == 0, peer_v2: (flags & E_V1) == 0, ev_count: 100,
+                     interval_us: 30000, now: now, busy: (flags & E_BUSY) != 0, phy: 1, managed: 0xF, sec_ok: (flags & E_NOSEC) == 0, max_tx: max_tx }
+
+fn env(central: Bool, now: Int) -> ll_cs_proc.Env
+    envf(central, 0, now)
+
+// The same with the ACL on `phy` and the PHYs in `managed` managed.
+fn env_phy(central: Bool, phy: Int, managed: Int) -> ll_cs_proc.Env
+    ll_cs_proc.Env { central: central, encrypted: true, peer_cs: true, peer_v2: true, ev_count: 100, interval_us: 30000, now: 10, busy: false, phy: phy,
+                     managed: managed, sec_ok: true, max_tx: 251 }
+
+fn rnd12(seed: Int) -> Vec[u8; 12]
+    var v: Vec[u8; 12] = Vec.new()
+    for i in 0..12
+        let _a = v.push(((seed + i) & 0xFF) as u8)
+    v
+
+// Capabilities that do everything the configuration check looks at: mode 3, all three RTT types, LE 2M and LE 2M 2BT, two antennas and four paths, both
+// roles, the initiator phase tone, a FAE table, Channel Selection Algorithm #3c, every optional timing and every SNR level.
+fn caps_full() -> CapPdu
+    ll_cs_pdu.CapPdu { v2: true, mode_types: 1, rtt_cap: 0, n_aa: 255, n_sound: 255, n_rand: 255, nadm_sound: 0, nadm_rand: 0, sync_phy: 6, num_ant: 2,
+                       max_path: 4, role: 3, ipt: 1, no_fae: 0, ch3c: 1, sounding_pct: 1, num_configs: ll_cs_proc.cfg_slots(), max_procs: 0, t_sw: 0, t_ip1: 0x7F,
+                       t_ip2: 0x7F, t_fcs: 0x1FF, t_pm: 3, rtt_phy: 0, tx_snr: 0x7F, t_ip2_ipt: 0, t_sw_ipt: 0, n2_aa: 0, n2_sound: 0, n2_rand: 0 }
+
+// The least a device may report: no option, one antenna, both roles, no FAE table, the mandatory timings.
+fn caps_min() -> CapPdu
+    ll_cs_pdu.CapPdu { v2: false, mode_types: 0, rtt_cap: 0, n_aa: 255, n_sound: 0, n_rand: 0, nadm_sound: 0, nadm_rand: 0, sync_phy: 0, num_ant: 1,
+                       max_path: 1, role: 3, ipt: 0, no_fae: 1, ch3c: 0, sounding_pct: 0, num_configs: ll_cs_proc.cfg_slots(), max_procs: 0, t_sw: 0, t_ip1: 0,
+                       t_ip2: 0, t_fcs: 0, t_pm: 0, rtt_phy: 0, tx_snr: 0, t_ip2_ipt: 0, t_sw_ipt: 0, n2_aa: 0, n2_sound: 0, n2_rand: 0 }
+
+// The same as `caps_full` with field `f` of the PDU order (see `cap_put`) set to `v`.
+fn caps_set(f: Int, v: Int) -> CapPdu
+    var c = caps_full()
+    cap_put(var c, f, v)
+    c
+
+fn cap_put(var c: CapPdu, f: Int, v: Int)
+    match f
+        0  => c.mode_types = v
+        1  => c.rtt_cap = v
+        2  => c.n_aa = v
+        3  => c.n_sound = v
+        4  => c.n_rand = v
+        7  => c.sync_phy = v
+        8  => c.num_ant = v
+        9  => c.max_path = v
+        10 => c.role = v
+        11 => c.ipt = v
+        12 => c.no_fae = v
+        13 => c.ch3c = v
+        15 => c.num_configs = v
+        18 => c.t_ip1 = v
+        19 => c.t_ip2 = v
+        20 => c.t_fcs = v
+        21 => c.t_pm = v
+        23 => c.tx_snr = v
+        _  => c.v2 = v == 1
+
+// The fields of a configuration that `cfg_put` sets, by number.
+const C_ID = 0
+const C_ACTION = 1
+const C_LO = 2
+const C_HI = 3
+const C_REP = 4
+const C_MAIN = 5
+const C_SUB = 6
+const C_MIN = 7
+const C_MAX = 8
+const C_MREP = 9
+const C_M0 = 10
+const C_PHY = 11
+const C_RTT = 12
+const C_ROLE = 13
+const C_IPT = 14
+const C_CHSEL = 15
+const C_SHAPE = 16
+const C_JUMP = 17
+const C_IP1 = 18
+const C_IP2 = 19
+const C_FCS = 20
+const C_PM = 21
+
+fn cfg_put(var c: CfgPdu, f: Int, v: Int)
+    match f
+        0  => c.config_id = v
+        1  => c.action = v
+        2  => c.chm_lo = v
+        3  => c.chm_hi = v
+        4  => c.chm_rep = v
+        5  => c.main_mode = v
+        6  => c.sub_mode = v
+        7  => c.main_min = v
+        8  => c.main_max = v
+        9  => c.main_rep = v
+        10 => c.mode0_steps = v
+        11 => c.sync_phy = v
+        12 => c.rtt_type = v
+        13 => c.role = v
+        14 => c.ipt = v
+        15 => c.chsel = v
+        16 => c.c3_shape = v
+        17 => c.c3_jump = v
+        18 => c.t_ip1 = v
+        19 => c.t_ip2 = v
+        20 => c.t_fcs = v
+        _  => c.t_pm = v
+
+// A configuration every check accepts: Main_Mode 2 alone, every allowed channel, LE 1M, RTT of the access address, the mandatory timings; `role` is the
+// role of the device that sends it.
+fn cfg_ok(id: Int, role: Int) -> CfgPdu
+    ll_cs_pdu.CfgPdu { config_id: id, action: 1, chm_lo: ll_cs_pdu.CHM_LO_ALLOWED, chm_hi: ll_cs_pdu.CHM_HI_ALLOWED, chm_rep: 3, main_mode: 2, sub_mode: 0xFF,
+                       main_min: 0, main_max: 0, main_rep: 1, mode0_steps: 1, sync_phy: 1, rtt_type: 0, role: role, ipt: 0, chsel: 0, c3_shape: 0, c3_jump: 0,
+                       t_ip1: 7, t_ip2: 7, t_fcs: 9, t_pm: 2 }
+
+// The same with the field `f` set to `v`.
+fn cfg_set(f: Int, v: Int) -> CfgPdu
+    var c = cfg_ok(0, 0)
+    cfg_put(var c, f, v)
+    c
+
+fn cfg_set2(f: Int, v: Int, g: Int, w: Int) -> CfgPdu
+    var c = cfg_ok(0, 0)
+    cfg_put(var c, f, v)
+    cfg_put(var c, g, w)
+    c
+
+// The start fields by number, in the order of LL_CS_REQ.
+const S_ID = 0
+const S_EVENT = 1
+const S_OMIN = 2
+const S_OMAX = 3
+const S_LEN = 4
+const S_EINT = 5
+const S_SUBS = 6
+const S_SINT = 7
+const S_SLEN = 8
+const S_PINT = 9
+const S_PCNT = 10
+const S_ACI = 11
+const S_PREF = 12
+const S_PHY = 13
+const S_DELTA = 14
+const S_SNRI = 15
+const S_SNRR = 16
+
+fn start_put(var s: StartPdu, f: Int, v: Int)
+    match f
+        0  => s.config_id = v
+        1  => s.conn_event = v
+        2  => s.offset_min = v
+        3  => s.offset_max = v
+        4  => s.max_proc_len = v
+        5  => s.event_interval = v
+        6  => s.subevents = v
+        7  => s.subevent_interval = v
+        8  => s.subevent_len = v
+        9  => s.proc_interval = v
+        10 => s.proc_count = v
+        11 => s.aci = v
+        12 => s.pref_ant = v
+        13 => s.phy = v
+        14 => s.pwr_delta = v
+        15 => s.snr_i = v
+        _  => s.snr_r = v
+
+// A Start every check accepts, in the event 110 of an interval of 30 ms: one procedure of one subevent of 2.5 ms, 1 to 2 ms after the anchor, one antenna each, on LE 1M.
+fn start_ok(id: Int) -> StartPdu
+    ll_cs_pdu.StartPdu { config_id: id, conn_event: 110, offset_min: 1000, offset_max: 2000, max_proc_len: 100, event_interval: 1, subevents: 1, subevent_interval: 0,
+                         subevent_len: 2500, proc_interval: 0, proc_count: 1, aci: 0, pref_ant: 1, phy: 1, pwr_delta: 0, snr_i: 0xF, snr_r: 0xF }
+
+fn start_set(f: Int, v: Int) -> StartPdu
+    var s = start_ok(0)
+    start_put(var s, f, v)
+    s
+
+fn start_set2(f: Int, v: Int, g: Int, w: Int) -> StartPdu
+    var s = start_ok(0)
+    start_put(var s, f, v)
+    start_put(var s, g, w)
+    s
+
+// The PDU `p` as the Link Layer queues it: its opcode, and the rejection it carries.
+fn op_of(var p: Pdu) -> Int
+    ll_data.dpdu_opcode(var p)
+
+fn rejects(var p: Pdu, rejected: Int, code: Int) -> Bool
+    ll_data.dpdu_opcode(var p) == ll_data.OP_REJECT_EXT_IND and ll_data.dpdu_byte(var p, 1) == rejected and ll_data.dpdu_byte(var p, 2) == code
+
+// A PDU of opcode `op` and the CtrData `ct` as the peer sends it, the scripted peer's.
+fn script(op: Int, ct: [Int]) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var p, op)
+    for v in ct
+        ll_cs_pdu.put8(var p, v)
+    ll_data.dpdu_finish(var p)
+    p
+
+fn script_reject(op: Int, code: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_reject_ext(var p, op, code)
+    p
+
+fn script_unknown(op: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_unknown_rsp(var p, op)
+    p
+
+// The LL_CS_CAPABILITIES_REQ of a new Central with the record `c`, in `out`.
+fn caps_req(var c: CapPdu, var out: Pdu)
+    var cen = fresh()
+    var e = env(true, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e, var c, var out), 0)
+
+// Run Security Start between the two ends: the Central begins, the random octets of both come, the PDUs cross.
+fn secure(var cen: Cs, var per: Cs)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var ec, rnd12(1), var a), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var ec, rnd12(2), var a), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_SEC_REQ)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.feed_random(var per, var ep, rnd12(3), var b), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.feed_random(var per, var ep, rnd12(4), var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_SEC_RSP)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+
+// Run the Capabilities Exchange with the Central asking: both ends hold the other's record.
+fn exchange(var cen: Cs, var per: Cs)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var caps, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+
+// Run the Configuration with the Central sending the request for the configuration `id` in `role`.
+fn configure(var cen: Cs, var per: Cs, id: Int, role: Int)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    var c = cfg_ok(id, role)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+
+// Run the FAE Table Request: the end `asker` asks the other.
+fn fae_table(var asker: Cs, var other: Cs, asker_central: Bool)
+    var caps = caps_full()
+    var ea = env(asker_central, 10)
+    var eo = env(not asker_central, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_fae(var asker, var ea, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var other, var eo, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var asker, var ea, var caps, var b, var a), ll_cs_proc.R_NONE)
+
+// Two ends that have done everything a Start needs: secured, capabilities exchanged, the configuration 0 created by the Central in `role` (0 the initiator), and
+// the FAE table of the reflector known to the initiator.  The events owed to the Hosts are taken.
+fn ready(var cen: Cs, var per: Cs, role: Int)
+    secure(var cen, var per)
+    exchange(var cen, var per)
+    configure(var cen, var per, 0, role)
+    if role == 0
+        fae_table(var cen, var per, true)
+    else
+        fae_table(var per, var cen, false)
+    cen.owed = 0
+    per.owed = 0
+
+// The environment of each end for the Start.
+fn envs_central() -> ll_cs_proc.Env
+    env(true, 20)
+
+fn envs_peripheral() -> ll_cs_proc.Env
+    env(false, 20)
+
+// ── Security Start ──────────────────────────────────────────────────
+
+@test
+fn test_security_start_joins_the_parts_of_both_ends_and_starts_the_counter_at_zero()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    secure(var cen, var per)
+    test.assert(cen.secured)
+    test.assert(per.secured)
+    test.assert(cen.fresh)
+    test.assert(per.fresh)
+    test.assert_eq(cen.proc_count, 0)
+    test.assert_eq(per.proc_count, 0)
+    // CS_IV is 16 octets, the Peripheral's 8 above the Central's 8; the Central's random octets 0 to 7 are 1 to 8, the Peripheral's are 3 to 10.
+    for k in 0..8
+        test.assert_eq(ll_cs_proc.cs_iv(var cen, k), 1 + k)
+        test.assert_eq(ll_cs_proc.cs_iv(var per, k), 1 + k)
+        test.assert_eq(ll_cs_proc.cs_iv(var cen, 8 + k), 3 + k)
+        test.assert_eq(ll_cs_proc.cs_iv(var per, 8 + k), 3 + k)
+    // CS_IN is 8 octets: random octets 8 to 11 of each end.
+    for k in 0..4
+        test.assert_eq(ll_cs_proc.cs_in(var cen, k), 9 + k)
+        test.assert_eq(ll_cs_proc.cs_in(var per, k), 9 + k)
+        test.assert_eq(ll_cs_proc.cs_in(var cen, 4 + k), 11 + k)
+        test.assert_eq(ll_cs_proc.cs_in(var per, 4 + k), 11 + k)
+    // CS_PV is 16 octets from the random octets 12 to 19, which the second 12 octets of each end give: the Central's start at 2, the Peripheral's at 4.
+    for k in 0..8
+        test.assert_eq(ll_cs_proc.cs_pv(var cen, k), 2 + k)
+        test.assert_eq(ll_cs_proc.cs_pv(var per, k), 2 + k)
+        test.assert_eq(ll_cs_proc.cs_pv(var cen, 8 + k), 4 + k)
+        test.assert_eq(ll_cs_proc.cs_pv(var per, 8 + k), 4 + k)
+
+@test
+fn test_both_ends_owe_the_host_the_security_event_when_the_procedure_completes()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    secure(var cen, var per)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_SEC))
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_SEC))
+    test.assert_eq(cen.st_sec, 0)
+    test.assert_eq(per.st_sec, 0)
+    test.assert(not ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_SEC))
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_the_central_sends_the_pdu_with_its_20_octets_after_the_last_random_octets()
+    if skip()
+        return
+    var cen = fresh()
+    var e = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var e), 0)
+    test.assert(ll_cs_proc.wants_random(var cen))
+    test.assert_eq(cen.wait, ll_cs_proc.W_RND_C)
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var e, rnd12(0x40), var a), ll_cs_proc.R_NONE)
+    test.assert(ll_cs_proc.wants_random(var cen))
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var e, rnd12(0x80), var a), ll_cs_proc.R_SEND)
+    test.assert(not ll_cs_proc.wants_random(var cen))
+    test.assert_eq(cen.wait, ll_cs_proc.W_SEC)
+    test.assert_eq(cen.t0, 10)
+    test.assert_eq(ll_data.dpdu_len(var a), 21)
+    for k in 0..12
+        test.assert_eq(ll_cs_pdu.ct(var a, k), 0x40 + k)
+    for k in 0..8
+        test.assert_eq(ll_cs_pdu.ct(var a, 12 + k), 0x80 + k)
+
+@test
+fn test_random_octets_are_taken_only_while_a_procedure_waits_for_them()
+    if skip()
+        return
+    var cen = fresh()
+    var e = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert(not ll_cs_proc.wants_random(var cen))
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var e, rnd12(1), var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.rnd_n, 0)
+
+@test
+fn test_the_host_cannot_start_security_without_the_feature_set_or_the_peer_or_the_encryption()
+    if skip()
+        return
+    var cen = fresh()
+    var e = env(true, 10)
+    var none = fresh_no_host()
+    test.assert_eq(ll_cs_proc.begin_security(var none, var e), ll_cs_proc.E_DISALLOWED)
+    var e1 = envf(true, E_NOPEER, 10)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var e1), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    var e2 = envf(true, E_PLAIN, 10)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var e2), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_a_peripheral_cannot_start_security_and_a_central_cannot_start_it_twice()
+    if skip()
+        return
+    var per = fresh()
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.begin_security(var per, var ep), ll_cs_proc.E_DISALLOWED)
+    var cen = fresh()
+    var ec = env(true, 10)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_security_cannot_start_while_cs_procedures_are_outstanding()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var ec = env(true, 20)
+    var a = ll_pdu.pdu_new()
+    var s = start_ok(0)
+    var caps = caps_full()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    var ep = env(false, 20)
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_SEND)
+    test.assert(cen.run_open)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_a_peripheral_refuses_a_security_request_without_the_feature_set_or_the_encryption()
+    if skip()
+        return
+    var caps = caps_full()
+    var per = fresh_no_host()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    let _x = ll_cs_proc.feed_random(var cen, var ec, rnd12(1), var a)
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var ec, rnd12(2), var a), ll_cs_proc.R_SEND)
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert(rejects(var b, ll_cs.OP_CS_SEC_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE))
+    var per2 = fresh()
+    var ep2 = envf(false, E_PLAIN, 10)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep2, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert(rejects(var b, ll_cs.OP_CS_SEC_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    test.assert_eq(per2.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_a_second_security_request_while_the_first_waits_for_random_octets_is_refused()
+    if skip()
+        return
+    var caps = caps_full()
+    var per = fresh()
+    var ep = env(false, 10)
+    var req = script(ll_cs.OP_CS_SEC_REQ, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per.wait, ll_cs_proc.W_RND_P)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_SEC_REQ, ll_cs_proc.E_DISALLOWED))
+
+@test
+fn test_the_peripheral_keeps_the_centrals_parts_in_the_low_half_and_joins_its_own_above()
+    if skip()
+        return
+    var caps = caps_full()
+    var per = fresh()
+    var ep = env(false, 10)
+    var req = script(ll_cs.OP_CS_SEC_REQ, [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 21, 22, 23, 24, 25, 26, 27, 28])
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_NONE)
+    let _x = ll_cs_proc.feed_random(var per, var ep, rnd12(100), var out)
+    test.assert_eq(ll_cs_proc.feed_random(var per, var ep, rnd12(120), var out), ll_cs_proc.R_SEND)
+    for k in 0..8
+        test.assert_eq(ll_cs_proc.cs_iv(var per, k), 1 + k)
+        test.assert_eq(ll_cs_proc.cs_iv(var per, 8 + k), 100 + k)
+        test.assert_eq(ll_cs_proc.cs_pv(var per, k), 21 + k)
+        test.assert_eq(ll_cs_proc.cs_pv(var per, 8 + k), 120 + k)
+    for k in 0..4
+        test.assert_eq(ll_cs_proc.cs_in(var per, k), 11 + k)
+        test.assert_eq(ll_cs_proc.cs_in(var per, 4 + k), 108 + k)
+
+@test
+fn test_the_pdus_of_the_wrong_role_are_not_known()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var per = fresh()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var out = ll_pdu.pdu_new()
+    var req = script(ll_cs.OP_CS_SEC_REQ, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    var rsp = script(ll_cs.OP_CS_SEC_RSP, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var req, var out), ll_cs_proc.R_UNKNOWN)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var rsp, var out), ll_cs_proc.R_UNKNOWN)
+    var cs_rsp = script(ll_cs.OP_CS_RSP, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    var cs_ind = script(ll_cs.OP_CS_IND, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var cs_rsp, var out), ll_cs_proc.R_UNKNOWN)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var cs_ind, var out), ll_cs_proc.R_UNKNOWN)
+
+@test
+fn test_a_security_response_nobody_asked_for_is_ignored()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var out = ll_pdu.pdu_new()
+    var rsp = script(ll_cs.OP_CS_SEC_RSP, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var out), ll_cs_proc.R_NONE)
+    test.assert(not cen.secured)
+
+@test
+fn test_a_pdu_of_the_wrong_length_is_ignored_by_every_procedure()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var out = ll_pdu.pdu_new()
+    for op in [0x39, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x3A, 0x36, 0x37, 0x38]
+        var p = script(op, [1, 2, 3])
+        test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var p, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(cen.owed, 0)
+
+@test
+fn test_an_opcode_that_is_no_pdu_of_the_feature_is_not_known()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var out = ll_pdu.pdu_new()
+    var p = script(0x3B, [0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var p, var out), ll_cs_proc.R_NONE)
+
+@test
+fn test_the_peer_refusing_the_security_request_ends_the_procedure_with_its_code()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    let _x = ll_cs_proc.feed_random(var cen, var ec, rnd12(1), var a)
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var ec, rnd12(2), var a), ll_cs_proc.R_SEND)
+    var r = script_reject(ll_cs.OP_CS_SEC_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var r, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_SEC))
+    test.assert_eq(cen.st_sec, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert(not cen.secured)
+
+@test
+fn test_the_peer_answering_unknown_to_the_security_request_ends_it_with_unsupported_remote_feature()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    let _x = ll_cs_proc.feed_random(var cen, var ec, rnd12(1), var a)
+    let _y = ll_cs_proc.feed_random(var cen, var ec, rnd12(2), var a)
+    var u = script_unknown(ll_cs.OP_CS_SEC_REQ)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var u, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_sec, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_SEC))
+
+@test
+fn test_a_refusal_of_a_request_this_end_did_not_send_changes_nothing()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    for op in [0x2E, 0x30, 0x32, 0x33, 0x35, 0x36, 0x3B, 0x00]
+        var r = script_reject(op, 0x0C)
+        test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var r, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_RND_C)
+    test.assert_eq(cen.owed, 0)
+
+@test
+fn test_the_central_that_hears_nothing_for_40_seconds_ends_the_connection()
+    if skip()
+        return
+    var cen = fresh()
+    var ec = env(true, 1000000)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    let _x = ll_cs_proc.feed_random(var cen, var ec, rnd12(1), var a)
+    test.assert_eq(ll_cs_proc.feed_random(var cen, var ec, rnd12(2), var a), ll_cs_proc.R_SEND)
+    var e1 = env(true, 1000000 + 40000000)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e1), 0)
+    var e2 = env(true, 1000000 + 40000001)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(cen.st_sec, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_SEC))
+
+@test
+fn test_waiting_for_random_octets_never_times_out_and_an_idle_record_never_does()
+    if skip()
+        return
+    var cen = fresh()
+    var ec = env(true, 10)
+    test.assert_eq(ll_cs_proc.poll(var cen, var ec), 0)
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    var late = env(true, 900000000)
+    test.assert_eq(ll_cs_proc.poll(var cen, var late), 0)
+    test.assert_eq(cen.wait, ll_cs_proc.W_RND_C)
+    var per = fresh()
+    var ep = env(false, 10)
+    var req = script(ll_cs.OP_CS_SEC_REQ, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    var out = ll_pdu.pdu_new()
+    var caps = caps_full()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_NONE)
+    var late2 = env(false, 900000000)
+    test.assert_eq(ll_cs_proc.poll(var per, var late2), 0)
+
+// ── Capabilities Exchange ───────────────────────────────────────────
+
+@test
+fn test_the_capabilities_exchange_gives_each_end_the_record_of_the_other()
+    if skip()
+        return
+    var cc = caps_full()
+    var cp = caps_set(8, 1)
+    var cen = fresh()
+    var per = fresh()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var cc, var a), 0)
+    test.assert_eq(cen.wait, ll_cs_proc.W_CAP)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_CAPABILITIES_REQ)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var cp, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_CAPABILITIES_RSP)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var cc, var b, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(ll_cs_proc.caps_known(var cen))
+    test.assert(ll_cs_proc.caps_known(var per))
+    var got = ll_cs_pdu.cap_new()
+    var scratch = ll_pdu.pdu_new()
+    test.assert(ll_cs_proc.load_caps(var cen, var got, var scratch))
+    test.assert_eq(got.num_ant, 1)
+    test.assert_eq(got.num_configs, cp.num_configs)
+    test.assert_eq(got.t_ip1, 0x7F)
+    test.assert(got.v2)
+    var got2 = ll_cs_pdu.cap_new()
+    test.assert(ll_cs_proc.load_caps(var per, var got2, var scratch))
+    test.assert_eq(got2.num_ant, 2)
+    test.assert_eq(got2.tx_snr, 0x7F)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CAPS))
+    test.assert_eq(cen.st_caps, 0)
+    test.assert(cen.caps_air)
+    test.assert(per.caps_air)
+
+@test
+fn test_the_responder_does_not_owe_the_host_an_event_for_an_exchange_it_did_not_ask_for()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    test.assert_eq(per.owed, 0)
+    test.assert_eq(cen.owed, ll_cs_proc.OWED_CAPS)
+
+@test
+fn test_the_v2_record_goes_out_only_when_both_ends_have_enhancement_1()
+    if skip()
+        return
+    var cc = caps_full()
+    var cen = fresh()
+    var a = ll_pdu.pdu_new()
+    var e1 = envf(true, E_V1, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e1, var cc, var a), 0)
+    test.assert_eq(ll_data.dpdu_len(var a), 26)
+    var cen2 = fresh()
+    var e2 = env(true, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen2, var e2, var cc, var a), 0)
+    test.assert_eq(ll_data.dpdu_len(var a), 32)
+    var cv1 = caps_set(99, 0)
+    var cen3 = fresh()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen3, var e2, var cv1, var a), 0)
+    test.assert_eq(ll_data.dpdu_len(var a), 26)
+
+@test
+fn test_the_answer_is_in_the_version_of_the_request()
+    if skip()
+        return
+    var cc = caps_full()
+    var per = fresh()
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    var cv1 = caps_set(99, 0)
+    var cen = fresh()
+    var ec = envf(true, E_V1, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var cv1, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var cc, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_data.dpdu_len(var b), 26)
+    var cen2 = fresh()
+    var per2 = fresh()
+    var ec2 = env(true, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen2, var ec2, var cc, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep, var cc, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_data.dpdu_len(var b), 32)
+    var per3 = fresh()
+    test.assert_eq(ll_cs_proc.receive(var per3, var ep, var cv1, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_data.dpdu_len(var b), 26)
+
+@test
+fn test_the_host_cannot_ask_for_capabilities_without_the_feature_the_peer_or_the_encryption()
+    if skip()
+        return
+    var cc = caps_full()
+    var a = ll_pdu.pdu_new()
+    var none = fresh_no_host()
+    var e = env(true, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var none, var e, var cc, var a), ll_cs_proc.E_DISALLOWED)
+    var cen = fresh()
+    var e1 = envf(true, E_NOPEER, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e1, var cc, var a), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    var e2 = envf(true, E_PLAIN, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e2, var cc, var a), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e, var cc, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e, var cc, var a), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_a_record_that_does_not_fit_the_packet_is_not_asked_for_and_is_refused_as_limited_resources()
+    if skip()
+        return
+    var cc = caps_full()
+    var cen = fresh()
+    var a = ll_pdu.pdu_new()
+    var small = envf(true, E_SMALL, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var small, var cc, var a), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    var per = fresh()
+    var ec = env(true, 10)
+    var req = ll_pdu.pdu_new()
+    caps_req(var cc, var req)
+    var ps = envf(false, E_SMALL, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var ps, var cc, var req, var a), ll_cs_proc.R_SEND)
+    test.assert(rejects(var a, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_LIMITED))
+
+@test
+fn test_a_capabilities_request_is_refused_without_the_feature_set_or_the_encryption()
+    if skip()
+        return
+    var cc = caps_full()
+    var req = ll_pdu.pdu_new()
+    var ec = env(true, 10)
+    caps_req(var cc, var req)
+    var out = ll_pdu.pdu_new()
+    var none = fresh_no_host()
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.receive(var none, var ep, var cc, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE))
+    var per = fresh()
+    var pe = envf(false, E_PLAIN, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var pe, var cc, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    test.assert(not ll_cs_proc.caps_known(var per))
+
+@test
+fn test_a_capabilities_record_out_of_range_is_refused_with_invalid_ll_parameters()
+    if skip()
+        return
+    var cc = caps_full()
+    var ep = env(false, 10)
+    for f in [15, 8, 9, 10]
+        for v in [0, 4, 5, 9]
+            var bad = caps_set(f, v)
+            // The fields that the check holds to a range: configurations 1 to 4, antennas 1 to 4, paths from the antennas to 4, a role.
+            var ok = true
+            if f == 15 and (v < 1 or v > 4)
+                ok = false
+            if f == 8 and (v < 1 or v > 4)
+                ok = false
+            if f == 9 and (v < bad.num_ant or v > 4)
+                ok = false
+            // The role has two bits on the air: 4 reads 0 and 5 and 9 read 1.
+            if f == 10 and ((v & 3) < 1)
+                ok = false
+            var req = ll_pdu.pdu_new()
+            var ec = env(true, 10)
+            caps_req(var bad, var req)
+            var per = fresh()
+            var out = ll_pdu.pdu_new()
+            test.assert_eq(ll_cs_proc.receive(var per, var ep, var cc, var req, var out), ll_cs_proc.R_SEND)
+            if ok
+                test.assert_eq(op_of(var out), ll_cs.OP_CS_CAPABILITIES_RSP)
+            else
+                test.assert(rejects(var out, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_INVALID_LL))
+                test.assert(not ll_cs_proc.caps_known(var per))
+
+@test
+fn test_a_capabilities_response_out_of_range_ends_the_procedure_with_invalid_ll_parameters()
+    if skip()
+        return
+    var cc = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var cc, var a), 0)
+    var bad = caps_set(15, 0)
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var rsp, ll_cs.OP_CS_CAPABILITIES_RSP, var bad)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var cc, var rsp, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_caps, ll_cs_proc.E_INVALID_LL)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CAPS))
+    test.assert(not ll_cs_proc.caps_known(var cen))
+
+@test
+fn test_a_capabilities_response_nobody_asked_for_is_ignored()
+    if skip()
+        return
+    var cc = caps_full()
+    var cen = fresh()
+    var ec = env(true, 10)
+    var rsp = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var rsp, ll_cs.OP_CS_CAPABILITIES_RSP, var cc)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var cc, var rsp, var out), ll_cs_proc.R_NONE)
+    test.assert(not ll_cs_proc.caps_known(var cen))
+
+@test
+fn test_the_peer_refusing_the_capabilities_request_ends_it_with_its_code_or_unsupported_remote_feature()
+    if skip()
+        return
+    var cc = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    var cen = fresh()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var cc, var a), 0)
+    var r = script_reject(ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var cc, var r, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_caps, ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    var cen2 = fresh()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen2, var ec, var cc, var a), 0)
+    var u = script_unknown(ll_cs.OP_CS_CAPABILITIES_REQ)
+    test.assert_eq(ll_cs_proc.receive(var cen2, var ec, var cc, var u, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen2.st_caps, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert(ll_cs_proc.take_owed(var cen2, ll_cs_proc.OWED_CAPS))
+
+@test
+fn test_both_ends_may_ask_for_capabilities_at_once()
+    if skip()
+        return
+    var cc = caps_full()
+    var cen = fresh()
+    var per = fresh()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    var ra = ll_pdu.pdu_new()
+    var rb = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var cc, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var per, var ep, var cc, var b), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var cc, var a, var ra), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var cc, var b, var rb), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var cc, var ra, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var cc, var rb, var b), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(cen.owed, ll_cs_proc.OWED_CAPS)
+    test.assert_eq(per.owed, ll_cs_proc.OWED_CAPS)
+
+@test
+fn test_the_capabilities_request_unanswered_for_40_seconds_ends_the_connection()
+    if skip()
+        return
+    var cc = caps_full()
+    var cen = fresh()
+    var ec = env(true, 500)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var cc, var a), 0)
+    var e1 = env(true, 500 + 40000000)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e1), 0)
+    var e2 = env(true, 500 + 40000001)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(cen.st_caps, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CAPS))
+
+@test
+fn test_capabilities_the_host_knows_are_kept_until_the_peer_or_a_configuration_replaces_them()
+    if skip()
+        return
+    var cs = fresh()
+    var scratch = ll_pdu.pdu_new()
+    var c = caps_full()
+    test.assert_eq(ll_cs_proc.cache_caps(var cs, var c, var scratch), 0)
+    test.assert(ll_cs_proc.caps_known(var cs))
+    test.assert(not cs.caps_air)
+    // The Host may write them again, while nothing came from the peer.
+    var c2 = caps_set(8, 1)
+    test.assert_eq(ll_cs_proc.cache_caps(var cs, var c2, var scratch), 0)
+    var got = ll_cs_pdu.cap_new()
+    test.assert(ll_cs_proc.load_caps(var cs, var got, var scratch))
+    test.assert_eq(got.num_ant, 1)
+    // A record that came from the peer cannot be overwritten.
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    test.assert_eq(ll_cs_proc.cache_caps(var cen, var c, var scratch), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(ll_cs_proc.cache_caps(var per, var c, var scratch), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_capabilities_cannot_be_written_once_a_configuration_exists()
+    if skip()
+        return
+    var cs = fresh()
+    var scratch = ll_pdu.pdu_new()
+    var c = caps_full()
+    var cc = caps_full()
+    test.assert_eq(ll_cs_proc.cache_caps(var cs, var c, var scratch), 0)
+    var ec = env(true, 10)
+    var out = ll_pdu.pdu_new()
+    var cfg = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cs, var ec, var cc, var cfg, true, var out), 0)
+    test.assert_eq(ll_cs_proc.cache_caps(var cs, var c, var scratch), ll_cs_proc.E_DISALLOWED)
+
+// ── Configuration ───────────────────────────────────────────────────
+
+fn stored(var cs: Cs, id: Int) -> CfgPdu
+    var c = ll_cs_pdu.cfg_new()
+    var scratch = ll_pdu.pdu_new()
+    test.assert(ll_cs_proc.load_config(var cs, id, var c, var scratch))
+    c
+
+fn same_config(a: CfgPdu, b: CfgPdu) -> Bool
+    a.config_id == b.config_id and a.action == b.action and a.chm_lo == b.chm_lo and a.chm_hi == b.chm_hi and a.chm_rep == b.chm_rep and a.main_mode == b.main_mode
+        and a.sub_mode == b.sub_mode and a.main_min == b.main_min and a.main_max == b.main_max and a.main_rep == b.main_rep and a.mode0_steps == b.mode0_steps
+        and a.sync_phy == b.sync_phy and a.rtt_type == b.rtt_type and a.role == b.role and a.ipt == b.ipt and a.chsel == b.chsel and a.c3_shape == b.c3_shape
+        and a.c3_jump == b.c3_jump and a.t_ip1 == b.t_ip1 and a.t_ip2 == b.t_ip2 and a.t_fcs == b.t_fcs and a.t_pm == b.t_pm
+
+fn cfg_pdu(var c: CfgPdu) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_req(var p, var c)
+    p
+
+// The verdict of the check on `c` with the capabilities `l` of this end and `p` of the peer, the request this end's.
+fn check(var c: CfgPdu, var l: CapPdu, var p: CapPdu) -> Int
+    ll_cs_proc.config_check(var c, var l, var p, true, true)
+
+fn check_full(var c: CfgPdu) -> Int
+    var l = caps_full()
+    var p = caps_full()
+    check(var c, var l, var p)
+
+@test
+fn test_a_configuration_the_central_creates_is_kept_by_both_ends_with_opposite_roles()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var want = cfg_set2(C_MAIN, 3, C_RTT, 4)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var want, false, var a), 0)
+    test.assert_eq(cen.wait, ll_cs_proc.W_CFG)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_CONFIG_REQ)
+    test.assert_eq(ll_data.dpdu_len(var a), 28)
+    // Nothing is in force until the peer accepts.
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_CONFIG_RSP)
+    test.assert_eq(ll_cs_pdu.get_config_rsp(var b), 0)
+    test.assert(ll_cs_proc.cfg_used(var per, 0))
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(ll_cs_proc.cfg_used(var cen, 0))
+    test.assert(same_config(stored(var cen, 0), want))
+    test.assert(same_config(stored(var per, 0), want))
+    test.assert(ll_cs_proc.cfg_mine(var cen, 0))
+    test.assert(not ll_cs_proc.cfg_mine(var per, 0))
+    test.assert_eq(ll_cs_proc.cfg_role(var cen, 0), 0)
+    test.assert_eq(ll_cs_proc.cfg_role(var per, 0), 1)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_a_configuration_the_peripheral_creates_in_the_reflector_role_makes_the_central_the_initiator()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var want = cfg_ok(0, 1)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var per, var ep, var caps, var want, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.cfg_role(var per, 0), 1)
+    test.assert_eq(ll_cs_proc.cfg_role(var cen, 0), 0)
+    test.assert(same_config(stored(var cen, 0), want))
+
+@test
+fn test_both_ends_owe_the_host_the_config_event_with_the_id_and_the_action()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    take_all(var cen)
+    configure(var cen, var per, 0, 0)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CFG))
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_CFG))
+    test.assert_eq(cen.ev_cfg, 0)
+    test.assert_eq(per.ev_cfg, 0)
+    test.assert_eq(cen.ev_act, 1)
+    test.assert_eq(per.ev_act, 1)
+    test.assert_eq(cen.st_cfg, 0)
+    test.assert_eq(per.st_cfg, 0)
+
+@test
+fn test_either_end_may_remove_a_configuration_whoever_created_it()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    configure(var cen, var per, 0, 0)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    var rm = cfg_set(C_ACTION, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var per, var ep, var caps, var rm, false, var a), 0)
+    test.assert_eq(ll_data.dpdu_len(var a), 28)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+    test.assert(not ll_cs_proc.cfg_used(var per, 0))
+    test.assert(not ll_cs_proc.any_config(var cen))
+    test.assert_eq(per.ev_act, 0)
+    test.assert_eq(cen.ev_act, 0)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CFG))
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_CFG))
+
+@test
+fn test_a_configuration_can_be_changed_by_creating_it_again()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    configure(var cen, var per, 0, 0)
+    var want = cfg_set(C_REP, 9)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var want, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(stored(var cen, 0).chm_rep, 9)
+    test.assert_eq(stored(var per, 0).chm_rep, 9)
+
+@test
+fn test_every_configuration_slot_is_independent()
+    if skip()
+        return
+    if ll_cs_proc.cfg_slots() < 2
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    configure(var cen, var per, 0, 0)
+    configure(var cen, var per, 1, 1)
+    test.assert_eq(stored(var cen, 0).role, 0)
+    test.assert_eq(stored(var cen, 1).role, 1)
+    test.assert_eq(ll_cs_proc.cfg_role(var cen, 1), 1)
+    test.assert_eq(ll_cs_proc.cfg_role(var per, 1), 0)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    var rm = cfg_set2(C_ID, 0, C_ACTION, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var rm, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+    test.assert(ll_cs_proc.cfg_used(var cen, 1))
+    test.assert(ll_cs_proc.cfg_used(var per, 1))
+    test.assert(ll_cs_proc.any_config(var per))
+
+@test
+fn test_a_configuration_beyond_the_slots_of_this_build_is_refused_as_unsupported()
+    if skip()
+        return
+    let slots = ll_cs_proc.cfg_slots()
+    if slots >= 4
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var caps = caps_set(15, 4)
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    var c = cfg_set(C_ID, slots)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    var ep = env(false, 10)
+    var req = cfg_pdu(var c)
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_UNSUPPORTED_LL))
+
+@test
+fn test_a_configuration_with_a_field_the_specification_forbids_is_malformed()
+    if skip()
+        return
+    // The channel map: the channels 0, 1, 23, 24, 25, 77 and 78 may not be set, nor the bit above them.
+    for ch in [0, 1, 23, 24, 25, 77, 78, 79]
+        var lo = ll_cs_pdu.CHM_LO_ALLOWED
+        var hi = ll_cs_pdu.CHM_HI_ALLOWED
+        if ch < 40
+            lo = lo | (1 << ch)
+        else
+            hi = hi | (1 << (ch - 40))
+        var c = cfg_set2(C_LO, lo, C_HI, hi)
+        test.assert_eq(check_full(var c), 1)
+    // Fewer than 15 channels.
+    var few = cfg_set2(C_LO, 0x3FFC, C_HI, 0)
+    var edge14 = cfg_set2(C_LO, 0xFFFC, C_HI, 0)
+    var edge15 = cfg_set2(C_LO, 0x1FFFC, C_HI, 0)
+    test.assert_eq(check_full(var few), 1)
+    test.assert_eq(check_full(var edge14), 1)
+    test.assert_eq(check_full(var edge15), 0)
+    // The identifiers and the action.
+    var id4 = cfg_set(C_ID, 4)
+    var id63 = cfg_set(C_ID, 63)
+    var act2 = cfg_set(C_ACTION, 2)
+    test.assert_eq(check_full(var id4), 1)
+    test.assert_eq(check_full(var id63), 1)
+    test.assert_eq(check_full(var act2), 1)
+    // The numbers of the configuration.
+    var rep0 = cfg_set(C_REP, 0)
+    var m0 = cfg_set(C_MAIN, 0)
+    var m4 = cfg_set(C_MAIN, 4)
+    var mff = cfg_set(C_MAIN, 0xFF)
+    var s0 = cfg_set(C_SUB, 0)
+    var s4 = cfg_set(C_SUB, 4)
+    var rp4 = cfg_set(C_MREP, 4)
+    var z0 = cfg_set(C_M0, 0)
+    var z4 = cfg_set(C_M0, 4)
+    var r7 = cfg_set(C_RTT, 7)
+    var role2 = cfg_set(C_ROLE, 2)
+    var ipt2 = cfg_set(C_IPT, 2)
+    var sel2 = cfg_set(C_CHSEL, 2)
+    test.assert_eq(check_full(var rep0), 1)
+    test.assert_eq(check_full(var m0), 1)
+    test.assert_eq(check_full(var m4), 1)
+    test.assert_eq(check_full(var mff), 1)
+    test.assert_eq(check_full(var s0), 1)
+    test.assert_eq(check_full(var s4), 1)
+    test.assert_eq(check_full(var rp4), 1)
+    test.assert_eq(check_full(var z0), 1)
+    test.assert_eq(check_full(var z4), 1)
+    test.assert_eq(check_full(var r7), 1)
+    test.assert_eq(check_full(var role2), 1)
+    test.assert_eq(check_full(var ipt2), 1)
+    test.assert_eq(check_full(var sel2), 1)
+    // The PHY is one bit of 1, 2, 4 and 8.
+    for phy in [0, 3, 5, 6, 7, 9, 16, 255]
+        var c = cfg_set(C_PHY, phy)
+        test.assert_eq(check_full(var c), 1)
+    // The step timings are indices of their tables.
+    var ip1 = cfg_set(C_IP1, 8)
+    var ip2 = cfg_set(C_IP2, 8)
+    var fcs = cfg_set(C_FCS, 10)
+    var pm = cfg_set(C_PM, 3)
+    test.assert_eq(check_full(var ip1), 1)
+    test.assert_eq(check_full(var ip2), 1)
+    test.assert_eq(check_full(var fcs), 1)
+    test.assert_eq(check_full(var pm), 1)
+
+@test
+fn test_the_main_and_sub_mode_pairs_are_those_of_table_4_11()
+    if skip()
+        return
+    let valid = [[1, 0xFF], [2, 0xFF], [3, 0xFF], [2, 1], [2, 3], [3, 2]]
+    for main in [0, 1, 2, 3, 4, 0xFF]
+        for sub in [0, 1, 2, 3, 4, 0xFF]
+            var want = false
+            for v in valid
+                if v[0] == main and v[1] == sub
+                    want = true
+            test.assert_eq(ll_cs_proc.modes_ok(main, sub), want)
+            var c = cfg_set2(C_MAIN, main, C_SUB, sub)
+            if sub != 0xFF
+                cfg_put(var c, C_MIN, 1)
+                cfg_put(var c, C_MAX, 2)
+            if want
+                test.assert_eq(check_full(var c), 0)
+            else
+                test.assert_eq(check_full(var c), 1)
+
+@test
+fn test_the_main_mode_step_range_is_held_only_when_there_is_a_sub_mode()
+    if skip()
+        return
+    var none_lo = cfg_set2(C_MIN, 0, C_MAX, 0)
+    test.assert_eq(check_full(var none_lo), 0)
+    var junk = cfg_set2(C_MIN, 200, C_MAX, 7)
+    test.assert_eq(check_full(var junk), 0)
+    for r in [[0, 1], [1, 0], [5, 4], [0, 0]]
+        var c = cfg_set2(C_SUB, 1, C_MIN, r[0])
+        cfg_put(var c, C_MAX, r[1])
+        test.assert_eq(check_full(var c), 1)
+    for r in [[1, 1], [1, 255], [255, 255], [3, 9]]
+        var c = cfg_set2(C_SUB, 1, C_MIN, r[0])
+        cfg_put(var c, C_MAX, r[1])
+        test.assert_eq(check_full(var c), 0)
+
+@test
+fn test_the_channel_selection_shape_and_jump_are_held_only_with_algorithm_3c()
+    if skip()
+        return
+    var c3b = cfg_set2(C_SHAPE, 9, C_JUMP, 0)
+    test.assert_eq(check_full(var c3b), 0)
+    for shape in [0, 1]
+        for jump in [2, 3, 4, 5, 6, 7, 8]
+            var c = cfg_set2(C_CHSEL, 1, C_SHAPE, shape)
+            cfg_put(var c, C_JUMP, jump)
+            test.assert_eq(check_full(var c), 0)
+    for jump in [0, 1, 9, 255]
+        var c = cfg_set2(C_CHSEL, 1, C_JUMP, jump)
+        test.assert_eq(check_full(var c), 1)
+    var s2 = cfg_set2(C_CHSEL, 1, C_SHAPE, 2)
+    cfg_put(var s2, C_JUMP, 2)
+    test.assert_eq(check_full(var s2), 1)
+
+@test
+fn test_every_value_of_each_option_that_the_capabilities_allow_is_accepted()
+    if skip()
+        return
+    for rtt in [0, 1, 2, 3, 4, 5, 6]
+        var c = cfg_set(C_RTT, rtt)
+        test.assert_eq(check_full(var c), 0)
+    for phy in [1, 2, 8]
+        var c = cfg_set(C_PHY, phy)
+        test.assert_eq(check_full(var c), 0)
+    for role in [0, 1]
+        var c = cfg_set(C_ROLE, role)
+        test.assert_eq(check_full(var c), 0)
+    for rep in [0, 1, 2, 3]
+        var c = cfg_set(C_MREP, rep)
+        test.assert_eq(check_full(var c), 0)
+    for steps in [1, 2, 3]
+        var c = cfg_set(C_M0, steps)
+        test.assert_eq(check_full(var c), 0)
+    for i in 0..8
+        var c = cfg_set2(C_IP1, i, C_IP2, 7 - i)
+        test.assert_eq(check_full(var c), 0)
+    for i in 0..10
+        var c = cfg_set(C_FCS, i)
+        test.assert_eq(check_full(var c), 0)
+    for i in 0..3
+        var c = cfg_set(C_PM, i)
+        test.assert_eq(check_full(var c), 0)
+    var ipt = cfg_set2(C_IPT, 1, C_ROLE, 1)
+    test.assert_eq(check_full(var ipt), 0)
+    var m3 = cfg_set(C_MAIN, 3)
+    test.assert_eq(check_full(var m3), 0)
+
+@test
+fn test_what_a_device_lacks_makes_a_configuration_unsupported_and_not_malformed()
+    if skip()
+        return
+    var full = caps_full()
+    var min = caps_min()
+    // Mode 3 as main or sub mode needs the capability of both devices.
+    var m3 = cfg_set(C_MAIN, 3)
+    var s3 = cfg_set2(C_MAIN, 2, C_SUB, 3)
+    cfg_put(var s3, C_MIN, 1)
+    cfg_put(var s3, C_MAX, 4)
+    test.assert_eq(check(var m3, var min, var full), 2)
+    test.assert_eq(check(var m3, var full, var min), 2)
+    test.assert_eq(check(var s3, var min, var full), 2)
+    test.assert_eq(check(var s3, var full, var min), 2)
+    // The sounding sequence of the RTT types 1 and 2, the random sequence of 3 to 6.
+    for rtt in [1, 2, 3, 4, 5, 6]
+        var c = cfg_set(C_RTT, rtt)
+        test.assert_eq(check(var c, var min, var full), 2)
+        test.assert_eq(check(var c, var full, var min), 2)
+    var aa = cfg_set(C_RTT, 0)
+    test.assert_eq(check(var aa, var min, var min), 0)
+    // LE 2M and LE 2M 2BT by their bits, LE Coded never.
+    var p2 = cfg_set(C_PHY, 2)
+    var p8 = cfg_set(C_PHY, 8)
+    var p4 = cfg_set(C_PHY, 4)
+    test.assert_eq(check(var p2, var min, var full), 2)
+    test.assert_eq(check(var p2, var full, var min), 2)
+    test.assert_eq(check(var p8, var min, var full), 2)
+    test.assert_eq(check(var p8, var full, var min), 2)
+    test.assert_eq(check_full(var p4), 2)
+    var only2m = caps_set(7, 2)
+    var only2bt = caps_set(7, 4)
+    test.assert_eq(check(var p2, var only2m, var only2m), 0)
+    test.assert_eq(check(var p8, var only2m, var only2m), 2)
+    test.assert_eq(check(var p8, var only2bt, var only2bt), 0)
+    test.assert_eq(check(var p2, var only2bt, var only2bt), 2)
+    // The initiator phase tone needs the reflector to have it.
+    var ipt_r = cfg_set2(C_IPT, 1, C_ROLE, 1)
+    var ipt_i = cfg_set2(C_IPT, 1, C_ROLE, 0)
+    test.assert_eq(check(var ipt_r, var min, var full), 2)
+    test.assert_eq(check(var ipt_r, var full, var min), 0)
+    test.assert_eq(check(var ipt_i, var full, var min), 2)
+    test.assert_eq(check(var ipt_i, var min, var full), 0)
+    // Channel Selection Algorithm #3c.
+    var c3c = cfg_set2(C_CHSEL, 1, C_JUMP, 2)
+    test.assert_eq(check(var c3c, var min, var full), 2)
+    test.assert_eq(check(var c3c, var full, var min), 2)
+    // The timings: the mandatory one always, an optional one by its bit in both devices.
+    for i in 0..7
+        var ip1 = cfg_set(C_IP1, i)
+        var no = caps_set(18, 0)
+        var yes = caps_set(18, 1 << i)
+        test.assert_eq(check(var ip1, var no, var yes), 2)
+        test.assert_eq(check(var ip1, var yes, var no), 2)
+        test.assert_eq(check(var ip1, var yes, var yes), 0)
+        var ip2 = cfg_set(C_IP2, i)
+        var no2 = caps_set(19, 0)
+        var yes2 = caps_set(19, 1 << i)
+        test.assert_eq(check(var ip2, var no2, var yes2), 2)
+        test.assert_eq(check(var ip2, var yes2, var yes2), 0)
+    for i in 0..9
+        var fcs = cfg_set(C_FCS, i)
+        var no = caps_set(20, 0)
+        var yes = caps_set(20, 1 << i)
+        test.assert_eq(check(var fcs, var no, var yes), 2)
+        test.assert_eq(check(var fcs, var yes, var yes), 0)
+    for i in 0..2
+        var pm = cfg_set(C_PM, i)
+        var no = caps_set(21, 0)
+        var yes = caps_set(21, 1 << i)
+        test.assert_eq(check(var pm, var no, var yes), 2)
+        test.assert_eq(check(var pm, var yes, var yes), 0)
+    var mandatory = cfg_set(C_IP1, 7)
+    test.assert_eq(check(var mandatory, var min, var min), 0)
+
+@test
+fn test_each_end_needs_the_role_the_configuration_gives_it()
+    if skip()
+        return
+    var init_only = caps_set(10, 1)
+    var refl_only = caps_set(10, 2)
+    var full = caps_full()
+    // The requester that sends role 0 takes the initiator role and leaves the reflector to the other end.
+    var c0 = cfg_set(C_ROLE, 0)
+    var c1 = cfg_set(C_ROLE, 1)
+    test.assert_eq(ll_cs_proc.config_check(var c0, var init_only, var refl_only, true, true), 0)
+    test.assert_eq(ll_cs_proc.config_check(var c0, var refl_only, var init_only, true, true), 2)
+    test.assert_eq(ll_cs_proc.config_check(var c1, var refl_only, var init_only, true, true), 0)
+    test.assert_eq(ll_cs_proc.config_check(var c1, var init_only, var refl_only, true, true), 2)
+    // The receiver takes the other role: the local end of a request that says role 0 is the reflector.
+    test.assert_eq(ll_cs_proc.config_check(var c0, var refl_only, var init_only, true, false), 0)
+    test.assert_eq(ll_cs_proc.config_check(var c0, var init_only, var refl_only, true, false), 2)
+    test.assert_eq(ll_cs_proc.config_check(var c0, var refl_only, var full, false, false), 0)
+    test.assert_eq(ll_cs_proc.config_check(var c0, var init_only, var full, false, false), 2)
+
+@test
+fn test_a_removal_checks_only_the_identifier()
+    if skip()
+        return
+    var full = caps_full()
+    var rm = cfg_set2(C_ACTION, 0, C_CHSEL, 7)
+    test.assert_eq(check(var rm, var full, var full), 0)
+    var bad_id = cfg_set2(C_ACTION, 0, C_ID, 5)
+    test.assert_eq(check(var bad_id, var full, var full), 1)
+    var one = caps_set(15, 1)
+    var other = cfg_set2(C_ACTION, 0, C_ID, 1)
+    test.assert_eq(check(var other, var one, var full), 2)
+    test.assert_eq(ll_cs_proc.config_check(var other, var full, var one, true, true), 2)
+    // Without the peer's record only this end's limits count.
+    var alone = ll_cs_proc.config_check(var other, var full, var one, false, true)
+    if ll_cs_proc.cfg_slots() >= 2
+        test.assert_eq(alone, 0)
+    else
+        test.assert_eq(alone, 2)
+
+// What the Host's request for a configuration is answered with.
+fn config_status(var cs: Cs, var e: ll_cs_proc.Env, var c: CfgPdu, local_only: Bool) -> Int
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    ll_cs_proc.begin_config(var cs, var e, var caps, var c, local_only, var out)
+
+@test
+fn test_the_hosts_request_for_a_configuration_meets_the_checks_of_every_procedure()
+    if skip()
+        return
+    var good = cfg_ok(0, 0)
+    var none = fresh_no_host()
+    var e = env(true, 10)
+    test.assert_eq(config_status(var none, var e, var good, false), ll_cs_proc.E_DISALLOWED)
+    var cs = fresh()
+    var e1 = envf(true, E_NOPEER, 10)
+    test.assert_eq(config_status(var cs, var e1, var good, false), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    var e2 = envf(true, E_PLAIN, 10)
+    test.assert_eq(config_status(var cs, var e2, var good, false), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    // The peer's capabilities must be known, unless the configuration stays with this end.
+    test.assert_eq(config_status(var cs, var e, var good, false), ll_cs_proc.E_DISALLOWED)
+    var local = cfg_ok(1, 0)
+    if ll_cs_proc.cfg_slots() >= 2
+        test.assert_eq(config_status(var cs, var e, var local, true), 0)
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var e3 = env(true, 10)
+    test.assert_eq(config_status(var cen, var e3, var good, false), 0)
+    // One procedure at a time.
+    test.assert_eq(config_status(var cen, var e3, var good, false), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_the_hosts_request_for_a_configuration_is_refused_for_its_fields_with_the_hci_codes()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var e = env(true, 10)
+    var bad = cfg_set(C_REP, 0)
+    test.assert_eq(config_status(var cen, var e, var bad, false), ll_cs_proc.E_INVALID_PARAMS)
+    var lacks = cfg_set(C_PHY, 4)
+    test.assert_eq(config_status(var cen, var e, var lacks, false), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    var unknown = cfg_set(C_ACTION, 0)
+    test.assert_eq(config_status(var cen, var e, var unknown, false), ll_cs_proc.E_INVALID_PARAMS)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+
+@test
+fn test_a_configuration_the_start_is_using_cannot_be_changed_or_removed()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s0 = start_ok(0)
+    run_start(var cen, var per, true, var s0)
+    var e = env(true, 30)
+    var c = cfg_set(C_REP, 5)
+    test.assert_eq(config_status(var cen, var e, var c, false), ll_cs_proc.E_DISALLOWED)
+    var caps = caps_full()
+    var ep = env(false, 30)
+    var req = cfg_pdu(var c)
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_DISALLOWED))
+    test.assert_eq(stored(var per, 0).chm_rep, 3)
+
+@test
+fn test_a_configuration_request_with_parameters_this_end_does_not_take_is_refused_with_unsupported_ll_parameter_value()
+    if skip()
+        return
+    var caps = caps_min()
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var ep = env(false, 10)
+    var out = ll_pdu.pdu_new()
+    for f in [C_REP, C_MAIN, C_PHY, C_RTT, C_ROLE, C_IP1]
+        var c = cfg_ok(0, 0)
+        if f == C_REP
+            cfg_put(var c, f, 0)
+        else if f == C_MAIN
+            cfg_put(var c, f, 3)
+        else if f == C_PHY
+            cfg_put(var c, f, 2)
+        else if f == C_RTT
+            cfg_put(var c, f, 3)
+        else if f == C_ROLE
+            cfg_put(var c, f, 2)
+        else
+            cfg_put(var c, f, 9)
+        var req = cfg_pdu(var c)
+        test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+        test.assert(rejects(var out, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_UNSUPPORTED_LL))
+        test.assert(not ll_cs_proc.cfg_used(var per, 0))
+        test.assert_eq(per.owed & ll_cs_proc.OWED_CFG, 0)
+
+@test
+fn test_a_configuration_request_is_refused_without_the_feature_set_or_the_encryption()
+    if skip()
+        return
+    var caps = caps_full()
+    var c = cfg_ok(0, 0)
+    var req = cfg_pdu(var c)
+    var out = ll_pdu.pdu_new()
+    var none = fresh_no_host()
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.receive(var none, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE))
+    var per = fresh()
+    var pe = envf(false, E_PLAIN, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var pe, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    test.assert(not ll_cs_proc.cfg_used(var per, 0))
+
+@test
+fn test_the_removal_of_a_configuration_that_does_not_exist_is_refused()
+    if skip()
+        return
+    var caps = caps_full()
+    var rm = cfg_set(C_ACTION, 0)
+    var req = cfg_pdu(var rm)
+    var out = ll_pdu.pdu_new()
+    var per = fresh()
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_UNSUPPORTED_LL))
+    test.assert_eq(per.owed, 0)
+
+@test
+fn test_a_peer_that_refuses_the_configuration_leaves_nothing_in_force()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    take_all(var cen)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    var c = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), 0)
+    var r = script_reject(ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_UNSUPPORTED_LL)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var r, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CFG))
+    test.assert_eq(cen.st_cfg, ll_cs_proc.E_UNSUPPORTED_LL)
+    test.assert_eq(cen.ev_cfg, 0)
+    // A response that comes after the refusal changes nothing.
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_rsp(var rsp, 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var a), ll_cs_proc.R_NONE)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+
+@test
+fn test_a_peer_that_does_not_know_the_configuration_pdu_ends_it_with_unsupported_remote_feature()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    var c = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), 0)
+    var u = script_unknown(ll_cs.OP_CS_CONFIG_REQ)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var u, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_cfg, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+
+@test
+fn test_a_response_for_another_configuration_or_none_at_all_is_ignored()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    var rsp0 = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_rsp(var rsp0, 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp0, var out), ll_cs_proc.R_NONE)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+    var c = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), 0)
+    var rsp1 = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_rsp(var rsp1, 1)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp1, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_CFG)
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+
+@test
+fn test_the_configuration_request_unanswered_for_40_seconds_ends_the_connection()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var caps = caps_full()
+    var ec = env(true, 7000)
+    var a = ll_pdu.pdu_new()
+    var c = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), 0)
+    var e1 = env(true, 7000 + 40000000)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e1), 0)
+    var e2 = env(true, 7000 + 40000001)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(cen.st_cfg, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_CFG))
+    test.assert(not ll_cs_proc.cfg_used(var cen, 0))
+
+@test
+fn test_a_configuration_request_that_crosses_the_centrals_is_rejected_and_the_central_goes_on()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    take_all(var cen)
+    take_all(var per)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var cfg_c = cfg_set(C_REP, 5)
+    var cfg_p = cfg_set2(C_REP, 7, C_ROLE, 1)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var cfg_c, false, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_config(var per, var ep, var caps, var cfg_p, false, var b), 0)
+    // The Central receives the Peripheral's request while its own is out: LL Procedure Collision, and its own goes on.
+    var rej = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var rej), ll_cs_proc.R_SEND)
+    test.assert(rejects(var rej, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_COLLISION))
+    test.assert_eq(cen.wait, ll_cs_proc.W_CFG)
+    test.assert_eq(cen.owed, 0)
+    // The Peripheral receives the Central's request: it is answered, and the Peripheral's own request is left to the Central's rejection.
+    var rsp = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var rsp), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var rsp), ll_cs.OP_CS_CONFIG_RSP)
+    test.assert_eq(per.wait, ll_cs_proc.W_CFG)
+    test.assert_eq(per.owed, ll_cs_proc.OWED_CFG)
+    test.assert_eq(per.st_cfg, 0)
+    test.assert_eq(stored(var per, 0).chm_rep, 5)
+    take_all(var per)
+    // The rejection ends the Peripheral's request with the collision error.
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var rej, var b), ll_cs_proc.R_NONE)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(per.st_cfg, ll_cs_proc.E_COLLISION)
+    test.assert_eq(per.owed, ll_cs_proc.OWED_CFG)
+    test.assert_eq(per.yield_op, 0)
+    // The Central's request completes as if nothing had crossed it.
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(stored(var cen, 0).chm_rep, 5)
+    test.assert_eq(stored(var per, 0).chm_rep, 5)
+
+@test
+fn test_a_removal_is_a_configuration_procedure_for_the_collision_rule_too()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    configure(var cen, var per, 0, 0)
+    take_all(var cen)
+    take_all(var per)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var rm = cfg_set(C_ACTION, 0)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var rm, false, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_config(var per, var ep, var caps, var rm, false, var b), 0)
+    var rej = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var rej), ll_cs_proc.R_SEND)
+    test.assert(rejects(var rej, ll_cs.OP_CS_CONFIG_REQ, ll_cs_proc.E_COLLISION))
+    test.assert(ll_cs_proc.cfg_used(var cen, 0))
+
+// ── The state a test sets ───────────────────────────────────────────
+
+fn take_all(var cs: Cs)
+    cs.owed = 0
+
+fn set_count(var cs: Cs, v: Int)
+    cs.proc_count = v
+
+// The series the Start left open: the configuration, N_PROCEDURE_COUNT and the CSProcCount of the first instance.
+fn set_series(var cs: Cs, cfg: Int, n: Int, start: Int)
+    cs.run_open = true
+    cs.series_cfg = cfg
+    cs.series_n = n
+    cs.series_start = start
+
+// Run a Start with `starter` beginning, as the Central or not, and `other` taking part: the PDUs of the three-way exchange cross, and both ends have the
+// procedures started.
+fn run_start(var starter: Cs, var other: Cs, starter_central: Bool, var s: StartPdu)
+    var caps = caps_full()
+    var es = env(starter_central, 20)
+    var eo = env(not starter_central, 20)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var starter, var es, var caps, var s, var a), 0)
+    if starter_central
+        test.assert_eq(ll_cs_proc.receive(var other, var eo, var caps, var a, var b), ll_cs_proc.R_SEND)
+        test.assert_eq(ll_cs_proc.receive(var starter, var es, var caps, var b, var a), ll_cs_proc.R_SEND)
+        test.assert_eq(ll_cs_proc.receive(var other, var eo, var caps, var a, var b), ll_cs_proc.R_NONE)
+    else
+        test.assert_eq(ll_cs_proc.receive(var other, var eo, var caps, var a, var b), ll_cs_proc.R_SEND)
+        test.assert_eq(ll_cs_proc.receive(var starter, var es, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(starter.run_open)
+    test.assert(other.run_open)
+
+// A series of `count` procedures (0 for no end) started by the Central, whose procedure interval is 3 connection intervals when it repeats.
+fn running(var cen: Cs, var per: Cs, count: Int)
+    ready(var cen, var per, 0)
+    var s = start_set(S_PCNT, count)
+    if count != 1
+        start_put(var s, S_PINT, 3)
+    run_start(var cen, var per, true, var s)
+    take_all(var cen)
+    take_all(var per)
+
+fn run_of(var cs: Cs) -> StartPdu
+    var s = ll_cs_pdu.start_new()
+    var scratch = ll_pdu.pdu_new()
+    test.assert(ll_cs_proc.load_run(var cs, var s, var scratch))
+    s
+
+fn start_status(var cs: Cs, var e: ll_cs_proc.Env, var s: StartPdu) -> Int
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    ll_cs_proc.begin_start(var cs, var e, var caps, var s, var out)
+
+fn start_pdu(var s: StartPdu) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_req(var p, var s)
+    p
+
+// ── Mode-0 FAE Table Request ────────────────────────────────────────
+
+@test
+fn test_the_fae_table_of_the_reflector_reaches_the_initiator()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    take_all(var cen)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var ec, var a), 0)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_FAE_REQ)
+    test.assert_eq(ll_data.dpdu_len(var a), 1)
+    test.assert_eq(cen.wait, ll_cs_proc.W_FAE)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_FAE_RSP)
+    test.assert_eq(ll_data.dpdu_len(var b), 73)
+    test.assert_eq(b.n, 75)
+    for i in 0..72
+        test.assert_eq(ll_cs_pdu.fae_value(var b, i), ll_cs_proc.local_fae(i))
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(cen.fae_known)
+    test.assert(cen.fae_air)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_FAE))
+    test.assert_eq(cen.st_fae, 0)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(not per.fae_known)
+
+@test
+fn test_the_72_values_of_the_table_are_kept_in_the_order_of_the_allowed_channels()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var ec, var a), 0)
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_begin(var rsp)
+    for i in 0..72
+        ll_cs_pdu.put_fae_value(var rsp, i * 3 - 100)
+    ll_cs_pdu.put_fae_end(var rsp)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var a), ll_cs_proc.R_NONE)
+    for i in 0..72
+        test.assert_eq(ll_cs_proc.peer_fae(var cen, i), i * 3 - 100)
+    test.assert(cen.fae_known)
+
+@test
+fn test_the_ends_of_the_signed_range_of_a_fae_value_are_kept()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var ec, var a), 0)
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_begin(var rsp)
+    for i in 0..72
+        if i % 2 == 0
+            ll_cs_pdu.put_fae_value(var rsp, -128)
+        else
+            ll_cs_pdu.put_fae_value(var rsp, 127)
+    ll_cs_pdu.put_fae_end(var rsp)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.peer_fae(var cen, 0), -128)
+    test.assert_eq(ll_cs_proc.peer_fae(var cen, 1), 127)
+    test.assert_eq(ll_cs_proc.peer_fae(var cen, 70), -128)
+    test.assert_eq(ll_cs_proc.peer_fae(var cen, 71), 127)
+
+@test
+fn test_the_host_cannot_ask_for_a_fae_table_the_peer_does_not_have_or_without_the_basics()
+    if skip()
+        return
+    var a = ll_pdu.pdu_new()
+    var e = env(true, 10)
+    // The capabilities of the peer are not known.
+    var cs0 = fresh()
+    test.assert_eq(ll_cs_proc.begin_fae(var cs0, var e, var a), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    // The peer has No_FAE.
+    var cen = fresh()
+    var per = fresh()
+    var ep = env(false, 10)
+    var nofae = caps_set(12, 1)
+    var full = caps_full()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var e, var full, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var nofae, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var e, var full, var b, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var e, var a), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    // The checks of every procedure.
+    var none = fresh_no_host()
+    test.assert_eq(ll_cs_proc.begin_fae(var none, var e, var a), ll_cs_proc.E_DISALLOWED)
+    var e1 = envf(true, E_NOPEER, 10)
+    var e2 = envf(true, E_PLAIN, 10)
+    var cen2 = fresh()
+    var per2 = fresh()
+    exchange(var cen2, var per2)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen2, var e1, var a), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen2, var e2, var a), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen2, var e, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen2, var e, var a), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_a_device_with_no_fae_refuses_a_fae_table_request_with_unsupported_feature_or_parameter_value()
+    if skip()
+        return
+    var req = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_req(var req)
+    var per = fresh()
+    var ep = env(false, 10)
+    var out = ll_pdu.pdu_new()
+    var nofae = caps_set(12, 1)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var nofae, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_UNSUPPORTED_FEATURE))
+
+@test
+fn test_a_fae_table_request_is_refused_without_the_feature_set_the_encryption_or_the_room()
+    if skip()
+        return
+    var req = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_req(var req)
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var none = fresh_no_host()
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.receive(var none, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE))
+    var per = fresh()
+    var pe = envf(false, E_PLAIN, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var pe, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    var per2 = fresh()
+    var small = envf(false, E_SMALL, 10)
+    test.assert_eq(ll_cs_proc.receive(var per2, var small, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_LIMITED))
+
+@test
+fn test_a_fae_table_nobody_asked_for_is_ignored()
+    if skip()
+        return
+    var cen = fresh()
+    var ec = env(true, 10)
+    var caps = caps_full()
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_begin(var rsp)
+    for i in 0..72
+        ll_cs_pdu.put_fae_value(var rsp, 5)
+    ll_cs_pdu.put_fae_end(var rsp)
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var out), ll_cs_proc.R_NONE)
+    test.assert(not cen.fae_known)
+    test.assert_eq(cen.owed, 0)
+
+@test
+fn test_the_peer_refusing_the_fae_request_ends_it_with_its_code()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    take_all(var cen)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var ec, var a), 0)
+    var r = script_reject(ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var r, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_fae, ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_FAE))
+    test.assert(not cen.fae_known)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var ec, var a), 0)
+    var u = script_unknown(ll_cs.OP_CS_FAE_REQ)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var u, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_fae, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+
+@test
+fn test_the_fae_request_unanswered_for_40_seconds_ends_the_connection()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var ec = env(true, 100)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_fae(var cen, var ec, var a), 0)
+    var e1 = env(true, 100 + 40000000)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e1), 0)
+    var e2 = env(true, 100 + 40000001)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(cen.st_fae, ll_cs_proc.E_RESPONSE_TIMEOUT)
+
+@test
+fn test_a_fae_table_the_host_knows_is_kept_until_the_peer_sends_one_or_a_configuration_exists()
+    if skip()
+        return
+    var cs = fresh()
+    for i in 0..72
+        test.assert_eq(ll_cs_proc.cache_fae(var cs, i, i - 30, i == 71), 0)
+    test.assert(cs.fae_known)
+    test.assert(not cs.fae_air)
+    for i in 0..72
+        test.assert_eq(ll_cs_proc.peer_fae(var cs, i), i - 30)
+    // The Host may write it again, while nothing came from the peer.
+    test.assert_eq(ll_cs_proc.cache_fae(var cs, 0, 9, false), 0)
+    // One that came from the peer cannot be replaced.
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    fae_table(var cen, var per, true)
+    test.assert_eq(ll_cs_proc.cache_fae(var cen, 0, 1, false), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_a_fae_table_cannot_be_written_once_a_configuration_exists()
+    if skip()
+        return
+    var cs = fresh()
+    var caps = caps_full()
+    var e = env(true, 10)
+    var out = ll_pdu.pdu_new()
+    var scratch = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.cache_caps(var cs, var caps, var scratch), 0)
+    var cfg = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cs, var e, var caps, var cfg, true, var out), 0)
+    test.assert_eq(ll_cs_proc.cache_fae(var cs, 0, 1, false), ll_cs_proc.E_DISALLOWED)
+
+// ── Start ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_start_the_central_begins_runs_request_response_indication_and_both_ends_hold_the_same_parameters()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_set2(S_DELTA, -5, S_PCNT, 7)
+    start_put(var s, S_PINT, 3)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_REQ)
+    test.assert_eq(ll_data.dpdu_len(var a), 29)
+    test.assert_eq(cen.wait, ll_cs_proc.W_START)
+    test.assert(cen.start_host)
+    test.assert_eq(cen.t0, 20)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_RSP)
+    test.assert_eq(ll_data.dpdu_len(var b), 22)
+    test.assert_eq(per.wait, ll_cs_proc.W_START)
+    test.assert(not per.start_host)
+    var rsp = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_rsp(var b, var rsp))
+    test.assert_eq(rsp.config_id, 0)
+    test.assert_eq(rsp.offset_min, 1000)
+    test.assert_eq(rsp.offset_max, 2000)
+    test.assert_eq(rsp.subevent_len, 2500)
+    test.assert_eq(rsp.pwr_delta, 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_IND)
+    test.assert_eq(ll_data.dpdu_len(var a), 19)
+    var ind = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_ind(var a, var ind))
+    test.assert_eq(ind.conn_event, 110)
+    test.assert_eq(ind.offset_min, 1000)
+    test.assert_eq(ind.pwr_delta, -5)
+    test.assert_eq(ind.phy, 1)
+    test.assert(cen.run_open)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_NONE)
+    test.assert(per.run_open)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+    // Both ends read the same parameters: the request's, with the indication's over them.
+    var rc = run_of(var cen)
+    var rp = run_of(var per)
+    for pair in [[rc.config_id, rp.config_id], [rc.conn_event, rp.conn_event], [rc.offset_min, rp.offset_min], [rc.event_interval, rp.event_interval],
+                 [rc.subevents, rp.subevents], [rc.subevent_interval, rp.subevent_interval], [rc.subevent_len, rp.subevent_len], [rc.max_proc_len, rp.max_proc_len],
+                 [rc.proc_interval, rp.proc_interval], [rc.proc_count, rp.proc_count], [rc.aci, rp.aci], [rc.pref_ant, rp.pref_ant], [rc.phy, rp.phy],
+                 [rc.pwr_delta, rp.pwr_delta]]
+        test.assert_eq(pair[0], pair[1])
+    test.assert_eq(rc.offset_min, 1000)
+    test.assert_eq(rc.offset_max, 1000)
+    test.assert_eq(rc.proc_count, 7)
+    test.assert_eq(rc.proc_interval, 3)
+    test.assert_eq(rc.pwr_delta, -5)
+    // The series is described to the instances that follow.
+    test.assert_eq(cen.series_cfg, 0)
+    test.assert_eq(cen.series_n, 7)
+    test.assert_eq(cen.series_start, 0)
+    test.assert_eq(per.series_n, 7)
+    // Both Hosts are owed the answer: the one that asked and the one that was asked.
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_PROC))
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_PROC))
+    test.assert_eq(cen.st_proc, 0)
+    test.assert_eq(per.st_proc, 0)
+
+@test
+fn test_a_start_the_peripheral_begins_is_answered_by_the_central_with_the_indication_alone()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 1)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var per, var ep, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_IND)
+    var ind = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_ind(var b, var ind))
+    test.assert_eq(ind.offset_min, 1000)
+    test.assert_eq(ind.phy, 1)
+    test.assert_eq(ind.pwr_delta, 0)
+    test.assert(cen.run_open)
+    test.assert(not cen.start_host)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(per.run_open)
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_PROC))
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_PROC))
+
+@test
+fn test_either_role_of_the_configuration_may_start_from_either_end()
+    if skip()
+        return
+    for role in [0, 1]
+        for central_starts in [true, false]
+            var cen = fresh()
+            var per = fresh()
+            ready(var cen, var per, role)
+            var s = start_ok(0)
+            if central_starts
+                run_start(var cen, var per, true, var s)
+            else
+                run_start(var per, var cen, false, var s)
+            test.assert_eq(run_of(var cen).subevent_len, 2500)
+            test.assert_eq(run_of(var per).subevent_len, 2500)
+
+@test
+fn test_the_indication_names_a_connection_event_no_sooner_than_six_events_ahead()
+    if skip()
+        return
+    test.assert_eq(ll_cs_proc.pick_event(110, 100), 110)
+    test.assert_eq(ll_cs_proc.pick_event(106, 100), 106)
+    test.assert_eq(ll_cs_proc.pick_event(105, 100), 106)
+    test.assert_eq(ll_cs_proc.pick_event(100, 100), 106)
+    test.assert_eq(ll_cs_proc.pick_event(99, 100), 106)
+    test.assert_eq(ll_cs_proc.pick_event(3, 0xFFFE), 4)
+    test.assert_eq(ll_cs_proc.pick_event(10, 0xFFFE), 10)
+    test.assert_eq(ll_cs_proc.pick_event(0xFFF0, 0xFFFE), 4)
+    // One far ahead stays.
+    test.assert_eq(ll_cs_proc.pick_event(30000, 100), 30000)
+
+@test
+fn test_an_indication_in_the_past_is_moved_to_the_next_events_the_central_can_use()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 1)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var s = start_set(S_EVENT, 98)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var per, var ep, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var ind = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_ind(var b, var ind))
+    test.assert_eq(ind.conn_event, 106)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert_eq(run_of(var per).conn_event, 106)
+
+@test
+fn test_the_series_starts_at_the_counter_after_security_the_first_time_and_at_the_next_after_that()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_set2(S_PCNT, 3, S_PINT, 3)
+    run_start(var cen, var per, true, var s)
+    test.assert_eq(cen.series_start, 0)
+    test.assert_eq(per.series_start, 0)
+    // After a procedure has run the counter is not fresh, and the next series starts one above it.
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 110), 0)
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 110), 0)
+    test.assert_eq(cen.proc_count, 0)
+    ll_cs_proc.series_done(var cen)
+    ll_cs_proc.series_done(var per)
+    var s2 = start_set2(S_PCNT, 3, S_PINT, 3)
+    run_start(var cen, var per, true, var s2)
+    test.assert_eq(cen.series_start, 1)
+    test.assert_eq(per.series_start, 1)
+    set_count(var cen, 0xFFFF)
+    ll_cs_proc.series_done(var cen)
+    var s3 = start_set(S_PCNT, 2)
+    start_put(var s3, S_PINT, 3)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    ll_cs_proc.series_done(var per)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s3, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_SEND)
+    test.assert_eq(cen.series_start, 0)
+
+@test
+fn test_the_host_cannot_start_procedures_until_security_the_capabilities_the_configuration_and_the_fae_table_are_known()
+    if skip()
+        return
+    var e = env(true, 20)
+    var s = start_ok(0)
+    var cen = fresh()
+    var per = fresh()
+    // Security has not started.
+    test.assert_eq(start_status(var cen, var e, var s), ll_cs_proc.E_DISALLOWED)
+    secure(var cen, var per)
+    // The peer's capabilities are not known.
+    test.assert_eq(start_status(var cen, var e, var s), ll_cs_proc.E_DISALLOWED)
+    exchange(var cen, var per)
+    // The configuration does not exist.
+    test.assert_eq(start_status(var cen, var e, var s), ll_cs_proc.E_INVALID_PARAMS)
+    configure(var cen, var per, 0, 0)
+    // The initiator has no FAE table of the reflector.
+    test.assert_eq(start_status(var cen, var e, var s), ll_cs_proc.E_DISALLOWED)
+    fae_table(var cen, var per, true)
+    test.assert_eq(start_status(var cen, var e, var s), 0)
+
+@test
+fn test_the_reflector_needs_no_fae_table_and_an_initiator_whose_peer_has_none_needs_none()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    secure(var cen, var per)
+    exchange(var cen, var per)
+    configure(var cen, var per, 0, 1)
+    var e = env(true, 20)
+    var s = start_ok(0)
+    test.assert_eq(start_status(var cen, var e, var s), 0)
+    // The Peripheral is the initiator of that configuration, and the Central's capabilities say it has a table.
+    var ep = env(false, 20)
+    test.assert_eq(start_status(var per, var ep, var s), ll_cs_proc.E_DISALLOWED)
+    // With No_FAE in the record of the peer an initiator asks for nothing.
+    var cen2 = fresh()
+    var per2 = fresh()
+    secure(var cen2, var per2)
+    var full = caps_full()
+    var nofae = caps_set(12, 1)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    var ec2 = env(true, 10)
+    var ep2 = env(false, 10)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen2, var ec2, var full, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep2, var nofae, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen2, var ec2, var full, var b, var a), ll_cs_proc.R_NONE)
+    var cfg = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cen2, var ec2, var full, var cfg, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep2, var nofae, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen2, var ec2, var full, var b, var a), ll_cs_proc.R_NONE)
+    var e2 = env(true, 20)
+    test.assert_eq(start_status(var cen2, var e2, var s), 0)
+
+@test
+fn test_the_hosts_start_meets_the_checks_every_procedure_meets_and_waits_for_the_others()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_ok(0)
+    var none = fresh_no_host()
+    var e = env(true, 20)
+    test.assert_eq(start_status(var none, var e, var s), ll_cs_proc.E_DISALLOWED)
+    var e1 = envf(true, E_NOPEER, 20)
+    var e2 = envf(true, E_PLAIN, 20)
+    var e3 = envf(true, E_BUSY, 20)
+    test.assert_eq(start_status(var cen, var e1, var s), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(start_status(var cen, var e2, var s), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    // An ACL procedure that the Start excludes is out.
+    test.assert_eq(start_status(var cen, var e3, var s), ll_cs_proc.E_DISALLOWED)
+    // The LL_CS_REQ does not fit the packet.
+    var e4 = envf(true, E_SMALL, 20)
+    test.assert_eq(start_status(var cen, var e4, var s), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(start_status(var cen, var e, var s), 0)
+    test.assert_eq(start_status(var cen, var e, var s), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_the_hosts_start_with_a_field_the_specification_forbids_is_refused_as_invalid_parameters()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var e = env(true, 20)
+    for pair in [[S_EVENT, 20110], [S_OMIN, 499], [S_OMAX, 30000], [S_LEN, 0], [S_EINT, 0], [S_SUBS, 0], [S_SUBS, 33], [S_SLEN, 1249], [S_SINT, 1], [S_PINT, 2],
+                 [S_ACI, 8], [S_PHY, 3], [S_PREF, 0]]
+        var s = start_set(pair[0], pair[1])
+        test.assert_eq(start_status(var cen, var e, var s), ll_cs_proc.E_INVALID_PARAMS)
+        test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_the_hosts_start_with_a_value_beyond_the_capabilities_is_refused_as_limited_resources()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var e = env(true, 20)
+    var caps = caps_min()
+    var out = ll_pdu.pdu_new()
+    // Two antennas of the initiator, an SNR level this device does not supply.
+    var s1 = start_set(S_ACI, 1)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var e, var caps, var s1, var out), ll_cs_proc.E_LIMITED)
+    var s2 = start_set(S_SNRI, 3)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var e, var caps, var s2, var out), ll_cs_proc.E_LIMITED)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+
+// The verdict on `s` for the device that is the initiator (or not) and sends (or receives) the request, with `l` and `p` the capabilities.
+fn start_check(var s: StartPdu, local_init: Bool, local_sends: Bool, var l: CapPdu, var p: CapPdu) -> Int
+    var e = env(true, 20)
+    ll_cs_proc.start_check(var s, local_init, local_sends, var l, var p, var e)
+
+fn start_check_full(var s: StartPdu) -> Int
+    var l = caps_full()
+    var p = caps_full()
+    start_check(var s, true, true, var l, var p)
+
+@test
+fn test_a_start_with_a_field_the_specification_forbids_is_malformed()
+    if skip()
+        return
+    // The connection event counter lies within 2^14 of the current event 100.
+    var near_hi = start_set(S_EVENT, 100 + 16383)
+    var far_hi = start_set(S_EVENT, 100 + 16384)
+    var near_lo = start_set(S_EVENT, (100 - 16383) & 0xFFFF)
+    var far_lo = start_set(S_EVENT, (100 - 16384) & 0xFFFF)
+    test.assert_eq(start_check_full(var near_hi), 0)
+    test.assert_eq(start_check_full(var far_hi), 1)
+    test.assert_eq(start_check_full(var near_lo), 0)
+    test.assert_eq(start_check_full(var far_lo), 1)
+    // The offsets: at least 500 microseconds, the maximum not below the minimum and below the connection interval of 30 ms.
+    var o500 = start_set2(S_OMIN, 500, S_OMAX, 500)
+    var o499 = start_set2(S_OMIN, 499, S_OMAX, 500)
+    var o_hi = start_set2(S_OMIN, 29999, S_OMAX, 29999)
+    var o_max = start_set(S_OMAX, 30000)
+    var o_inv = start_set(S_OMAX, 999)
+    var o_4s = start_set2(S_OMIN, 4000000, S_OMAX, 4000000)
+    test.assert_eq(start_check_full(var o500), 0)
+    test.assert_eq(start_check_full(var o499), 1)
+    test.assert_eq(start_check_full(var o_hi), 0)
+    test.assert_eq(start_check_full(var o_max), 1)
+    test.assert_eq(start_check_full(var o_inv), 1)
+    test.assert_eq(start_check_full(var o_4s), 1)
+    // The procedure length, the event interval, the subevents.
+    for pair in [[S_LEN, 0], [S_EINT, 0], [S_SUBS, 0], [S_SUBS, 33]]
+        var s = start_set(pair[0], pair[1])
+        test.assert_eq(start_check_full(var s), 1)
+    for pair in [[S_LEN, 1], [S_LEN, 0xFFFF], [S_EINT, 1], [S_EINT, 0xFFFF]]
+        var s = start_set(pair[0], pair[1])
+        test.assert_eq(start_check_full(var s), 0)
+    var many = start_set2(S_SUBS, 32, S_SINT, 5)
+    test.assert_eq(start_check_full(var many), 0)
+    // The subevent length: 1250 microseconds up to below 4 seconds.
+    var l1249 = start_set(S_SLEN, 1249)
+    var l1250 = start_set(S_SLEN, 1250)
+    var l_top = start_set(S_SLEN, 3999999)
+    var l_4s = start_set(S_SLEN, 4000000)
+    test.assert_eq(start_check_full(var l1249), 1)
+    test.assert_eq(start_check_full(var l1250), 0)
+    test.assert_eq(start_check_full(var l_top), 0)
+    test.assert_eq(start_check_full(var l_4s), 1)
+    // One subevent has no interval; more than one need the length and the minimum space of 150 microseconds.
+    var one_with = start_set(S_SINT, 1)
+    var two_short = start_set2(S_SUBS, 2, S_SINT, 4)
+    var two_ok = start_set2(S_SUBS, 2, S_SINT, 5)
+    test.assert_eq(start_check_full(var one_with), 1)
+    test.assert_eq(start_check_full(var two_short), 1)
+    test.assert_eq(start_check_full(var two_ok), 0)
+    // The procedure interval exceeds the procedure, the offset and the minimum space: 64650 microseconds, so 3 intervals of 30 ms and not 2.
+    var p2 = start_set(S_PINT, 2)
+    var p3 = start_set(S_PINT, 3)
+    var p0 = start_set(S_PINT, 0)
+    test.assert_eq(start_check_full(var p2), 1)
+    test.assert_eq(start_check_full(var p3), 0)
+    test.assert_eq(start_check_full(var p0), 0)
+    // The antenna index and the PHY.
+    var a8 = start_set(S_ACI, 8)
+    test.assert_eq(start_check_full(var a8), 1)
+    for phy in [0, 3, 5, 6, 7, 16, 255]
+        var s = start_set(S_PHY, phy)
+        test.assert_eq(start_check_full(var s), 1)
+    for phy in [1, 2, 4, 8]
+        var s = start_set(S_PHY, phy)
+        test.assert_eq(start_check_full(var s), 0)
+
+@test
+fn test_the_preferred_antennas_are_as_many_as_the_receiver_has_and_at_least_those_the_index_uses()
+    if skip()
+        return
+    // The receiver of a request this end sends is the peer, whose capabilities say two antennas.
+    var none = start_set(S_PREF, 0)
+    var high = start_set(S_PREF, 0x10)
+    var two = start_set(S_PREF, 3)
+    var three = start_set(S_PREF, 7)
+    test.assert_eq(start_check_full(var none), 1)
+    test.assert_eq(start_check_full(var high), 1)
+    test.assert_eq(start_check_full(var two), 0)
+    test.assert_eq(start_check_full(var three), 1)
+    // The index 7 uses two antennas on each side, so one preferred antenna is too few.
+    var aci7_one = start_set2(S_ACI, 7, S_PREF, 1)
+    var aci7_two = start_set2(S_ACI, 7, S_PREF, 3)
+    test.assert_eq(start_check_full(var aci7_one), 1)
+    test.assert_eq(start_check_full(var aci7_two), 0)
+    // A request this end receives counts this end's own antennas.
+    var full = caps_full()
+    var min = caps_min()
+    var one = start_set(S_PREF, 1)
+    test.assert_eq(start_check(var one, true, false, var min, var full), 0)
+    test.assert_eq(start_check(var two, true, false, var min, var full), 1)
+    test.assert_eq(start_check(var two, true, false, var full, var min), 0)
+
+@test
+fn test_an_antenna_index_the_capabilities_of_a_device_lack_is_beyond_them_and_not_malformed()
+    if skip()
+        return
+    var full = caps_full()
+    var min = caps_min()
+    // Table 5.3: the index, the initiator's antennas, the reflector's and the paths.
+    let table = [[0, 1, 1, 1], [1, 2, 1, 2], [2, 3, 1, 3], [3, 4, 1, 4], [4, 1, 2, 2], [5, 1, 3, 3], [6, 1, 4, 4], [7, 2, 2, 4]]
+    for row in table
+        test.assert_eq(ll_cs_proc.aci_initiator(row[0]), row[1])
+        test.assert_eq(ll_cs_proc.aci_reflector(row[0]), row[2])
+        test.assert_eq(ll_cs_proc.aci_paths(row[0]), row[3])
+        var s = start_set(S_ACI, row[0])
+        cfg_pref(var s, row[0])
+        // Both devices with two antennas and four paths: those the index needs no more than two of.
+        var want = 0
+        if row[1] > 2 or row[2] > 2
+            want = 2
+        test.assert_eq(start_check(var s, true, true, var full, var full), want)
+        // Where the initiator is the device with one antenna and one path, only the index 0 and the reflector-heavy ones with one path fit.
+        var want_min = 2
+        if row[0] == 0
+            want_min = 0
+        test.assert_eq(start_check(var s, true, true, var min, var min), want_min)
+    test.assert_eq(ll_cs_proc.aci_initiator(8), 0)
+    test.assert_eq(ll_cs_proc.aci_reflector(8), 0)
+    test.assert_eq(ll_cs_proc.aci_paths(8), 0)
+
+// The preferred antennas of the receiver that the index needs: as many bits as the receiver's side of it has antennas, the least ones.
+fn cfg_pref(var s: StartPdu, aci: Int)
+    var n = ll_cs_proc.aci_initiator(aci)
+    if ll_cs_proc.aci_reflector(aci) > n
+        n = ll_cs_proc.aci_reflector(aci)
+    s.pref_ant = (1 << n) - 1
+
+@test
+fn test_the_antennas_of_each_side_are_those_of_its_role_in_the_configuration()
+    if skip()
+        return
+    var full = caps_full()
+    var a2 = caps_set(8, 2)
+    var a1 = caps_set(8, 1)
+    // The index 5 (one initiator antenna, three reflector antennas) needs a reflector with three: none of these has them.
+    var s5 = start_set2(S_ACI, 5, S_PREF, 7)
+    test.assert_eq(start_check(var s5, true, true, var full, var full), 2)
+    // The index 4 (1:2): the initiator has one antenna and the reflector two, whichever end that is.
+    var one_pref = start_set2(S_ACI, 4, S_PREF, 1)
+    var two_pref = start_set2(S_ACI, 4, S_PREF, 3)
+    test.assert_eq(start_check(var one_pref, false, true, var a2, var a1), 0)
+    test.assert_eq(start_check(var two_pref, true, true, var a1, var a2), 0)
+    test.assert_eq(start_check(var two_pref, true, true, var a2, var a1), 2)
+    test.assert_eq(start_check(var two_pref, false, true, var a1, var a2), 2)
+
+@test
+fn test_the_snr_indices_are_a_level_the_transmitting_side_supplies_or_0xf()
+    if skip()
+        return
+    var full = caps_full()
+    var min = caps_min()
+    var none = start_ok(0)
+    test.assert_eq(start_check(var none, true, true, var min, var min), 0)
+    for idx in [0, 3, 6]
+        var si = start_set(S_SNRI, idx)
+        var sr = start_set(S_SNRR, idx)
+        // The initiator's index comes from the initiator's capabilities, the reflector's from the reflector's.
+        test.assert_eq(start_check(var si, true, true, var full, var min), 0)
+        test.assert_eq(start_check(var si, true, true, var min, var full), 2)
+        test.assert_eq(start_check(var si, false, true, var min, var full), 0)
+        test.assert_eq(start_check(var si, false, true, var full, var min), 2)
+        test.assert_eq(start_check(var sr, true, true, var min, var full), 0)
+        test.assert_eq(start_check(var sr, true, true, var full, var min), 2)
+        test.assert_eq(start_check(var sr, false, true, var full, var min), 0)
+        test.assert_eq(start_check(var sr, false, true, var min, var full), 2)
+    var seven = start_set(S_SNRI, 7)
+    var fourteen = start_set(S_SNRR, 14)
+    test.assert_eq(start_check(var seven, true, true, var full, var full), 2)
+    test.assert_eq(start_check(var fourteen, true, true, var full, var full), 2)
+
+@test
+fn test_an_answer_lies_inside_the_request_it_answers()
+    if skip()
+        return
+    var req = start_ok(0)
+    var same = start_ok(0)
+    test.assert(ll_cs_proc.answer_ok(var same, var req, false))
+    test.assert(ll_cs_proc.answer_ok(var same, var req, true))
+    // The configuration, and a connection event no sooner than the request's.
+    var other_id = start_set(S_ID, 1)
+    var older = start_set(S_EVENT, 109)
+    var newer = start_set(S_EVENT, 111)
+    test.assert(not ll_cs_proc.answer_ok(var other_id, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var older, var req, false))
+    test.assert(ll_cs_proc.answer_ok(var newer, var req, false))
+    // The window of a response lies inside the request's; the indication names one offset inside it.
+    var tighter = start_set2(S_OMIN, 1200, S_OMAX, 1800)
+    var lower = start_set(S_OMIN, 900)
+    var higher = start_set(S_OMAX, 2001)
+    var empty = start_set2(S_OMIN, 1500, S_OMAX, 1400)
+    test.assert(ll_cs_proc.answer_ok(var tighter, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var lower, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var higher, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var empty, var req, false))
+    var at_min = start_set(S_OMIN, 1000)
+    var at_max = start_set(S_OMIN, 2000)
+    var past_max = start_set(S_OMIN, 2001)
+    var below = start_set(S_OMIN, 999)
+    test.assert(ll_cs_proc.answer_ok(var at_min, var req, true))
+    test.assert(ll_cs_proc.answer_ok(var at_max, var req, true))
+    test.assert(not ll_cs_proc.answer_ok(var past_max, var req, true))
+    test.assert(not ll_cs_proc.answer_ok(var below, var req, true))
+    // The subevent interval is no smaller and the subevent length no larger.
+    var mult = start_set2(S_SUBS, 2, S_SINT, 6)
+    test.assert(ll_cs_proc.answer_ok(var mult, var mult, false))
+    var shorter = start_set2(S_SUBS, 2, S_SINT, 5)
+    test.assert(not ll_cs_proc.answer_ok(var shorter, var mult, false))
+    var longer = start_set(S_SLEN, 2501)
+    var short_len = start_set(S_SLEN, 2000)
+    var too_short = start_set(S_SLEN, 1249)
+    test.assert(not ll_cs_proc.answer_ok(var longer, var req, false))
+    test.assert(ll_cs_proc.answer_ok(var short_len, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var too_short, var req, false))
+    // Intervals, subevents and the antenna index in range.
+    var e0 = start_set(S_EINT, 0)
+    var s0 = start_set(S_SUBS, 0)
+    var s33 = start_set(S_SUBS, 33)
+    var a8 = start_set(S_ACI, 8)
+    test.assert(not ll_cs_proc.answer_ok(var e0, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var s0, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var s33, var req, false))
+    test.assert(not ll_cs_proc.answer_ok(var a8, var req, false))
+
+// Run the Configuration with the Central sending the request `c`.
+fn configure_cfg(var cen: Cs, var per: Cs, var c: CfgPdu)
+    var caps = caps_full()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var cen, var ec, var caps, var c, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+
+// ── Start: what the peer sends ──────────────────────────────────────
+
+@test
+fn test_a_start_request_is_refused_without_the_feature_set_or_the_encryption()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var s = start_ok(0)
+    var req = start_pdu(var s)
+    var out = ll_pdu.pdu_new()
+    ll_cs_proc.set_host(var per, false)
+    var ep = env(false, 20)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE))
+    ll_cs_proc.set_host(var per, true)
+    var plain = envf(false, E_PLAIN, 20)
+    test.assert_eq(ll_cs_proc.receive(var per, var plain, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+    test.assert(not per.run_open)
+
+@test
+fn test_a_start_request_is_refused_while_security_is_under_way_and_before_it_has_completed()
+    if skip()
+        return
+    var caps = caps_full()
+    var s = start_ok(0)
+    var req = start_pdu(var s)
+    var out = ll_pdu.pdu_new()
+    // Not secured at all.
+    var fresh_per = fresh()
+    var ep = env(false, 20)
+    test.assert_eq(ll_cs_proc.receive(var fresh_per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_DISALLOWED))
+    // The Central waits for the response to its own security request.
+    var cen = fresh()
+    var ec = env(true, 20)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_security(var cen, var ec), 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_DISALLOWED))
+    let _x = ll_cs_proc.feed_random(var cen, var ec, rnd12(1), var a)
+    let _y = ll_cs_proc.feed_random(var cen, var ec, rnd12(2), var a)
+    test.assert_eq(cen.wait, ll_cs_proc.W_SEC)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_DISALLOWED))
+    // The Peripheral collects the random octets of its own parts.
+    var per = fresh()
+    var ep2 = env(false, 20)
+    var sec_req = script(ll_cs.OP_CS_SEC_REQ, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert_eq(ll_cs_proc.receive(var per, var ep2, var caps, var sec_req, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep2, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_DISALLOWED))
+
+@test
+fn test_a_start_request_for_a_configuration_that_was_not_created_is_refused_with_invalid_ll_parameters()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var s = start_set(S_ID, 3)
+    var req = start_pdu(var s)
+    var out = ll_pdu.pdu_new()
+    var ep = env(false, 20)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_INVALID_LL))
+    var removed = fresh()
+    var other = fresh()
+    ready(var removed, var other, 0)
+    var rm = cfg_set(C_ACTION, 0)
+    var ec = env(true, 20)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_config(var removed, var ec, var caps, var rm, false, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var other, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var removed, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    var s0 = start_ok(0)
+    var req0 = start_pdu(var s0)
+    test.assert_eq(ll_cs_proc.receive(var other, var ep, var caps, var req0, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_INVALID_LL))
+
+@test
+fn test_a_start_request_is_refused_when_the_hosts_security_requirements_are_not_met_or_a_procedure_of_the_acl_is_out()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var s = start_ok(0)
+    var req = start_pdu(var s)
+    var out = ll_pdu.pdu_new()
+    var nosec = envf(false, E_NOSEC, 20)
+    test.assert_eq(ll_cs_proc.receive(var per, var nosec, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_SECURITY_REASONS))
+    var busy = envf(false, E_BUSY, 20)
+    test.assert_eq(ll_cs_proc.receive(var per, var busy, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_DIFFERENT_COLLISION))
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_the_phy_of_the_power_delta_is_the_acl_phy_or_one_whose_power_the_link_layer_manages()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var s2 = start_set(S_PHY, 2)
+    var req = start_pdu(var s2)
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var unmanaged = env_phy(false, 1, 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var unmanaged, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_UNSUPPORTED_LL))
+    var managed = env_phy(false, 1, 2)
+    test.assert_eq(ll_cs_proc.receive(var per, var managed, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var out), ll_cs.OP_CS_RSP)
+    var rsp = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_rsp(var out, var rsp))
+    // The answer names the PHY of the ACL.
+    test.assert_eq(rsp.phy, 1)
+    var cen2 = fresh()
+    var per2 = fresh()
+    ready(var cen2, var per2, 0)
+    var on_acl = env_phy(false, 2, 0)
+    test.assert_eq(ll_cs_proc.receive(var per2, var on_acl, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var out), ll_cs.OP_CS_RSP)
+    test.assert_eq(ll_cs_pdu.get_rsp(var out, var rsp), true)
+    test.assert_eq(rsp.phy, 2)
+
+@test
+fn test_a_start_request_with_parameters_this_end_cannot_take_is_refused_with_unsupported_ll_parameter_value()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    for pair in [[S_OMIN, 100], [S_EVENT, 30000], [S_SLEN, 100], [S_ACI, 2], [S_SNRI, 9], [S_PREF, 0]]
+        var cen = fresh()
+        var per = fresh()
+        ready(var cen, var per, 0)
+        var s = start_set(pair[0], pair[1])
+        var req = start_pdu(var s)
+        var ep = env(false, 20)
+        test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+        test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_UNSUPPORTED_LL))
+        test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+        test.assert(not per.run_open)
+        test.assert_eq(per.owed, 0)
+
+@test
+fn test_a_start_request_before_the_capabilities_are_known_is_refused_as_disallowed()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    secure(var cen, var per)
+    var caps = caps_full()
+    var ep = env(false, 20)
+    var out = ll_pdu.pdu_new()
+    var local_cfg = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var per, var ep, var caps, var local_cfg, true, var out), 0)
+    var s = start_ok(0)
+    var req = start_pdu(var s)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_DISALLOWED))
+
+@test
+fn test_a_start_the_peer_sends_while_this_ends_own_is_out_is_rejected_by_the_central_and_taken_by_the_peripheral()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var sc = start_ok(0)
+    var sp = start_set(S_SLEN, 2000)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var sc, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_start(var per, var ep, var caps, var sp, var b), 0)
+    // The Central rejects the Peripheral's request and goes on.
+    var rej = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var rej), ll_cs_proc.R_SEND)
+    test.assert(rejects(var rej, ll_cs.OP_CS_REQ, ll_cs_proc.E_COLLISION))
+    test.assert_eq(cen.wait, ll_cs_proc.W_START)
+    test.assert(cen.start_host)
+    // The Peripheral's own request ends with the collision error, which its Host is owed, and the Central's is answered.
+    var rsp = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var rsp), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var rsp), ll_cs.OP_CS_RSP)
+    test.assert_eq(per.st_proc, ll_cs_proc.E_COLLISION)
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_PROC))
+    test.assert_eq(per.yield_op, ll_cs.OP_CS_REQ)
+    test.assert_eq(per.wait, ll_cs_proc.W_START)
+    // The Central's rejection of the Peripheral's request is not an answer to the Central's own.
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var rej, var b), ll_cs_proc.R_NONE)
+    test.assert_eq(per.yield_op, 0)
+    test.assert_eq(per.wait, ll_cs_proc.W_START)
+    test.assert_eq(per.owed, 0)
+    // The Central's procedure completes.
+    var ind = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var ind), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var ind, var b), ll_cs_proc.R_NONE)
+    test.assert(cen.run_open)
+    test.assert(per.run_open)
+    test.assert_eq(run_of(var per).subevent_len, 2500)
+
+@test
+fn test_a_request_to_a_peripheral_that_waits_for_the_indication_after_its_own_answer_is_a_collision_too()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    // A second request of the Central arrives before its indication.
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var out), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var out), ll_cs.OP_CS_RSP)
+    test.assert_eq(per.yield_op, ll_cs.OP_CS_REQ)
+
+@test
+fn test_a_response_that_the_request_does_not_allow_is_refused_and_ends_the_start()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    for pair in [[S_OMIN, 900], [S_OMAX, 2001], [S_SLEN, 2501], [S_EVENT, 109], [S_ID, 1], [S_ACI, 8], [S_EINT, 0], [S_SUBS, 0], [S_SUBS, 33], [S_SLEN, 1249]]
+        var cen = fresh()
+        var per = fresh()
+        ready(var cen, var per, 0)
+        var ec = env(true, 20)
+        var s = start_ok(0)
+        var a = ll_pdu.pdu_new()
+        test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+        var answer = start_set(pair[0], pair[1])
+        var rsp = ll_pdu.pdu_new()
+        ll_cs_pdu.put_rsp(var rsp, var answer)
+        test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var out), ll_cs_proc.R_SEND)
+        test.assert(rejects(var out, ll_cs.OP_CS_RSP, ll_cs_proc.E_UNSUPPORTED_LL))
+        test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+        test.assert(not cen.run_open)
+        test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_PROC))
+        test.assert_eq(cen.st_proc, ll_cs_proc.E_UNSUPPORTED_LL)
+
+@test
+fn test_a_response_nobody_asked_for_and_an_indication_nobody_asked_for_are_ignored()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var s = start_ok(0)
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_rsp(var rsp, var s)
+    var ind = ll_pdu.pdu_new()
+    ll_cs_pdu.put_ind(var ind, var s)
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var ind, var out), ll_cs_proc.R_NONE)
+    test.assert(not cen.run_open)
+    test.assert(not per.run_open)
+    test.assert_eq(cen.owed, 0)
+    test.assert_eq(per.owed, 0)
+
+@test
+fn test_an_indication_the_response_does_not_allow_ends_the_start_without_an_answer()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    for pair in [[S_OMIN, 999], [S_OMIN, 2001], [S_SLEN, 2501], [S_EVENT, 109], [S_ID, 1], [S_ACI, 8], [S_EINT, 0], [S_SUBS, 0]]
+        for host in [true, false]
+            var cen = fresh()
+            var per = fresh()
+            ready(var cen, var per, 1)
+            var ec = env(true, 20)
+            var ep = env(false, 20)
+            var s = start_ok(0)
+            var a = ll_pdu.pdu_new()
+            if host
+                test.assert_eq(ll_cs_proc.begin_start(var per, var ep, var caps, var s, var a), 0)
+            else
+                test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+                var b = ll_pdu.pdu_new()
+                test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+            var answer = start_set(pair[0], pair[1])
+            var ind = ll_pdu.pdu_new()
+            ll_cs_pdu.put_ind(var ind, var answer)
+            test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var ind, var out), ll_cs_proc.R_NONE)
+            test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+            test.assert(not per.run_open)
+            // Only a Start the Host asked for is reported when it fails.
+            if host
+                test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_PROC))
+                test.assert_eq(per.st_proc, ll_cs_proc.E_UNSUPPORTED_LL)
+            else
+                test.assert_eq(per.owed, 0)
+
+@test
+fn test_a_start_the_peer_refuses_ends_with_its_code_and_tells_only_the_host_that_asked()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    var r = script_reject(ll_cs.OP_CS_REQ, ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var r, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_PROC))
+    test.assert_eq(cen.st_proc, ll_cs_proc.E_DISALLOWED)
+    test.assert(not cen.run_open)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    var u = script_unknown(ll_cs.OP_CS_REQ)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var u, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(cen.st_proc, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    // The Peripheral that answered and waits for the indication takes the Central's refusal of its answer, and its Host was not told of the Start.
+    var cen2 = fresh()
+    var per2 = fresh()
+    ready(var cen2, var per2, 0)
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen2, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var r2 = script_reject(ll_cs.OP_CS_RSP, ll_cs_proc.E_UNSUPPORTED_LL)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep, var caps, var r2, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per2.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(per2.owed, 0)
+    test.assert(not per2.run_open)
+
+@test
+fn test_the_start_unanswered_for_40_seconds_ends_the_connection_at_either_end()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var ec = env(true, 5000)
+    var ep = env(false, 5000)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var e1 = env(true, 5000 + 40000000)
+    var e2 = env(true, 5000 + 40000001)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e1), 0)
+    test.assert_eq(ll_cs_proc.poll(var per, var e1), 0)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(ll_cs_proc.poll(var per, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(cen.st_proc, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_PROC))
+    test.assert_eq(per.owed, 0)
+
+@test
+fn test_every_pdu_a_procedure_queues_starts_its_timer_again()
+    if skip()
+        return
+    var caps = caps_full()
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var ec = env(true, 100)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(cen.t0, 100)
+    var ep = env(false, 9000)
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(per.t0, 9000)
+
+// ── The procedures that run ─────────────────────────────────────────
+
+@test
+fn test_the_first_instance_after_security_uses_the_counter_as_it_is_and_each_later_one_adds_one()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 5)
+    test.assert(cen.fresh)
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 110), 0)
+    test.assert_eq(cen.proc_count, 0)
+    test.assert(not cen.fresh)
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 140), 0)
+    test.assert_eq(cen.proc_count, 1)
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 170), 0)
+    test.assert_eq(cen.proc_count, 2)
+    set_count(var cen, 0xFFFF)
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 200), 0)
+    test.assert_eq(cen.proc_count, 0)
+
+@test
+fn test_an_instance_needs_a_series_that_is_open()
+    if skip()
+        return
+    var cen = fresh()
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 110), ll_cs_proc.E_DISALLOWED)
+    var per = fresh()
+    running(var cen, var per, 1)
+    ll_cs_proc.series_done(var cen)
+    test.assert(not cen.run_open)
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 110), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_an_instance_with_fewer_than_15_filtered_channels_does_not_start_and_ends_the_series()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    secure(var cen, var per)
+    exchange(var cen, var per)
+    // The configuration has the channels 2 to 16, 15 of them.
+    var cfg = cfg_set2(C_LO, 0x1FFFC, C_HI, 0)
+    configure_cfg(var cen, var per, var cfg)
+    fae_table(var cen, var per, true)
+    var s = start_ok(0)
+    run_start(var cen, var per, true, var s)
+    test.assert_eq(ll_cs_proc.filtered_count(var cen, 0, 110), 15)
+    // The peer's update takes away one of them while no procedure runs: the map applies at once.
+    var caps = caps_full()
+    var ep = env(false, 20)
+    var out = ll_pdu.pdu_new()
+    var m = ll_cs_pdu.chm_new(0x0FFFC, ll_cs_pdu.CHM_HI_ALLOWED, 0)
+    var upd = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd, var m)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert(per.pend_chm)
+    test.assert_eq(ll_cs_proc.filtered_count(var per, 0, 5), 15)
+    test.assert_eq(ll_cs_proc.filtered_count(var per, 0, 100), 14)
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 110), ll_cs_proc.E_INSUFFICIENT_CHANNELS)
+    test.assert(not per.run_open)
+    test.assert_eq(per.chm_lo, 0x0FFFC)
+
+@test
+fn test_a_map_that_the_instant_has_reached_replaces_the_one_in_force_for_the_instances_from_the_instant_on()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ep = env(false, 20)
+    var out = ll_pdu.pdu_new()
+    var m = ll_cs_pdu.chm_new(0xFFFFFFFFFC, 0x1FF, 150)
+    var upd = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd, var m)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert(per.pend_chm)
+    test.assert_eq(per.pend_instant, 150)
+    // The channels of the map: those of the allowed set.
+    let full = ll_cs_pdu.chm_count(ll_cs_pdu.CHM_LO_ALLOWED, ll_cs_pdu.CHM_HI_ALLOWED)
+    test.assert_eq(ll_cs_proc.filtered_count(var per, 0, 149), full)
+    test.assert_eq(ll_cs_proc.filtered_count(var per, 0, 150), ll_cs_pdu.chm_count(0xFFFFFFFFFC & ll_cs_pdu.CHM_LO_ALLOWED, 0x1FF))
+    test.assert_eq(ll_cs_proc.filtered_lo(var per, 0, 150), 0xFFFFFFFFFC & ll_cs_pdu.CHM_LO_ALLOWED)
+    test.assert_eq(ll_cs_proc.filtered_hi(var per, 0, 149), ll_cs_pdu.CHM_HI_ALLOWED)
+    test.assert_eq(ll_cs_proc.filtered_hi(var per, 0, 200), 0x1FF)
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 149), 0)
+    test.assert(per.pend_chm)
+    test.assert_eq(per.chm_hi, ll_cs_pdu.CHM_HI_ALLOWED)
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 150), 0)
+    test.assert(not per.pend_chm)
+    test.assert_eq(per.chm_hi, 0x1FF)
+
+// ── Procedure Repeat Termination ────────────────────────────────────
+
+@test
+fn test_the_higher_of_two_counters_is_the_one_the_modulo_difference_says()
+    if skip()
+        return
+    test.assert_eq(ll_cs_proc.higher_count(5, 7), 7)
+    test.assert_eq(ll_cs_proc.higher_count(7, 5), 7)
+    test.assert_eq(ll_cs_proc.higher_count(9, 9), 9)
+    test.assert_eq(ll_cs_proc.higher_count(0xFFFF, 1), 1)
+    test.assert_eq(ll_cs_proc.higher_count(1, 0xFFFF), 1)
+    test.assert_eq(ll_cs_proc.higher_count(0, 32766), 32766)
+    test.assert_eq(ll_cs_proc.higher_count(0, 32767), 0)
+    test.assert_eq(ll_cs_proc.higher_count(32767, 0), 32767)
+
+@test
+fn test_the_termination_stops_the_repeats_at_both_ends_and_they_agree_on_the_counter()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var ep = env(false, 30)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 110), 0)
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 110), 0)
+    test.assert_eq(ll_cs_proc.instance_begin(var cen, 140), 0)
+    // The Peripheral has begun an instance more than the Central knows of.
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 140), 0)
+    test.assert_eq(ll_cs_proc.instance_begin(var per, 170), 0)
+    test.assert_eq(cen.proc_count, 1)
+    test.assert_eq(per.proc_count, 2)
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var ec, 0, 0x13, var a), 0)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_TERMINATE_REQ)
+    test.assert_eq(ll_data.dpdu_len(var a), 5)
+    var t = ll_cs_pdu.term_new(0, 0, 0)
+    test.assert(ll_cs_pdu.get_terminate(var a, var t))
+    test.assert_eq(t.config_id, 0)
+    test.assert_eq(t.proc_count, 1)
+    test.assert_eq(t.error, 0x13)
+    test.assert_eq(cen.wait, ll_cs_proc.W_TERM)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_TERMINATE_RSP)
+    var r = ll_cs_pdu.term_new(0, 0, 0)
+    test.assert(ll_cs_pdu.get_terminate(var b, var r))
+    test.assert_eq(r.proc_count, 2)
+    test.assert_eq(r.error, 0x13)
+    test.assert(not per.run_open)
+    test.assert_eq(per.term_error, 0x13)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(not cen.run_open)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    // Both keep the higher counter, which keeps the two generators in step.
+    test.assert_eq(cen.proc_count, 2)
+    test.assert_eq(per.proc_count, 2)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_TERM))
+    test.assert_eq(cen.st_term, 0)
+
+@test
+fn test_the_peripheral_may_terminate_too_and_a_series_that_ends_by_itself_needs_no_termination()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 4)
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var ep = env(false, 30)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_terminate(var per, var ep, 0, 0x16, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var b, var a), ll_cs_proc.R_NONE)
+    test.assert(not cen.run_open)
+    test.assert(not per.run_open)
+
+@test
+fn test_the_host_cannot_terminate_what_is_not_a_repeating_series_or_another_configuration()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    var a = ll_pdu.pdu_new()
+    var ec = env(true, 30)
+    // No series.
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var ec, 0, 0x13, var a), ll_cs_proc.E_DISALLOWED)
+    var single = fresh()
+    var other = fresh()
+    running(var single, var other, 1)
+    // One procedure only: there is nothing to repeat.
+    test.assert_eq(ll_cs_proc.begin_terminate(var single, var ec, 0, 0x13, var a), ll_cs_proc.E_DISALLOWED)
+    var cen2 = fresh()
+    var per2 = fresh()
+    running(var cen2, var per2, 0)
+    // The configuration is not the series'.
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen2, var ec, 1, 0x13, var a), ll_cs_proc.E_DISALLOWED)
+    var none = fresh_no_host()
+    test.assert_eq(ll_cs_proc.begin_terminate(var none, var ec, 0, 0x13, var a), ll_cs_proc.E_DISALLOWED)
+    var e1 = envf(true, E_NOPEER, 30)
+    var e2 = envf(true, E_PLAIN, 30)
+    var e3 = envf(true, E_SMALL, 30)
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen2, var e1, 0, 0x13, var a), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen2, var e2, 0, 0x13, var a), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen2, var e3, 0, 0x13, var a), 0)
+    // The PDU fits a packet of 27 octets, and another procedure of this end is waiting now.
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen2, var ec, 0, 0x13, var a), ll_cs_proc.E_DISALLOWED)
+
+@test
+fn test_a_termination_request_names_a_counter_and_a_configuration_of_the_series_or_is_refused()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var ep = env(false, 30)
+    // A series of 3 procedures whose first counter is 10: the counters 10, 11 and 12 belong to it, and so does 9 by the condition of Section 5.1.27, which
+    // is true of a counter one below the first: (9 - 10 + 1) mod 65536 is 0.
+    for pair in [[10, 1], [11, 1], [12, 1], [9, 1], [13, 0], [14, 0], [8, 0], [0, 0], [0xFFFF, 0]]
+        var cen = fresh()
+        var per = fresh()
+        running(var cen, var per, 3)
+        set_series(var per, 0, 3, 10)
+        var t = ll_cs_pdu.term_new(0, pair[0], 0x13)
+        var req = ll_pdu.pdu_new()
+        ll_cs_pdu.put_terminate(var req, ll_cs.OP_CS_TERMINATE_REQ, var t)
+        test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+        if pair[1] == 1
+            test.assert_eq(op_of(var out), ll_cs.OP_CS_TERMINATE_RSP)
+            test.assert(not per.run_open)
+        else
+            test.assert(rejects(var out, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_DISALLOWED))
+            test.assert(per.run_open)
+    // The counter wraps: a series of 5 that began at 65534 has the counters 65534, 65535, 0, 1 and 2.
+    for pair in [[65534, 1], [65535, 1], [0, 1], [2, 1], [3, 0], [65532, 0]]
+        var cen = fresh()
+        var per = fresh()
+        running(var cen, var per, 5)
+        set_series(var per, 0, 5, 65534)
+        var t = ll_cs_pdu.term_new(0, pair[0], 0x13)
+        var req = ll_pdu.pdu_new()
+        ll_cs_pdu.put_terminate(var req, ll_cs.OP_CS_TERMINATE_REQ, var t)
+        test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+        if pair[1] == 1
+            test.assert_eq(op_of(var out), ll_cs.OP_CS_TERMINATE_RSP)
+        else
+            test.assert(rejects(var out, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_DISALLOWED))
+    // A series with no end takes any counter.
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var t = ll_cs_pdu.term_new(0, 40000, 0x13)
+    var req = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var req, ll_cs.OP_CS_TERMINATE_REQ, var t)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var out), ll_cs.OP_CS_TERMINATE_RSP)
+    // Another configuration, a single procedure and no series at all.
+    var cen3 = fresh()
+    var per3 = fresh()
+    running(var cen3, var per3, 3)
+    var t1 = ll_cs_pdu.term_new(1, 0, 0x13)
+    var req1 = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var req1, ll_cs.OP_CS_TERMINATE_REQ, var t1)
+    test.assert_eq(ll_cs_proc.receive(var per3, var ep, var caps, var req1, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_DISALLOWED))
+    var cen4 = fresh()
+    var per4 = fresh()
+    running(var cen4, var per4, 1)
+    var t0 = ll_cs_pdu.term_new(0, 0, 0x13)
+    var req0 = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var req0, ll_cs.OP_CS_TERMINATE_REQ, var t0)
+    test.assert_eq(ll_cs_proc.receive(var per4, var ep, var caps, var req0, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_DISALLOWED))
+    var per5 = fresh()
+    test.assert_eq(ll_cs_proc.receive(var per5, var ep, var caps, var req0, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_DISALLOWED))
+
+@test
+fn test_a_termination_request_is_refused_on_a_link_that_is_not_encrypted()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var t = ll_cs_pdu.term_new(0, 0, 0x13)
+    var req = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var req, ll_cs.OP_CS_TERMINATE_REQ, var t)
+    var plain = envf(false, E_PLAIN, 30)
+    test.assert_eq(ll_cs_proc.receive(var per, var plain, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
+    test.assert(per.run_open)
+
+@test
+fn test_a_termination_that_crosses_the_other_ends_is_rejected_by_the_central_and_taken_by_the_peripheral()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var ep = env(false, 30)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var ec, 0, 0x13, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_terminate(var per, var ep, 0, 0x16, var b), 0)
+    var rej = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var rej), ll_cs_proc.R_SEND)
+    test.assert(rejects(var rej, ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_COLLISION))
+    test.assert_eq(cen.wait, ll_cs_proc.W_TERM)
+    var rsp = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var rsp), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var rsp), ll_cs.OP_CS_TERMINATE_RSP)
+    test.assert(not per.run_open)
+    test.assert_eq(per.wait, ll_cs_proc.W_TERM)
+    // The Peripheral's own request ends with the rejection of the Central, and the Central's completes.
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var rej, var b), ll_cs_proc.R_NONE)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(per.st_term, ll_cs_proc.E_COLLISION)
+    test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_TERM))
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var a), ll_cs_proc.R_NONE)
+    test.assert(not cen.run_open)
+
+@test
+fn test_the_peer_refusing_the_termination_leaves_the_series_running()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var ec, 0, 0x13, var a), 0)
+    var r = script_reject(ll_cs.OP_CS_TERMINATE_REQ, ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var r, var a), ll_cs_proc.R_NONE)
+    test.assert(cen.run_open)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(cen.st_term, ll_cs_proc.E_DISALLOWED)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_TERM))
+
+@test
+fn test_a_termination_response_for_another_configuration_or_none_at_all_is_ignored()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var a = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    var t = ll_cs_pdu.term_new(0, 0, 0x13)
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var rsp, ll_cs.OP_CS_TERMINATE_RSP, var t)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp, var out), ll_cs_proc.R_NONE)
+    test.assert(cen.run_open)
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var ec, 0, 0x13, var a), 0)
+    var t1 = ll_cs_pdu.term_new(1, 0, 0x13)
+    var rsp1 = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var rsp1, ll_cs.OP_CS_TERMINATE_RSP, var t1)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var rsp1, var out), ll_cs_proc.R_NONE)
+    test.assert(cen.run_open)
+    test.assert_eq(cen.wait, ll_cs_proc.W_TERM)
+
+@test
+fn test_the_termination_unanswered_for_40_seconds_ends_the_connection()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var ec = env(true, 800)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var ec, 0, 0x13, var a), 0)
+    var e1 = env(true, 800 + 40000000)
+    var e2 = env(true, 800 + 40000001)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e1), 0)
+    test.assert_eq(ll_cs_proc.poll(var cen, var e2), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(cen.st_term, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_TERM))
+
+// ── Channel Map Update ──────────────────────────────────────────────
+
+@test
+fn test_a_map_the_host_sets_with_no_procedure_running_takes_effect_at_once_and_goes_to_the_peer()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var ep = env(false, 30)
+    var a = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    var lo = 0x7FFFFC
+    var hi = 0
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, lo, hi, 200, var a), 0)
+    test.assert_eq(op_of(var a), ll_cs.OP_CS_CHANNEL_MAP_IND)
+    test.assert_eq(ll_data.dpdu_len(var a), 13)
+    var m = ll_cs_pdu.chm_new(0, 0, 0)
+    test.assert(ll_cs_pdu.get_channel_map(var a, var m))
+    test.assert_eq(m.lo, 0x7FFFFC)
+    test.assert_eq(m.hi, 0)
+    test.assert_eq(m.instant, 200)
+    // The channels not allowed are cut, the rest is in force now at the end that sent it.
+    test.assert_eq(cen.chm_lo, 0x7FFFFC & ll_cs_pdu.CHM_LO_ALLOWED)
+    test.assert_eq(cen.chm_hi, 0)
+    test.assert(not cen.pend_chm)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per.chm_lo, cen.chm_lo)
+    test.assert_eq(per.chm_hi, 0)
+    test.assert(not per.pend_chm)
+
+@test
+fn test_a_map_that_arrives_while_a_procedure_runs_waits_for_its_instant_and_ends_no_procedure()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 30)
+    var ep = env(false, 30)
+    var a = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, 0x7FFFFC, 0x3, 140, var a), 0)
+    test.assert(cen.pend_chm)
+    test.assert_eq(cen.pend_instant, 140)
+    test.assert_eq(cen.chm_hi, ll_cs_pdu.CHM_HI_ALLOWED)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var out), ll_cs_proc.R_NONE)
+    test.assert(per.pend_chm)
+    test.assert_eq(per.pend_instant, 140)
+    test.assert(per.run_open)
+    test.assert(cen.run_open)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_a_map_with_an_instant_in_the_past_ends_the_series_with_instant_passed_and_applies_to_the_procedures_after_it()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var caps = caps_full()
+    var ep = env(false, 30)
+    var out = ll_pdu.pdu_new()
+    // The current event is 100: the instant 90 is in the past, 110 is not.
+    var m = ll_cs_pdu.chm_new(0x7FFFFC, 0x1, 90)
+    var upd = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd, var m)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var upd, var out), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var out), ll_cs.OP_CS_TERMINATE_REQ)
+    var t = ll_cs_pdu.term_new(0, 0, 0)
+    test.assert(ll_cs_pdu.get_terminate(var out, var t))
+    test.assert_eq(t.config_id, 0)
+    test.assert_eq(t.error, ll_cs_proc.E_INSTANT_PASSED)
+    test.assert_eq(per.wait, ll_cs_proc.W_TERM)
+    // The map applies from the next instance.
+    test.assert(per.pend_chm)
+    test.assert_eq(ll_cs_proc.filtered_hi(var per, 0, 100), 0x1)
+    var cen2 = fresh()
+    var per2 = fresh()
+    running(var cen2, var per2, 0)
+    var m2 = ll_cs_pdu.chm_new(0x7FFFFC, 0x1, 110)
+    var upd2 = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd2, var m2)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep, var caps, var upd2, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per2.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_a_past_instant_ends_nothing_when_the_series_is_one_procedure_or_another_procedure_waits()
+    if skip()
+        return
+    var caps = caps_full()
+    var ep = env(false, 30)
+    var out = ll_pdu.pdu_new()
+    var m = ll_cs_pdu.chm_new(0x7FFFFC, 0x1, 90)
+    var upd = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd, var m)
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 1)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert(per.run_open)
+    var cen2 = fresh()
+    var per2 = fresh()
+    running(var cen2, var per2, 0)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_terminate(var per2, var ep, 0, 0x13, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per2, var ep, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per2.wait, ll_cs_proc.W_TERM)
+
+@test
+fn test_a_map_the_host_gives_is_refused_when_it_names_a_channel_that_is_not_allowed_or_too_few()
+    if skip()
+        return
+    var cen = fresh()
+    var ec = env(true, 30)
+    var a = ll_pdu.pdu_new()
+    // 15 allowed channels are enough, 14 are not, and each of the reserved channels fails.
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, 0x1FFFC, 0, 200, var a), 0)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, 0xFFFC, 0, 200, var a), ll_cs_proc.E_INVALID_PARAMS)
+    for ch in [0, 1, 23, 24, 25]
+        test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, ll_cs_pdu.CHM_LO_ALLOWED | (1 << ch), ll_cs_pdu.CHM_HI_ALLOWED, 200, var a), ll_cs_proc.E_INVALID_PARAMS)
+    for ch in [77, 78, 79]
+        test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, ll_cs_pdu.CHM_LO_ALLOWED, ll_cs_pdu.CHM_HI_ALLOWED | (1 << (ch - 40)), 200, var a), ll_cs_proc.E_INVALID_PARAMS)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, 0, 0, 200, var a), ll_cs_proc.E_INVALID_PARAMS)
+
+@test
+fn test_a_map_the_host_gives_waits_for_the_basics_and_for_the_acl_procedures_with_an_instant()
+    if skip()
+        return
+    var a = ll_pdu.pdu_new()
+    var none = fresh_no_host()
+    var e = env(true, 30)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var none, var e, 0x7FFFFC, 0, 200, var a), ll_cs_proc.E_DISALLOWED)
+    var cen = fresh()
+    var e1 = envf(true, E_NOPEER, 30)
+    var e2 = envf(true, E_PLAIN, 30)
+    var e3 = envf(true, E_BUSY, 30)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var e1, 0x7FFFFC, 0, 200, var a), ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var e2, 0x7FFFFC, 0, 200, var a), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var e3, 0x7FFFFC, 0, 200, var a), ll_cs_proc.E_DISALLOWED)
+    test.assert(not cen.pend_chm)
+    test.assert_eq(cen.chm_lo, ll_cs_pdu.CHM_LO_ALLOWED)
+
+@test
+fn test_a_map_that_arrives_on_a_link_that_is_not_encrypted_or_of_the_wrong_length_changes_nothing()
+    if skip()
+        return
+    var per = fresh()
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var m = ll_cs_pdu.chm_new(0x7FFFFC, 0, 200)
+    var upd = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd, var m)
+    var plain = envf(false, E_PLAIN, 30)
+    test.assert_eq(ll_cs_proc.receive(var per, var plain, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per.chm_lo, ll_cs_pdu.CHM_LO_ALLOWED)
+    var ep = env(false, 30)
+    upd.b[1] = 12
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per.chm_lo, ll_cs_pdu.CHM_LO_ALLOWED)
+
+@test
+fn test_the_filtered_map_is_the_configurations_and_the_updates_and_a_new_connection_starts_with_every_allowed_channel()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    secure(var cen, var per)
+    exchange(var cen, var per)
+    var cfg = cfg_set2(C_LO, 0x7FFFFC, C_HI, 0xFF)
+    configure_cfg(var cen, var per, var cfg)
+    test.assert_eq(ll_cs_proc.cfg_map_lo(var cen, 0), 0x7FFFFC)
+    test.assert_eq(ll_cs_proc.cfg_map_hi(var cen, 0), 0xFF)
+    test.assert_eq(ll_cs_proc.cfg_map_lo(var per, 0), 0x7FFFFC)
+    test.assert_eq(cen.chm_lo, ll_cs_pdu.CHM_LO_ALLOWED)
+    test.assert_eq(ll_cs_proc.filtered_lo(var cen, 0, 100), 0x7FFFFC)
+    test.assert_eq(ll_cs_proc.filtered_hi(var cen, 0, 100), 0xFF)
+    var a = ll_pdu.pdu_new()
+    var ec = env(true, 30)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var ec, 0xFFFC, 0xF0, 200, var a), 0)
+    test.assert_eq(ll_cs_proc.filtered_lo(var cen, 0, 100), 0xFFFC)
+    test.assert_eq(ll_cs_proc.filtered_hi(var cen, 0, 100), 0xF0)
+    ll_cs_proc.cs_reset(var cen)
+    test.assert_eq(cen.chm_lo, ll_cs_pdu.CHM_LO_ALLOWED)
+    test.assert_eq(cen.chm_hi, ll_cs_pdu.CHM_HI_ALLOWED)
+
+// ── Packets too short for the answer ────────────────────────────────
+
+// The environment of an end whose packets carry 3 octets of payload at most, so that no PDU of Channel Sounding but a rejection fits.
+fn env_tiny(central: Bool) -> ll_cs_proc.Env
+    ll_cs_proc.Env { central: central, encrypted: true, peer_cs: true, peer_v2: true, ev_count: 100, interval_us: 30000, now: 20, busy: false, phy: 1, managed: 0xF,
+                     sec_ok: true, max_tx: 3 }
+
+@test
+fn test_an_indication_that_does_not_fit_a_packet_is_refused_as_limited_resources_and_starts_nothing()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 1)
+    var caps = caps_full()
+    var ep = env(false, 20)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var per, var ep, var caps, var s, var a), 0)
+    var tiny = env_tiny(true)
+    test.assert_eq(ll_cs_proc.receive(var cen, var tiny, var caps, var a, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_LIMITED))
+    test.assert(not cen.run_open)
+
+@test
+fn test_a_response_that_does_not_fit_a_packet_is_refused_as_limited_resources_and_the_peripheral_waits_for_nothing()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    var out = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    var tiny = env_tiny(false)
+    test.assert_eq(ll_cs_proc.receive(var per, var tiny, var caps, var a, var out), ll_cs_proc.R_SEND)
+    test.assert(rejects(var out, ll_cs.OP_CS_REQ, ll_cs_proc.E_LIMITED))
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_the_central_whose_indication_does_not_fit_gives_the_start_up_and_tells_its_host()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var s = start_ok(0)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var tiny = env_tiny(true)
+    test.assert_eq(ll_cs_proc.receive(var cen, var tiny, var caps, var b, var a), ll_cs_proc.R_SEND)
+    test.assert(rejects(var a, ll_cs.OP_CS_RSP, ll_cs_proc.E_LIMITED))
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert(not cen.run_open)
+    test.assert(ll_cs_proc.take_owed(var cen, ll_cs_proc.OWED_PROC))
+    test.assert_eq(cen.st_proc, ll_cs_proc.E_LIMITED)
+
+@test
+fn test_a_termination_and_a_map_that_do_not_fit_a_packet_are_not_sent()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    running(var cen, var per, 0)
+    var tiny = env_tiny(true)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_terminate(var cen, var tiny, 0, 0x13, var a), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(ll_cs_proc.begin_channel_map(var cen, var tiny, 0x7FFFFC, 0, 200, var a), ll_cs_proc.E_DISALLOWED)
+    test.assert(not cen.pend_chm)
+    // The termination a past instant asks for is not sent either, and the map applies.
+    var caps = caps_full()
+    var tp = env_tiny(false)
+    var out = ll_pdu.pdu_new()
+    var m = ll_cs_pdu.chm_new(0x7FFFFC, 0x1, 90)
+    var upd = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var upd, var m)
+    test.assert_eq(ll_cs_proc.receive(var per, var tp, var caps, var upd, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+    test.assert(per.pend_chm)
+
+@test
+fn test_a_configuration_that_does_not_fit_a_packet_is_not_asked_for()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    exchange(var cen, var per)
+    var e = envf(true, E_SMALL, 10)
+    var good = cfg_ok(0, 0)
+    test.assert_eq(config_status(var cen, var e, var good, false), ll_cs_proc.E_DISALLOWED)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+
+// ── A configuration the Host keeps to itself ────────────────────────
+
+@test
+fn test_a_configuration_without_the_peer_is_kept_and_removed_at_this_end_alone()
+    if skip()
+        return
+    var cs = fresh()
+    var e = env(true, 10)
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var c = cfg_ok(0, 1)
+    test.assert_eq(ll_cs_proc.begin_config(var cs, var e, var caps, var c, true, var out), 0)
+    test.assert(ll_cs_proc.cfg_used(var cs, 0))
+    test.assert(ll_cs_proc.cfg_mine(var cs, 0))
+    test.assert_eq(ll_cs_proc.cfg_role(var cs, 0), 1)
+    test.assert_eq(cs.wait, ll_cs_proc.W_NONE)
+    test.assert(ll_cs_proc.take_owed(var cs, ll_cs_proc.OWED_CFG))
+    test.assert_eq(cs.ev_cfg, 0)
+    test.assert_eq(cs.ev_act, 1)
+    var rm = cfg_set(C_ACTION, 0)
+    test.assert_eq(ll_cs_proc.begin_config(var cs, var e, var caps, var rm, true, var out), 0)
+    test.assert(not ll_cs_proc.cfg_used(var cs, 0))
+    test.assert_eq(cs.ev_act, 0)
+    test.assert(ll_cs_proc.take_owed(var cs, ll_cs_proc.OWED_CFG))
+    // A removal of one that is not there is refused here as it is with the peer.
+    test.assert_eq(ll_cs_proc.begin_config(var cs, var e, var caps, var rm, true, var out), ll_cs_proc.E_INVALID_PARAMS)
+
+// ── What a handler does with a PDU of the wrong length ──────────────
+
+@test
+fn test_each_handler_ignores_a_pdu_of_the_wrong_length_when_it_is_called_directly()
+    if skip()
+        return
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var short = script(ll_cs.OP_CS_REQ, [1, 2])
+    var cen = fresh()
+    var per = fresh()
+    var ec = env(true, 10)
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.rx_sec_req(var per, var ep, var short, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.rx_sec_rsp(var cen, var ec, var short), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.rx_caps_req(var per, var ep, var caps, var short, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.rx_config_req(var per, var ep, var caps, var short, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.rx_req(var per, var ep, var caps, var short, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.rx_terminate_req(var per, var ep, var short, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.rx_channel_map(var per, var ep, var short, var out), ll_cs_proc.R_NONE)
+    // The responses are taken only by an end that waits for them.
+    var asker = fresh()
+    var e = env(true, 10)
+    var a = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var asker, var e, var caps, var a), 0)
+    test.assert_eq(ll_cs_proc.rx_caps_rsp(var asker, var short), ll_cs_proc.R_NONE)
+    test.assert_eq(asker.wait, ll_cs_proc.W_CAP)
+    var cen2 = fresh()
+    var per2 = fresh()
+    exchange(var cen2, var per2)
+    test.assert_eq(ll_cs_proc.begin_fae(var cen2, var e, var a), 0)
+    test.assert_eq(ll_cs_proc.rx_fae_rsp(var cen2, var short), ll_cs_proc.R_NONE)
+
+// ── Helpers and tables ──────────────────────────────────────────────
+
+@test
+fn test_the_peers_record_is_read_back_as_the_version_it_came_in()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    var caps = caps_full()
+    var ec = envf(true, E_V1, 10)
+    var ep = env(false, 10)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var caps, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var got = ll_cs_pdu.cap_new()
+    var scratch = ll_pdu.pdu_new()
+    test.assert(ll_cs_proc.load_caps(var per, var got, var scratch))
+    test.assert(not got.v2)
+    test.assert_eq(got.t_ip2_ipt, 0)
+    test.assert_eq(got.num_ant, 2)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
+    var got2 = ll_cs_pdu.cap_new()
+    test.assert(ll_cs_proc.load_caps(var cen, var got2, var scratch))
+    test.assert(not got2.v2)
+    var none = fresh()
+    test.assert(not ll_cs_proc.load_caps(var none, var got, var scratch))
+
+@test
+fn test_a_configuration_or_a_run_that_does_not_exist_is_not_read()
+    if skip()
+        return
+    var cs = fresh()
+    var c = ll_cs_pdu.cfg_new()
+    var s = ll_cs_pdu.start_new()
+    var scratch = ll_pdu.pdu_new()
+    test.assert(not ll_cs_proc.load_config(var cs, 0, var c, var scratch))
+    test.assert(not ll_cs_proc.load_config(var cs, 9, var c, var scratch))
+    test.assert(not ll_cs_proc.load_config(var cs, -1, var c, var scratch))
+    test.assert(not ll_cs_proc.load_run(var cs, var s, var scratch))
+    test.assert(not ll_cs_proc.cfg_used(var cs, 9))
+    test.assert(not ll_cs_proc.cfg_used(var cs, -1))
+
+@test
+fn test_the_step_timings_are_held_to_their_tables_and_their_capability_masks()
+    if skip()
+        return
+    // The T_IP table has 8 entries, the T_FCS table 10 and the T_PM table 3; the last of each is the mandatory timing and needs no bit.
+    test.assert(ll_cs_proc.timing_ok(0, 7, 0))
+    test.assert(not ll_cs_proc.timing_ok(0, 6, 0))
+    test.assert(ll_cs_proc.timing_ok(0, 6, 0x40))
+    test.assert(not ll_cs_proc.timing_ok(0, 8, 0xFFFF))
+    test.assert(not ll_cs_proc.timing_ok(0, -1, 0xFFFF))
+    test.assert(ll_cs_proc.timing_ok(1, 9, 0))
+    test.assert(ll_cs_proc.timing_ok(1, 8, 0x100))
+    test.assert(not ll_cs_proc.timing_ok(1, 8, 0xFF))
+    test.assert(not ll_cs_proc.timing_ok(1, 10, 0xFFFF))
+    test.assert(ll_cs_proc.timing_ok(2, 2, 0))
+    test.assert(ll_cs_proc.timing_ok(2, 1, 0x2))
+    test.assert(not ll_cs_proc.timing_ok(2, 0, 0x2))
+    test.assert(not ll_cs_proc.timing_ok(2, 3, 0xF))
+
+@test
+fn test_bits_counts_the_set_bits_of_a_16_bit_value()
+    if skip()
+        return
+    test.assert_eq(ll_cs_proc.bits(0), 0)
+    test.assert_eq(ll_cs_proc.bits(0xFFFF), 16)
+    test.assert_eq(ll_cs_proc.bits(0x8001), 2)
+    test.assert_eq(ll_cs_proc.bits(0x10000), 0)
+
+@test
+fn test_the_connection_event_comparisons_are_taken_modulo_65536()
+    if skip()
+        return
+    test.assert(ll_cs_proc.event_near(100, 100))
+    test.assert(ll_cs_proc.event_near(100 + 16383, 100))
+    test.assert(not ll_cs_proc.event_near(100 + 16384, 100))
+    test.assert(ll_cs_proc.event_near(3, 0xFFFE))
+    test.assert(ll_cs_proc.event_near(0xFFFE, 3))
+    test.assert(ll_cs_proc.event_not_before(100, 100))
+    test.assert(ll_cs_proc.event_not_before(5, 0xFFF0))
+    test.assert(not ll_cs_proc.event_not_before(0xFFF0, 5))
+    test.assert(ll_cs_proc.event_not_before(100 + 32767, 100))
+    test.assert(not ll_cs_proc.event_not_before(100 + 32768, 100))
+    test.assert(not ll_cs_proc.event_past(100, 100))
+    test.assert(not ll_cs_proc.event_past(101, 100))
+    test.assert(ll_cs_proc.event_past(99, 100))
+    test.assert(ll_cs_proc.event_past(100 - 32766, 100))
+    test.assert(not ll_cs_proc.event_past(100 + 32765, 100))
+    test.assert(ll_cs_proc.event_past(0xFFFF, 0))
+
+@test
+fn test_the_requests_the_peer_may_refuse_are_the_opcodes_this_end_sends_as_requests()
+    if skip()
+        return
+    var n = 0
+    for op in 0..256
+        if ll_cs.refusable(op)
+            n = n + 1
+    test.assert_eq(n, 7)
+    for op in [0x39, 0x2E, 0x30, 0x32, 0x33, 0x35, 0x36]
+        test.assert(ll_cs.refusable(op))
+    for op in [0x2D, 0x2F, 0x31, 0x34, 0x37, 0x38, 0x3A]
+        test.assert(not ll_cs.refusable(op))
+
+@test
+fn test_the_scheduling_hook_agrees_to_every_start_until_the_arbiter_joins_it()
+    if skip()
+        return
+    var s = start_ok(0)
+    var e = env(true, 10)
+    test.assert(ll_cs_proc.schedule_ok(var s, var e))
+
+// ── The record and its storage ──────────────────────────────────────
+
+@test
+fn test_the_environments_start_with_a_peripheral_of_30_ms_on_an_encrypted_link()
+    if skip()
+        return
+    let e = ll_cs_proc.env_new()
+    test.assert(not e.central)
+    test.assert(e.encrypted)
+    test.assert(e.peer_cs)
+    test.assert_eq(e.interval_us, 30000)
+    test.assert_eq(e.max_tx, 251)
+    test.assert_eq(e.phy, 1)
+    test.assert(e.sec_ok)
+    test.assert(not e.busy)
+    let t = ll_cs_proc.env_at(12345)
+    test.assert_eq(t.now, 12345)
+    test.assert(t.encrypted)
+    test.assert_eq(t.max_tx, 251)
+
+@test
+fn test_the_capabilities_a_build_reports_follow_its_keys_and_are_valid()
+    if skip()
+        return
+    var c = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var c)
+    test.assert(ll_cs_proc.caps_valid(var c))
+    test.assert_eq(c.v2, ctl_limits.cs_ipt_on())
+    test.assert_eq(c.num_ant, noble_controller_config.CTL_CS_ANT)
+    test.assert_eq(c.max_path, noble_controller_config.CTL_CS_ANT)
+    test.assert_eq(c.role, noble_controller_config.CTL_CS_ROLES)
+    test.assert_eq(c.num_configs, noble_controller_config.CTL_CS_CONFIGS)
+    test.assert_eq((c.mode_types & 1) == 1, ctl_limits.cs_mode3_on())
+    test.assert_eq(c.ch3c == 1, ctl_limits.cs_3c_on())
+    test.assert_eq(c.ipt == 1, ctl_limits.cs_ipt_on())
+    test.assert_eq(c.n_sound != 0, ctl_limits.cs_rtt_seq_on())
+    test.assert_eq(c.n_rand != 0, ctl_limits.cs_rtt_seq_on())
+    test.assert_eq(c.sounding_pct == 1, ctl_limits.cs_rtt_seq_on())
+    // The access address round trip is mandatory, the table of frequency errors is absent, the optional timings are not offered.
+    test.assert(c.n_aa != 0)
+    test.assert_eq(c.no_fae, 1)
+    test.assert_eq(c.t_ip1, 0)
+    test.assert_eq(c.t_fcs, 0)
+    test.assert_eq(c.sync_phy, 0)
+    // The capabilities of a device with every option are those of its flags.
+    var all = ll_cs_pdu.cap_new()
+    ll_cs_proc.caps_with(var all, 2, 4, 3, true, true, true, true)
+    test.assert(ll_cs_proc.caps_valid(var all))
+    test.assert(all.v2)
+    test.assert_eq(all.mode_types, 1)
+    test.assert_eq(all.n_sound, 255)
+    test.assert_eq(all.n_rand, 255)
+    test.assert_eq(all.sounding_pct, 1)
+    test.assert_eq(all.ipt, 1)
+    test.assert_eq(all.ch3c, 1)
+    test.assert_eq(all.role, 2)
+    test.assert_eq(all.num_ant, 4)
+    test.assert_eq(all.max_path, 4)
+    test.assert_eq(all.num_configs, 3)
+    var none = ll_cs_pdu.cap_new()
+    ll_cs_proc.caps_with(var none, 1, 1, 1, false, false, false, false)
+    test.assert(ll_cs_proc.caps_valid(var none))
+    test.assert(not none.v2)
+    test.assert_eq(none.mode_types, 0)
+    test.assert_eq(none.n_sound, 0)
+    test.assert_eq(none.n_rand, 0)
+    test.assert_eq(none.sounding_pct, 0)
+    test.assert_eq(none.ipt, 0)
+    test.assert_eq(none.ch3c, 0)
+    // The capabilities of the build go out in a PDU and come back.
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var p, ll_cs.OP_CS_CAPABILITIES_REQ, var c)
+    var d = ll_cs_pdu.cap_new()
+    test.assert(ll_cs_pdu.get_caps(var p, var d))
+    test.assert_eq(d.num_ant, c.num_ant)
+    test.assert_eq(d.role, c.role)
+
+@test
+fn test_a_new_record_is_empty_and_a_reset_one_forgets_the_connection()
+    if skip()
+        return
+    var cs = fresh()
+    test.assert_eq(cs.owner, -1)
+    test.assert(cs.host)
+    test.assert(not cs.secured)
+    test.assert(not ll_cs_proc.caps_known(var cs))
+    test.assert_eq(cs.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(cs.chm_lo, ll_cs_pdu.CHM_LO_ALLOWED)
+    test.assert_eq(cs.chm_hi, ll_cs_pdu.CHM_HI_ALLOWED)
+    var per = fresh()
+    ready(var cs, var per, 0)
+    var s = start_ok(0)
+    run_start(var cs, var per, true, var s)
+    test.assert(cs.secured)
+    test.assert(ll_cs_proc.caps_known(var cs))
+    test.assert(ll_cs_proc.any_config(var cs))
+    test.assert(cs.fae_known)
+    test.assert(cs.run_open)
+    ll_cs_proc.cs_reset(var cs)
+    test.assert(not cs.secured)
+    test.assert(not cs.fresh)
+    test.assert(not ll_cs_proc.caps_known(var cs))
+    test.assert(not ll_cs_proc.any_config(var cs))
+    test.assert(not cs.fae_known)
+    test.assert(not cs.run_open)
+    test.assert_eq(cs.owed, 0)
+    test.assert_eq(cs.proc_count, 0)
+    test.assert_eq(cs.series_n, 0)
+    test.assert_eq(ll_cs_proc.cs_iv(var cs, 0), 0)
+    test.assert_eq(ll_cs_proc.peer_fae(var cs, 5), 0)
+    // The Host Support bit is the Host's and not the connection's.
+    test.assert(cs.host)
+
+@test
+fn test_the_store_holds_the_fixed_part_and_one_slot_for_each_configuration_of_the_build()
+    if skip()
+        return
+    let cs = ll_cs_proc.cs_new()
+    test.assert_eq(ll_cs_proc.bulk_octets(), 224 + 32 * noble_controller_config.CTL_CS_CONFIGS)
+    test.assert_eq(cs.bulk.len(), ll_cs_proc.bulk_octets())
+    test.assert_eq(ll_cs_proc.cfg_slots(), noble_controller_config.CTL_CS_CONFIGS)
+    // The areas of the store follow one another without overlap.
+    test.assert(ll_cs_proc.OFF_FAE >= ll_cs_proc.OFF_CAPS + 32)
+    test.assert(ll_cs_proc.OFF_SEC >= ll_cs_proc.OFF_FAE + 72)
+    test.assert(ll_cs_proc.OFF_REQ >= ll_cs_proc.OFF_SEC + 40)
+    test.assert(ll_cs_proc.OFF_IND >= ll_cs_proc.OFF_REQ + 28)
+    test.assert(ll_cs_proc.OFF_PCFG >= ll_cs_proc.OFF_IND + 18)
+    test.assert(ll_cs_proc.OFF_CFG >= ll_cs_proc.OFF_PCFG + 28)
+    test.assert_eq(ll_cs_proc.cfg_base(0), ll_cs_proc.OFF_CFG)
+    test.assert_eq(ll_cs_proc.cfg_base(1), ll_cs_proc.OFF_CFG + ll_cs_proc.CFG_OCT)
+
+@test
+fn test_the_storage_of_a_connection_is_its_words_and_its_store_in_the_budget_of_the_schema()
+    if skip()
+        return
+    // The figures of the schema: 34 words of 8 octets, a store of 224 octets and 32 for each configuration, and the rounding of a `Vec` to 8 octets.
+    test.assert_eq(ctl_budget.CTL_CS_WORDS, ll_cs_proc.CS_WORDS * 8)
+    test.assert_eq(ctl_budget.CTL_CS_STORE, ll_cs_proc.OFF_CFG)
+    test.assert_eq(ctl_budget.CTL_CS_CONFIG, ll_cs_proc.CFG_OCT)
+    let store = ctl_budget.CTL_CS_STORE + ctl_budget.CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS
+    // The planning (`ll_cs_plan`) is the other part of the figure: a generator for each connection, the plan's head and its steps.
+    let planning = ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_GEN_RECORD) + ctl_budget.CTL_CS_PLAN_FIXED + ctl_budget.vec_bytes(noble_controller_config.CTL_CS_STEPS, ctl_budget.CTL_CS_STEP_RECORD)
+    test.assert_eq(ctl_budget.controller_cs_bytes(), planning + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, store))
+    test.assert_eq(ctl_limits.cs_slots(), noble_controller_config.CTL_CS)
+    test.assert_eq(ll_cs_proc.bulk_octets(), store)
+    test.assert_eq(store % 8, 0)
+
+@test
+fn test_a_build_without_the_feature_keeps_the_two_tables_at_one_element_each_in_the_budget()
+    if ctl_limits.cs_on()
+        return
+    test.assert_eq(ctl_budget.controller_cs_bytes(), ctl_budget.vec_bytes(1, 8) + ctl_budget.vec_bytes(1, 1))
+    test.assert_eq(ctl_limits.cs_slots(), 1)
+
+// ── The records in the Controller's tables ──────────────────────────
+
+// The tables of a Controller with `ctl_cs` records.
+fn tables() -> Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1]
+    var w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1] = Vec.new()
+    w
+
+fn store_tables() -> Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1]
+    var b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1] = Vec.new()
+    b
+
+@test
+fn test_the_tables_start_with_every_record_free()
+    if skip()
+        return
+    var w = tables()
+    var b = store_tables()
+    ll_cs_proc.tables_fill(var w, var b)
+    test.assert_eq(w.len(), noble_controller_config.CTL_CS * ll_cs_proc.CS_WORDS)
+    test.assert_eq(b.len(), noble_controller_config.CTL_CS * ll_cs_proc.bulk_octets())
+    for slot in 0..noble_controller_config.CTL_CS
+        test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_OWNER], -1)
+        test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_WAIT], ll_cs_proc.W_NONE)
+        test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_CHM_LO], ll_cs_pdu.CHM_LO_ALLOWED)
+        test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_CHM_HI], ll_cs_pdu.CHM_HI_ALLOWED)
+
+@test
+fn test_a_record_stored_and_loaded_comes_back_whole_in_every_slot()
+    if skip()
+        return
+    var w = tables()
+    var b = store_tables()
+    ll_cs_proc.tables_fill(var w, var b)
+    for slot in 0..noble_controller_config.CTL_CS
+        var cen = fresh()
+        var per = fresh()
+        ready(var cen, var per, 0)
+        var s = start_set(S_PCNT, 4)
+        start_put(var s, S_PINT, 3)
+        run_start(var cen, var per, true, var s)
+        ll_cs_proc.store(var w, var b, slot, var cen)
+        var back = ll_cs_proc.cs_new()
+        ll_cs_proc.load(var w, var b, slot, var back)
+        test.assert_eq(back.secured, cen.secured)
+        test.assert_eq(back.run_open, cen.run_open)
+        test.assert_eq(back.series_n, 4)
+        test.assert_eq(back.series_cfg, cen.series_cfg)
+        test.assert_eq(back.proc_count, cen.proc_count)
+        test.assert_eq(back.owed, cen.owed)
+        test.assert_eq(back.chm_lo, cen.chm_lo)
+        test.assert(ll_cs_proc.caps_known(var back))
+        test.assert(ll_cs_proc.cfg_used(var back, 0))
+        test.assert_eq(ll_cs_proc.cfg_role(var back, 0), 0)
+        test.assert_eq(ll_cs_proc.cs_iv(var back, 0), ll_cs_proc.cs_iv(var cen, 0))
+        test.assert_eq(ll_cs_proc.peer_fae(var back, 3), ll_cs_proc.peer_fae(var cen, 3))
+        test.assert_eq(run_of(var back).subevent_len, 2500)
+
+fn fill_numbers(var cs: Cs)
+    cs.owner = 3
+    cs.secured = true
+    cs.fresh = true
+    cs.caps_air = true
+    cs.fae_known = true
+    cs.fae_air = true
+    cs.run_open = true
+    cs.start_host = true
+    cs.pend_chm = true
+    cs.wait = 4
+    cs.wait_cfg = 5
+    cs.t0 = 6
+    cs.rnd_n = 7
+    cs.yield_op = 8
+    cs.owed = 9
+    cs.st_caps = 10
+    cs.st_fae = 11
+    cs.st_sec = 12
+    cs.st_cfg = 13
+    cs.st_proc = 14
+    cs.st_term = 15
+    cs.ev_cfg = 16
+    cs.ev_act = 17
+    cs.proc_count = 18
+    cs.series_cfg = 19
+    cs.series_n = 20
+    cs.series_start = 21
+    cs.term_error = 22
+    cs.chm_lo = 23
+    cs.chm_hi = 24
+    cs.pend_lo = 25
+    cs.pend_hi = 26
+    cs.pend_instant = 27
+
+@test
+fn test_every_number_of_a_record_has_its_own_word_and_comes_back_through_the_tables()
+    if skip()
+        return
+    var w = tables()
+    var b = store_tables()
+    ll_cs_proc.tables_fill(var w, var b)
+    var cs = fresh()
+    fill_numbers(var cs)
+    ll_cs_proc.store(var w, var b, 0, var cs)
+    var back = ll_cs_proc.cs_new()
+    ll_cs_proc.load(var w, var b, 0, var back)
+    test.assert_eq(back.owner, 3)
+    test.assert(back.host)
+    test.assert(back.secured)
+    test.assert(back.fresh)
+    test.assert(back.caps_air)
+    test.assert(back.fae_known)
+    test.assert(back.fae_air)
+    test.assert(back.run_open)
+    test.assert(back.start_host)
+    test.assert(back.pend_chm)
+    test.assert_eq(back.wait, 4)
+    test.assert_eq(back.wait_cfg, 5)
+    test.assert_eq(back.t0, 6)
+    test.assert_eq(back.rnd_n, 7)
+    test.assert_eq(back.yield_op, 8)
+    test.assert_eq(back.owed, 9)
+    test.assert_eq(back.st_caps, 10)
+    test.assert_eq(back.st_fae, 11)
+    test.assert_eq(back.st_sec, 12)
+    test.assert_eq(back.st_cfg, 13)
+    test.assert_eq(back.st_proc, 14)
+    test.assert_eq(back.st_term, 15)
+    test.assert_eq(back.ev_cfg, 16)
+    test.assert_eq(back.ev_act, 17)
+    test.assert_eq(back.proc_count, 18)
+    test.assert_eq(back.series_cfg, 19)
+    test.assert_eq(back.series_n, 20)
+    test.assert_eq(back.series_start, 21)
+    test.assert_eq(back.term_error, 22)
+    test.assert_eq(back.chm_lo, 23)
+    test.assert_eq(back.chm_hi, 24)
+    test.assert_eq(back.pend_lo, 25)
+    test.assert_eq(back.pend_hi, 26)
+    test.assert_eq(back.pend_instant, 27)
+    // The word of each field is where the index says.
+    test.assert_eq(w[ll_cs_proc.WD_PEND_INSTANT], 27)
+    test.assert_eq(w[ll_cs_proc.WD_OWNER], 3)
+    test.assert_eq(ll_cs_proc.CS_WORDS, 34)
+
+@test
+fn test_a_claimed_record_is_new_and_a_freed_one_belongs_to_nobody()
+    if skip()
+        return
+    var cs = fresh()
+    var per = fresh()
+    ready(var cs, var per, 0)
+    ll_cs_proc.claim(var cs, 2, true)
+    test.assert_eq(cs.owner, 2)
+    test.assert(cs.host)
+    test.assert(not cs.secured)
+    test.assert(not ll_cs_proc.caps_known(var cs))
+    ll_cs_proc.claim(var cs, 5, false)
+    test.assert(not cs.host)
+    ll_cs_proc.free(var cs)
+    test.assert_eq(cs.owner, -1)
+    test.assert_eq(ll_cs_proc.b2i(true), 1)
+    test.assert_eq(ll_cs_proc.b2i(false), 0)

@@ -236,16 +236,18 @@ doc     = "buffers of subevent data the advertiser keeps, and of responses each 
 
 # Channel Sounding (ll_cs.nv; Core 6.3, Vol 6 Part H).  `ctl_cs` is the count of connections that run it at once and the switch: 0 is a
 # build without it.  The keys that describe the feature are 0 or false exactly when the count is 0, and the keys that choose among its
-# options need the count.  Two keys state the storage of the planning (`CsState` of ll_cs_plan.nv): `ctl_cs` the generator of each connection
-# that runs the feature, 712 B, and `ctl_cs_steps` the plan of one subevent, 40 B and 56 B a step.  A build without the feature makes none of
-# it, so the keys have no floor.
+# options need the count.  Three keys state the storage.  `ctl_cs`: for each connection that runs the feature, the generator of the planning
+# (`CsState` of ll_cs_plan.nv, 712 B) and one record of the procedures (ll_cs_proc.nv) in two tables of the Controller, 34 words of 8 B and a store of 224 B;
+# a build without the feature keeps those two tables at one element each, which is the floor.  `ctl_cs_configs`: 32 B more of store for each configuration a
+# connection holds.  `ctl_cs_steps`: the plan of one subevent, 40 B and 56 B a step.
 [config.ctl_cs]
 type     = "int"
 default  = 0
 min      = 0
 max      = 2
 requires = ["ctl_pcl"]
-bytes_expr = "(ctl_cs * 712 + 15) / 8 * 8"
+bytes_expr = "(ctl_cs * 712 + 15) / 8 * 8 + (ctl_cs * 272 + 15) / 8 * 8 + (ctl_cs * 224 + 15) / 8 * 8"
+floor    = 32
 doc      = "connections that run Channel Sounding at once (ll_cs.nv), 0 for a build without it, which then answers its 18 commands with Unknown HCI Command, its 14 Link Layer PDUs with LL_UNKNOWN_RSP and leaves LE features 46, 47, 48 and 75 clear; needs CTL_PCL, whose power delta the Channel Sounding request names"
 
 [config.ctl_cs_configs]
@@ -255,6 +257,7 @@ min      = 0
 max      = 4
 zero_iff = "ctl_cs"
 min_when = [{ when = "ctl_cs", min = 1 }]
+bytes_expr = "ctl_cs * 32 * ctl_cs_configs"
 doc      = "configurations a connection holds for Channel Sounding, 1 to 4 (the Num_Config_Supported the capabilities answer); 0 exactly when CTL_CS is 0"
 
 [config.ctl_cs_steps]

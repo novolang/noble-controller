@@ -69,6 +69,10 @@ use ll_past
 use ll_pcl
 use ll_ploss
 use ll_cs
+@when(noble_controller_config.CTL_CS > 0)
+use ll_cs_pdu
+@when(noble_controller_config.CTL_CS > 0)
+use ll_cs_proc
 use ll_sub
 use ll_rate
 use ll_fs
@@ -560,6 +564,9 @@ struct Controller
     host_sub: Bool
     pwa: Vec[PwAdv; if noble_controller_config.CTL_PAWR_ADV then max1(noble_controller_config.CTL_PER_ADV) else 1]
     pws: Vec[PwSync; if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1]
+    cs_w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1]
+    cs_b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1]
+    cs_host: Bool
 
 // A Controller in its power-on state, for hardware with the capabilities
 // `caps`.  The public address is zero until `ctl_set_public` gives it.
@@ -584,7 +591,7 @@ fn controller_new(caps: Int) -> Controller
         xs: ll_ext.xctx_new(), xv: ll_pdu.pdu_new(), xp: ll_ext.xpri_new(), xview: false,
         xsets: Vec.new(), coded: true, adv_set: -1, adv_base: 0, adv_xset: -1,
         pads: Vec.new(), psyncs: Vec.new(), preq: ll_per.preq_new(), pal: ll_per.pal_new(), per_late: 0,
-        past_def: ll_past.cfg_new(), past_cfg: Vec.new(), past_tx: Vec.new(), pcl: Vec.new(), sub: Vec.new(), sub_def: Vec.new(), host_sub: false, pwa: Vec.new(), pws: Vec.new() }
+        past_def: ll_past.cfg_new(), past_cfg: Vec.new(), past_tx: Vec.new(), pcl: Vec.new(), sub: Vec.new(), sub_def: Vec.new(), host_sub: false, pwa: Vec.new(), pws: Vec.new(), cs_w: Vec.new(), cs_b: Vec.new(), cs_host: false }
     for _ in 0..ctl_limits.padv_n()
         let _p = c.pads.push(ll_per.padv_new())
     for _ in 0..ctl_limits.psync_n()
@@ -605,6 +612,8 @@ fn controller_new(caps: Int) -> Controller
             let _sb = c.sub.push(ll_sub.sub_new())
     if ctl_limits.sub_on() or ctl_limits.fs_on()
         let _sd = c.sub_def.push(ll_sub.sub_new())
+    if noble_controller_config.CTL_CS > 0
+        cs_tables_init(var c)
     for _ in 0..ctl_limits.sets()
         let _x = c.xsets.push(ll_xadv.xset_new())
     for _ in 0..ctl_limits.cis_slots()
@@ -688,6 +697,8 @@ fn reset_parameters(var c: Controller)
         for k in 0..noble_controller_config.CTL_LINKS
             ll_pcl.pcl_reset(var c.pcl[k], TX_POWER_DBM)
     c.host_sub = false
+    if noble_controller_config.CTL_CS > 0
+        cs_reset_all(var c)
     if ctl_limits.fs_on() and not ctl_limits.sub_on()
         c.sub_def[0] = ll_sub.sub_new()
     if ctl_limits.sub_on()
@@ -4879,6 +4890,8 @@ fn ctl_step(var c: Controller) -> Bool
         let _w = ctl_rate_poll(var c)
     if ctl_limits.fs_on()
         let _f = ctl_fs_poll(var c)
+    if noble_controller_config.CTL_CS > 0
+        let _s = ctl_cs_poll(var c)
     if ctl_limits.pawr_adv_on()
         ctl_pawr_poll(var c)
     ctl_flush_events(var c)
@@ -7271,6 +7284,8 @@ fn apply_defaults(var c: Controller, ls: Int)
         ll_pcl.pcl_reset(var c.pcl[ls], TX_POWER_DBM)
         for k in 0..ll_pcl.PHYS
             c.links[ls].txp[k] = TX_POWER_DBM as i8
+    if noble_controller_config.CTL_CS > 0
+        cs_release(var c, ls)
 
 // Record the Resolvable Private Addresses of the connection just opened in slot `ls`, which
 // the Host is told of in LE Enhanced Connection Complete: `c.ci_kind` has bit 0 when the
@@ -7322,6 +7337,8 @@ fn release_ended(var c: Controller, slot: Int)
         if ctl_limits.iso_on() and iso_on(var c)
             cis_acl_lost(var c, slot, c.links[slot].reason)
         ll_link.link_released(var c.links[slot])
+        if noble_controller_config.CTL_CS > 0
+            cs_release(var c, slot)
         if ctl_limits.past_on()
             c.past_tx[slot].used = false
         ll_arb.arb_cancel(var c.arb, slot_class(slot))
@@ -7403,6 +7420,8 @@ fn ctl_secure_wanted(var c: Controller) -> Bool
     for slot in 0..noble_controller_config.CTL_LINKS
         if ll_link.link_wants_random(var c.links[slot]) or ll_link.link_wants_cipher(var c.links[slot])
             return true
+    if noble_controller_config.CTL_CS > 0
+        return cs_wants_random(var c)
     false
 
 // Whether a link waits for random octets.
@@ -7411,6 +7430,8 @@ fn ctl_wants_random(var c: Controller) -> Bool
     for slot in 0..noble_controller_config.CTL_LINKS
         if ll_link.link_wants_random(var c.links[slot])
             return true
+    if noble_controller_config.CTL_CS > 0
+        return cs_wants_random(var c)
     false
 
 // Run the work of the Encryption Start procedure that needs the cipher or random
@@ -7423,6 +7444,9 @@ fn ctl_secure_poll<C: Cipher[e]>(var c: Controller, var cc: C, var rnd: Vec[u8; 
     for slot in 0..noble_controller_config.CTL_LINKS
         if ll_link.link_secure_poll(var c.links[slot], var cc, var rnd, have and not used)
             used = true
+    if noble_controller_config.CTL_CS > 0
+        if have and not used
+            used = cs_feed(var c, rnd)
     used
 
 // The rest of the work for a packet with a good CRC of the link in `slot`
@@ -7435,7 +7459,7 @@ fn ctl_conn_rx_slow(var c: Controller, slot: Int, var rx: Pdu)
     if ll_link.link_rx_slow(var c.links[slot], var rx) == ll_link.RX_TO_HOST
         let _e = flush_link(var c, slot)
         forward_acl(var c, c.links[slot].handle, var rx)
-    if (ctl_limits.iso_on() or ctl_limits.past_on() or ctl_limits.pcl_on() or ctl_limits.sub_on() or ctl_limits.fs_on()) and c.links[slot].ctl_in
+    if (ctl_limits.iso_on() or ctl_limits.past_on() or ctl_limits.pcl_on() or ctl_limits.sub_on() or ctl_limits.fs_on() or ctl_limits.cs_on()) and c.links[slot].ctl_in
         ctl_iso_ctrl(var c, slot, var rx)
     ll_link.link_set_room(var c.links[slot], ctl_pool.pool_free(var c.pool))
 
@@ -8754,6 +8778,352 @@ fn cs_dispatch(var c: Controller, opcode: Int)
         answer_command_status(var c, opcode, ll_cs.STUB_STATUS)
     else
         answer_status(var c, opcode, ll_cs.STUB_STATUS)
+
+// ── Channel Sounding: the procedures of the Link Layer ──────────────
+// The procedures are in ll_cs_proc.nv, over one record `Cs` for each connection that runs them.  The Controller keeps the records as numbers and octets
+// in its two tables `cs_w` and `cs_b` (`ctl_cs` records, claimed by the first request of the Host or the peer and given back when the connection ends) and
+// copies the record of a link into a `Cs` for the length of a call, so that a build without the feature has no type of the feature.  Everything here is
+// removed from such a build.  The functions read the link into the environment of the procedures, queue the PDUs they answer with and carry the Host's
+// requests over (`ctl_cs_security` and its kin, which the commands of the Host call).
+
+// The tables of a new Controller: every record free.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_tables_init(var c: Controller)
+    ll_cs_proc.tables_fill(var c.cs_w, var c.cs_b)
+
+// The record in slot `i` of the tables, copied into `cs`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_get(var c: Controller, i: Int, var cs: ll_cs_proc.Cs)
+    ll_cs_proc.load(var c.cs_w, var c.cs_b, i, var cs)
+
+// `cs` copied into slot `i` of the tables.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_put(var c: Controller, i: Int, var cs: ll_cs_proc.Cs)
+    ll_cs_proc.store(var c.cs_w, var c.cs_b, i, var cs)
+
+// The slot of the link a record belongs to.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_owner(var c: Controller, i: Int) -> Int
+    c.cs_w[i * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_OWNER]
+
+// What the procedure of record `i` waits for (`ll_cs_proc.W_NONE` and the others).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_wait(var c: Controller, i: Int) -> Int
+    c.cs_w[i * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_WAIT]
+
+// The record of the link in slot `ls`, -1 when it has none.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_find(var c: Controller, ls: Int) -> Int
+    for i in 0..ctl_limits.cs_slots()
+        if cs_owner(var c, i) == ls
+            return i
+    -1
+
+// The record of the link in slot `ls`, a free one when it has none (new, with the Host Support bit as the Host set it); -1 when every record belongs to another
+// connection.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_claim(var c: Controller, ls: Int) -> Int
+    let have = cs_find(var c, ls)
+    if have >= 0
+        return have
+    for i in 0..ctl_limits.cs_slots()
+        if cs_owner(var c, i) < 0
+            var cs = ll_cs_proc.cs_new()
+            ll_cs_proc.claim(var cs, ls, c.cs_host)
+            cs_put(var c, i, var cs)
+            return i
+    -1
+
+// The record of the link in slot `ls` is given back.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_release(var c: Controller, ls: Int)
+    let i = cs_find(var c, ls)
+    if i >= 0
+        var cs = ll_cs_proc.cs_new()
+        ll_cs_proc.free(var cs)
+        cs_put(var c, i, var cs)
+
+// Every record is given back and the Host Support bit is cleared, as a reset of the Controller does.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_reset_all(var c: Controller)
+    c.cs_host = false
+    var cs = ll_cs_proc.cs_new()
+    ll_cs_proc.free(var cs)
+    for i in 0..ctl_limits.cs_slots()
+        cs_put(var c, i, var cs)
+
+// The Host sets or clears Channel Sounding (Host Support), which it does before the first connection: the records take it.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_set_host(var c: Controller, on: Bool)
+    c.cs_host = on
+    for i in 0..ctl_limits.cs_slots()
+        c.cs_w[i * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_HOST] = ll_cs_proc.b2i(on)
+
+// The PHY of the link as LL_CS_REQ names it: 1 LE 1M, 2 LE 2M, 4 LE Coded S=8, 8 LE Coded S=2.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_phy_bit(var c: Controller, ls: Int) -> Int
+    if c.links[ls].phy == ll_phy.PHY_2M
+        return 2
+    if c.links[ls].phy == ll_phy.PHY_CODED
+        if c.links[ls].phy_opt == ll_phy.OPT_S2
+            return 8
+        return 4
+    1
+
+// What the procedures need to know of the link in slot `ls`.  The PHYs whose power the Link Layer manages are all four: LE Power Control keeps a level
+// for each.  The Host's security requirements are met until a command sets them.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_env(var c: Controller, ls: Int, var en: ll_cs_proc.Env)
+    en.central = c.links[ls].central
+    en.encrypted = ll_link.link_encrypted(var c.links[ls])
+    en.peer_cs = c.links[ls].have_feat and (c.links[ls].peer_feat[5] as Int & ll_cs.FEAT5_CS) != 0
+    en.peer_v2 = ll_link.fx_get(c.links[ls], ll_link.FX_HAVE, 1) == 1 and (ll_link.fx_get(c.links[ls], ll_link.FX_PEER, 0xFFFFFF) & ll_cs.PAGE1_CS_ENHANCEMENT_1) != 0
+    en.ev_count = c.links[ls].ev_count
+    en.interval_us = ll_link.interval_us(var c.links[ls])
+    en.now = c.now
+    var busy = ll_link.instant_busy(var c.links[ls]) or c.links[ls].proc == ll_link.PROC_PARAM
+    if ctl_limits.pcl_on() and c.pcl[ls].wait
+        busy = true
+    if ctl_limits.sub_on() and c.sub[ls].wait
+        busy = true
+    en.busy = busy
+    en.phy = cs_phy_bit(var c, ls)
+    en.managed = 0xF
+    en.sec_ok = true
+    en.max_tx = ll_link.tx_limit(var c.links[ls])
+
+// A control PDU of Channel Sounding, or a refusal of one of its requests, arrived on the link in slot `ls` (`Link.ctl_in`): the procedure answers.  A request
+// of the peer for which every record is taken is refused with Rejected Due To Limited Resources.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_rx(var c: Controller, ls: Int, op: Int, var rx: Pdu)
+    var i = cs_find(var c, ls)
+    if i < 0 and ll_cs.is_pdu(op)
+        i = cs_claim(var c, ls)
+        if i < 0
+            if op == ll_cs.OP_CS_SEC_REQ or op == ll_cs.OP_CS_CAPABILITIES_REQ or op == ll_cs.OP_CS_CONFIG_REQ or op == ll_cs.OP_CS_REQ or op == ll_cs.OP_CS_FAE_REQ
+                iso_reject(var c, ls, op, ll_cs_proc.E_LIMITED)
+            return
+    if i < 0
+        return
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let r = ll_cs_proc.receive(var cs, var en, var local, var rx, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    if r == ll_cs_proc.R_SEND
+        let _s = iso_send(c, ls)
+    else if r == ll_cs_proc.R_UNKNOWN
+        ll_link.answer_unknown(var c.links[ls], op)
+        ll_link.link_prepare(var c.links[ls])
+
+// The work of the procedures that is not in a radio event: a procedure that the peer leaves unanswered for 40 seconds ends the connection (Section 5.2).
+// True when a connection was ended.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_poll(var c: Controller) -> Bool
+    var did = false
+    for i in 0..ctl_limits.cs_slots()
+        let ls = cs_owner(var c, i)
+        if ls >= 0 and cs_wait(var c, i) != ll_cs_proc.W_NONE and ctl_conn_active(var c, ls)
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            var en = ll_cs_proc.env_at(c.now)
+            let late = ll_cs_proc.poll(var cs, var en)
+            cs_put(var c, i, var cs)
+            if late != 0
+                ll_link.link_close(var c.links[ls], ll_link.REASON_RESPONSE_TIMEOUT)
+                did = true
+    did
+
+// Whether a procedure of a connection waits for random octets (the Central's parts of Security Start, or the Peripheral's).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_wants_random(var c: Controller) -> Bool
+    for i in 0..ctl_limits.cs_slots()
+        let w = cs_wait(var c, i)
+        if cs_owner(var c, i) >= 0 and (w == ll_cs_proc.W_RND_C or w == ll_cs_proc.W_RND_P)
+            return true
+    false
+
+// Give the random octets `rnd` to the procedure that waits for them; true when it took them.  The PDU the last octets complete goes out.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_feed(var c: Controller, rnd: Vec[u8; 12]) -> Bool
+    for i in 0..ctl_limits.cs_slots()
+        let ls = cs_owner(var c, i)
+        let w = cs_wait(var c, i)
+        if ls >= 0 and (w == ll_cs_proc.W_RND_C or w == ll_cs_proc.W_RND_P) and ctl_conn_active(var c, ls)
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            var en = ll_cs_proc.env_at(c.now)
+            let r = ll_cs_proc.feed_random(var cs, var en, rnd, var c.links[ls].tmp)
+            cs_put(var c, i, var cs)
+            if r == ll_cs_proc.R_SEND
+                let _s = iso_send(c, ls)
+            return true
+    false
+
+// The record for a request of the Host on the link in slot `ls`: its index, or -1 for a link that is not on, -2 for one with no room in its control
+// queue and -3 when every record belongs to another connection.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_request(var c: Controller, ls: Int) -> Int
+    if ls < 0 or not ctl_conn_active(var c, ls)
+        return -1
+    if c.links[ls].cq_count >= ll_link.CTRL_SLOTS - 1
+        return -2
+    let i = cs_claim(var c, ls)
+    if i < 0
+        return -3
+    i
+
+// The HCI status of a request that found no record: Unknown Connection Identifier, Command Disallowed, Rejected Due To Limited Resources.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_request_status(i: Int) -> Int
+    if i == -1
+        return STATUS_UNKNOWN_CONNECTION
+    if i == -2
+        return STATUS_COMMAND_DISALLOWED
+    ll_cs_proc.E_LIMITED
+
+// The Host's request ended with `st`: the PDU in the `tmp` of the link goes out when it succeeded.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_sent(var c: Controller, ls: Int, st: Int) -> Int
+    if st == 0
+        let _s = iso_send(c, ls)
+    st
+
+// LE CS Security Enable for the link in slot `ls`: the Central collects its parts of the security values and sends LL_CS_SEC_REQ.  The status the command gets.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_security(var c: Controller, ls: Int) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_security(var cs, var en)
+    cs_put(var c, i, var cs)
+    st
+
+// LE CS Read Remote Supported Capabilities for the link in slot `ls`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_capabilities(var c: Controller, ls: Int) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_capabilities(var cs, var en, var local, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    cs_sent(var c, ls, st)
+
+// LE CS Create Config and LE CS Remove Config for the link in slot `ls`: the configuration `cfg` is created (`cfg.action` 1) or removed (0), with the
+// peer, or `local_only` (no PDU goes out).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_config(var c: Controller, ls: Int, var cfg: CfgPdu, local_only: Bool) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_config(var cs, var en, var local, var cfg, local_only, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    if local_only
+        return st
+    cs_sent(var c, ls, st)
+
+// LE CS Read Remote FAE Table for the link in slot `ls`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_fae(var c: Controller, ls: Int) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_fae(var cs, var en, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    cs_sent(var c, ls, st)
+
+// LE CS Procedure Enable for the link in slot `ls`: the procedures `s` describes start.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_start(var c: Controller, ls: Int, var s: StartPdu) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_start(var cs, var en, var local, var s, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    cs_sent(var c, ls, st)
+
+// The repeats of the series on the link in slot `ls` are to stop, for `error`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_terminate(var c: Controller, ls: Int, config_id: Int, error: Int) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_terminate(var cs, var en, config_id, error, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    cs_sent(var c, ls, st)
+
+// LE CS Set Channel Classification for the link in slot `ls`: the map `lo` and `hi` (`ll_cs_pdu.chm_has`) applies from the event `instant`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_channel_map(var c: Controller, ls: Int, lo: Int, hi: Int, instant: Int) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let st = ll_cs_proc.begin_channel_map(var cs, var en, lo, hi, instant, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    cs_sent(var c, ls, st)
 
 // ── The Sleep Clock Accuracy request ────────────────────────────────
 
@@ -10281,6 +10651,10 @@ fn iso_terminate(var c: Controller, ls: Int, var rx: Pdu)
 fn ctl_iso_ctrl(var c: Controller, ls: Int, var rx: Pdu)
     c.links[ls].ctl_in = false
     let op = ll_data.dpdu_opcode(var rx)
+    if noble_controller_config.CTL_CS > 0
+        if ll_cs.is_pdu(op) or ll_link.cs_refusal(var rx, op)
+            cs_rx(var c, ls, op, var rx)
+            return
     if ctl_limits.past_on() and op == ll_data.OP_PERIODIC_SYNC_IND
         past_rx(var c, ls, var rx)
         return

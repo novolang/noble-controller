@@ -1,0 +1,880 @@
+// tests/ll_cs_pdu_tests.nv — the unit tests of src/ll_cs_pdu.nv: the fourteen control PDUs of Channel Sounding, written and read back.
+//
+// Each field of each PDU is held to its boundaries, the least and the greatest value its width allows, in a record whose other fields hold a value of
+// their own, so that a field that spills into its neighbour or reads the wrong octet fails.  The octets of every PDU are checked against the figures of
+// [Vol 6] Part B, Sections 2.4.2.42 to 2.4.2.53; the opcode and the length of each are those of Table 2.22 and the text.
+//
+//   novo test tests/ll_cs_pdu_tests.nv
+
+use std.test
+use ll_pdu
+use ll_data
+use ll_cs
+use ll_cs_pdu
+
+// ── The fields by number ────────────────────────────────────────────
+
+// The capabilities record: the fields in the order of the PDU, and the widths in bits of each.
+fn cap_widths() -> [Int]
+    [8, 8, 8, 8, 8, 16, 16, 8, 4, 4, 2, 1, 1, 1, 1, 8, 16, 8, 16, 16, 16, 16, 1, 7, 16, 8, 8, 8, 8]
+
+fn cap_get(c: CapPdu, f: Int) -> Int
+    match f
+        0  => c.mode_types
+        1  => c.rtt_cap
+        2  => c.n_aa
+        3  => c.n_sound
+        4  => c.n_rand
+        5  => c.nadm_sound
+        6  => c.nadm_rand
+        7  => c.sync_phy
+        8  => c.num_ant
+        9  => c.max_path
+        10 => c.role
+        11 => c.ipt
+        12 => c.no_fae
+        13 => c.ch3c
+        14 => c.sounding_pct
+        15 => c.num_configs
+        16 => c.max_procs
+        17 => c.t_sw
+        18 => c.t_ip1
+        19 => c.t_ip2
+        20 => c.t_fcs
+        21 => c.t_pm
+        22 => c.rtt_phy
+        23 => c.tx_snr
+        24 => c.t_ip2_ipt
+        25 => c.t_sw_ipt
+        26 => c.n2_aa
+        27 => c.n2_sound
+        _  => c.n2_rand
+
+fn cap_put(var c: CapPdu, f: Int, v: Int)
+    match f
+        0  => c.mode_types = v
+        1  => c.rtt_cap = v
+        2  => c.n_aa = v
+        3  => c.n_sound = v
+        4  => c.n_rand = v
+        5  => c.nadm_sound = v
+        6  => c.nadm_rand = v
+        7  => c.sync_phy = v
+        8  => c.num_ant = v
+        9  => c.max_path = v
+        10 => c.role = v
+        11 => c.ipt = v
+        12 => c.no_fae = v
+        13 => c.ch3c = v
+        14 => c.sounding_pct = v
+        15 => c.num_configs = v
+        16 => c.max_procs = v
+        17 => c.t_sw = v
+        18 => c.t_ip1 = v
+        19 => c.t_ip2 = v
+        20 => c.t_fcs = v
+        21 => c.t_pm = v
+        22 => c.rtt_phy = v
+        23 => c.tx_snr = v
+        24 => c.t_ip2_ipt = v
+        25 => c.t_sw_ipt = v
+        26 => c.n2_aa = v
+        27 => c.n2_sound = v
+        _  => c.n2_rand = v
+
+fn cap_set_v2(var c: CapPdu, on: Bool)
+    c.v2 = on
+
+// The configuration record: the fields in the order of the PDU after Action, and their widths.
+fn cfg_widths() -> [Int]
+    [6, 2, 40, 40, 8, 8, 8, 8, 8, 8, 8, 8, 4, 2, 1, 4, 4, 8, 8, 8, 8, 8]
+
+fn cfg_get(c: CfgPdu, f: Int) -> Int
+    match f
+        0  => c.config_id
+        1  => c.action
+        2  => c.chm_lo
+        3  => c.chm_hi
+        4  => c.chm_rep
+        5  => c.main_mode
+        6  => c.sub_mode
+        7  => c.main_min
+        8  => c.main_max
+        9  => c.main_rep
+        10 => c.mode0_steps
+        11 => c.sync_phy
+        12 => c.rtt_type
+        13 => c.role
+        14 => c.ipt
+        15 => c.chsel
+        16 => c.c3_shape
+        17 => c.c3_jump
+        18 => c.t_ip1
+        19 => c.t_ip2
+        20 => c.t_fcs
+        _  => c.t_pm
+
+fn cfg_put(var c: CfgPdu, f: Int, v: Int)
+    match f
+        0  => c.config_id = v
+        1  => c.action = v
+        2  => c.chm_lo = v
+        3  => c.chm_hi = v
+        4  => c.chm_rep = v
+        5  => c.main_mode = v
+        6  => c.sub_mode = v
+        7  => c.main_min = v
+        8  => c.main_max = v
+        9  => c.main_rep = v
+        10 => c.mode0_steps = v
+        11 => c.sync_phy = v
+        12 => c.rtt_type = v
+        13 => c.role = v
+        14 => c.ipt = v
+        15 => c.chsel = v
+        16 => c.c3_shape = v
+        17 => c.c3_jump = v
+        18 => c.t_ip1 = v
+        19 => c.t_ip2 = v
+        20 => c.t_fcs = v
+        _  => c.t_pm = v
+
+// The start record: the fields of LL_CS_REQ in the order of the PDU, and their widths; the power delta is signed and 8 bits wide.
+fn start_widths() -> [Int]
+    [6, 16, 24, 24, 16, 16, 8, 16, 24, 16, 16, 8, 8, 8, 8, 4, 4]
+
+fn start_get(s: StartPdu, f: Int) -> Int
+    match f
+        0  => s.config_id
+        1  => s.conn_event
+        2  => s.offset_min
+        3  => s.offset_max
+        4  => s.max_proc_len
+        5  => s.event_interval
+        6  => s.subevents
+        7  => s.subevent_interval
+        8  => s.subevent_len
+        9  => s.proc_interval
+        10 => s.proc_count
+        11 => s.aci
+        12 => s.pref_ant
+        13 => s.phy
+        14 => s.pwr_delta
+        15 => s.snr_i
+        _  => s.snr_r
+
+fn start_put(var s: StartPdu, f: Int, v: Int)
+    match f
+        0  => s.config_id = v
+        1  => s.conn_event = v
+        2  => s.offset_min = v
+        3  => s.offset_max = v
+        4  => s.max_proc_len = v
+        5  => s.event_interval = v
+        6  => s.subevents = v
+        7  => s.subevent_interval = v
+        8  => s.subevent_len = v
+        9  => s.proc_interval = v
+        10 => s.proc_count = v
+        11 => s.aci = v
+        12 => s.pref_ant = v
+        13 => s.phy = v
+        14 => s.pwr_delta = v
+        15 => s.snr_i = v
+        _  => s.snr_r = v
+
+// The value of the greatest `bits`-bit field, and of the greatest one that is signed (the power delta).
+fn top(bits: Int) -> Int
+    (1 << bits) - 1
+
+// A value for field `f` that is none of the boundaries, different for each field, to fill the fields that are not under test.
+fn filler(f: Int, bits: Int) -> Int
+    (0x5A5A5A5A5A + f * 0x0101010101) & top(bits)
+
+// ── Records and octets ──────────────────────────────────────────────
+
+fn caps_filled(v2: Bool) -> CapPdu
+    var c = ll_cs_pdu.cap_new()
+    cap_set_v2(var c, v2)
+    let w = cap_widths()
+    for f in 0..29
+        if v2 or f < 24
+            cap_put(var c, f, filler(f, w[f]))
+    c
+
+fn caps_equal(a: CapPdu, b: CapPdu) -> Bool
+    if a.v2 != b.v2
+        return false
+    for f in 0..29
+        if cap_get(a, f) != cap_get(b, f)
+            return false
+    true
+
+fn cfg_filled() -> CfgPdu
+    var c = ll_cs_pdu.cfg_new()
+    let w = cfg_widths()
+    for f in 0..22
+        cfg_put(var c, f, filler(f, w[f]))
+    cfg_put(var c, 1, 1)
+    c
+
+fn cfg_equal(a: CfgPdu, b: CfgPdu) -> Bool
+    for f in 0..22
+        if cfg_get(a, f) != cfg_get(b, f)
+            return false
+    true
+
+fn start_filled() -> StartPdu
+    var s = ll_cs_pdu.start_new()
+    let w = start_widths()
+    for f in 0..17
+        if f == 14
+            start_put(var s, f, -37)
+        else
+            start_put(var s, f, filler(f, w[f]))
+    s
+
+fn start_equal(a: StartPdu, b: StartPdu) -> Bool
+    for f in 0..17
+        if start_get(a, f) != start_get(b, f)
+            return false
+    true
+
+// The octet `k` of CtrData of the PDU.
+fn ctrl(var p: Pdu, k: Int) -> Int
+    ll_cs_pdu.ct(var p, k)
+
+// The length of the PDU as the header gives it, the opcode, and the octets the buffer holds, which is the header and the payload.
+fn check_shape(var p: Pdu, op: Int, ctr: Int)
+    test.assert_eq(ll_data.dpdu_opcode(var p), op)
+    test.assert_eq(ll_data.dpdu_len(var p), ctr + 1)
+    test.assert_eq(p.n, ctr + 3)
+    test.assert_eq(ll_data.dpdu_llid(var p), ll_data.LLID_CONTROL)
+
+// ── The lengths ─────────────────────────────────────────────────────
+
+@test
+fn test_the_fourteen_opcodes_have_the_lengths_of_the_specification()
+    let ops = [0x39, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x3A, 0x36, 0x37, 0x38]
+    let ctr = [20, 20, 25, 25, 27, 1, 28, 21, 18, 4, 4, 0, 72, 12]
+    for i in 0..14
+        test.assert(ll_cs.is_pdu(ops[i]))
+        test.assert_eq(ll_cs.pdu_payload_len(ops[i]), ctr[i] + 1)
+        test.assert(ll_cs.pdu_len_ok(ops[i], ctr[i] + 1))
+        test.assert(not ll_cs.pdu_len_ok(ops[i], ctr[i]))
+        test.assert(not ll_cs.pdu_len_ok(ops[i], ctr[i] + 2))
+
+@test
+fn test_the_capabilities_pdus_have_two_lengths_and_no_other()
+    for op in [0x2E, 0x2F]
+        test.assert(ll_cs.pdu_len_ok(op, 26))
+        test.assert(ll_cs.pdu_len_ok(op, 32))
+        for n in 0..80
+            if n != 26 and n != 32
+                test.assert(not ll_cs.pdu_len_ok(op, n))
+
+@test
+fn test_an_opcode_that_is_no_pdu_of_the_feature_has_no_length()
+    for op in [0x00, 0x2C, 0x3B, 0x3C, 0x3E, 0x3F, 0x07, 0x11]
+        test.assert_eq(ll_cs.pdu_payload_len(op), -1)
+        test.assert(not ll_cs.pdu_len_ok(op, 5))
+
+@test
+fn test_the_longest_pdu_is_75_octets_and_fits_a_buffer_of_the_link()
+    test.assert_eq(ll_cs_pdu.PDU_OCTETS_MAX, 2 + ll_cs.pdu_payload_len(0x37))
+    var longest = 0
+    for op in 0x2D..0x3B
+        let n = 2 + ll_cs.pdu_payload_len(op)
+        if n > longest
+            longest = n
+    test.assert_eq(longest, ll_cs_pdu.PDU_OCTETS_MAX)
+    test.assert(ll_cs_pdu.PDU_OCTETS_MAX < ll_pdu.DATA_OCTETS_MAX)
+
+// ── LL_CS_SEC_REQ and LL_CS_SEC_RSP ─────────────────────────────────
+
+@test
+fn test_sec_req_and_rsp_carry_iv_in_and_pv_in_that_order()
+    var s = ll_cs_pdu.sec_new()
+    for i in 0..8
+        s.iv[i] = (0x10 + i) as u8
+        s.pv[i] = (0x30 + i) as u8
+    for i in 0..4
+        s.inn[i] = (0x20 + i) as u8
+    for op in [ll_cs.OP_CS_SEC_REQ, ll_cs.OP_CS_SEC_RSP]
+        var p = ll_pdu.pdu_new()
+        ll_cs_pdu.put_sec(var p, op, var s)
+        check_shape(var p, op, 20)
+        for i in 0..8
+            test.assert_eq(ctrl(var p, i), 0x10 + i)
+            test.assert_eq(ctrl(var p, 12 + i), 0x30 + i)
+        for i in 0..4
+            test.assert_eq(ctrl(var p, 8 + i), 0x20 + i)
+        var t = ll_cs_pdu.sec_new()
+        test.assert(ll_cs_pdu.get_sec(var p, var t))
+        for i in 0..8
+            test.assert_eq(t.iv[i] as Int, 0x10 + i)
+            test.assert_eq(t.pv[i] as Int, 0x30 + i)
+        for i in 0..4
+            test.assert_eq(t.inn[i] as Int, 0x20 + i)
+
+@test
+fn test_sec_octets_hold_every_value_from_0_to_255()
+    for v in [0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF]
+        var s = ll_cs_pdu.sec_new()
+        for i in 0..8
+            s.iv[i] = v as u8
+            s.pv[i] = (255 - v) as u8
+        for i in 0..4
+            s.inn[i] = v as u8
+        var p = ll_pdu.pdu_new()
+        ll_cs_pdu.put_sec(var p, ll_cs.OP_CS_SEC_REQ, var s)
+        var t = ll_cs_pdu.sec_new()
+        test.assert(ll_cs_pdu.get_sec(var p, var t))
+        for i in 0..8
+            test.assert_eq(t.iv[i] as Int, v)
+            test.assert_eq(t.pv[i] as Int, 255 - v)
+        for i in 0..4
+            test.assert_eq(t.inn[i] as Int, v)
+
+@test
+fn test_a_sec_pdu_of_another_length_is_refused()
+    var s = ll_cs_pdu.sec_new()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_sec(var p, ll_cs.OP_CS_SEC_REQ, var s)
+    p.b[1] = 20
+    test.assert(not ll_cs_pdu.get_sec(var p, var s))
+    p.b[1] = 22
+    test.assert(not ll_cs_pdu.get_sec(var p, var s))
+
+// ── LL_CS_CAPABILITIES_REQ and LL_CS_CAPABILITIES_RSP ───────────────
+
+@test
+fn test_the_capabilities_octets_are_those_of_figure_2_65()
+    var c = ll_cs_pdu.cap_new()
+    cap_set_v2(var c, true)
+    let vals = [0x01, 0x02, 0x03, 0x04, 0x05, 0x0607, 0x0809, 0x0A, 0x3, 0x4, 0x2, 1, 1, 1, 1, 0x0B, 0x0C0D, 0x0E, 0x0F10, 0x1112, 0x1314, 0x1516, 1, 0x55, 0x1718, 0x19, 0x1A, 0x1B, 0x1C]
+    for f in 0..29
+        cap_put(var c, f, vals[f])
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var p, ll_cs.OP_CS_CAPABILITIES_REQ, var c)
+    check_shape(var p, ll_cs.OP_CS_CAPABILITIES_REQ, 31)
+    let want = [0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x06, 0x09, 0x08, 0x0A, 0x43, 0x3E, 0x0B, 0x0D, 0x0C, 0x0E, 0x10, 0x0F, 0x12, 0x11, 0x14, 0x13, 0x16, 0x15, 0xAB, 0x18, 0x17, 0x19, 0x1A, 0x1B, 0x1C]
+    for k in 0..31
+        test.assert_eq(ctrl(var p, k), want[k])
+
+@test
+fn test_every_capability_field_round_trips_at_its_boundaries_in_both_versions_and_both_pdus()
+    let w = cap_widths()
+    for op in [ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs.OP_CS_CAPABILITIES_RSP]
+        for v2 in [false, true]
+            var last = 24
+            if v2
+                last = 29
+            for f in 0..last
+                for v in [0, top(w[f]), 1, top(w[f]) - 1]
+                    var c = caps_filled(v2)
+                    cap_put(var c, f, v)
+                    var p = ll_pdu.pdu_new()
+                    ll_cs_pdu.put_caps(var p, op, var c)
+                    var n = 25
+                    if v2
+                        n = 31
+                    check_shape(var p, op, n)
+                    var d = ll_cs_pdu.cap_new()
+                    test.assert(ll_cs_pdu.get_caps(var p, var d))
+                    test.assert(caps_equal(c, d))
+
+@test
+fn test_the_fields_a_v1_record_lacks_read_zero_and_a_v1_pdu_never_carries_them()
+    var c = caps_filled(true)
+    cap_set_v2(var c, false)
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var p, ll_cs.OP_CS_CAPABILITIES_RSP, var c)
+    check_shape(var p, ll_cs.OP_CS_CAPABILITIES_RSP, 25)
+    var d = ll_cs_pdu.cap_new()
+    cap_put(var d, 24, 99)
+    test.assert(ll_cs_pdu.get_caps(var p, var d))
+    test.assert(not d.v2)
+    for f in 24..29
+        test.assert_eq(cap_get(d, f), 0)
+
+@test
+fn test_a_capabilities_pdu_of_another_length_is_refused()
+    var c = caps_filled(false)
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var p, ll_cs.OP_CS_CAPABILITIES_REQ, var c)
+    var d = ll_cs_pdu.cap_new()
+    for n in [0, 1, 24, 25, 27, 30, 31, 33, 40, 26, 32]
+        p.b[1] = n as u8
+        if n == 26 or n == 32
+            test.assert(ll_cs_pdu.get_caps(var p, var d))
+        else
+            test.assert(not ll_cs_pdu.get_caps(var p, var d))
+
+// ── LL_CS_CONFIG_REQ and LL_CS_CONFIG_RSP ───────────────────────────
+
+@test
+fn test_the_config_octets_are_those_of_figure_2_66()
+    var c = ll_cs_pdu.cfg_new()
+    cfg_put(var c, 0, 3)
+    cfg_put(var c, 1, 1)
+    cfg_put(var c, 2, 0x0102030405)
+    cfg_put(var c, 3, 0x060708090A)
+    let rest = [0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x9, 0x1, 1, 0x7, 0x1, 0x14, 0x15, 0x16, 0x17, 0x18]
+    for f in 4..22
+        cfg_put(var c, f, rest[f - 4])
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_req(var p, var c)
+    check_shape(var p, ll_cs.OP_CS_CONFIG_REQ, 27)
+    let want = [0x43, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x59, 0x17, 0x14, 0x15, 0x16, 0x17, 0x18, 0x00]
+    for k in 0..27
+        test.assert_eq(ctrl(var p, k), want[k])
+
+@test
+fn test_every_config_field_round_trips_at_its_boundaries()
+    let w = cfg_widths()
+    for f in 0..22
+        for v in [0, top(w[f]), 1, top(w[f]) - 1]
+            if f == 1
+                // Action: 0 removes (its own test), 2 and 3 are reserved values that the codec keeps.
+                if v == 0
+                    continue
+            var c = cfg_filled()
+            cfg_put(var c, f, v)
+            var p = ll_pdu.pdu_new()
+            ll_cs_pdu.put_config_req(var p, var c)
+            check_shape(var p, ll_cs.OP_CS_CONFIG_REQ, 27)
+            var d = ll_cs_pdu.cfg_new()
+            test.assert(ll_cs_pdu.get_config_req(var p, var d))
+            test.assert(cfg_equal(c, d))
+
+@test
+fn test_the_channel_map_of_a_config_carries_all_80_bits()
+    for bit in 0..80
+        var c = cfg_filled()
+        if bit < 40
+            cfg_put(var c, 2, 1 << bit)
+            cfg_put(var c, 3, 0)
+        else
+            cfg_put(var c, 2, 0)
+            cfg_put(var c, 3, 1 << (bit - 40))
+        var p = ll_pdu.pdu_new()
+        ll_cs_pdu.put_config_req(var p, var c)
+        var d = ll_cs_pdu.cfg_new()
+        test.assert(ll_cs_pdu.get_config_req(var p, var d))
+        for ch in 0..80
+            test.assert_eq(ll_cs_pdu.chm_has(d.chm_lo, d.chm_hi, ch), ch == bit)
+        test.assert_eq(ll_cs_pdu.chm_count(d.chm_lo, d.chm_hi), 1)
+
+@test
+fn test_a_config_that_removes_carries_zero_in_every_field_but_the_id_and_the_action()
+    for id in 0..4
+        var c = cfg_filled()
+        cfg_put(var c, 0, id)
+        cfg_put(var c, 1, 0)
+        var p = ll_pdu.pdu_new()
+        ll_cs_pdu.put_config_req(var p, var c)
+        check_shape(var p, ll_cs.OP_CS_CONFIG_REQ, 27)
+        test.assert_eq(ctrl(var p, 0), id)
+        for k in 1..27
+            test.assert_eq(ctrl(var p, k), 0)
+        var d = cfg_filled()
+        test.assert(ll_cs_pdu.get_config_req(var p, var d))
+        test.assert_eq(d.config_id, id)
+        test.assert_eq(d.action, 0)
+        for f in 2..22
+            test.assert_eq(cfg_get(d, f), 0)
+
+@test
+fn test_config_rsp_carries_the_id_in_six_bits()
+    for id in 0..64
+        var p = ll_pdu.pdu_new()
+        ll_cs_pdu.put_config_rsp(var p, id)
+        check_shape(var p, ll_cs.OP_CS_CONFIG_RSP, 1)
+        test.assert_eq(ll_cs_pdu.get_config_rsp(var p), id)
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_rsp(var p, 2)
+    p.b[3] = 0xC2
+    test.assert_eq(ll_cs_pdu.get_config_rsp(var p), 2)
+    p.b[1] = 3
+    test.assert_eq(ll_cs_pdu.get_config_rsp(var p), -1)
+
+@test
+fn test_a_config_pdu_of_another_length_is_refused()
+    var c = cfg_filled()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_config_req(var p, var c)
+    var d = ll_cs_pdu.cfg_new()
+    p.b[1] = 27
+    test.assert(not ll_cs_pdu.get_config_req(var p, var d))
+    p.b[1] = 29
+    test.assert(not ll_cs_pdu.get_config_req(var p, var d))
+
+// ── LL_CS_REQ, LL_CS_RSP and LL_CS_IND ──────────────────────────────
+
+@test
+fn test_the_req_octets_are_those_of_figure_2_68()
+    var s = ll_cs_pdu.start_new()
+    let vals = [0x2A, 0x0102, 0x030405, 0x060708, 0x090A, 0x0B0C, 0x0D, 0x0E0F, 0x101112, 0x1314, 0x1516, 0x17, 0x18, 0x04, -2, 0x3, 0xC]
+    for f in 0..17
+        start_put(var s, f, vals[f])
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_req(var p, var s)
+    check_shape(var p, ll_cs.OP_CS_REQ, 28)
+    let want = [0x2A, 0x02, 0x01, 0x05, 0x04, 0x03, 0x08, 0x07, 0x06, 0x0A, 0x09, 0x0C, 0x0B, 0x0D, 0x0F, 0x0E, 0x12, 0x11, 0x10, 0x14, 0x13, 0x16, 0x15, 0x17, 0x18, 0x04, 0xFE, 0xC3]
+    for k in 0..28
+        test.assert_eq(ctrl(var p, k), want[k])
+
+@test
+fn test_every_req_field_round_trips_at_its_boundaries()
+    let w = start_widths()
+    for f in 0..17
+        var vals = [0, top(w[f]), 1, top(w[f]) - 1]
+        if f == 14
+            vals = [-128, 127, 0, -1, 1]
+        for v in vals
+            var s = start_filled()
+            start_put(var s, f, v)
+            var p = ll_pdu.pdu_new()
+            ll_cs_pdu.put_req(var p, var s)
+            check_shape(var p, ll_cs.OP_CS_REQ, 28)
+            var d = ll_cs_pdu.start_new()
+            test.assert(ll_cs_pdu.get_req(var p, var d))
+            test.assert(start_equal(s, d))
+
+// The fields LL_CS_RSP has: Config_ID, connEventCount, Offset_Min, Offset_Max, Event_Interval, Subevents_Per_Event, Subevent_Interval, Subevent_Len, ACI,
+// PHY and Pwr_Delta; the others read as 0 and the SNR indices as 0xF.
+fn rsp_has(f: Int) -> Bool
+    f == 0 or f == 1 or f == 2 or f == 3 or f == 5 or f == 6 or f == 7 or f == 8 or f == 11 or f == 13 or f == 14
+
+@test
+fn test_the_rsp_octets_are_those_of_figure_2_69()
+    var s = ll_cs_pdu.start_new()
+    let vals = [0x2A, 0x0102, 0x030405, 0x060708, 0, 0x090A, 0x0B, 0x0C0D, 0x0E0F10, 0, 0, 0x11, 0, 0x02, -3, 0xF, 0xF]
+    for f in 0..17
+        start_put(var s, f, vals[f])
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_rsp(var p, var s)
+    check_shape(var p, ll_cs.OP_CS_RSP, 21)
+    let want = [0x2A, 0x02, 0x01, 0x05, 0x04, 0x03, 0x08, 0x07, 0x06, 0x0A, 0x09, 0x0B, 0x0D, 0x0C, 0x10, 0x0F, 0x0E, 0x11, 0x02, 0xFD, 0x00]
+    for k in 0..21
+        test.assert_eq(ctrl(var p, k), want[k])
+
+@test
+fn test_every_rsp_field_round_trips_at_its_boundaries_and_the_others_read_zero()
+    let w = start_widths()
+    for f in 0..17
+        if not rsp_has(f)
+            continue
+        var vals = [0, top(w[f]), 1, top(w[f]) - 1]
+        if f == 14
+            vals = [-128, 127, 0, -1, 1]
+        for v in vals
+            var s = start_filled()
+            start_put(var s, f, v)
+            var p = ll_pdu.pdu_new()
+            ll_cs_pdu.put_rsp(var p, var s)
+            check_shape(var p, ll_cs.OP_CS_RSP, 21)
+            var d = ll_cs_pdu.start_new()
+            test.assert(ll_cs_pdu.get_rsp(var p, var d))
+            for g in 0..17
+                if rsp_has(g)
+                    test.assert_eq(start_get(d, g), start_get(s, g))
+                else if g == 15 or g == 16
+                    test.assert_eq(start_get(d, g), 0xF)
+                else
+                    test.assert_eq(start_get(d, g), 0)
+
+// The fields LL_CS_IND has: Config_ID, connEventCount, Offset (in `offset_min`), Event_Interval, Subevents_Per_Event, Subevent_Interval, Subevent_Len, ACI, PHY
+// and Pwr_Delta.
+fn ind_has(f: Int) -> Bool
+    f == 0 or f == 1 or f == 2 or f == 5 or f == 6 or f == 7 or f == 8 or f == 11 or f == 13 or f == 14
+
+@test
+fn test_the_ind_octets_are_those_of_figure_2_70()
+    var s = ll_cs_pdu.start_new()
+    let vals = [0x2A, 0x0102, 0x030405, 0, 0, 0x0607, 0x08, 0x090A, 0x0B0C0D, 0, 0, 0x0E, 0, 0x04, -4, 0xF, 0xF]
+    for f in 0..17
+        start_put(var s, f, vals[f])
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_ind(var p, var s)
+    check_shape(var p, ll_cs.OP_CS_IND, 18)
+    let want = [0x2A, 0x02, 0x01, 0x05, 0x04, 0x03, 0x07, 0x06, 0x08, 0x0A, 0x09, 0x0D, 0x0C, 0x0B, 0x0E, 0x04, 0xFC, 0x00]
+    for k in 0..18
+        test.assert_eq(ctrl(var p, k), want[k])
+
+@test
+fn test_every_ind_field_round_trips_at_its_boundaries_and_the_others_read_zero()
+    let w = start_widths()
+    for f in 0..17
+        if not ind_has(f)
+            continue
+        var vals = [0, top(w[f]), 1, top(w[f]) - 1]
+        if f == 14
+            vals = [-128, 127, 0, -1, 1]
+        for v in vals
+            var s = start_filled()
+            start_put(var s, f, v)
+            var p = ll_pdu.pdu_new()
+            ll_cs_pdu.put_ind(var p, var s)
+            check_shape(var p, ll_cs.OP_CS_IND, 18)
+            var d = ll_cs_pdu.start_new()
+            test.assert(ll_cs_pdu.get_ind(var p, var d))
+            for g in 0..17
+                if ind_has(g)
+                    test.assert_eq(start_get(d, g), start_get(s, g))
+                else if g == 15 or g == 16
+                    test.assert_eq(start_get(d, g), 0xF)
+                else
+                    test.assert_eq(start_get(d, g), 0)
+
+@test
+fn test_the_config_id_of_a_start_pdu_is_six_bits_and_the_other_two_are_reserved()
+    var s = start_filled()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_req(var p, var s)
+    test.assert_eq(ctrl(var p, 0) & 0xC0, 0)
+    var d = ll_cs_pdu.start_new()
+    p.b[3] = 0xFF
+    test.assert(ll_cs_pdu.get_req(var p, var d))
+    test.assert_eq(d.config_id, 0x3F)
+
+@test
+fn test_a_start_pdu_of_another_length_is_refused()
+    var s = start_filled()
+    var d = ll_cs_pdu.start_new()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_req(var p, var s)
+    p.b[1] = 28
+    test.assert(not ll_cs_pdu.get_req(var p, var d))
+    ll_cs_pdu.put_rsp(var p, var s)
+    p.b[1] = 20
+    test.assert(not ll_cs_pdu.get_rsp(var p, var d))
+    ll_cs_pdu.put_ind(var p, var s)
+    p.b[1] = 20
+    test.assert(not ll_cs_pdu.get_ind(var p, var d))
+
+// ── LL_CS_TERMINATE_REQ and LL_CS_TERMINATE_RSP ─────────────────────
+
+@test
+fn test_the_terminate_pdus_carry_the_id_the_proc_count_and_the_error()
+    for op in [ll_cs.OP_CS_TERMINATE_REQ, ll_cs.OP_CS_TERMINATE_RSP]
+        for id in [0, 1, 63]
+            for count in [0, 1, 0x7FFF, 0xFFFF]
+                for err in [0, 0x13, 0x28, 0xFF]
+                    var t = ll_cs_pdu.term_new(id, count, err)
+                    var p = ll_pdu.pdu_new()
+                    ll_cs_pdu.put_terminate(var p, op, var t)
+                    check_shape(var p, op, 4)
+                    test.assert_eq(ctrl(var p, 0), id)
+                    test.assert_eq(ctrl(var p, 1), count & 0xFF)
+                    test.assert_eq(ctrl(var p, 2), count >>> 8)
+                    test.assert_eq(ctrl(var p, 3), err)
+                    var u = ll_cs_pdu.term_new(0, 0, 0)
+                    test.assert(ll_cs_pdu.get_terminate(var p, var u))
+                    test.assert_eq(u.config_id, id)
+                    test.assert_eq(u.proc_count, count)
+                    test.assert_eq(u.error, err)
+
+@test
+fn test_a_terminate_pdu_of_another_length_is_refused()
+    var t = ll_cs_pdu.term_new(1, 2, 3)
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_terminate(var p, ll_cs.OP_CS_TERMINATE_REQ, var t)
+    p.b[1] = 4
+    test.assert(not ll_cs_pdu.get_terminate(var p, var t))
+    p.b[1] = 6
+    test.assert(not ll_cs_pdu.get_terminate(var p, var t))
+
+// ── LL_CS_FAE_REQ and LL_CS_FAE_RSP ─────────────────────────────────
+
+@test
+fn test_fae_req_has_no_ctrdata()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_req(var p)
+    check_shape(var p, ll_cs.OP_CS_FAE_REQ, 0)
+
+@test
+fn test_fae_rsp_carries_72_signed_octets()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_begin(var p)
+    for i in 0..72
+        ll_cs_pdu.put_fae_value(var p, i * 7 - 128)
+    ll_cs_pdu.put_fae_end(var p)
+    check_shape(var p, ll_cs.OP_CS_FAE_RSP, 72)
+    test.assert_eq(p.n, ll_cs_pdu.PDU_OCTETS_MAX)
+    for i in 0..72
+        var want = i * 7 - 128
+        if want > 127
+            want = want - 256
+        test.assert_eq(ll_cs_pdu.fae_value(var p, i), want)
+
+@test
+fn test_fae_values_hold_the_ends_of_the_signed_range()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_begin(var p)
+    for i in 0..72
+        if i % 2 == 0
+            ll_cs_pdu.put_fae_value(var p, -128)
+        else
+            ll_cs_pdu.put_fae_value(var p, 127)
+    ll_cs_pdu.put_fae_end(var p)
+    for i in 0..72
+        if i % 2 == 0
+            test.assert_eq(ll_cs_pdu.fae_value(var p, i), -128)
+        else
+            test.assert_eq(ll_cs_pdu.fae_value(var p, i), 127)
+
+@test
+fn test_a_pdu_of_the_longest_length_is_written_whole_past_the_39_octets_of_an_advertising_pdu()
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_fae_begin(var p)
+    for i in 0..72
+        ll_cs_pdu.put_fae_value(var p, 0x80 + i)
+    ll_cs_pdu.put_fae_end(var p)
+    test.assert_eq(p.n, 75)
+    test.assert_eq(p.b[1] as Int, 73)
+    test.assert_eq(p.b[74] as Int, 0x80 + 71)
+
+// ── LL_CS_CHANNEL_MAP_IND ───────────────────────────────────────────
+
+@test
+fn test_the_channel_map_pdu_carries_the_map_and_the_instant()
+    var m = ll_cs_pdu.chm_new(0x0102030405, 0x060708090A, 0x0B0C)
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var p, var m)
+    check_shape(var p, ll_cs.OP_CS_CHANNEL_MAP_IND, 12)
+    let want = [0x05, 0x04, 0x03, 0x02, 0x01, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x0C, 0x0B]
+    for k in 0..12
+        test.assert_eq(ctrl(var p, k), want[k])
+    var d = ll_cs_pdu.chm_new(0, 0, 0)
+    test.assert(ll_cs_pdu.get_channel_map(var p, var d))
+    test.assert_eq(d.lo, 0x0102030405)
+    test.assert_eq(d.hi, 0x060708090A)
+    test.assert_eq(d.instant, 0x0B0C)
+
+@test
+fn test_the_channel_map_pdu_holds_the_boundaries_of_its_fields()
+    for lo in [0, 0xFFFFFFFFFF, 1, 0x8000000000]
+        for hi in [0, 0xFFFFFFFFFF, 1, 0x8000000000]
+            for instant in [0, 0xFFFF, 1, 0x8000]
+                var m = ll_cs_pdu.chm_new(lo, hi, instant)
+                var p = ll_pdu.pdu_new()
+                ll_cs_pdu.put_channel_map(var p, var m)
+                var d = ll_cs_pdu.chm_new(5, 5, 5)
+                test.assert(ll_cs_pdu.get_channel_map(var p, var d))
+                test.assert_eq(d.lo, lo)
+                test.assert_eq(d.hi, hi)
+                test.assert_eq(d.instant, instant)
+
+@test
+fn test_a_channel_map_pdu_of_another_length_is_refused()
+    var m = ll_cs_pdu.chm_new(1, 2, 3)
+    var p = ll_pdu.pdu_new()
+    ll_cs_pdu.put_channel_map(var p, var m)
+    p.b[1] = 12
+    test.assert(not ll_cs_pdu.get_channel_map(var p, var m))
+    p.b[1] = 14
+    test.assert(not ll_cs_pdu.get_channel_map(var p, var m))
+
+// ── The channel map helpers ─────────────────────────────────────────
+
+@test
+fn test_the_allowed_channel_map_names_the_72_channels_of_the_specification()
+    for ch in 0..80
+        test.assert_eq(ll_cs_pdu.chm_has(CHM_LO_ALLOWED, CHM_HI_ALLOWED, ch), ll_cs.channel_ok(ch))
+    test.assert_eq(ll_cs_pdu.chm_count(CHM_LO_ALLOWED, CHM_HI_ALLOWED), ll_cs.CHANNEL_COUNT)
+
+@test
+fn test_chm_count_counts_the_bits_of_both_halves()
+    test.assert_eq(ll_cs_pdu.chm_count(0, 0), 0)
+    test.assert_eq(ll_cs_pdu.chm_count(0xFFFFFFFFFF, 0xFFFFFFFFFF), 80)
+    test.assert_eq(ll_cs_pdu.chm_count(0x5, 0x3), 4)
+
+// ── The PHY encodings ───────────────────────────────────────────────
+
+@test
+fn test_the_config_sync_phy_converts_both_ways()
+    test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(1), 0x01)
+    test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(2), 0x02)
+    test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(3), 0x08)
+    for hci in [0, 4, 255, -1]
+        test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(hci), -1)
+    for hci in [1, 2, 3]
+        test.assert_eq(ll_cs_pdu.sync_phy_to_hci(sync_phy_to_pdu(hci)), hci)
+    // LE Coded (bit 2), no bit, two bits and the reserved bits name no PHY of Channel Sounding.
+    for bit in [0x00, 0x04, 0x03, 0x09, 0x10, 0xFF]
+        test.assert_eq(ll_cs_pdu.sync_phy_to_hci(bit), -1)
+
+@test
+fn test_the_capability_bit_of_a_sync_phy_follows_table_2_30()
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(1), 0)
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(2), 0x02)
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(3), 0x04)
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(0), -1)
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(4), -1)
+
+@test
+fn test_a_capability_mask_allows_a_pdu_sync_phy_by_its_bit_and_never_le_coded()
+    test.assert(ll_cs_pdu.sync_phy_allowed(0, 0x01))
+    test.assert(not ll_cs_pdu.sync_phy_allowed(0, 0x02))
+    test.assert(ll_cs_pdu.sync_phy_allowed(0x02, 0x02))
+    test.assert(not ll_cs_pdu.sync_phy_allowed(0x02, 0x08))
+    test.assert(ll_cs_pdu.sync_phy_allowed(0x04, 0x08))
+    test.assert(not ll_cs_pdu.sync_phy_allowed(0x06, 0x04))
+    test.assert(not ll_cs_pdu.sync_phy_allowed(0x06, 0x00))
+    test.assert(not ll_cs_pdu.sync_phy_allowed(0x06, 0x03))
+
+@test
+fn test_the_procedure_phy_converts_both_ways()
+    for hci in [1, 2, 3, 4]
+        let bit = ll_cs_pdu.proc_phy_to_pdu(hci)
+        test.assert_eq(bit, 1 << (hci - 1))
+        test.assert_eq(ll_cs_pdu.proc_phy_to_hci(bit), hci)
+    for hci in [0, 5, -1, 255]
+        test.assert_eq(ll_cs_pdu.proc_phy_to_pdu(hci), -1)
+    for bit in [0x00, 0x03, 0x05, 0x0F, 0x10, 0x80]
+        test.assert_eq(ll_cs_pdu.proc_phy_to_hci(bit), -1)
+
+@test
+fn test_the_five_phy_encodings_name_the_same_phy_where_they_share_one()
+    // LE 1M and LE 2M are the first two in every encoding; LE 2M 2BT is 3 for the HCI sync PHY, bit 3 of the config PDU and bit 2 of the capability mask.
+    test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(2), ll_cs_pdu.proc_phy_to_pdu(2))
+    test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(1), ll_cs_pdu.proc_phy_to_pdu(1))
+    test.assert_eq(ll_cs_pdu.sync_phy_to_pdu(3), 1 << 3)
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(3), 1 << 2)
+    test.assert_eq(ll_cs_pdu.sync_phy_cap_bit(2), 1 << 1)
+
+// ── The setters ─────────────────────────────────────────────────────
+
+@test
+fn test_a_capability_record_is_made_the_v2_one_or_the_v1_one()
+    var c = ll_cs_pdu.cap_new()
+    test.assert(not c.v2)
+    ll_cs_pdu.cap_version(var c, true)
+    test.assert(c.v2)
+    ll_cs_pdu.cap_version(var c, false)
+    test.assert(not c.v2)
+
+@test
+fn test_the_fields_an_answer_chooses_are_the_event_the_phy_and_the_power_delta()
+    var s = start_filled()
+    ll_cs_pdu.start_answer(var s, 0x1234, 0x08, -9)
+    test.assert_eq(s.conn_event, 0x1234)
+    test.assert_eq(s.phy, 0x08)
+    test.assert_eq(s.pwr_delta, -9)
+    test.assert_eq(s.config_id, start_filled().config_id)
+    test.assert_eq(s.subevent_len, start_filled().subevent_len)
+
+@test
+fn test_a_start_record_is_cleared_to_zero_with_the_snr_indices_at_0xf()
+    var s = start_filled()
+    ll_cs_pdu.start_clear(var s)
+    for f in 0..17
+        if f == 15 or f == 16
+            test.assert_eq(start_get(s, f), 0xF)
+        else
+            test.assert_eq(start_get(s, f), 0)
+    var n = ll_cs_pdu.start_new()
+    test.assert_eq(n.snr_i, 0xF)
+    test.assert_eq(n.snr_r, 0xF)
