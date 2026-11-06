@@ -1,0 +1,356 @@
+// tests/ll_cs_res_tests.nv — the unit tests of src/ll_cs_res.nv: the length of the data of a step in each mode and role, its octets against the tables of
+// [Vol 4] Part E, Section 7.7.65.44, and the time difference of a round-trip step against the nominal offsets of [Vol 6] Part H, Section 4.3.
+//
+// The records of the radio are `@value` structs; the tests write them through `var` parameters, as the Link Layer's helpers do.
+//
+//   novo test tests/ll_cs_res_tests.nv
+
+use std.test
+use ll_cs_res
+use ll_cs_plan
+use ll_cs_radio
+use ll_cs
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// The head of a plan: the role, the PHY, the RTT type, the antenna paths and the timings (T_IP1, T_IP2, T_PM and T_SW in microseconds).
+fn head_of(var h: CsPlan, role: Int, phy: Int, rtt: Int, n_ap: Int, ip1: Int, ip2: Int, pm: Int, sw: Int)
+    h.role = role as u8
+    h.phy = phy as u8
+    h.rtt = rtt as u8
+    h.n_ap = n_ap as u8
+    h.t_ip1_us = ip1 as u8
+    h.t_ip2_us = ip2 as u8
+    h.t_pm_us = pm as u8
+    h.t_sw_us = sw as u8
+
+fn step_of(var s: CsStep, mode: Int, ch: Int, perm: Int, ext_i: Bool, ext_r: Bool)
+    s.mode = mode as u8
+    s.ch = ch as u8
+    s.perm = perm as u8
+    s.ext_i = ext_i
+    s.ext_r = ext_r
+
+// A step the radio ran: the access address check, the bit errors, RSSI, antenna, the departure and arrival of CS_SYNC in picoseconds, the frequency offset and the two PCTs.
+fn raw_of(var r: CsStepRaw, aa_q: Int, errors: Int, rssi: Int, ant: Int, tod: Int, toa: Int, ffo: Int)
+    r.done = true
+    r.aa_q = aa_q as u8
+    r.bit_errors = errors as u8
+    r.rssi_dbm = rssi as i8
+    r.ant = ant as u8
+    r.tod_ps = tod
+    r.toa_ps = toa
+    r.toa_valid = true
+    r.tod_valid = true
+    r.ffo = ffo as u16
+    r.pct1 = 0x00ABCDEF
+    r.pct2 = 0x00123456
+
+fn invalid_times(var r: CsStepRaw, toa: Bool, tod: Bool)
+    r.toa_valid = toa
+    r.tod_valid = tod
+
+fn cal_of(var k: CsCal, tx1: Int, rx1: Int, tx2: Int, rx2: Int, tx3: Int, rx3: Int)
+    k.tx_1m_ps = tx1
+    k.rx_1m_ps = rx1
+    k.tx_2m_ps = tx2
+    k.rx_2m_ps = rx2
+    k.tx_2bt_ps = tx3
+    k.rx_2bt_ps = rx3
+
+fn tone(var r: CsStepRaw, i: Int, q: Int, tq: Int, present: Bool)
+    let t = ll_cs_radio.CsTone { i: i as i16, q: q as i16, tq: tq as u8, present: present }
+    let _a = r.tones.push(t)
+
+fn u16at(d: Vec[u8; 40], at: Int) -> Int
+    (d[at] as Int) | ((d[at + 1] as Int) << 8)
+
+fn u24at(d: Vec[u8; 40], at: Int) -> Int
+    u16at(d, at) | ((d[at + 2] as Int) << 16)
+
+// ── The lengths ─────────────────────────────────────────────────────
+
+@test
+fn test_the_data_of_a_step_has_the_length_the_tables_of_the_event_give()
+    // Mode 0: 5 octets for the initiator, 3 for the reflector.
+    test.assert_eq(ll_cs_res.data_len(0, 0, 0, 1, false), 5)
+    test.assert_eq(ll_cs_res.data_len(1, 0, 0, 1, false), 3)
+    // Mode 1: 6, and 14 with a sounding sequence when the PCTs are reported; a random sequence has no PCT.
+    test.assert_eq(ll_cs_res.data_len(0, 1, 0, 1, true), 6)
+    test.assert_eq(ll_cs_res.data_len(1, 1, 1, 1, true), 14)
+    test.assert_eq(ll_cs_res.data_len(1, 1, 2, 1, true), 14)
+    test.assert_eq(ll_cs_res.data_len(1, 1, 1, 1, false), 6)
+    test.assert_eq(ll_cs_res.data_len(1, 1, 3, 1, true), 6)
+    // Mode 2: 1 + 4 (N_AP + 1): 9, 13, 17, 21.
+    for n in 1..5
+        test.assert_eq(ll_cs_res.data_len(0, 2, 0, n, false), 1 + 4 * (n + 1))
+        test.assert_eq(ll_cs_res.data_len(1, 2, 5, n, true), 1 + 4 * (n + 1))
+    // Mode 3: 7 + 4 (N_AP + 1), 15 to 27, and 35 at most with the PCTs.
+    test.assert_eq(ll_cs_res.data_len(0, 3, 0, 1, false), 15)
+    test.assert_eq(ll_cs_res.data_len(0, 3, 0, 4, false), 27)
+    test.assert_eq(ll_cs_res.data_len(0, 3, 2, 4, true), 35)
+    test.assert(ll_cs_res.data_len(0, 3, 2, 4, true) <= ll_cs_res.DATA_OCTETS_MAX)
+
+@test
+fn test_a_step_that_did_not_run_takes_three_octets_and_one_that_did_takes_its_data_as_well()
+    test.assert_eq(ll_cs_res.record_len(0, 2, 0, 1, false, false), 3)
+    test.assert_eq(ll_cs_res.record_len(0, 2, 0, 1, false, true), 3 + 9)
+    test.assert_eq(ll_cs_res.record_len(1, 0, 0, 1, false, true), 3 + 3)
+
+@test
+fn test_the_rtt_types_name_the_sequences()
+    test.assert(not ll_cs_res.rtt_sounding(0))
+    test.assert(ll_cs_res.rtt_sounding(1))
+    test.assert(ll_cs_res.rtt_sounding(2))
+    test.assert(not ll_cs_res.rtt_sounding(3))
+    test.assert(not ll_cs_res.rtt_random(2))
+    test.assert(ll_cs_res.rtt_random(3))
+    test.assert(ll_cs_res.rtt_random(6))
+    test.assert(not ll_cs_res.rtt_random(0))
+
+// ── The fields ──────────────────────────────────────────────────────
+
+@test
+fn test_the_packet_quality_carries_the_check_and_the_bit_errors_of_a_sequence_in_a_round_trip_step()
+    test.assert_eq(ll_cs_res.packet_quality(0, 3, 0, 1), 0)
+    test.assert_eq(ll_cs_res.packet_quality(2, 3, 0, 1), 2)
+    test.assert_eq(ll_cs_res.packet_quality(1, 3, 3, 1), 0x31)
+    test.assert_eq(ll_cs_res.packet_quality(1, 40, 3, 3), 0xF1)
+    test.assert_eq(ll_cs_res.packet_quality(0, 9, 3, 0), 0)
+
+@test
+fn test_picoseconds_become_half_nanoseconds_rounded_to_the_nearest()
+    test.assert_eq(ll_cs_res.half_ns(0), 0)
+    test.assert_eq(ll_cs_res.half_ns(249), 0)
+    test.assert_eq(ll_cs_res.half_ns(250), 1)
+    test.assert_eq(ll_cs_res.half_ns(500), 1)
+    test.assert_eq(ll_cs_res.half_ns(1_000_000), 2000)
+    test.assert_eq(ll_cs_res.half_ns(-249), 0)
+    test.assert_eq(ll_cs_res.half_ns(-250), -1)
+    test.assert_eq(ll_cs_res.half_ns(-1_000_000), -2000)
+
+@test
+fn test_a_phase_correction_term_is_i_in_the_low_12_bits_and_q_above_in_twos_complement()
+    test.assert_eq(ll_cs_res.tone_pct(0, 0), 0)
+    test.assert_eq(ll_cs_res.tone_pct(1, 2), 0x002001)
+    test.assert_eq(ll_cs_res.tone_pct(-1, -2), 0xFFEFFF)
+    test.assert_eq(ll_cs_res.tone_pct(2047, -2048), 0x8007FF)
+    test.assert_eq(ll_cs_res.tone_pct(0x1FFF, 0), 0xFFF)
+
+@test
+fn test_the_delays_of_the_antenna_port_are_those_of_the_phy_of_the_step()
+    var k = ll_cs_radio.cs_cal_none()
+    cal_of(var k, 1, 2, 3, 4, 5, 6)
+    test.assert_eq(ll_cs_res.tx_delay(var k, 1), 1)
+    test.assert_eq(ll_cs_res.rx_delay(var k, 1), 2)
+    test.assert_eq(ll_cs_res.tx_delay(var k, 2), 3)
+    test.assert_eq(ll_cs_res.rx_delay(var k, 2), 4)
+    test.assert_eq(ll_cs_res.tx_delay(var k, 3), 5)
+    test.assert_eq(ll_cs_res.rx_delay(var k, 3), 6)
+
+// ── The time difference ─────────────────────────────────────────────
+
+@test
+fn test_the_nominal_offset_of_a_round_trip_step_is_the_sync_the_ramp_down_and_the_interlude()
+    var h = ll_cs_radio.cs_plan_new()
+    // LE 1M, AA only: 44 + 5 + 145 microseconds.
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 1, false), 194_000)
+    // LE 2M: the CS_SYNC is 26 microseconds; a 32-bit random sequence on LE 1M is 76.
+    head_of(var h, 0, 2, 0, 1, 145, 145, 40, 0)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 1, false), 176_000)
+    head_of(var h, 0, 1, 3, 1, 145, 145, 40, 0)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 1, false), 76_000 + 5_000 + 145_000)
+    head_of(var h, 0, 1, 0, 1, 30, 145, 40, 0)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 1, false), 44_000 + 5_000 + 30_000)
+
+@test
+fn test_the_nominal_offset_of_a_mode_3_step_adds_the_tones_and_the_guard_times_and_the_extension_slot_when_it_carries_a_tone()
+    var h = ll_cs_radio.cs_plan_new()
+    // T_SY 44, T_RD 5, 2 T_GD 20, 2 (T_SW + T_PM) N_AP 80, one slot of 40, T_IP2 145: 334; with the extension slot's tone 374.
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 3, false), 334_000)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 3, true), 374_000)
+    // Four paths and a 10 microsecond switch: 2 (10 + 40) 4 = 400, the slot 50 (or 100).
+    head_of(var h, 0, 1, 0, 4, 145, 145, 40, 10)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 3, false), 44_000 + 5_000 + 20_000 + 400_000 + 50_000 + 145_000)
+    test.assert_eq(ll_cs_res.center_delta_ns(var h, 3, true), 44_000 + 5_000 + 20_000 + 400_000 + 100_000 + 145_000)
+
+@test
+fn test_an_initiator_reports_arrival_less_departure_and_a_reflector_departure_less_arrival_without_the_nominal_offset()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 1, 10, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    // 194 microseconds and 20 nanoseconds of flight: 40 half nanoseconds.
+    raw_of(var r, 0, 0, -40, 1, 1_000_000, 1_000_000 + 194_000_000 + 20_000, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), 40)
+    // The reflector's departure follows the arrival by the nominal 194 microseconds: nothing is left.
+    head_of(var h, 1, 1, 0, 1, 145, 145, 40, 0)
+    raw_of(var r, 0, 0, -40, 1, 1_000_000 + 194_000_000, 1_000_000, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), 0)
+    // Slower than the nominal by 100 nanoseconds.
+    raw_of(var r, 0, 0, -40, 1, 1_000_000 + 194_100_000, 1_000_000, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), 200)
+    // And faster: a negative value.
+    raw_of(var r, 0, 0, -40, 1, 1_000_000 + 193_900_000, 1_000_000, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), -200)
+
+@test
+fn test_the_delays_between_the_timestamps_and_the_antenna_port_are_taken_off_the_time_difference()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 1, 10, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    // The timestamp of departure is taken 1,500 ps before the antenna port and the one of arrival 2,500 ps after it: the round trip is 4,000 ps shorter.
+    var k = ll_cs_radio.cs_cal_none()
+    cal_of(var k, 1_500, 2_500, 0, 0, 0, 0)
+    raw_of(var r, 0, 0, -40, 1, 1_000_000, 1_000_000 + 194_000_000 + 24_000, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), 40)
+
+@test
+fn test_a_time_that_was_not_measured_or_does_not_fit_in_sixteen_bits_is_not_available()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 1, 10, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    raw_of(var r, 0, 0, -40, 1, 0, 194_020_000, 0)
+    invalid_times(var r, false, true)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), ll_cs_res.TIME_NA)
+    invalid_times(var r, true, false)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), ll_cs_res.TIME_NA)
+    // 16.4 microseconds is the range: a minute of flight is beyond it.
+    raw_of(var r, 0, 0, -40, 1, 0, 194_000_000 + 20_000_000, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), ll_cs_res.TIME_NA)
+    raw_of(var r, 0, 0, -40, 1, 0, 194_000_000 + 16_383_500, 0)
+    test.assert_eq(ll_cs_res.time_diff(var h, var s, var r, var k), 32767)
+
+// ── The data of a step ──────────────────────────────────────────────
+
+@test
+fn test_the_data_of_a_mode_0_step_is_the_quality_the_rssi_the_antenna_and_for_an_initiator_the_frequency_offset()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 0, 5, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    raw_of(var r, 1, 7, -45, 2, 0, 0, 0xC123)
+    var d = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d, var h, var s, var r, var k, false), 5)
+    // The bit errors are for a sequence of a round-trip step: not in mode 0.
+    test.assert_eq(d[0] as Int, 1)
+    test.assert_eq(d[1] as Int, 0xD3)
+    test.assert_eq(d[2] as Int, 2)
+    test.assert_eq(u16at(d, 3), 0xC123)
+    head_of(var h, 1, 1, 0, 1, 145, 145, 40, 0)
+    var d2 = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d2, var h, var s, var r, var k, false), 3)
+    test.assert_eq(d2[1] as Int, 0xD3)
+    test.assert_eq(d2[2] as Int, 2)
+
+@test
+fn test_the_data_of_a_mode_1_step_adds_the_nadm_the_time_difference_and_the_pcts_of_a_sounding_sequence()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 3, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 1, 5, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    raw_of(var r, 0, 4, -45, 3, 1_000_000, 1_000_000 + 76_000_000 + 5_000_000 + 145_000_000 + 10_000, 0)
+    var d = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d, var h, var s, var r, var k, true), 6)
+    // Packet_Quality with 4 bit errors, Packet_NADM unknown, Packet_RSSI, ToA_ToD (20 half nanoseconds), Packet_Antenna.
+    test.assert_eq(d[0] as Int, 0x40)
+    test.assert_eq(d[1] as Int, 0xFF)
+    test.assert_eq(d[2] as Int, 0xD3)
+    test.assert_eq(u16at(d, 3), 20)
+    test.assert_eq(d[5] as Int, 3)
+    // A sounding sequence adds PCT1 and PCT2, 4 octets each.
+    head_of(var h, 0, 1, 1, 1, 145, 145, 40, 0)
+    var d2 = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d2, var h, var s, var r, var k, true), 14)
+    test.assert_eq(u24at(d2, 6) | ((d2[9] as Int) << 24), 0x00ABCDEF)
+    test.assert_eq(u24at(d2, 10) | ((d2[13] as Int) << 24), 0x00123456)
+    var d3 = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d3, var h, var s, var r, var k, false), 6)
+
+@test
+fn test_the_data_of_a_mode_2_step_is_the_permutation_and_a_pct_and_a_quality_for_every_path_and_the_extension_slot()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 2, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 2, 9, 1, false, true)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    raw_of(var r, 0, 0, -45, 1, 0, 0, 0)
+    tone(var r, 100, -50, 0, true)
+    tone(var r, -3, 7, 1, true)
+    tone(var r, 5, 5, 2, true)
+    var d = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d, var h, var s, var r, var k, false), 13)
+    test.assert_eq(d[0] as Int, 1)
+    test.assert_eq(u24at(d, 1), 100 | ((-50 & 0xFFF) << 12))
+    test.assert_eq(d[4] as Int, 0)
+    test.assert_eq(u24at(d, 5), (-3 & 0xFFF) | (7 << 12))
+    test.assert_eq(d[8] as Int, 1)
+    // The extension slot: the reflector's tone is expected by the initiator (the high nibble 2).
+    test.assert_eq(u24at(d, 9), 5 | (5 << 12))
+    test.assert_eq(d[12] as Int, 0x22)
+    // The reflector expects the initiator's: the slot says "not expected" when the initiator sent none.
+    head_of(var h, 1, 1, 0, 2, 145, 145, 40, 0)
+    var d2 = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d2, var h, var s, var r, var k, false), 13)
+    test.assert_eq(d2[12] as Int, 0x12)
+
+@test
+fn test_a_tone_slot_with_no_measurement_reads_zeros_and_not_available()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 2, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 2, 9, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    raw_of(var r, 0, 0, -45, 1, 0, 0, 0)
+    // The radio gives one tone present, one absent, and none for the third slot.
+    tone(var r, 8, 9, 0, true)
+    tone(var r, 8, 9, 0, false)
+    var d = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d, var h, var s, var r, var k, false), 13)
+    test.assert_eq(u24at(d, 5), 0)
+    test.assert_eq(d[8] as Int, 3)
+    test.assert_eq(u24at(d, 9), 0)
+    test.assert_eq(d[12] as Int, 0x13)
+
+@test
+fn test_the_data_of_a_mode_3_step_is_the_round_trip_fields_then_the_tones()
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 0, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 3, 9, 4, false, true)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    // The departure and arrival that make a mode 3 round trip of 1 nanosecond: 374 microseconds nominal with the reflector's tone in the extension slot.
+    raw_of(var r, 0, 0, -45, 1, 0, 374_000_000 + 1_000, 0)
+    tone(var r, 1, 2, 0, true)
+    tone(var r, 3, 4, 0, true)
+    var d = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d, var h, var s, var r, var k, false), 15)
+    test.assert_eq(d[1] as Int, 0xFF)
+    test.assert_eq(u16at(d, 3), 2)
+    test.assert_eq(d[5] as Int, 1)
+    test.assert_eq(d[6] as Int, 4)
+    test.assert_eq(u24at(d, 7), 1 | (2 << 12))
+    test.assert_eq(d[10] as Int, 0)
+    test.assert_eq(u24at(d, 11), 3 | (4 << 12))
+    test.assert_eq(d[14] as Int, 0x20)
+    // With a sounding sequence the PCTs come between the antenna and the permutation.
+    head_of(var h, 0, 1, 1, 1, 145, 145, 40, 0)
+    var d2 = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d2, var h, var s, var r, var k, true), 23)
+    test.assert_eq(d2[14] as Int, 4)

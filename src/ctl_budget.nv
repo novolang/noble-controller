@@ -33,9 +33,12 @@ const CTL_PAWR_BUF_RECORD = 56
 const CTL_CS_GEN_RECORD = 712
 const CTL_CS_PLAN_FIXED = 32
 const CTL_CS_STEP_RECORD = 56
-const CTL_CS_WORDS = 272
+const CTL_CS_WORDS = 304
 const CTL_CS_STORE = 224
-const CTL_CS_CONFIG = 32
+const CTL_CS_CONFIG = 56
+const CTL_CS_GLOBAL_WORDS = 320
+const CTL_CS_GLOBAL_OCTETS = 160
+const CTL_CS_RESULT_STEP = 40
 
 // The larger of `n` and 1: a table of an absent feature keeps one record.  A `const fn` of another module cannot take part in
 // the `assert_const` below, so this module keeps its own copy of the one in ctl_limits.nv.
@@ -112,12 +115,14 @@ const fn controller_pawr_bytes() -> Int
     adv + sync
 
 // Channel Sounding: for each connection that runs it, the generator of the planning (`CsState` of ll_cs_plan.nv), and the two tables of the records of the
-// procedures, 272 B of words and 224 B of store with 32 B of store more for each configuration; and the plan of one subevent, which holds as many steps as
+// procedures, 304 B of words and 224 B of store with 56 B of store more for each configuration; after the records, in the same tables, what the Controller keeps for all its
+// connections (40 words, 160 octets, and 40 octets for each step of the result of a subevent); and the plan of one subevent, which holds as many steps as
 // `ctl_cs_steps`.  With the feature out the two tables of the procedures stay at one element each and the rest is not made.
 @tier(embedded)
 const fn controller_cs_bytes() -> Int
     if noble_controller_config.CTL_CS > 0
-        vec_bytes(noble_controller_config.CTL_CS, CTL_CS_GEN_RECORD) + vec_bytes(noble_controller_config.CTL_CS, CTL_CS_WORDS) + vec_bytes(noble_controller_config.CTL_CS, CTL_CS_STORE + CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS) + CTL_CS_PLAN_FIXED + vec_bytes(noble_controller_config.CTL_CS_STEPS, CTL_CS_STEP_RECORD)
+        vec_bytes(noble_controller_config.CTL_CS, CTL_CS_GEN_RECORD) + vec_bytes(noble_controller_config.CTL_CS, CTL_CS_WORDS) + CTL_CS_GLOBAL_WORDS + vec_bytes(noble_controller_config.CTL_CS,
+            CTL_CS_STORE + CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS) + CTL_CS_GLOBAL_OCTETS + CTL_CS_RESULT_STEP * noble_controller_config.CTL_CS_STEPS + CTL_CS_PLAN_FIXED + vec_bytes(noble_controller_config.CTL_CS_STEPS, CTL_CS_STEP_RECORD)
     else
         vec_bytes(1, 8) + vec_bytes(1, 1)
 

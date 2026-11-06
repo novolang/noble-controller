@@ -1,0 +1,578 @@
+// src/ll_cs_hci.nv — what the HCI commands of Channel Sounding say in the terms of the Link Layer: the capability record of the Host and of the PDU, the
+// parameters of a configuration, of the procedure parameters and of an LE CS Test, and the plan a configuration gives.
+//
+// [Vol 4] Part E, Sections 7.7.65.39 to 7.7.65.43 and 7.8.130 to 7.8.143; [Vol 6] Part B, Sections 2.4.2.44 to 2.4.2.49 and 5.1.24 to 5.1.26.  Every function
+// reads or writes octets in a buffer of 48 (`Buf`) or a record of `ll_cs_pdu` and answers with the status code the command gets: 0, Invalid HCI Command
+// Parameters (0x12), Unsupported Feature or Parameter Value (0x11), Rejected Due To Limited Resources (0x0D).  The functions that read the parameters of a
+// command take the reader of the transport (`h4_rx.H4Rx`); the commands themselves, their order of checks and their events are in `ctl_hci.nv`.
+//
+// The HCI and the Link Layer say the same thing in different words, five times over ([Vol 4] Part E and [Vol 6] Part B differ in the PHY, the step timing,
+// the capabilities' subfeature bits, the power delta and the SNR index): this module is where they are converted, so that `ll_cs_proc` and `ll_cs_plan` keep to the
+// Link Layer's and the Host's side keeps to the HCI's.
+//
+// This module holds no state.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
+
+use h4_rx
+use ll_cs
+use ll_cs_pdu
+use ll_cs_proc
+use ll_cs_plan
+use ll_cs_radio
+use ctl_limits
+use noble_controller_config
+
+// ── Buffers ─────────────────────────────────────────────────────────
+
+// The octets a command's parameters are copied to: the longest are the [v2] capability record (34), the procedure parameters (20) and LE CS Test without its
+// overrides (30) with the two it takes (14).
+const BUF_OCTETS = 48
+
+@tier(embedded)
+fn buf_new() -> Vec[u8; 48]
+    var v: Vec[u8; 48] = Vec.new()
+    for _ in 0..BUF_OCTETS
+        let _a = v.push(0)
+    v
+
+@tier(embedded)
+@no_alloc
+fn g8(var b: Vec[u8; 48], at: Int) -> Int
+    b[at] as Int
+
+@tier(embedded)
+@no_alloc
+fn g16(var b: Vec[u8; 48], at: Int) -> Int
+    b[at] as Int | (b[at + 1] as Int << 8)
+
+@tier(embedded)
+@no_alloc
+fn g24(var b: Vec[u8; 48], at: Int) -> Int
+    g16(var b, at) | (b[at + 2] as Int << 16)
+
+@tier(embedded)
+@no_alloc
+fn p8(var b: Vec[u8; 48], at: Int, v: Int)
+    b[at] = (v & 0xFF) as u8
+
+@tier(embedded)
+@no_alloc
+fn p16(var b: Vec[u8; 48], at: Int, v: Int)
+    p8(var b, at, v)
+    p8(var b, at + 1, v >>> 8)
+
+// Copy `n` octets of the parameters of the command in `rx`, from the one at `from`, into `b` at 0.
+@tier(embedded)
+fn buf_take(var rx: h4_rx.H4Rx, from: Int, n: Int, var b: Vec[u8; 48])
+    for i in 0..n
+        p8(var b, i, h4_rx.h4_param(var rx, from + i))
+
+// ── The capability record ───────────────────────────────────────────
+
+// The octets of the capability record of the HCI: 28 for the [v1] commands and events, 34 for the [v2] ones ([Vol 4] Part E, Section 7.8.130).
+const CAPS_V1 = 28
+const CAPS_V2 = 34
+
+// Write the record `c` in the order of the HCI to `b` at 0, in the [v2] form when `v2`; the octets written.  A record with no [v2] fields gives the 2M counts of the
+// 1M ones, which is what the specification says for a [v1] record that a [v2] command or event carries.
+@tier(embedded)
+fn caps_put(var c: ll_cs_pdu.CapPdu, v2: Bool, var b: Vec[u8; 48]) -> Int
+    p8(var b, 0, c.num_configs)
+    p16(var b, 1, c.max_procs)
+    p8(var b, 3, c.num_ant)
+    p8(var b, 4, c.max_path)
+    p8(var b, 5, c.role)
+    p8(var b, 6, c.mode_types)
+    p8(var b, 7, c.rtt_cap)
+    p8(var b, 8, c.n_aa)
+    p8(var b, 9, c.n_sound)
+    p8(var b, 10, c.n_rand)
+    p16(var b, 11, c.nadm_sound)
+    p16(var b, 13, c.nadm_rand)
+    p8(var b, 15, c.sync_phy)
+    var sub = (c.no_fae << 1) | (c.ch3c << 2) | (c.sounding_pct << 3) | (c.ipt << 4)
+    if v2 and c.v2
+        sub = sub | (c.rtt_phy << 5)
+    p16(var b, 16, sub)
+    p16(var b, 18, c.t_ip1)
+    p16(var b, 20, c.t_ip2)
+    p16(var b, 22, c.t_fcs)
+    p16(var b, 24, c.t_pm)
+    p8(var b, 26, c.t_sw)
+    p8(var b, 27, c.tx_snr)
+    if not v2
+        return CAPS_V1
+    if c.v2
+        p16(var b, 28, c.t_ip2_ipt)
+        p8(var b, 30, c.t_sw_ipt)
+        p8(var b, 31, c.n2_aa)
+        p8(var b, 32, c.n2_sound)
+        p8(var b, 33, c.n2_rand)
+    else
+        p16(var b, 28, 0)
+        p8(var b, 30, 0)
+        p8(var b, 31, c.n_aa)
+        p8(var b, 32, c.n_sound)
+        p8(var b, 33, c.n_rand)
+    CAPS_V2
+
+// Read the record in the order of the HCI from `b` at 0 into `c`, as the [v2] record when `v2`.
+@tier(embedded)
+fn caps_get(var b: Vec[u8; 48], v2: Bool, var c: ll_cs_pdu.CapPdu)
+    let sub = g16(var b, 16)
+    c.v2 = v2
+    c.num_configs = g8(var b, 0)
+    c.max_procs = g16(var b, 1)
+    c.num_ant = g8(var b, 3)
+    c.max_path = g8(var b, 4)
+    c.role = g8(var b, 5)
+    c.mode_types = g8(var b, 6)
+    c.rtt_cap = g8(var b, 7)
+    c.n_aa = g8(var b, 8)
+    c.n_sound = g8(var b, 9)
+    c.n_rand = g8(var b, 10)
+    c.nadm_sound = g16(var b, 11)
+    c.nadm_rand = g16(var b, 13)
+    c.sync_phy = g8(var b, 15)
+    c.no_fae = (sub >>> 1) & 1
+    c.ch3c = (sub >>> 2) & 1
+    c.sounding_pct = (sub >>> 3) & 1
+    c.ipt = (sub >>> 4) & 1
+    c.rtt_phy = 0
+    c.t_ip1 = g16(var b, 18)
+    c.t_ip2 = g16(var b, 20)
+    c.t_fcs = g16(var b, 22)
+    c.t_pm = g16(var b, 24)
+    c.t_sw = g8(var b, 26)
+    c.tx_snr = g8(var b, 27)
+    c.t_ip2_ipt = 0
+    c.t_sw_ipt = 0
+    c.n2_aa = 0
+    c.n2_sound = 0
+    c.n2_rand = 0
+    if v2
+        c.rtt_phy = (sub >>> 5) & 1
+        c.t_ip2_ipt = g16(var b, 28)
+        c.t_sw_ipt = g8(var b, 30)
+        c.n2_aa = g8(var b, 31)
+        c.n2_sound = g8(var b, 32)
+        c.n2_rand = g8(var b, 33)
+
+// The status of a record a Host wrote (LE CS Write Cached Remote Supported Capabilities): 0, or Invalid HCI Command Parameters for a field the specification
+// reserves or a value outside its range.
+@tier(embedded)
+fn caps_host_check(var c: ll_cs_pdu.CapPdu) -> Int
+    if not ll_cs_proc.caps_valid(var c) or (c.mode_types & ~1) != 0 or (c.sync_phy & ~6) != 0 or c.t_sw > 10 or not ll_cs.t_sw_ok(c.t_sw)
+        return ll_cs_proc.E_INVALID_PARAMS
+    if c.tx_snr > 0x1F or c.rtt_cap > 0x3F or c.t_ip1 > 0x7F or c.t_ip2 > 0x7F or c.t_fcs > 0x1FF or c.t_pm > 0x3
+        return ll_cs_proc.E_INVALID_PARAMS
+    0
+
+// Cut the capabilities `c` of the build down to what the radio `rc` runs: the intersection that LE CS Read Local Supported Capabilities reports.  A radio that
+// does not take part has no role.  The counts and masks of the radio replace the build's, which names none.
+@tier(embedded)
+fn caps_radio(var c: ll_cs_pdu.CapPdu, var rc: ll_cs_radio.CsCaps)
+    if not rc.supported
+        c.role = 0
+        return
+    c.role = c.role & rc.roles
+    c.mode_types = c.mode_types & rc.modes
+    c.n_aa = rc.n_aa
+    if (rc.rtt_types & 0x06) == 0
+        c.n_sound = 0
+    else if c.n_sound != 0
+        c.n_sound = rc.n_sound
+    if (rc.rtt_types & 0x78) == 0
+        c.n_rand = 0
+    else if c.n_rand != 0
+        c.n_rand = rc.n_rand
+    c.rtt_cap = rc.rtt_cap
+    c.nadm_sound = rc.nadm_sound
+    c.nadm_rand = rc.nadm_rand
+    c.sync_phy = rc.phys & 6
+    if rc.ant_elements < c.num_ant
+        c.num_ant = rc.ant_elements
+    var paths = rc.max_paths
+    if paths > c.max_path
+        paths = c.max_path
+    if paths < c.num_ant
+        paths = c.num_ant
+    c.max_path = paths
+    c.t_ip1 = rc.t_ip1 & 0x7F
+    c.t_ip2 = rc.t_ip2 & 0x7F
+    c.t_fcs = rc.t_fcs & 0x1FF
+    c.t_pm = rc.t_pm & 0x3
+    c.t_sw = rc.t_sw_us
+    c.tx_snr = rc.snr_mask & 0x1F
+    c.no_fae = ll_cs_proc.b2i(rc.no_fae)
+    if not rc.ch3c
+        c.ch3c = 0
+    if not rc.sounding_pct
+        c.sounding_pct = 0
+    if not rc.ipt
+        c.ipt = 0
+    if c.v2
+        c.rtt_phy = ll_cs_proc.b2i(rc.rtt_per_phy)
+        c.t_ip2_ipt = rc.t_ip2_ipt & 0x7F
+        c.t_sw_ipt = rc.t_sw_ipt_us
+        c.n2_aa = rc.n_2m_aa
+        c.n2_sound = rc.n_2m_sound
+        c.n2_rand = rc.n_2m_rand
+    else
+        c.rtt_phy = 0
+
+// ── The PHY and the timings ─────────────────────────────────────────
+
+// The PHYs have five encodings; `ll_cs_pdu.sync_phy_to_pdu` and its kin convert the HCI's CS_SYNC_PHY and PHY into the bits of the PDUs and back.
+
+// ── LE CS Create Config ─────────────────────────────────────────────
+
+// Read the parameters of LE CS Create Config in `rx` into `c` as the configuration of the PDU, with the timings the Controller picks: the mandatory ones, T_IP1
+// and T_IP2 145 microseconds, T_FCS 150 and T_PM 40 (indices 7, 7, 9 and 2), which every device runs.  `action` is 1.
+@tier(embedded)
+fn config_from_rx(var rx: h4_rx.H4Rx, var c: ll_cs_pdu.CfgPdu)
+    let p = 2
+    c.config_id = h4_rx.h4_param(var rx, p)
+    c.action = 1
+    c.main_mode = h4_rx.h4_param(var rx, p + 2)
+    c.sub_mode = h4_rx.h4_param(var rx, p + 3)
+    c.main_min = h4_rx.h4_param(var rx, p + 4)
+    c.main_max = h4_rx.h4_param(var rx, p + 5)
+    c.main_rep = h4_rx.h4_param(var rx, p + 6)
+    c.mode0_steps = h4_rx.h4_param(var rx, p + 7)
+    c.role = h4_rx.h4_param(var rx, p + 8)
+    c.rtt_type = h4_rx.h4_param(var rx, p + 9)
+    c.sync_phy = ll_cs_pdu.sync_phy_to_pdu(h4_rx.h4_param(var rx, p + 10))
+    var lo = 0
+    var hi = 0
+    for i in 0..5
+        lo = lo | (h4_rx.h4_param(var rx, p + 11 + i) << (8 * i))
+        hi = hi | (h4_rx.h4_param(var rx, p + 16 + i) << (8 * i))
+    c.chm_lo = lo
+    c.chm_hi = hi
+    c.chm_rep = h4_rx.h4_param(var rx, p + 21)
+    c.chsel = h4_rx.h4_param(var rx, p + 22)
+    c.c3_shape = h4_rx.h4_param(var rx, p + 23)
+    c.c3_jump = h4_rx.h4_param(var rx, p + 24)
+    c.ipt = h4_rx.h4_param(var rx, p + 25) & 1
+    c.t_ip1 = 7
+    c.t_ip2 = 7
+    c.t_fcs = 9
+    c.t_pm = 2
+
+// ── LE CS Set Procedure Parameters ──────────────────────────────────
+
+// The 20 octets of the parameters of LE CS Set Procedure Parameters that follow the handle and the Config_ID, as the Controller keeps them (`Buf` at 0):
+// Max_Procedure_Len 2, Min_Procedure_Interval 2, Max_Procedure_Interval 2, Max_Procedure_Count 2, Min_Subevent_Len 3, Max_Subevent_Len 3,
+// Tone_Antenna_Config_Selection, PHY, Tx_Power_Delta, Preferred_Peer_Antenna, SNR_Control_Initiator, SNR_Control_Reflector.
+const PP_MAX_LEN = 0
+const PP_MIN_INT = 2
+const PP_MAX_INT = 4
+const PP_COUNT = 6
+const PP_MIN_SUB = 8
+const PP_MAX_SUB = 11
+const PP_ACI = 14
+const PP_PHY = 15
+const PP_DELTA = 16
+const PP_PREF = 17
+const PP_SNR_I = 18
+const PP_SNR_R = 19
+
+// The scheduling the Controller picks where the Host only recommends: the first subevent starts 1 millisecond after the anchor of the event at the soonest and up to
+// 3 milliseconds (and always before the next event); each CS event is one connection event and holds one subevent.
+const OFFSET_MIN_US = 1000
+const OFFSET_SPAN_US = 2000
+
+// Whether `v` is a Tx_Power_Delta, Max_TX_Power or Selected_TX_Power the HCI allows: a signed value from -127 to +20 dBm.
+@tier(embedded)
+@no_alloc
+fn dbm_ok(v: Int) -> Bool
+    v <= 20 or v >= 0x81
+
+// The SNR control index of the HCI (0 to 4, 0xFF for none) as the PDU carries it (0 to 4, 0xF).
+@tier(embedded)
+@no_alloc
+fn snr_to_pdu(hci: Int) -> Int
+    if hci == 0xFF
+        0xF
+    else
+        hci
+
+@tier(embedded)
+@no_alloc
+fn snr_ok(v: Int) -> Bool
+    v <= 4 or v == 0xFF
+
+// The parameters of the Start the Controller makes of the procedure parameters in `pp`, for the configuration `id` on a connection whose current event is
+// `en.ev_count` and whose interval is `en.interval_us`: the fields of LL_CS_REQ.  The answer is 0, Invalid HCI Command Parameters for a value outside the range
+// of the command, or Rejected Due To Limited Resources when no procedure interval the Host allows leaves room for the procedure.
+@tier(embedded)
+fn start_from_pp(var pp: Vec[u8; 48], id: Int, var en: ll_cs_proc.Env,
+                 var s: ll_cs_pdu.StartPdu) -> Int
+    let max_len = g16(var pp, PP_MAX_LEN)
+    let min_int = g16(var pp, PP_MIN_INT)
+    let max_int = g16(var pp, PP_MAX_INT)
+    let count = g16(var pp, PP_COUNT)
+    let min_sub = g24(var pp, PP_MIN_SUB)
+    let max_sub = g24(var pp, PP_MAX_SUB)
+    if max_len < 1 or min_sub < ll_cs_proc.SUBEVENT_LEN_MIN_US or max_sub < min_sub or max_sub >= ll_cs_proc.FOUR_SECONDS_US
+        return ll_cs_proc.E_INVALID_PARAMS
+    if count != 1 and (min_int < 1 or max_int < min_int)
+        return ll_cs_proc.E_INVALID_PARAMS
+    if g8(var pp, PP_ACI) > 7 or ll_cs_pdu.proc_phy_to_pdu(g8(var pp, PP_PHY)) < 0 or not snr_ok(g8(var pp, PP_SNR_I)) or not snr_ok(g8(var pp, PP_SNR_R))
+        return ll_cs_proc.E_INVALID_PARAMS
+    if (g8(var pp, PP_PREF) & ~0xF) != 0
+        return ll_cs_proc.E_INVALID_PARAMS
+    s.config_id = id
+    s.conn_event = (en.ev_count + ll_cs_proc.EVENT_AHEAD) & 0xFFFF
+    s.offset_min = OFFSET_MIN_US
+    s.offset_max = OFFSET_MIN_US + OFFSET_SPAN_US
+    if s.offset_max >= en.interval_us
+        s.offset_max = en.interval_us - 1
+    if s.offset_min > s.offset_max
+        s.offset_min = s.offset_max
+    s.max_proc_len = max_len
+    s.event_interval = 1
+    s.subevents = 1
+    s.subevent_interval = 0
+    var len = max_sub
+    if len > max_len * ll_cs_proc.UNIT_US
+        len = max_len * ll_cs_proc.UNIT_US
+    if len < ll_cs_proc.SUBEVENT_LEN_MIN_US
+        return ll_cs_proc.E_LIMITED
+    s.subevent_len = len
+    s.proc_count = count
+    s.proc_interval = 0
+    if count != 1
+        // The procedure takes its length, the offset and the minimum space after it; the interval is the connection events that cover it, at the least the Host's.
+        let need = (max_len * ll_cs_proc.UNIT_US + s.offset_max + ll_cs.T_MES_US) / en.interval_us + 1
+        var p = min_int
+        if p < need
+            p = need
+        if p > max_int
+            return ll_cs_proc.E_LIMITED
+        s.proc_interval = p
+    s.aci = g8(var pp, PP_ACI)
+    s.pref_ant = g8(var pp, PP_PREF)
+    s.phy = ll_cs_pdu.proc_phy_to_pdu(g8(var pp, PP_PHY))
+    s.pwr_delta = 0
+    if g8(var pp, PP_DELTA) != 0x80
+        s.pwr_delta = g8(var pp, PP_DELTA)
+    s.snr_i = snr_to_pdu(g8(var pp, PP_SNR_I))
+    s.snr_r = snr_to_pdu(g8(var pp, PP_SNR_R))
+    0
+
+// ── The plan of a configuration ─────────────────────────────────────
+
+// The configuration of the planning for the series that runs in the record `cs`: the configuration of the PDU, the parameters of the Start, the channel map in force
+// (a Channel Map Update takes effect at the start of a procedure instance, `ll_cs_proc.instance_begin`) and the capabilities `local`.  The answer is the configuration's IPT
+// flag (0 or 1), or -1 when the record has no series.  `scratch` is overwritten.
+@tier(embedded)
+fn plan_cfg(var cs: ll_cs_proc.Cs, var local: ll_cs_pdu.CapPdu, var scratch: Pdu,
+            var out: ll_cs_plan.CsCfg) -> Int
+    let id = cs.series_cfg
+    var c = ll_cs_pdu.cfg_new()
+    // cov: skip — a series that is open has its configuration and its Start
+    if not ll_cs_proc.load_config(var cs, id, var c, var scratch)
+        return -1
+    var s = ll_cs_pdu.start_new()
+    // cov: skip — a series that is open has its configuration and its Start
+    if not ll_cs_proc.load_run(var cs, var s, var scratch)
+        return -1
+    let lo = ll_cs_proc.cfg_map_lo(var cs, id) & cs.chm_lo
+    let hi = ll_cs_proc.cfg_map_hi(var cs, id) & cs.chm_hi
+    for i in 0..5
+        out.chmap[i] = ((lo >>> (8 * i)) & 0xFF) as u8
+        out.chmap[5 + i] = ((hi >>> (8 * i)) & 0xFF) as u8
+    out.ch_rep = c.chm_rep
+    out.main_mode = c.main_mode
+    out.sub_mode = 0
+    if c.sub_mode != 0xFF
+        out.sub_mode = c.sub_mode
+    out.main_min = c.main_min
+    out.main_max = c.main_max
+    out.main_rep = c.main_rep
+    out.mode0_steps = c.mode0_steps
+    out.phy = ll_cs_pdu.sync_phy_to_hci(c.sync_phy)
+    out.rtt = c.rtt_type
+    out.t_ip1_us = ll_cs.t_ip_us(c.t_ip1)
+    out.t_ip2_us = ll_cs.t_ip_us(c.t_ip2)
+    out.t_fcs_us = ll_cs.t_fcs_us(c.t_fcs)
+    out.t_pm_us = ll_cs.t_pm_us(c.t_pm)
+    out.t_sw_us = local.t_sw
+    out.aci = s.aci
+    out.sub_len_us = s.subevent_len
+    out.proc_len_us = s.max_proc_len * ll_cs_proc.UNIT_US
+    c.ipt
+
+// ── The Host's security requirements ────────────────────────────────
+
+// The bits of CS_Security_Requirements the Controller can enforce: CS tone (0), 150 ns RTT accuracy (1) and, with the sequences built, RTT sounding or random
+// sequence (3).  The 10 ns accuracy (2) and the attack detector metric (4) it does not report.
+@tier(embedded)
+fn sec_supported() -> Int
+    var m = 0x3
+    if ctl_limits.cs_rtt_seq_on()
+        m = m | 0x8
+    m
+
+// Whether a procedure of the configuration `c` meets the requirements `req` (the bits of CS_Security_Requirements): tones need a main or sub mode of 2 or 3, the
+// accuracy a mode of 1 or 3 (the class the Controller reports is 150 ns), the sequence a sounding or random RTT type.
+@tier(embedded)
+fn sec_met(req: Int, var c: ll_cs_pdu.CfgPdu) -> Bool
+    var tone = c.main_mode == 2 or c.main_mode == 3
+    var rtt = c.main_mode == 1 or c.main_mode == 3
+    if c.sub_mode != 0xFF
+        tone = tone or c.sub_mode == 2 or c.sub_mode == 3
+        rtt = rtt or c.sub_mode == 1 or c.sub_mode == 3
+    if (req & 1) != 0 and not tone
+        return false
+    if (req & 2) != 0 and not rtt
+        return false
+    if (req & 4) != 0
+        return false
+    if (req & 8) != 0 and (c.rtt_type == 0 or not rtt)
+        return false
+    (req & 0x10) == 0
+
+// ── LE CS Test ──────────────────────────────────────────────────────
+
+// The octets of the parameters of LE CS Test before the overrides, and the octets of the overrides this Controller takes: the channel map with its three, and
+// the number of main mode steps of the submode insertion (Override_Config bit 2).
+const TEST_OCTETS = 30
+const TEST_OVERRIDE_BASE = 13
+const TEST_MAIN = 0
+const TEST_SUB = 1
+const TEST_REP = 2
+const TEST_MODE0 = 3
+const TEST_ROLE = 4
+const TEST_RTT = 5
+const TEST_PHY = 6
+const TEST_ANT = 7
+const TEST_SUB_LEN = 8
+const TEST_SUB_INT = 11
+const TEST_MAX_SUB = 13
+const TEST_POWER = 14
+const TEST_T_IP1 = 15
+const TEST_T_IP2 = 16
+const TEST_T_FCS = 17
+const TEST_T_PM = 18
+const TEST_T_SW = 19
+const TEST_ACI = 20
+const TEST_ENH = 21
+const TEST_SNR_I = 22
+const TEST_SNR_R = 23
+const TEST_NONCE = 24
+const TEST_CH_REP = 26
+const TEST_OVERRIDE = 27
+const TEST_OVERRIDE_LEN = 29
+const TEST_DATA = 30
+
+// The Override_Config bits: bit 2 the number of main mode steps, bit 10 the stable phase test; the others (0 and 3 to 8) are not taken, bit 0 meaning the
+// channel list is the one of the command.
+const OVERRIDE_MAIN_STEPS = 0x4
+const OVERRIDE_TAKEN = 0x4
+
+// The octets of Override_Parameters_Data a command with `override_config` carries when it keeps to the overrides this Controller takes.
+@tier(embedded)
+@no_alloc
+fn test_override_len(override_config: Int) -> Int
+    if (override_config & OVERRIDE_MAIN_STEPS) != 0
+        TEST_OVERRIDE_BASE + 1
+    else
+        TEST_OVERRIDE_BASE
+
+// The configuration of the planning for the test in `t` (the 30 octets of the parameters, then the overrides), whose parameters `test_check` accepted: the main
+// mode steps are the Min and Max of 6 and 10 the specification gives, or the override's, and the map is the one of the override data.
+@tier(embedded)
+fn test_cfg(var t: Vec[u8; 48], var out: ll_cs_plan.CsCfg)
+    out.main_mode = g8(var t, TEST_MAIN)
+    out.sub_mode = 0
+    if g8(var t, TEST_SUB) != 0xFF
+        out.sub_mode = g8(var t, TEST_SUB)
+    out.main_min = 6
+    out.main_max = 10
+    if (g16(var t, TEST_OVERRIDE) & OVERRIDE_MAIN_STEPS) != 0
+        out.main_min = g8(var t, TEST_DATA + TEST_OVERRIDE_BASE)
+        out.main_max = g8(var t, TEST_DATA + TEST_OVERRIDE_BASE)
+    out.main_rep = g8(var t, TEST_REP)
+    out.mode0_steps = g8(var t, TEST_MODE0)
+    out.rtt = g8(var t, TEST_RTT)
+    out.phy = g8(var t, TEST_PHY)
+    out.t_ip1_us = g8(var t, TEST_T_IP1)
+    out.t_ip2_us = g8(var t, TEST_T_IP2)
+    out.t_fcs_us = g8(var t, TEST_T_FCS)
+    out.t_pm_us = g8(var t, TEST_T_PM)
+    out.t_sw_us = g8(var t, TEST_T_SW)
+    out.aci = g8(var t, TEST_ACI)
+    out.sub_len_us = g24(var t, TEST_SUB_LEN)
+    out.ch_rep = g8(var t, TEST_CH_REP)
+    for i in 0..10
+        out.chmap[i] = g8(var t, TEST_DATA + i) as u8
+
+// The status of the parameters of LE CS Test in `t` and of the override data it carries, against the capabilities `local` and the options of the build: 0;
+// Invalid HCI Command Parameters for a value outside the range of the specification or for an override whose data does not have the length the bits give; Unsupported
+// Feature or Parameter Value for an override this Controller does not take (Override_Config bits 0, 3 to 8 and the stable phase test of bit 10), for Channel Selection
+// Algorithm #3c, for a role, mode, PHY, RTT type, antenna or step timing the capabilities lack, and for a switch time beyond a build of one antenna.
+@tier(embedded)
+fn test_check(var t: Vec[u8; 48], var local: ll_cs_pdu.CapPdu) -> Int
+    let ov = g16(var t, TEST_OVERRIDE)
+    // The overrides this Controller does not take come first: the data of an override it does not know has a length it cannot check.
+    if (ov & ~OVERRIDE_TAKEN) != 0
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    let main = g8(var t, TEST_MAIN)
+    let sub = g8(var t, TEST_SUB)
+    let rtt = g8(var t, TEST_RTT)
+    let phy = g8(var t, TEST_PHY)
+    let role = g8(var t, TEST_ROLE)
+    let ip1 = ll_cs.t_ip_index(g8(var t, TEST_T_IP1))
+    let ip2 = ll_cs.t_ip_index(g8(var t, TEST_T_IP2))
+    let fcs = ll_cs.t_fcs_index(g8(var t, TEST_T_FCS))
+    let pm = ll_cs.t_pm_index(g8(var t, TEST_T_PM))
+    let sub_len = g24(var t, TEST_SUB_LEN)
+    let sub_int = g16(var t, TEST_SUB_INT)
+    let max_sub = g8(var t, TEST_MAX_SUB)
+    let power = g8(var t, TEST_POWER)
+    if not ll_cs_proc.modes_ok(main, sub) or g8(var t, TEST_REP) > 3 or g8(var t, TEST_MODE0) < 1 or g8(var t, TEST_MODE0) > 3 or role > 1 or rtt > 6
+        return ll_cs_proc.E_INVALID_PARAMS
+    if phy < 1 or phy > 3 or g8(var t, TEST_ANT) < 1 or g8(var t, TEST_ANT) > 4 or g8(var t, TEST_ACI) > 7 or g8(var t, TEST_ENH) > 1
+        return ll_cs_proc.E_INVALID_PARAMS
+    if sub_len < ll_cs_proc.SUBEVENT_LEN_MIN_US or sub_len >= ll_cs_proc.FOUR_SECONDS_US or max_sub > ll_cs.SUBEVENTS_MAX
+        return ll_cs_proc.E_INVALID_PARAMS
+    if sub_int != 0 and (sub_int < 2 or sub_int * ll_cs_proc.UNIT_US < sub_len + ll_cs.T_MES_US)
+        return ll_cs_proc.E_INVALID_PARAMS
+    if g8(var t, TEST_CH_REP) < 1 or ip1 < 0 or ip2 < 0 or fcs < 0 or pm < 0 or not ll_cs.t_sw_ok(g8(var t, TEST_T_SW))
+        return ll_cs_proc.E_INVALID_PARAMS
+    if power != 0x7E and power != 0x7F and not dbm_ok(power)
+        return ll_cs_proc.E_INVALID_PARAMS
+    if not snr_ok(g8(var t, TEST_SNR_I)) or not snr_ok(g8(var t, TEST_SNR_R)) or g8(var t, TEST_OVERRIDE_LEN) != test_override_len(ov)
+        return ll_cs_proc.E_INVALID_PARAMS
+    if (ov & OVERRIDE_MAIN_STEPS) != 0 and (sub == 0xFF or g8(var t, TEST_DATA + TEST_OVERRIDE_BASE) < 1)
+        return ll_cs_proc.E_INVALID_PARAMS
+    // The channels, from the override data that carries them.
+    var lo = 0
+    var hi = 0
+    for i in 0..5
+        lo = lo | (g8(var t, TEST_DATA + i) << (8 * i))
+        hi = hi | (g8(var t, TEST_DATA + 5 + i) << (8 * i))
+    if (lo & ~ll_cs_pdu.CHM_LO_ALLOWED) != 0 or (hi & ~ll_cs_pdu.CHM_HI_ALLOWED) != 0 or ll_cs_pdu.chm_count(lo, hi) < ll_cs_proc.CHANNELS_MIN
+        return ll_cs_proc.E_INVALID_PARAMS
+    if g8(var t, TEST_DATA + 10) != 0
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if ((local.role >>> role) & 1) == 0 or (main == 3 or sub == 3) and (local.mode_types & 1) == 0
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if phy != 1 and not ll_cs_pdu.sync_phy_allowed(local.sync_phy, ll_cs_pdu.sync_phy_to_pdu(phy))
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if rtt == 1 or rtt == 2
+        if local.n_sound == 0
+            return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if rtt >= 3 and local.n_rand == 0
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if g8(var t, TEST_ANT) > local.num_ant or ll_cs_proc.aci_initiator(g8(var t, TEST_ACI)) > local.num_ant and role == 0
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if g8(var t, TEST_ENH) == 1 and local.ipt == 0
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if not ll_cs_proc.timing_ok(0, ip1, local.t_ip1) or not ll_cs_proc.timing_ok(0, ip2, local.t_ip2) or not ll_cs_proc.timing_ok(1, fcs, local.t_fcs) or not ll_cs_proc.timing_ok(2, pm, local.t_pm)
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    if g8(var t, TEST_T_SW) != 0 and local.num_ant == 1
+        return ll_cs_proc.E_UNSUPPORTED_FEATURE
+    0

@@ -730,7 +730,7 @@ fn link_reset(var l: Link)
     l.owed = 0
     l.feat_status = 0
     l.ver_status = 0
-    l.fx = l.fx & (0xFFFF << FX_LOCAL)
+    l.fx = l.fx & ((0xFFFF << FX_LOCAL) | (1 << FX_CSHOST))
     l.win_len = 0
     l.ev_count = 0
     l.unmapped = 0
@@ -1442,14 +1442,17 @@ fn link_event_done(var l: Link, now: Int)
 
 // The Controller's own feature set, eight octets.
 @tier(embedded)
-fn own_features(var f: Vec[u8; 8], host_iso: Bool, host_sub: Bool)
+fn own_features(var f: Vec[u8; 8], host_iso: Bool, host_sub: Bool, host_cs: Bool)
     for i in 0..8
         f[i] = 0
     f[0] = FEATURES_OCTET0 as u8
     f[1] = ctl_limits.features_octet1() as u8
     f[2] = FEATURES_OCTET2 as u8
     f[3] = ctl_limits.features_octet3() as u8
-    f[5] = ctl_limits.features_octet5() as u8
+    var o5 = ctl_limits.features_octet5()
+    if host_cs and ctl_limits.cs_on()
+        o5 = o5 | ll_cs.FEAT5_CS_HOST
+    f[5] = o5 as u8
     if ctl_limits.feat_on()
         f[7] = ll_feat.OCTET7_EXT as u8
     var o4 = ctl_limits.features_octet4()
@@ -1962,7 +1965,7 @@ fn ctrl_feature_request(var l: Link, var rx: Pdu)
     var f: Vec[u8; 8] = Vec.new()
     for _ in 0..8
         let _a = f.push(0)
-    own_features(var f, l.host_iso, l.host_sub)
+    own_features(var f, l.host_iso, l.host_sub, ctl_limits.cs_on() and fx_get(l, FX_CSHOST, 1) == 1)
     if l.no_coded
         clear_coded(var f)
     f[0] = (FEATURES_OCTET0 & l.peer_feat[0] as Int) as u8
@@ -2000,6 +2003,17 @@ const FX_RATEEV = 58
 const FX_QUIET = 59
 // The Host is owed LE Request Peer SCA Complete (bit 60; a build with `ctl_limits.sca_on()`).  The sixteen bits of `Link.owed` are all taken.
 const FX_SCA = 60
+// The Channel Sounding (Host Support) bit (feature 47), as the Host set it with LE Set Host Feature: it goes to the peer in the feature set.  Bit 61 survives the end of a
+// connection, as the page 1 bits of this end do.
+const FX_CSHOST = 61
+
+// Set the Channel Sounding (Host Support) bit, which the Host does before the first connection.
+@tier(embedded)
+fn link_set_host_cs(var l: Link, on: Bool)
+    var v = 0
+    if on
+        v = 1
+    fx_put(var l, FX_CSHOST, 1, v)
 
 // The value at bit `sh` under `mask`.
 @tier(embedded)
@@ -2109,7 +2123,7 @@ fn link_read_all_features(var l: Link, pages: Int) -> Int
         var f: Vec[u8; 8] = Vec.new()
         for _ in 0..8
             let _a = f.push(0)
-        own_features(var f, l.host_iso, l.host_sub)
+        own_features(var f, l.host_iso, l.host_sub, ctl_limits.cs_on() and fx_get(l, FX_CSHOST, 1) == 1)
         if l.no_coded
             clear_coded(var f)
         ll_data.ctrl_features(var l.tmp, features_request_opcode(var l), var f)
@@ -3877,7 +3891,7 @@ fn link_read_features(var l: Link) -> Int
     var f: Vec[u8; 8] = Vec.new()
     for _ in 0..8
         let _a = f.push(0)
-    own_features(var f, l.host_iso, l.host_sub)
+    own_features(var f, l.host_iso, l.host_sub, ctl_limits.cs_on() and fx_get(l, FX_CSHOST, 1) == 1)
     if l.no_coded
         clear_coded(var f)
     ll_data.ctrl_features(var l.tmp, features_request_opcode(var l), var f)

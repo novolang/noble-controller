@@ -1,0 +1,246 @@
+// src/ll_cs_res.nv — the result of a Channel Sounding subevent as the Host reads it: the data of a step in the form of the LE CS Subevent Result event,
+// from the plan the Link Layer made and the measurements the radio returned.
+//
+// [Vol 4] Part E, Sections 7.7.65.44 and 7.7.65.45; [Vol 6] Part H, Sections 3.1.2 and 4.3.  A step record in the event is three octets, the mode, the
+// channel and the length of the step data, and the data, which depends on the mode and on the role of this end:
+//
+//   mode 0, initiator   Packet_Quality, Packet_RSSI, Packet_Antenna, Measured_Freq_Offset (2)                            5 octets
+//   mode 0, reflector   Packet_Quality, Packet_RSSI, Packet_Antenna                                                        3
+//   mode 1              Packet_Quality, Packet_NADM, Packet_RSSI, ToA_ToD or ToD_ToA (2), Packet_Antenna                    6
+//                       and with a sounding sequence and phase-based ranging from it, Packet_PCT1 and Packet_PCT2 (4 each)  14
+//   mode 2              Antenna_Path_Permutation_Index, and for each of the N_AP + 1 tone slots a Tone_PCT (3) and its
+//                       Tone_Quality_Indicator (1)                                                                          1 + 4 (N_AP + 1)
+//   mode 3              the mode 1 fields, then the mode 2 fields                                                          7 + 4 (N_AP + 1), 8 more with the PCTs
+//
+// A step the radio did not run has no data (length 0), which the specification gives as "the step may have been aborted".  The time difference
+// of a round-trip step is the one the radio measured less the delays between its timestamps and the antenna port (`CsCal`) and less the nominal offset
+// T_SY_CENTER_DELTA of the step mode, in units of 0.5 nanosecond.
+//
+// This module holds no state.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
+
+use ll_cs
+use ll_cs_plan
+use ll_cs_radio
+
+// The octets of the data of the longest step: a mode 3 step with a sounding sequence and four antenna paths.
+const DATA_OCTETS_MAX = 40
+
+// The value of a time difference the radio did not measure, and of a frequency offset.
+const TIME_NA = 0x8000
+
+// Packet_NADM of a Controller that reports none: unknown.
+const NADM_UNKNOWN = 0xFF
+
+// Packet_RSSI that is not available.
+const RSSI_NA = 0x7F
+
+// Whether an RTT type carries a sounding sequence (1 and 2) and a random sequence (3 to 6).
+@tier(embedded)
+@no_alloc
+fn rtt_sounding(rtt: Int) -> Bool
+    rtt == 1 or rtt == 2
+
+@tier(embedded)
+@no_alloc
+fn rtt_random(rtt: Int) -> Bool
+    rtt >= 3
+
+// The octets of the data of a step of `mode` for the device in `role` (0 initiator, 1 reflector), with the RTT type `rtt`, `n_ap` antenna paths, and
+// `pct` when the build reports the phase correction terms of a sounding sequence.
+@tier(embedded)
+@no_alloc
+fn data_len(role: Int, mode: Int, rtt: Int, n_ap: Int, pct: Bool) -> Int
+    let seq = if pct and rtt_sounding(rtt)
+        8
+    else
+        0
+    let tones = 1 + 4 * (n_ap + 1)
+    match mode
+        0 => if role == 0
+            5
+        else
+            3
+        1 => 6 + seq
+        2 => tones
+        _ => 6 + seq + tones
+
+// The octets one step takes in the event, whether it ran or not.  A step that did not run (`done` false) has no data.
+@tier(embedded)
+@no_alloc
+fn record_len(role: Int, mode: Int, rtt: Int, n_ap: Int, pct: Bool, done: Bool) -> Int
+    if done
+        3 + data_len(role, mode, rtt, n_ap, pct)
+    else
+        3
+
+// An empty buffer for `step_data`.
+@tier(embedded)
+fn data_new() -> Vec[u8; 40]
+    var v: Vec[u8; 40] = Vec.new()
+    for _ in 0..DATA_OCTETS_MAX
+        let _a = v.push(0)
+    v
+
+@tier(embedded)
+@no_alloc
+fn put(var d: Vec[u8; 40], at: Int, v: Int)
+    d[at] = (v & 0xFF) as u8
+
+@tier(embedded)
+@no_alloc
+fn put16(var d: Vec[u8; 40], at: Int, v: Int)
+    put(var d, at, v)
+    put(var d, at + 1, v >>> 8)
+
+@tier(embedded)
+@no_alloc
+fn put24(var d: Vec[u8; 40], at: Int, v: Int)
+    put16(var d, at, v)
+    put(var d, at + 2, v >>> 16)
+
+@tier(embedded)
+@no_alloc
+fn put32(var d: Vec[u8; 40], at: Int, v: Int)
+    put24(var d, at, v)
+    put(var d, at + 3, v >>> 24)
+
+// Packet_Quality: the access address check in bits 0 to 3 and, for a round-trip step with a random or sounding sequence, the bit errors in bits 4 to 7.
+@tier(embedded)
+@no_alloc
+fn packet_quality(aa_q: Int, bit_errors: Int, rtt: Int, mode: Int) -> Int
+    var q = aa_q & 0xF
+    if mode != 0 and rtt != 0
+        var e = bit_errors
+        if e > 15
+            e = 15
+        q = q | (e << 4)
+    q
+
+// `v` rounded to the nearest multiple of 500 and divided by it: picoseconds into units of 0.5 nanosecond.
+@tier(embedded)
+@no_alloc
+fn half_ns(ps: Int) -> Int
+    if ps >= 0
+        (ps + 250) / 500
+    else
+        -((-ps + 250) / 500)
+
+// The delay in picoseconds from the instant a timestamp of CS_SYNC on `phy` (the HCI value, 1 LE 1M, 2 LE 2M, 3 LE 2M 2BT) is taken to the antenna port,
+// for departure and for arrival.
+@tier(embedded)
+@no_alloc
+fn tx_delay(var cal: CsCal, phy: Int) -> Int
+    if phy == 2
+        return cal.tx_2m_ps
+    if phy == 3
+        return cal.tx_2bt_ps
+    cal.tx_1m_ps
+
+@tier(embedded)
+@no_alloc
+fn rx_delay(var cal: CsCal, phy: Int) -> Int
+    if phy == 2
+        return cal.rx_2m_ps
+    if phy == 3
+        return cal.rx_2bt_ps
+    cal.rx_1m_ps
+
+// The nominal time between the center of the CS_SYNC of one device and the center of the CS_SYNC of the other in a step of `mode`, in nanoseconds
+// (T_SY_CENTER_DELTA of [Vol 6] Part H, Sections 4.3.2 and 4.3.4).  `ext` says the reflector's tone extension slot carries a tone (mode 3 only).
+@tier(embedded)
+@no_alloc
+fn center_delta_ns(var head: CsPlan, mode: Int, ext: Bool) -> Int
+    let sy = ll_cs_plan.sync_ns(head.phy as Int, ll_cs_plan.rtt_bits(head.rtt as Int))
+    let rd = ll_cs.T_RD_US * 1000
+    if mode == 1
+        return sy + rd + head.t_ip1_us as Int * 1000
+    let slot = (head.t_pm_us as Int + head.t_sw_us as Int) * 1000
+    var extra = slot
+    if ext
+        extra = 2 * slot
+    sy + rd + 2 * ll_cs.T_GD_US * 1000 + 2 * slot * head.n_ap as Int + extra + head.t_ip2_us as Int * 1000
+
+// The ToA_ToD_Initiator or ToD_ToA_Reflector of a step, in units of 0.5 nanosecond as a signed value, or `TIME_NA` when a timestamp is missing or the
+// difference is beyond the 16 bits the event has for it.  The initiator reports arrival less departure, the reflector departure less arrival, each at the
+// antenna port and without the nominal offset.
+@tier(embedded)
+@no_alloc
+fn time_diff(var head: CsPlan, var s: CsStep, var r: CsStepRaw, var cal: CsCal) -> Int
+    if not r.toa_valid or not r.tod_valid
+        return TIME_NA
+    let phy = head.phy as Int
+    let arrival = r.toa_ps - rx_delay(var cal, phy)
+    let departure = r.tod_ps + tx_delay(var cal, phy)
+    var dt = arrival - departure
+    if (head.role as Int) == ll_cs_radio.CS_ROLE_REFLECTOR
+        dt = departure - arrival
+    let v = half_ns(dt - center_delta_ns(var head, s.mode as Int, s.ext_r) * 1000)
+    if v < -32767 or v > 32767
+        return TIME_NA
+    v
+
+// The Tone_PCT of a tone slot: I in bits 0 to 11 and Q in bits 12 to 23, two's complement.
+@tier(embedded)
+@no_alloc
+fn tone_pct(i: Int, q: Int) -> Int
+    (i & 0xFFF) | ((q & 0xFFF) << 12)
+
+// Write the mode 2 fields of a step at `at`: the permutation index, and for each of the `N_AP + 1` tone slots the PCT and the quality indicator.  A slot
+// the radio has no measurement for, or in which no tone was received, reads I and Q zero with the quality `not available`.  The extension slot is the
+// last one; whether its tone is expected is what the other device was told to send.  Returns the octet after the last written.
+@tier(embedded)
+fn put_tones(var d: Vec[u8; 40], at: Int, var head: CsPlan, var s: CsStep, var r: CsStepRaw) -> Int
+    let n_ap = head.n_ap as Int
+    put(var d, at, s.perm as Int)
+    var o = at + 1
+    var expected = s.ext_i
+    if (head.role as Int) == ll_cs_radio.CS_ROLE_INITIATOR
+        expected = s.ext_r
+    for k in 0..n_ap + 1
+        var i = 0
+        var q = 0
+        var tq = ll_cs_radio.CS_TONE_QUALITY_UNAVAILABLE
+        if k < r.tones.len() and r.tones[k].present
+            i = r.tones[k].i as Int
+            q = r.tones[k].q as Int
+            tq = r.tones[k].tq as Int & 0xF
+        if k == n_ap
+            if expected
+                tq = tq | 0x20
+            else
+                tq = tq | 0x10
+        put24(var d, o, tone_pct(i, q))
+        put(var d, o + 3, tq)
+        o = o + 4
+    o
+
+// Write the data of the step `s` that ran, with the measurements `r`, for the plan `head` and the calibration `cal` into `d`; `pct` as in `data_len`.  The
+// octets written are `data_len` of them.
+@tier(embedded)
+fn step_data(var d: Vec[u8; 40], var head: CsPlan, var s: CsStep, var r: CsStepRaw, var cal: CsCal,
+             pct: Bool) -> Int
+    let role = head.role as Int
+    let mode = s.mode as Int
+    let rtt = head.rtt as Int
+    put(var d, 0, packet_quality(r.aa_q as Int, r.bit_errors as Int, rtt, mode))
+    if mode == 0
+        put(var d, 1, r.rssi_dbm as Int)
+        put(var d, 2, r.ant as Int)
+        if role == ll_cs_radio.CS_ROLE_INITIATOR
+            put16(var d, 3, r.ffo as Int)
+        return data_len(role, mode, rtt, head.n_ap as Int, pct)
+    if mode == 2
+        let _end = put_tones(var d, 0, var head, var s, var r)
+        return data_len(role, mode, rtt, head.n_ap as Int, pct)
+    put(var d, 1, NADM_UNKNOWN)
+    put(var d, 2, r.rssi_dbm as Int)
+    put16(var d, 3, time_diff(var head, var s, var r, var cal))
+    put(var d, 5, r.ant as Int)
+    var o = 6
+    if pct and rtt_sounding(rtt)
+        put32(var d, o, r.pct1 as Int)
+        put32(var d, o + 4, r.pct2 as Int)
+        o = o + 8
+    if mode == 3
+        let _end = put_tones(var d, o, var head, var s, var r)
+    data_len(role, mode, rtt, head.n_ap as Int, pct)

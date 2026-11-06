@@ -295,6 +295,9 @@ fn test_a_build_without_isochronous_channels_answers_none_of_the_commands()
         return
     var c = fresh()
     for op in [0x2060, 0x2061, 0x2063, 0x2065, 0x2066, 0x2067, 0x206E, 0x206F, 0x2074, 0x2075]
+        // LE Set Host Feature [v1] also sets bit 47 (Channel Sounding, Host Support), so a build with that feature answers it.
+        if op == 0x2074 and ctl_limits.cs_on()
+            continue
         let r = run(var c, op, [])
         let done = events_coded(r, 0x0E)
         test.assert_eq(done[0][6], ctl_hci.STATUS_UNKNOWN_COMMAND)

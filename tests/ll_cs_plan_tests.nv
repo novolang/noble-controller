@@ -1005,9 +1005,9 @@ fn test_the_storage_of_the_planning_is_the_figure_the_keys_state()
     let gens = noble_controller_config.CTL_CS
     let steps = noble_controller_config.CTL_CS_STEPS
     // Eight octets of length and 712 for each generator, 32 for the plan's head and count, and eight octets of length and 56 for each step; the
-    // records of the procedures (`ll_cs_proc`) are the other part of the figure.  A build without the feature makes only the two tables of the
-    // procedures, at one element each.
-    let procs = ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_STORE + ctl_budget.CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS)
+    // records of the procedures (`ll_cs_proc`) are the other part of the figure, with what the Controller keeps for all its connections (40 words and 160
+    // octets) and 40 octets for each step of the result that waits.  A build without the feature makes only the two tables of the procedures, at one element each.
+    let procs = ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.CTL_CS_GLOBAL_WORDS + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_STORE + ctl_budget.CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS) + ctl_budget.CTL_CS_GLOBAL_OCTETS + ctl_budget.CTL_CS_RESULT_STEP * steps
     if gens > 0
         test.assert_eq(ctl_budget.controller_cs_bytes(), 8 + 712 * gens + 32 + (8 + 56 * steps) + procs)
     else

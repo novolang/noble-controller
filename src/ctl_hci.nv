@@ -73,6 +73,14 @@ use ll_cs
 use ll_cs_pdu
 @when(noble_controller_config.CTL_CS > 0)
 use ll_cs_proc
+@when(noble_controller_config.CTL_CS > 0)
+use ll_cs_hci
+@when(noble_controller_config.CTL_CS > 0)
+use ll_cs_res
+@when(noble_controller_config.CTL_CS > 0)
+use ll_cs_plan
+@when(noble_controller_config.CTL_CS > 0)
+use ll_cs_radio
 use ll_sub
 use ll_rate
 use ll_fs
@@ -564,9 +572,8 @@ struct Controller
     host_sub: Bool
     pwa: Vec[PwAdv; if noble_controller_config.CTL_PAWR_ADV then max1(noble_controller_config.CTL_PER_ADV) else 1]
     pws: Vec[PwSync; if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1]
-    cs_w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1]
-    cs_b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1]
-    cs_host: Bool
+    cs_w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1]
+    cs_b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1]
 
 // A Controller in its power-on state, for hardware with the capabilities
 // `caps`.  The public address is zero until `ctl_set_public` gives it.
@@ -591,7 +598,7 @@ fn controller_new(caps: Int) -> Controller
         xs: ll_ext.xctx_new(), xv: ll_pdu.pdu_new(), xp: ll_ext.xpri_new(), xview: false,
         xsets: Vec.new(), coded: true, adv_set: -1, adv_base: 0, adv_xset: -1,
         pads: Vec.new(), psyncs: Vec.new(), preq: ll_per.preq_new(), pal: ll_per.pal_new(), per_late: 0,
-        past_def: ll_past.cfg_new(), past_cfg: Vec.new(), past_tx: Vec.new(), pcl: Vec.new(), sub: Vec.new(), sub_def: Vec.new(), host_sub: false, pwa: Vec.new(), pws: Vec.new(), cs_w: Vec.new(), cs_b: Vec.new(), cs_host: false }
+        past_def: ll_past.cfg_new(), past_cfg: Vec.new(), past_tx: Vec.new(), pcl: Vec.new(), sub: Vec.new(), sub_def: Vec.new(), host_sub: false, pwa: Vec.new(), pws: Vec.new(), cs_w: Vec.new(), cs_b: Vec.new() }
     for _ in 0..ctl_limits.padv_n()
         let _p = c.pads.push(ll_per.padv_new())
     for _ in 0..ctl_limits.psync_n()
@@ -1254,7 +1261,8 @@ fn command_answered(var c: Controller, opcode: Int) -> Bool
         return true
     if command_bit(opcode) < 0
         return false
-    if iso_command(opcode) and not ctl_limits.iso_on()
+    // LE Set Host Feature [v1] lies in the range of the isochronous commands and is also the Host's way to set bit 47 (Channel Sounding, Host Support).
+    if iso_command(opcode) and not ctl_limits.iso_on() and not (opcode == OP_LE_SET_HOST_FEATURE and ctl_limits.cs_on())
         return false
     if (big_command(opcode) or isotest_command(opcode)) and not ctl_limits.big_on()
         return false
@@ -1673,9 +1681,11 @@ fn cmd_le_features(var c: Controller, opcode: Int)
     for _ in 0..8
         let _a = f.push(0)
     if (c.caps as Int & CAP_LL) != 0
-        ll_link.own_features(var f, c.host_iso, c.host_sub)
+        ll_link.own_features(var f, c.host_iso, c.host_sub, host_cs_bit(var c))
         if not c.coded
             ll_link.clear_coded(var f)
+        if cs_tq_bit(var c)
+            f[6] = (f[6] as Int | ll_cs.FEAT6_CS_TQ) as u8
     for i in 0..8
         let _b = ctl_pool.pool_put(var c.pool, slot, f[i] as Int)
     complete_send(var c, slot)
@@ -1691,9 +1701,11 @@ fn cmd_le_read_all_local(var c: Controller)
     var f: Vec[u8; 8] = Vec.new()
     for _ in 0..8
         let _a = f.push(0)
-    ll_link.own_features(var f, c.host_iso, c.host_sub)
+    ll_link.own_features(var f, c.host_iso, c.host_sub, host_cs_bit(var c))
     if not c.coded
         ll_link.clear_coded(var f)
+    if cs_tq_bit(var c)
+        f[6] = (f[6] as Int | ll_cs.FEAT6_CS_TQ) as u8
     var p1 = ctl_limits.page1_bits()
     if ctl_limits.rate_on()
         p1 = ll_link.fx_get(c.links[0], ll_link.FX_LOCAL, 0xFFFF)
@@ -4562,9 +4574,13 @@ fn dispatch(var c: Controller)
     if ctl_limits.ploss_on() and ploss_command(opcode)
         ploss_dispatch(var c, opcode)
         return
-    // And for Channel Sounding.
-    if cs_command_on(opcode)
-        cs_dispatch(var c, opcode)
+    // And for Channel Sounding, whose Host Support bit LE Set Host Feature [v1] sets when the build has no isochronous channels to dispatch it.
+    if noble_controller_config.CTL_CS > 0
+        if cs_command_on(opcode)
+            cs_dispatch(var c, opcode)
+            return
+    if ctl_limits.cs_on() and opcode == OP_LE_SET_HOST_FEATURE
+        cmd_le_set_host_feature(var c)
         return
     // And for Connection Subrating.
     if ctl_limits.sub_on() and sub_command(opcode)
@@ -8327,6 +8343,8 @@ fn ctl_flush_events(var c: Controller)
         return
     if ctl_limits.big_on() and c.bi_owed and not ev_biginfo(var c)
         return
+    if noble_controller_config.CTL_CS > 0
+        let _cs = flush_cs(var c)
 
 // ── Isochronous channels ─────────────────────────────────────────────
 //
@@ -8770,14 +8788,1257 @@ fn pcl_dispatch(var c: Controller, opcode: Int)
 
 // ── Channel Sounding ────────────────────────────────────────────────
 
-// The Channel Sounding commands of a build that has the feature: each answers `ll_cs.STUB_STATUS`, with a Command Status event where the
-// command's result would follow in an event of its own and a Command Complete event otherwise.
+// ── Channel Sounding: the words and octets of the Controller ────────
+// After the records of the connections the tables `cs_w` and `cs_b` hold what the Controller as a whole keeps: the words `ll_cs_proc.GW_` and the octets `GO_` (the local
+// capability record, the parameters of an LE CS Test, the FAE table of the test, and the octets of the result of a subevent that waits to be sent).
+
+// Word `k` of the Controller's own words.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_gw(var c: Controller, k: Int) -> Int
+    c.cs_w[noble_controller_config.CTL_CS * ll_cs_proc.CS_WORDS + k]
+
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_gw_put(var c: Controller, k: Int, v: Int)
+    c.cs_w[noble_controller_config.CTL_CS * ll_cs_proc.CS_WORDS + k] = v
+
+// Octet `k` of the Controller's own octets.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_go(var c: Controller, k: Int) -> Int
+    c.cs_b[noble_controller_config.CTL_CS * ll_cs_proc.bulk_octets() + k] as Int
+
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_go_put(var c: Controller, k: Int, v: Int)
+    c.cs_b[noble_controller_config.CTL_CS * ll_cs_proc.bulk_octets() + k] = (v & 0xFF) as u8
+
+// Whether the Host set Channel Sounding (Host Support).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_host_get(var c: Controller) -> Bool
+    cs_gw(var c, ll_cs_proc.GW_HOST) != 0
+
+// Whether the Host set the Channel Sounding (Host Support) feature bit, which goes into the feature set the Host reads and the one sent to the peer.  False for a build without
+// the feature.
+@tier(embedded)
+fn host_cs_bit(var c: Controller) -> Bool
+    if noble_controller_config.CTL_CS > 0
+        return cs_host_get(var c)
+    false
+
+// Whether the radio reports the tone quality (LE feature 48), which the Controller tells the Host and not the peer.  False for a build without the feature.
+@tier(embedded)
+fn cs_tq_bit(var c: Controller) -> Bool
+    if noble_controller_config.CTL_CS > 0
+        return cs_gw(var c, ll_cs_proc.GW_TQ) != 0
+    false
+
+// The capabilities of this end: those of the build, cut down to what the radio runs once `ctl_cs_radio_init` has read it.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_local(var c: Controller, var out: ll_cs_pdu.CapPdu)
+    ll_cs_proc.local_caps(var out)
+    if cs_gw(var c, ll_cs_proc.GW_RADIO) != 0
+        var b = ll_cs_hci.buf_new()
+        for k in 0..ll_cs_hci.CAPS_V2
+            b[k] = cs_go(var c, ll_cs_proc.GO_CAPS + k) as u8
+        ll_cs_hci.caps_get(var b, out.v2, var out)
+
+// Read the capabilities of the radio `air` once, when the Controller starts, and keep what this end reports: the capabilities of the build cut down to the radio's, and
+// whether it reports the tone quality (LE feature 48).  A Controller that never calls this reports the capabilities of its build.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_radio_init<S: CsRadio[s]>(var c: Controller, var air: S) [s]
+    var rc = air.cs_caps()
+    var local = ll_cs_pdu.cap_new()
+    ll_cs_proc.local_caps(var local)
+    ll_cs_hci.caps_radio(var local, var rc)
+    var b = ll_cs_hci.buf_new()
+    let n = ll_cs_hci.caps_put(var local, true, var b)
+    for k in 0..n
+        cs_go_put(var c, ll_cs_proc.GO_CAPS + k, b[k] as Int)
+    cs_gw_put(var c, ll_cs_proc.GW_RADIO, 1)
+    cs_gw_put(var c, ll_cs_proc.GW_TQ, ll_cs_proc.b2i(rc.supported and rc.tq))
+
+// Whether the peer of the link in slot `ls` may be asked: its feature set is known, has Channel Sounding (46) and has its Host Support (47).  The status the command gets
+// otherwise: Command Disallowed when the features are not known or Host Support is clear, Unsupported Remote Feature when the peer has no Channel Sounding.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_peer_gate(var c: Controller, ls: Int) -> Int
+    if not c.links[ls].have_feat
+        return STATUS_COMMAND_DISALLOWED
+    let f5 = c.links[ls].peer_feat[5] as Int
+    if (f5 & ll_cs.FEAT5_CS) == 0
+        return STATUS_UNSUPPORTED_REMOTE
+    if (f5 & ll_cs.FEAT5_CS_HOST) == 0
+        return STATUS_COMMAND_DISALLOWED
+    STATUS_SUCCESS
+
+// The status of the checks every command with a connection handle meets: Unknown Connection Identifier for a handle that is no ACL, Command Disallowed when the Host has
+// not set Channel Sounding (Host Support), and, for a command that asks the peer, `cs_peer_gate`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_gate(var c: Controller, ls: Int, peer: Bool) -> Int
+    if ls < 0
+        return STATUS_UNKNOWN_CONNECTION
+    if not cs_host_get(var c)
+        return STATUS_COMMAND_DISALLOWED
+    if peer
+        return cs_peer_gate(var c, ls)
+    STATUS_SUCCESS
+
+// The Host is owed `bit` (an `OWED_` of ll_cs_proc) with the status `st` for the connection of the record `i`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_owe(var c: Controller, i: Int, bit: Int, st: Int)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    ll_cs_proc.owe(var cs, bit, st)
+    cs_put(var c, i, var cs)
+
+// ── Channel Sounding: the commands ──────────────────────────────────
+
+// The Channel Sounding commands of a build that has the feature.  Each checks what the specification lists for it ([Vol 4] Part E, Section 7.8.130 to 7.8.143, 7.8.157 and
+// 7.8.158) and answers with a Command Complete event, or with a Command Status event when the result follows as an event of its own (`ll_cs.status_reply`).
+@when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn cs_dispatch(var c: Controller, opcode: Int)
-    if ll_cs.status_reply(opcode)
-        answer_command_status(var c, opcode, ll_cs.STUB_STATUS)
+    match opcode
+        0x2089 => cmd_cs_read_local(var c, false)
+        0x20a5 => cmd_cs_read_local(var c, true)
+        0x208a => cmd_cs_read_remote(var c)
+        0x208b => cmd_cs_write_cached(var c, false)
+        0x20a6 => cmd_cs_write_cached(var c, true)
+        0x208c => cmd_cs_security_enable(var c)
+        0x208d => cmd_cs_default_settings(var c)
+        0x208e => cmd_cs_read_fae(var c)
+        0x208f => cmd_cs_write_fae(var c)
+        0x2090 => cmd_cs_create_config(var c)
+        0x2091 => cmd_cs_remove_config(var c)
+        0x2092 => cmd_cs_classification(var c)
+        0x2093 => cmd_cs_procedure_parameters(var c)
+        0x2094 => cmd_cs_procedure_enable(var c)
+        0x2095 => cmd_cs_test(var c)
+        0x2096 => cmd_cs_test_end(var c)
+        0x20a7 => cmd_cs_security_requirements(var c)
+        _      => cmd_cs_default_security_requirements(var c)
+
+// LE CS Read Local Supported Capabilities, [v1] (`v2` false) and [v2]: the record of this end, or Command Disallowed with zeros while the Host Support bit is clear.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_read_local(var c: Controller, v2: Bool)
+    var op = ll_cs.OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES
+    if v2
+        op = ll_cs.OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES_V2
+    var status = STATUS_SUCCESS
+    if not cs_host_get(var c)
+        status = STATUS_COMMAND_DISALLOWED
+    let slot = complete_begin(var c, op, status)
+    // cov: skip — ctl_step runs a command only with a free slot for its answer
+    if slot == ctl_pool.NO_SLOT
+        return
+    var local = ll_cs_pdu.cap_new()
+    cs_local(var c, var local)
+    var b = ll_cs_hci.buf_new()
+    let n = ll_cs_hci.caps_put(var local, v2, var b)
+    for k in 0..n
+        if status == STATUS_SUCCESS
+            let _a = ctl_pool.pool_put(var c.pool, slot, b[k] as Int)
+        else
+            let _z = ctl_pool.pool_put(var c.pool, slot, 0)
+    complete_send(var c, slot)
+
+// LE CS Read Remote Supported Capabilities: Command Status, and the Read Remote Supported Capabilities Complete event when the exchange with the peer is done.  The
+// capabilities the Host wrote (LE CS Write Cached Remote Supported Capabilities) or an earlier exchange left are the answer without one.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_read_remote(var c: Controller)
+    let ls = handle_slot(var c, param_handle(var c))
+    var status = cs_gate(var c, ls, true)
+    if status == STATUS_SUCCESS
+        var cached = false
+        let i = cs_find(var c, ls)
+        if i >= 0
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            cached = ll_cs_proc.caps_known(var cs) and cs.wait == ll_cs_proc.W_NONE
+        if cached
+            cs_owe(var c, cs_find(var c, ls), ll_cs_proc.OWED_CAPS, 0)
+        else
+            status = ctl_cs_capabilities(var c, ls)
+    answer_command_status(var c, ll_cs.OP_CS_READ_REMOTE_SUPPORTED_CAPABILITIES, status)
+
+// LE CS Write Cached Remote Supported Capabilities, [v1] and [v2]: the record of a peer the Host knows from an earlier connection.  The 2M counts of a [v1] record are those of
+// the 1M ones, which the event of the [v2] form says when it is read back.  Command Disallowed once the peer has sent its capabilities or a configuration exists.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_write_cached(var c: Controller, v2: Bool)
+    var op = ll_cs.OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES
+    var n = ll_cs_hci.CAPS_V1
+    if v2
+        op = ll_cs.OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES_V2
+        n = ll_cs_hci.CAPS_V2
+    let handle = param_handle(var c)
+    let ls = handle_slot(var c, handle)
+    var status = cs_gate(var c, ls, false)
+    if status == STATUS_SUCCESS
+        var b = ll_cs_hci.buf_new()
+        ll_cs_hci.buf_take(var c.rx, 2, n, var b)
+        var cp = ll_cs_pdu.cap_new()
+        ll_cs_hci.caps_get(var b, v2, var cp)
+        status = ll_cs_hci.caps_host_check(var cp)
+        if status == STATUS_SUCCESS
+            let i = cs_claim(var c, ls)
+            if i < 0
+                status = ll_cs_proc.E_LIMITED
+            else
+                var cs = ll_cs_proc.cs_new()
+                cs_get(var c, i, var cs)
+                status = ll_cs_proc.cache_caps(var cs, var cp, var c.links[ls].tmp)
+                cs_put(var c, i, var cs)
+    answer_handle(var c, op, status, handle)
+
+// LE CS Security Enable: Command Status, and the Security Enable Complete event when the Central has the Peripheral's part of the values.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_security_enable(var c: Controller)
+    let ls = handle_slot(var c, param_handle(var c))
+    var status = cs_gate(var c, ls, true)
+    if status == STATUS_SUCCESS
+        status = ctl_cs_security(var c, ls)
+    answer_command_status(var c, ll_cs.OP_CS_SECURITY_ENABLE, status)
+
+// The antenna selection of LE CS Set Default Settings: an element of the build (1 to its count), or one of the three codes 0xFD, 0xFE and 0xFF.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_antenna_ok(sel: Int, count: Int) -> Bool
+    sel >= 1 and sel <= count or sel >= 0xFD
+
+// LE CS Set Default Settings: the roles the Host enables, the antenna for CS_SYNC and the highest transmit power, for the connection.  Unsupported Feature or Parameter Value
+// for a role or an antenna this end lacks, Invalid HCI Command Parameters for a role switched off while a configuration of that role exists and for a power beyond the range.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_default_settings(var c: Controller)
+    let handle = param_handle(var c)
+    let ls = handle_slot(var c, handle)
+    let roles = h4_rx.h4_param(var c.rx, 2)
+    let ant = h4_rx.h4_param(var c.rx, 3)
+    let txp = h4_rx.h4_param(var c.rx, 4)
+    var status = STATUS_SUCCESS
+    var local = ll_cs_pdu.cap_new()
+    cs_local(var c, var local)
+    if ls < 0
+        status = STATUS_UNKNOWN_CONNECTION
+    else if (roles & ~local.role) != 0 or not cs_antenna_ok(ant, local.num_ant)
+        status = STATUS_UNSUPPORTED_FEATURE
+    else if not ll_cs_hci.dbm_ok(txp)
+        status = STATUS_INVALID_PARAMETERS
     else
-        answer_status(var c, opcode, ll_cs.STUB_STATUS)
+        let i = cs_claim(var c, ls)
+        if i < 0
+            status = ll_cs_proc.E_LIMITED
+        else
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            for id in 0..ll_cs_proc.cfg_slots()
+                if ll_cs_proc.cfg_used(var cs, id) and ((roles >>> ll_cs_proc.cfg_role(var cs, id)) & 1) == 0
+                    status = STATUS_INVALID_PARAMETERS
+            if status == STATUS_SUCCESS
+                ll_cs_proc.set_defaults(var cs, roles, ant, txp)
+                cs_put(var c, i, var cs)
+    answer_handle(var c, ll_cs.OP_CS_SET_DEFAULT_SETTINGS, status, handle)
+
+// LE CS Read Remote FAE Table: Command Status, and the Read Remote FAE Table Complete event with the 72 values.  A table the Host wrote or an earlier request left is the answer
+// without a request.  Unsupported Feature or Parameter Value when the peer needs no table (No_FAE).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_read_fae(var c: Controller)
+    let ls = handle_slot(var c, param_handle(var c))
+    var status = STATUS_SUCCESS
+    if ls < 0
+        status = STATUS_UNKNOWN_CONNECTION
+    else
+        status = cs_peer_gate(var c, ls)
+        if status == STATUS_SUCCESS and not cs_host_get(var c)
+            status = STATUS_COMMAND_DISALLOWED
+    if status == STATUS_SUCCESS
+        var cached = false
+        let i = cs_find(var c, ls)
+        if i >= 0
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            var peer = ll_cs_pdu.cap_new()
+            let have = ll_cs_proc.load_caps(var cs, var peer, var c.links[ls].tmp)
+            if have and peer.no_fae == 1
+                status = STATUS_UNSUPPORTED_FEATURE
+            cached = status == STATUS_SUCCESS and cs.fae_known and cs.wait == ll_cs_proc.W_NONE
+        if status == STATUS_SUCCESS
+            if cached
+                cs_owe(var c, cs_find(var c, ls), ll_cs_proc.OWED_FAE, 0)
+            else
+                status = ctl_cs_fae(var c, ls)
+    answer_command_status(var c, ll_cs.OP_CS_READ_REMOTE_FAE_TABLE, status)
+
+// LE CS Write Cached Remote FAE Table: the table of a peer the Host knows from an earlier connection, or, with the handle 0xFFF, the table LE CS Test uses.  Unsupported Feature
+// or Parameter Value when the peer needs no table, Command Disallowed once the peer has sent its table or a configuration exists.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_write_fae(var c: Controller)
+    let handle = param_handle(var c)
+    var status = STATUS_SUCCESS
+    if handle == ll_cs_proc.HANDLE_TEST
+        for k in 0..ll_cs.CHANNEL_COUNT
+            cs_go_put(var c, ll_cs_proc.GO_FAE + k, h4_rx.h4_param(var c.rx, 2 + k))
+        answer_handle(var c, ll_cs.OP_CS_WRITE_CACHED_REMOTE_FAE_TABLE, status, handle)
+        return
+    let ls = handle_slot(var c, handle)
+    if ls < 0
+        status = STATUS_UNKNOWN_CONNECTION
+    else
+        let i = cs_claim(var c, ls)
+        if i < 0
+            status = ll_cs_proc.E_LIMITED
+        else
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            var peer = ll_cs_pdu.cap_new()
+            if ll_cs_proc.load_caps(var cs, var peer, var c.links[ls].tmp) and peer.no_fae == 1
+                status = STATUS_UNSUPPORTED_FEATURE
+            else
+                for k in 0..ll_cs.CHANNEL_COUNT
+                    if status == STATUS_SUCCESS
+                        status = ll_cs_proc.cache_fae(var cs, k, h4_rx.h4_param(var c.rx, 2 + k), k == ll_cs.CHANNEL_COUNT - 1)
+            cs_put(var c, i, var cs)
+    answer_handle(var c, ll_cs.OP_CS_WRITE_CACHED_REMOTE_FAE_TABLE, status, handle)
+
+// Whether a procedure is enabled on any connection: LE CS Test and the commands that change a configuration or the requirements wait for it.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_any_running(var c: Controller) -> Bool
+    for i in 0..ctl_limits.cs_slots()
+        if cs_owner(var c, i) >= 0
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            if cs.run_open
+                return true
+    false
+
+// Whether a procedure is enabled on the connection of the link in slot `ls`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_link_running(var c: Controller, ls: Int) -> Bool
+    let i = cs_find(var c, ls)
+    if i < 0
+        return false
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    cs.run_open
+
+// LE CS Create Config: Command Status, and the Config Complete event when the peer has answered, or at once when `Create_Context` is 0 (the configuration is kept here
+// alone).  Invalid HCI Command Parameters for a role the Host did not enable with LE CS Set Default Settings or a configuration outside the specification, Unsupported Feature or
+// Parameter Value for one this end or the peer lacks, Command Disallowed for a configuration that is enabled.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_create_config(var c: Controller)
+    let ls = handle_slot(var c, param_handle(var c))
+    let context = h4_rx.h4_param(var c.rx, 3)
+    var cfg = ll_cs_pdu.cfg_new()
+    ll_cs_hci.config_from_rx(var c.rx, var cfg)
+    var status = cs_gate(var c, ls, context == 1)
+    if status == STATUS_SUCCESS and context > 1
+        status = STATUS_INVALID_PARAMETERS
+    if status == STATUS_SUCCESS
+        let i = cs_claim(var c, ls)
+        if i < 0
+            status = ll_cs_proc.E_LIMITED
+        else
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            if cfg.role <= 1 and ((cs.def_roles >>> cfg.role) & 1) == 0
+                status = STATUS_INVALID_PARAMETERS
+            else
+                status = ctl_cs_config(var c, ls, var cfg, context == 0)
+    answer_command_status(var c, ll_cs.OP_CS_CREATE_CONFIG, status)
+
+// LE CS Remove Config: Command Status, and the Config Complete event with Action 0 when the peer has removed the configuration (here alone when the peer's capabilities are
+// not known, since the configuration cannot have been made with it).  Command Disallowed while any procedure is enabled, Invalid HCI Command Parameters for a Config_ID with no
+// configuration.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_remove_config(var c: Controller)
+    let ls = handle_slot(var c, param_handle(var c))
+    var cfg = ll_cs_pdu.cfg_new()
+    ll_cs_pdu.cfg_remove(var cfg, h4_rx.h4_param(var c.rx, 2))
+    var status = cs_gate(var c, ls, false)
+    if status == STATUS_SUCCESS and cs_link_running(var c, ls)
+        status = STATUS_COMMAND_DISALLOWED
+    if status == STATUS_SUCCESS
+        let i = cs_claim(var c, ls)
+        if i < 0
+            status = ll_cs_proc.E_LIMITED
+        else
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            let known = ll_cs_proc.caps_known(var cs)
+            if not ll_cs_proc.cfg_used(var cs, cfg.config_id)
+                status = STATUS_INVALID_PARAMETERS
+            else if known
+                status = cs_peer_gate(var c, ls)
+            if status == STATUS_SUCCESS
+                status = ctl_cs_config(var c, ls, var cfg, not known)
+    answer_command_status(var c, ll_cs.OP_CS_REMOVE_CONFIG, status)
+
+// LE CS Set Channel Classification: the channels the Host found usable.  The map is kept for the connections that follow and sent to the peer on every connection that has
+// security started (LL_CS_CHANNEL_MAP_IND, six events ahead).  Command Disallowed within a second of the last, Invalid HCI Command Parameters for a reserved channel or fewer
+// than 15.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_classification(var c: Controller)
+    var lo = 0
+    var hi = 0
+    for k in 0..5
+        lo = lo | (h4_rx.h4_param(var c.rx, k) << (8 * k))
+        hi = hi | (h4_rx.h4_param(var c.rx, 5 + k) << (8 * k))
+    var status = STATUS_SUCCESS
+    let last = cs_gw(var c, ll_cs_proc.GW_CLASS_T)
+    if last != 0 and c.now - (last - 1) < CS_CLASS_GAP_US
+        status = STATUS_COMMAND_DISALLOWED
+    else if (lo & ~ll_cs_pdu.CHM_LO_ALLOWED) != 0 or (hi & ~ll_cs_pdu.CHM_HI_ALLOWED) != 0 or ll_cs_pdu.chm_count(lo, hi) < ll_cs_proc.CHANNELS_MIN
+        status = STATUS_INVALID_PARAMETERS
+    else
+        cs_gw_put(var c, ll_cs_proc.GW_CLASS_LO, lo)
+        cs_gw_put(var c, ll_cs_proc.GW_CLASS_HI, hi)
+        cs_gw_put(var c, ll_cs_proc.GW_CLASS_T, c.now + 1)
+        for i in 0..ctl_limits.cs_slots()
+            let ls = cs_owner(var c, i)
+            if ls >= 0 and ctl_conn_active(var c, ls)
+                var cs = ll_cs_proc.cs_new()
+                cs_get(var c, i, var cs)
+                if cs.secured
+                    let _s = ctl_cs_channel_map(var c, ls, lo, hi, (c.links[ls].ev_count + ll_cs_proc.EVENT_AHEAD) & 0xFFFF)
+    answer_status(var c, ll_cs.OP_CS_SET_CHANNEL_CLASSIFICATION, status)
+
+// The least time between two LE CS Set Channel Classification commands, in microseconds.
+const CS_CLASS_GAP_US = 1000000
+
+// The Start the Controller makes of the procedure parameters of the configuration `id` of the record `cs` on the link in slot `ls`: the status 0, 0x12 or 0x0D of
+// `ll_cs_hci.start_from_pp`, and the fields in `s`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_start_of(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs, id: Int,
+               var s: ll_cs_pdu.StartPdu) -> Int
+    var pp = ll_cs_hci.buf_new()
+    ll_cs_proc.pp_load(var cs, id, var pp)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    ll_cs_hci.start_from_pp(var pp, id, var en, var s)
+
+// LE CS Set Procedure Parameters: what the Host recommends for the procedures of a configuration, kept until the configuration goes.  The Controller picks the scheduling
+// the parameters leave open when the procedures are enabled (`ll_cs_hci.start_from_pp`).  Invalid HCI Command Parameters for a configuration that is not there or a value outside
+// the range, Rejected Due To Limited Resources for a value the capabilities lack, Command Disallowed while the configuration is enabled, Insufficient Channels for fewer than 15 channels.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_procedure_parameters(var c: Controller)
+    let handle = param_handle(var c)
+    let ls = handle_slot(var c, handle)
+    let id = h4_rx.h4_param(var c.rx, 2)
+    var status = cs_gate(var c, ls, false)
+    if status == STATUS_SUCCESS
+        let i = cs_claim(var c, ls)
+        if i < 0
+            status = ll_cs_proc.E_LIMITED
+        else
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            var pp = ll_cs_hci.buf_new()
+            ll_cs_hci.buf_take(var c.rx, 3, ll_cs_proc.PP_OCTETS, var pp)
+            var s = ll_cs_pdu.start_new()
+            var en = ll_cs_proc.env_new()
+            cs_env(var c, ls, var en)
+            if not ll_cs_proc.cfg_used(var cs, id)
+                status = STATUS_INVALID_PARAMETERS
+            else if cs.run_open and cs.series_cfg == id
+                status = STATUS_COMMAND_DISALLOWED
+            else
+                status = ll_cs_hci.start_from_pp(var pp, id, var en, var s)
+            if status == STATUS_SUCCESS
+                var local = ll_cs_pdu.cap_new()
+                cs_local(var c, var local)
+                var peer = ll_cs_pdu.cap_new()
+                if ll_cs_proc.load_caps(var cs, var peer, var c.links[ls].tmp)
+                    let k = ll_cs_proc.start_check(var s, ll_cs_proc.cfg_role(var cs, id) == 0, true, var local, var peer, var en)
+                    if k == 1
+                        status = STATUS_INVALID_PARAMETERS
+                    else if k == 2
+                        status = ll_cs_proc.E_LIMITED
+            if status == STATUS_SUCCESS and ll_cs_proc.filtered_count(var cs, id, en.ev_count) < ll_cs_proc.CHANNELS_MIN
+                status = ll_cs_proc.E_INSUFFICIENT_CHANNELS
+            if status == STATUS_SUCCESS
+                ll_cs_proc.pp_store(var cs, id, var pp)
+                cs_put(var c, i, var cs)
+    answer_handle(var c, ll_cs.OP_CS_SET_PROCEDURE_PARAMETERS, status, handle)
+
+// LE CS Procedure Enable: Command Status, and the Procedure Enable Complete event when the Start with the peer has completed (enable) or the series has been stopped
+// (disable).  A series of one procedure is stopped here, since the peer has no later instance to be told of.  Command Disallowed without procedure parameters, for a configuration
+// already enabled, and for a disable of one that is not; Invalid HCI Command Parameters for a configuration that is not there; Insufficient Channels for fewer than 15 channels.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_procedure_enable(var c: Controller)
+    let ls = handle_slot(var c, param_handle(var c))
+    let id = h4_rx.h4_param(var c.rx, 2)
+    let enable = h4_rx.h4_param(var c.rx, 3)
+    var status = cs_gate(var c, ls, true)
+    if status == STATUS_SUCCESS and enable > 1
+        status = STATUS_INVALID_PARAMETERS
+    if status == STATUS_SUCCESS
+        let i = cs_claim(var c, ls)
+        if i < 0
+            status = ll_cs_proc.E_LIMITED
+        else
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            if not ll_cs_proc.cfg_used(var cs, id)
+                status = STATUS_INVALID_PARAMETERS
+            else if enable == 1
+                if not ll_cs_proc.pp_set(var cs, id) or cs.run_open or cs_gw(var c, ll_cs_proc.GW_TEST_ON) != 0
+                    status = STATUS_COMMAND_DISALLOWED
+                else
+                    var s = ll_cs_pdu.start_new()
+                    status = cs_start_of(var c, ls, var cs, id, var s)
+                    if status == STATUS_SUCCESS and ll_cs_proc.filtered_count(var cs, id, c.links[ls].ev_count) < ll_cs_proc.CHANNELS_MIN
+                        status = ll_cs_proc.E_INSUFFICIENT_CHANNELS
+                    if status == STATUS_SUCCESS
+                        status = ctl_cs_start(var c, ls, var s)
+            else if not cs.run_open or cs.series_cfg != id
+                status = STATUS_COMMAND_DISALLOWED
+            else if cs.series_n == 1 and cs.wait == ll_cs_proc.W_NONE
+                ll_cs_proc.stop_series(var cs, id)
+                cs_put(var c, i, var cs)
+            else
+                status = ctl_cs_terminate(var c, ls, id, ll_cs_proc.E_TERMINATED_BY_HOST)
+    answer_command_status(var c, ll_cs.OP_CS_PROCEDURE_ENABLE, status)
+
+// LE CS Test: the Controller takes the parameters, keeps them and answers; the test runs when `ctl_cs_test_subevent` is called for it, and its results are the events of a
+// connection with the handle 0xFFF.  Invalid HCI Command Parameters for a value outside the range or an override whose data has the wrong length, Unsupported Feature or Parameter
+// Value for what this Controller does not take (see `ll_cs_hci.test_check`), Command Disallowed while a test or a procedure is on.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_test(var c: Controller)
+    let len = h4_rx.h4_param_len(var c.rx)
+    var status = STATUS_SUCCESS
+    if len < ll_cs_hci.TEST_OCTETS or len != ll_cs_hci.TEST_OCTETS + h4_rx.h4_param(var c.rx, ll_cs_hci.TEST_OVERRIDE_LEN)
+        status = STATUS_INVALID_PARAMETERS
+    else if cs_gw(var c, ll_cs_proc.GW_TEST_ON) != 0 or cs_any_running(var c)
+        status = STATUS_COMMAND_DISALLOWED
+    else
+        var t = ll_cs_hci.buf_new()
+        var n = len
+        if n > ll_cs_hci.BUF_OCTETS
+            n = ll_cs_hci.BUF_OCTETS
+        ll_cs_hci.buf_take(var c.rx, 0, n, var t)
+        var local = ll_cs_pdu.cap_new()
+        cs_local(var c, var local)
+        status = ll_cs_hci.test_check(var t, var local)
+        if status == STATUS_SUCCESS
+            for k in 0..ll_cs_hci.BUF_OCTETS
+                cs_go_put(var c, ll_cs_proc.GO_TEST + k, t[k] as Int)
+            cs_gw_put(var c, ll_cs_proc.GW_TEST_ON, 1)
+            cs_gw_put(var c, ll_cs_proc.GW_TEST_N, 0)
+            cs_gw_put(var c, ll_cs_proc.GW_TEST_BEGUN, 0)
+    answer_status(var c, ll_cs.OP_CS_TEST, status)
+
+// LE CS Test End: Command Status, and the Test End Complete event once the results of the test have gone to the Host.  Command Disallowed when no test is on.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_test_end(var c: Controller)
+    var status = STATUS_SUCCESS
+    if cs_gw(var c, ll_cs_proc.GW_TEST_ON) == 0
+        status = STATUS_COMMAND_DISALLOWED
+    else
+        cs_gw_put(var c, ll_cs_proc.GW_TEST_ON, 0)
+        cs_gw_put(var c, ll_cs_proc.GW_TEST_END, 1)
+    answer_command_status(var c, ll_cs.OP_CS_TEST_END, status)
+
+// The security requirements in the eight octets of the command at `at`: the mask, or -1 for a value this Controller cannot enforce (a reserved bit, the 10 ns accuracy, the
+// attack detector metric or, in a build without the sequences, the sequence requirement).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_requirements(var c: Controller, at: Int) -> Int
+    var m = 0
+    for k in 0..8
+        m = m | (h4_rx.h4_param(var c.rx, at + k) << (8 * k))
+    if (m & ~ll_cs_hci.sec_supported()) != 0
+        return -1
+    m
+
+// LE CS Set Security Requirements: the requirements the Controller enforces on the connection.  Command Disallowed while a procedure is enabled, Unsupported Feature or Parameter
+// Value for a requirement it cannot enforce.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_security_requirements(var c: Controller)
+    let handle = param_handle(var c)
+    let ls = handle_slot(var c, handle)
+    var status = cs_gate(var c, ls, false)
+    if status == STATUS_SUCCESS
+        let m = cs_requirements(var c, 2)
+        if m < 0
+            status = STATUS_UNSUPPORTED_FEATURE
+        else if cs_link_running(var c, ls)
+            status = STATUS_COMMAND_DISALLOWED
+        else
+            let i = cs_claim(var c, ls)
+            if i < 0
+                status = ll_cs_proc.E_LIMITED
+            else
+                var cs = ll_cs_proc.cs_new()
+                cs_get(var c, i, var cs)
+                ll_cs_proc.set_sec_req(var cs, m)
+                cs_put(var c, i, var cs)
+    answer_handle(var c, ll_cs.OP_CS_SET_SECURITY_REQUIREMENTS, status, handle)
+
+// LE CS Set Default Security Requirements: the requirements of the connections that follow.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cmd_cs_default_security_requirements(var c: Controller)
+    var status = STATUS_SUCCESS
+    if not cs_host_get(var c)
+        status = STATUS_COMMAND_DISALLOWED
+    else
+        let m = cs_requirements(var c, 0)
+        if m < 0
+            status = STATUS_UNSUPPORTED_FEATURE
+        else
+            cs_gw_put(var c, ll_cs_proc.GW_DEF_SEC, m)
+    answer_status(var c, ll_cs.OP_CS_SET_DEFAULT_SECURITY_REQUIREMENTS, status)
+
+// ── Channel Sounding: the events ────────────────────────────────────
+// The Host is owed an event for each bit of `Cs.owed` ([Vol 4] Part E, Sections 7.7.65.39 to 7.7.65.43), and the results of a subevent and the end of a test.  An event that
+// the Host's event mask leaves out is not sent and is not owed any longer; one that finds no free slot stays owed.  A slot is always left for the answer to a command, as the
+// other events do.
+
+// What `cs_meta` answers for an event the mask leaves out.
+const CS_MASKED = -2
+
+// Start the LE Meta event `sub` unless the Host masked it (`CS_MASKED`) or the pool has no slot to spare (`ctl_pool.NO_SLOT`).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_meta(var c: Controller, sub: Int) -> Int
+    if not le_event_enabled(var c, sub)
+        return CS_MASKED
+    if ctl_pool.pool_free(var c.pool) < 2
+        return ctl_pool.NO_SLOT
+    meta_begin(var c, sub)
+
+// Append the octet `v` to the event in `slot`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_octet(var c: Controller, slot: Int, v: Int)
+    let _a = ctl_pool.pool_put(var c.pool, slot, v & 0xFF)
+
+// The Read Remote Supported Capabilities Complete event, [v2] when the build has it and the Host unmasked it, otherwise [v1].  The record is the peer's, or zeros when the exchange
+// failed.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ev_cs_caps(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs) -> Bool
+    var sub = ll_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE
+    var v2 = false
+    if ctl_limits.cs_ipt_on() and le_event_enabled(var c, ll_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE_V2)
+        sub = ll_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE_V2
+        v2 = true
+    let slot = cs_meta(var c, sub)
+    if slot == ctl_pool.NO_SLOT
+        return false
+    if slot != CS_MASKED
+        cs_octet(var c, slot, cs.st_caps)
+        let _b = ctl_pool.pool_put_u16(var c.pool, slot, c.links[ls].handle)
+        var rec = ll_cs_hci.buf_new()
+        var n = ll_cs_hci.CAPS_V1
+        if v2
+            n = ll_cs_hci.CAPS_V2
+        var cp = ll_cs_pdu.cap_new()
+        if cs.st_caps == 0 and ll_cs_proc.load_caps(var cs, var cp, var c.links[ls].tmp)
+            let _n = ll_cs_hci.caps_put(var cp, v2, var rec)
+        for k in 0..n
+            cs_octet(var c, slot, rec[k] as Int)
+        event_send(var c, slot)
+    cs.owed = cs.owed & ~ll_cs_proc.OWED_CAPS
+    true
+
+// The Read Remote FAE Table Complete event: the 72 values of the peer's table, zeros when the request failed.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ev_cs_fae(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs) -> Bool
+    let slot = cs_meta(var c, ll_cs.SUB_CS_READ_REMOTE_FAE_TABLE_COMPLETE)
+    if slot == ctl_pool.NO_SLOT
+        return false
+    if slot != CS_MASKED
+        cs_octet(var c, slot, cs.st_fae)
+        let _b = ctl_pool.pool_put_u16(var c.pool, slot, c.links[ls].handle)
+        for k in 0..ll_cs.CHANNEL_COUNT
+            var v = 0
+            if cs.st_fae == 0
+                v = ll_cs_proc.peer_fae(var cs, k)
+            cs_octet(var c, slot, v)
+        event_send(var c, slot)
+    cs.owed = cs.owed & ~ll_cs_proc.OWED_FAE
+    true
+
+// The Security Enable Complete event.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ev_cs_security(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs) -> Bool
+    let slot = cs_meta(var c, ll_cs.SUB_CS_SECURITY_ENABLE_COMPLETE)
+    if slot == ctl_pool.NO_SLOT
+        return false
+    if slot != CS_MASKED
+        cs_octet(var c, slot, cs.st_sec)
+        let _b = ctl_pool.pool_put_u16(var c.pool, slot, c.links[ls].handle)
+        event_send(var c, slot)
+    cs.owed = cs.owed & ~ll_cs_proc.OWED_SEC
+    true
+
+// The Config Complete event: the 34 octets of the configuration; after the Config_ID and the action, zeros when the configuration was removed or the procedure failed.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ev_cs_config(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs) -> Bool
+    let slot = cs_meta(var c, ll_cs.SUB_CS_CONFIG_COMPLETE)
+    if slot == ctl_pool.NO_SLOT
+        return false
+    if slot != CS_MASKED
+        cs_octet(var c, slot, cs.st_cfg)
+        let _b = ctl_pool.pool_put_u16(var c.pool, slot, c.links[ls].handle)
+        cs_octet(var c, slot, cs.ev_cfg)
+        cs_octet(var c, slot, cs.ev_act)
+        var cfg = ll_cs_pdu.cfg_new()
+        var full = false
+        if cs.st_cfg == 0 and cs.ev_act == 1
+            full = ll_cs_proc.load_config(var cs, cs.ev_cfg, var cfg, var c.links[ls].tmp)
+        var role = 0
+        var phy = 0
+        var ip1 = 0
+        var ip2 = 0
+        var fcs = 0
+        var pm = 0
+        if full
+            role = ll_cs_proc.cfg_role(var cs, cs.ev_cfg)
+            phy = ll_cs_pdu.sync_phy_to_hci(cfg.sync_phy)
+            ip1 = ll_cs.t_ip_us(cfg.t_ip1)
+            ip2 = ll_cs.t_ip_us(cfg.t_ip2)
+            fcs = ll_cs.t_fcs_us(cfg.t_fcs)
+            pm = ll_cs.t_pm_us(cfg.t_pm)
+        cs_octet(var c, slot, cfg.main_mode)
+        cs_octet(var c, slot, cfg.sub_mode)
+        cs_octet(var c, slot, cfg.main_min)
+        cs_octet(var c, slot, cfg.main_max)
+        cs_octet(var c, slot, cfg.main_rep)
+        cs_octet(var c, slot, cfg.mode0_steps)
+        cs_octet(var c, slot, role)
+        cs_octet(var c, slot, cfg.rtt_type)
+        cs_octet(var c, slot, phy)
+        for k in 0..5
+            cs_octet(var c, slot, cfg.chm_lo >>> (8 * k))
+        for k in 0..5
+            cs_octet(var c, slot, cfg.chm_hi >>> (8 * k))
+        cs_octet(var c, slot, cfg.chm_rep)
+        cs_octet(var c, slot, cfg.chsel)
+        cs_octet(var c, slot, cfg.c3_shape)
+        cs_octet(var c, slot, cfg.c3_jump)
+        cs_octet(var c, slot, cfg.ipt)
+        cs_octet(var c, slot, ip1)
+        cs_octet(var c, slot, ip2)
+        cs_octet(var c, slot, fcs)
+        cs_octet(var c, slot, pm)
+        event_send(var c, slot)
+    cs.owed = cs.owed & ~ll_cs_proc.OWED_CFG
+    true
+
+// The Procedure Enable Complete event, for the start of a series (`term` false) or for its end at the Host's request (`term` true, State 0).  After the State the
+// parameters of the procedures the Start fixed: the antenna configuration, the transmit power, the lengths and intervals.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ev_cs_procedure(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs, term: Bool) -> Bool
+    let slot = cs_meta(var c, ll_cs.SUB_CS_PROCEDURE_ENABLE_COMPLETE)
+    if slot == ctl_pool.NO_SLOT
+        return false
+    if slot != CS_MASKED
+        var status = cs.st_proc
+        var id = cs.wait_cfg
+        if term
+            status = cs.st_term
+        else if status == 0
+            id = cs.series_cfg
+        var s = ll_cs_pdu.start_new()
+        var on = false
+        if not term and status == 0
+            on = ll_cs_proc.load_run(var cs, var s, var c.links[ls].tmp)
+        cs_octet(var c, slot, status)
+        let _b = ctl_pool.pool_put_u16(var c.pool, slot, c.links[ls].handle)
+        cs_octet(var c, slot, id)
+        cs_octet(var c, slot, ll_cs_proc.b2i(on))
+        cs_octet(var c, slot, s.aci)
+        var txp = 0
+        if on
+            txp = cs.def_txp
+        cs_octet(var c, slot, txp)
+        cs_octet(var c, slot, s.subevent_len)
+        cs_octet(var c, slot, s.subevent_len >>> 8)
+        cs_octet(var c, slot, s.subevent_len >>> 16)
+        cs_octet(var c, slot, s.subevents)
+        let _c = ctl_pool.pool_put_u16(var c.pool, slot, s.subevent_interval)
+        let _d = ctl_pool.pool_put_u16(var c.pool, slot, s.event_interval)
+        let _e = ctl_pool.pool_put_u16(var c.pool, slot, s.proc_interval)
+        let _f = ctl_pool.pool_put_u16(var c.pool, slot, s.proc_count)
+        let _g = ctl_pool.pool_put_u16(var c.pool, slot, s.max_proc_len)
+        event_send(var c, slot)
+    if term
+        cs.owed = cs.owed & ~ll_cs_proc.OWED_TERM
+    else
+        cs.owed = cs.owed & ~ll_cs_proc.OWED_PROC
+    true
+
+// The events the record `cs` of the link in slot `ls` owes the Host; false when one found no free slot.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_events(var c: Controller, ls: Int, var cs: ll_cs_proc.Cs) -> Bool
+    if (cs.owed & ll_cs_proc.OWED_CAPS) != 0 and not ev_cs_caps(var c, ls, var cs)
+        return false
+    if (cs.owed & ll_cs_proc.OWED_FAE) != 0 and not ev_cs_fae(var c, ls, var cs)
+        return false
+    if (cs.owed & ll_cs_proc.OWED_SEC) != 0 and not ev_cs_security(var c, ls, var cs)
+        return false
+    if (cs.owed & ll_cs_proc.OWED_CFG) != 0 and not ev_cs_config(var c, ls, var cs)
+        return false
+    if (cs.owed & ll_cs_proc.OWED_PROC) != 0 and not ev_cs_procedure(var c, ls, var cs, false)
+        return false
+    if (cs.owed & ll_cs_proc.OWED_TERM) != 0 and not ev_cs_procedure(var c, ls, var cs, true)
+        return false
+    true
+
+// The word of the record `i` that says what the Host is owed.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_owed(var c: Controller, i: Int) -> Int
+    c.cs_w[i * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_OWED]
+
+// ── Channel Sounding: the results ───────────────────────────────────
+// The result of a subevent waits in the octets of the Controller (`GO_RESULT`, the records of the steps in the order of the event: mode, channel, length of the data, data)
+// with its header in words, and goes out as an LE CS Subevent Result event and as many LE CS Subevent Result Continue events as its steps need, each at most 255 octets of
+// parameters and as soon as the pool has a slot.  One result waits at a time; a second that finds the first still there is reported by its header alone, aborted for
+// lack of resources, after it (`GW_NXT_`), and a third is dropped.
+
+// The octets of the parameters of the Result event before the steps and of a Continue event.
+const CS_RESULT_HEAD = 16
+const CS_CONTINUE_HEAD = 9
+const CS_EVENT_PARAMS = 255
+
+// Write the result's header (the words `GW_RES_` or `GW_NXT_`, as `at` says) for a subevent.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_res_head(var c: Controller, nxt: Bool, handle: Int, cfg_id: Int, start_ev: Int, proc: Int,
+               pdone: Int, sdone: Int, abort: Int)
+    var b = ll_cs_proc.GW_RES_STATE
+    if nxt
+        b = ll_cs_proc.GW_NXT_STATE
+    // The header words of the two are laid out alike: the state, the handle, the configuration, the start event, the procedure counter, then (the pending result only) the
+    // frequency compensation and the reference power, and the done statuses and the abort reason.
+    cs_gw_put(var c, b, 1)
+    cs_gw_put(var c, b + 1, handle)
+    cs_gw_put(var c, b + 2, cfg_id)
+    cs_gw_put(var c, b + 3, start_ev)
+    cs_gw_put(var c, b + 4, proc)
+    if nxt
+        cs_gw_put(var c, ll_cs_proc.GW_NXT_PDONE, pdone)
+        cs_gw_put(var c, ll_cs_proc.GW_NXT_SDONE, sdone)
+        cs_gw_put(var c, ll_cs_proc.GW_NXT_ABORT, abort)
+    else
+        cs_gw_put(var c, ll_cs_proc.GW_RES_PDONE, pdone)
+        cs_gw_put(var c, ll_cs_proc.GW_RES_SDONE, sdone)
+        cs_gw_put(var c, ll_cs_proc.GW_RES_ABORT, abort)
+        cs_gw_put(var c, ll_cs_proc.GW_RES_SENT_STEPS, 0)
+        cs_gw_put(var c, ll_cs_proc.GW_RES_SENT_OCT, 0)
+        cs_gw_put(var c, ll_cs_proc.GW_RES_CONT, 0)
+
+// The result that follows the pending one, which has a header alone, becomes the pending one.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_res_promote(var c: Controller)
+    if cs_gw(var c, ll_cs_proc.GW_NXT_STATE) == 0
+        return
+    cs_res_head(var c, false, cs_gw(var c, ll_cs_proc.GW_NXT_HANDLE), cs_gw(var c, ll_cs_proc.GW_NXT_CFG), cs_gw(var c, ll_cs_proc.GW_NXT_START),
+        cs_gw(var c, ll_cs_proc.GW_NXT_PROC), cs_gw(var c, ll_cs_proc.GW_NXT_PDONE), cs_gw(var c, ll_cs_proc.GW_NXT_SDONE), cs_gw(var c, ll_cs_proc.GW_NXT_ABORT))
+    cs_gw_put(var c, ll_cs_proc.GW_RES_FREQ, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_RPL, ll_cs_res.RSSI_NA)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_NAP, 0)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_STEPS, 0)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_OCT, 0)
+    cs_gw_put(var c, ll_cs_proc.GW_NXT_STATE, 0)
+
+// Send the next event of the pending result: the Result event first, then the Continue events.  False when no slot was free.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_res_event(var c: Controller) -> Bool
+    let steps = cs_gw(var c, ll_cs_proc.GW_RES_STEPS)
+    let sent = cs_gw(var c, ll_cs_proc.GW_RES_SENT_STEPS)
+    let oct = cs_gw(var c, ll_cs_proc.GW_RES_SENT_OCT)
+    let first = cs_gw(var c, ll_cs_proc.GW_RES_CONT) == 0
+    var head = CS_CONTINUE_HEAD
+    var sub = ll_cs.SUB_CS_SUBEVENT_RESULT_CONTINUE
+    if first
+        head = CS_RESULT_HEAD
+        sub = ll_cs.SUB_CS_SUBEVENT_RESULT
+    // The steps this event takes: as many as fit in its 255 octets.
+    var n = 0
+    var used = 0
+    var more = true
+    while more and sent + n < steps
+        let len = 3 + cs_go(var c, ll_cs_proc.GO_RESULT + oct + used + 2)
+        if head + used + len > CS_EVENT_PARAMS
+            more = false
+        else
+            used = used + len
+            n = n + 1
+    let last = sent + n >= steps
+    var pdone = 1
+    var sdone = 1
+    var abort = 0
+    if last
+        pdone = cs_gw(var c, ll_cs_proc.GW_RES_PDONE)
+        sdone = cs_gw(var c, ll_cs_proc.GW_RES_SDONE)
+        let a = cs_gw(var c, ll_cs_proc.GW_RES_ABORT)
+        if pdone == 0xF
+            abort = abort | (a & 0xF)
+        if sdone == 0xF
+            abort = abort | (a & 0xF0)
+    var slot = CS_MASKED
+    if le_event_enabled(var c, sub)
+        if ctl_pool.pool_free(var c.pool) < 2
+            return false
+        slot = meta_begin(var c, sub)
+        let _a = ctl_pool.pool_put_u16(var c.pool, slot, cs_gw(var c, ll_cs_proc.GW_RES_HANDLE))
+        cs_octet(var c, slot, cs_gw(var c, ll_cs_proc.GW_RES_CFG))
+        if first
+            let _b = ctl_pool.pool_put_u16(var c.pool, slot, cs_gw(var c, ll_cs_proc.GW_RES_START))
+            let _c = ctl_pool.pool_put_u16(var c.pool, slot, cs_gw(var c, ll_cs_proc.GW_RES_PROC))
+            let _d = ctl_pool.pool_put_u16(var c.pool, slot, cs_gw(var c, ll_cs_proc.GW_RES_FREQ))
+            cs_octet(var c, slot, cs_gw(var c, ll_cs_proc.GW_RES_RPL))
+        cs_octet(var c, slot, pdone)
+        cs_octet(var c, slot, sdone)
+        cs_octet(var c, slot, abort)
+        cs_octet(var c, slot, cs_gw(var c, ll_cs_proc.GW_RES_NAP))
+        cs_octet(var c, slot, n)
+        // Step_Mode[i], Step_Channel[i], Step_Data_Length[i] and Step_Data[i] one step after the other.
+        for k in 0..used
+            cs_octet(var c, slot, cs_go(var c, ll_cs_proc.GO_RESULT + oct + k))
+        event_send(var c, slot)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_SENT_STEPS, sent + n)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_SENT_OCT, oct + used)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_CONT, 1)
+    if last
+        cs_gw_put(var c, ll_cs_proc.GW_RES_STATE, 0)
+        cs_res_promote(var c)
+    true
+
+// The events of the result that waits, and the end of a test once nothing waits any longer; false when one found no free slot.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_flush_results(var c: Controller) -> Bool
+    while cs_gw(var c, ll_cs_proc.GW_RES_STATE) != 0
+        if not cs_res_event(var c)
+            return false
+    if cs_gw(var c, ll_cs_proc.GW_TEST_END) != 0
+        let slot = cs_meta(var c, ll_cs.SUB_CS_TEST_END_COMPLETE)
+        if slot == ctl_pool.NO_SLOT
+            return false
+        if slot != CS_MASKED
+            cs_octet(var c, slot, 0)
+            event_send(var c, slot)
+        cs_gw_put(var c, ll_cs_proc.GW_TEST_END, 0)
+    true
+
+// Queue the events the procedures and the results owe the Host.  False when one found no free slot, so that the events after it wait.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn flush_cs(var c: Controller) -> Bool
+    for i in 0..ctl_limits.cs_slots()
+        if cs_owed(var c, i) != 0
+            let ls = cs_owner(var c, i)
+            var cs = ll_cs_proc.cs_new()
+            cs_get(var c, i, var cs)
+            let ok = cs_events(var c, ls, var cs)
+            cs_put(var c, i, var cs)
+            if not ok
+                return false
+    cs_flush_results(var c)
+
+// ── Channel Sounding: running a subevent ────────────────────────────
+// The Controller does not call a `CsRadio` from the radio program: the functions below run one subevent when the caller says it is due, with the radio and the cipher the caller
+// holds and the storage of the planning (`ll_cs_plan.CsState`, a generator for each connection and the plan of a subevent) the caller owns, so that an image without Channel
+// Sounding holds none of it.  The caller (the arbiter's class of CS7, a test) says when: `ctl_cs_instance` at the start of each procedure instance, `ctl_cs_subevent` for each
+// subevent of it, `ctl_cs_test_subevent` for each subevent of an LE CS Test.  Each plans the subevent, hands the plan to the radio, runs it and keeps the result, which goes to
+// the Host as events (`flush_cs`).
+
+// What the functions answer: a subevent ran and the procedure goes on, the procedure is complete, there was nothing to run (no connection, no series, no test, or a procedure
+// instance that ended for lack of channels), the cipher failed.
+const RUN_OK = 0
+const RUN_DONE = 1
+const RUN_NONE = 2
+const RUN_FAULT = 3
+
+// The transmit power the plan names for an octet that `ll_cs_hci.dbm_ok` allowed, in dBm: a signed value from -127 to +20.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_tx_dbm(octet: Int) -> Int
+    if octet >= 0x80
+        return octet - 0x100
+    octet
+
+// Keep a result with no steps for a procedure instance that ended without running a subevent: the procedures after it are aborted for `abort` (the reason of the low nibble).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_abort_result(var c: Controller, handle: Int, cfg_id: Int, ev: Int, proc: Int, abort: Int)
+    if not le_event_enabled(var c, ll_cs.SUB_CS_SUBEVENT_RESULT)
+        return
+    if cs_gw(var c, ll_cs_proc.GW_RES_STATE) != 0
+        if cs_gw(var c, ll_cs_proc.GW_NXT_STATE) == 0
+            cs_res_head(var c, true, handle, cfg_id, ev, proc, 0xF, 0, abort)
+        else
+            c.dropped_events = c.dropped_events + 1
+        return
+    cs_res_head(var c, false, handle, cfg_id, ev, proc, 0xF, 0, abort)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_FREQ, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_RPL, ll_cs_res.RSSI_NA)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_NAP, 0)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_STEPS, 0)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_OCT, 0)
+
+// Keep the result of the subevent in `plan` for the Host: the record of each step, from the radio's measurements (`ran`, when the radio ran the plan) and the plan, and the header.
+// `pdone` and `sdone` are the done statuses of the last event, `abort` the reason in the nibbles of the Abort_Reason octet.  A result that finds one waiting is kept by its header
+// alone, aborted for lack of resources (the subevent abort reason 3), and one that finds that one waiting too is dropped and counted.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_store<S: CsRadio[s]>(var c: Controller, var air: S, var plan: ll_cs_plan.CsSubevent,
+                           ran: Bool, var raw: ll_cs_radio.CsRaw, pct: Bool, handle: Int,
+                           cfg_id: Int, start_ev: Int, proc: Int, pdone: Int, sdone: Int,
+                           abort: Int) [s]
+    if not le_event_enabled(var c, ll_cs.SUB_CS_SUBEVENT_RESULT)
+        return
+    if cs_gw(var c, ll_cs_proc.GW_RES_STATE) != 0
+        if cs_gw(var c, ll_cs_proc.GW_NXT_STATE) == 0
+            cs_res_head(var c, true, handle, cfg_id, start_ev, proc, pdone, 0xF, 0x30 | (abort & 0xF))
+        else
+            c.dropped_events = c.dropped_events + 1
+        return
+    cs_res_head(var c, false, handle, cfg_id, start_ev, proc, pdone, sdone, abort)
+    var cal = ll_cs_radio.cs_cal_none()
+    if ran
+        cal = air.cs_cal()
+    var d = ll_cs_res.data_new()
+    var pos = 0
+    var nap = 0
+    for j in 0..plan.n
+        let mode = plan.steps[j].mode as Int
+        cs_go_put(var c, ll_cs_proc.GO_RESULT + pos, mode)
+        cs_go_put(var c, ll_cs_proc.GO_RESULT + pos + 1, plan.steps[j].ch as Int)
+        var sr = ll_cs_radio.cs_step_raw_none()
+        var done = false
+        if ran
+            done = air.cs_step_raw(j, var sr) and sr.done
+        var len = 0
+        if done
+            len = ll_cs_res.step_data(var d, var plan.head, var plan.steps[j], var sr, var cal, pct)
+            for k in 0..len
+                cs_go_put(var c, ll_cs_proc.GO_RESULT + pos + 3 + k, d[k] as Int)
+        cs_go_put(var c, ll_cs_proc.GO_RESULT + pos + 2, len)
+        pos = pos + 3 + len
+        if mode >= 2
+            nap = plan.head.n_ap as Int
+    var freq = ll_cs_radio.CS_FREQ_UNAVAILABLE
+    if ran and (plan.head.role as Int) == ll_cs_radio.CS_ROLE_INITIATOR
+        freq = raw.ffo as Int
+    var rpl = ll_cs_res.RSSI_NA
+    if ran and nap > 0
+        rpl = raw.rpl_dbm as Int & 0xFF
+    cs_gw_put(var c, ll_cs_proc.GW_RES_FREQ, freq)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_RPL, rpl)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_NAP, nap)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_STEPS, plan.n)
+    cs_gw_put(var c, ll_cs_proc.GW_RES_OCT, pos)
+
+// Plan the subevent for the configuration `cfg` and the role `role` into `st.plan`, hand it to the radio, run it and keep the result for the Host: the part `ctl_cs_subevent`
+// and `ctl_cs_test_subevent` share.  `gen` is the index of the generator, `ls` the link (-1 for a test) and `proc_last` says the procedure ends with this subevent whatever the
+// plan says.  The answer is `RUN_FAULT`, `RUN_DONE` or `RUN_OK`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_run<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
+                                       var st: ll_cs_plan.CsState, gen: Int,
+                                       var cfg: ll_cs_plan.CsCfg, role: Int, ipt: Bool, tx: Int,
+                                       test: Bool, proc_last: Bool, pct: Bool, handle: Int,
+                                       cfg_id: Int, start_ev: Int, proc: Int, t0_us: Int,
+                                       anchor_ns: Int) -> Int [s, e]
+    let code = ll_cs_plan.plan_subevent(var cc, var st.gens[gen], var cfg, var st.plan, role, anchor_ns)
+    if code == ll_cs_plan.PLAN_FAULT
+        return RUN_FAULT
+    st.plan.head.ipt = ipt
+    st.plan.head.tx_dbm = tx as i8
+    if test
+        st.plan.head.test = 1
+    var raw = ll_cs_radio.cs_raw_new()
+    let armed = ll_cs_plan.plan_arm(var air, var st.plan, t0_us)
+    var status = armed
+    if armed == ll_cs_radio.CS_OK
+        status = air.cs_run(var raw)
+    let ran = armed == ll_cs_radio.CS_OK and (status == ll_cs_radio.CS_OK or status == ll_cs_radio.CS_ABORTED)
+    let complete = st.gens[gen].done or proc_last or code == ll_cs_plan.PLAN_NO_FIT
+    var pdone = 1
+    if complete
+        pdone = 0
+    var sdone = 0
+    var abort = 0
+    if armed != ll_cs_radio.CS_OK
+        sdone = 0xF
+        if armed == ll_cs_radio.CS_LATE or armed == ll_cs_radio.CS_RESOURCES
+            abort = 0x30
+        else
+            abort = 0xF0
+    else if status != ll_cs_radio.CS_OK
+        sdone = 0xF
+        abort = (raw.abort as Int & 0xF) << 4
+        if abort == 0
+            abort = 0xF0
+    // cov: skip — the first step is a mode 0 step of at most 483 microseconds and a subevent is at least 1250 microseconds long, so no command makes a plan that does not fit
+    if code == ll_cs_plan.PLAN_NO_FIT
+        // Not even the first step fits in the subevent: the procedures that follow are aborted for no reason the specification names.
+        pdone = 0xF
+        abort = 0xF
+    cs_store(var c,
+        var air,
+        var st.plan,
+        ran,
+        var raw,
+        pct,
+        handle,
+        cfg_id,
+        start_ev,
+        proc,
+        pdone,
+        sdone,
+        abort)
+    if complete
+        return RUN_DONE
+    RUN_OK
+
+// A procedure instance of the series of the connection in slot `ls` begins in the connection event `ev`: the channel map of a Channel Map Update whose instant has come takes
+// effect, CSProcCount is incremented (except for the first instance after Security Start), and the generator of the connection is keyed from the values of the Security Start
+// procedure (the first instance) and ratcheted (the later ones).  An instance that finds fewer than 15 channels after the filtering ends the series and is reported to the Host.
+// The answer is `RUN_OK`, `RUN_NONE` or `RUN_FAULT`.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_instance<C: Cipher[e]>(var c: Controller, var cc: C, var st: ll_cs_plan.CsState, ls: Int,
+                                 ev: Int) -> Int [e]
+    let i = cs_find(var c, ls)
+    if i < 0
+        return RUN_NONE
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let first = cs.fresh
+    let r = ll_cs_proc.instance_begin(var cs, ev)
+    if r != 0
+        if r == ll_cs_proc.E_INSUFFICIENT_CHANNELS
+            cs_abort_result(var c, c.links[ls].handle, cs.series_cfg, ev, cs.proc_count, 0x2)
+        cs_put(var c, i, var cs)
+        return RUN_NONE
+    var ok = true
+    if first
+        var iv: Vec[u8; 16] = Vec.new()
+        var pv: Vec[u8; 16] = Vec.new()
+        var nc: Vec[u8; 8] = Vec.new()
+        for k in 0..16
+            let _a = iv.push(ll_cs_proc.cs_iv(var cs, 15 - k) as u8)
+            let _b = pv.push(ll_cs_proc.cs_pv(var cs, 15 - k) as u8)
+        for k in 0..8
+            let _c = nc.push(ll_cs_proc.cs_in(var cs, 7 - k) as u8)
+        ok = ll_cs_plan.gen_instantiate(var cc, var st.gens[i], var iv, var nc, var pv)
+    if ok
+        ok = ll_cs_plan.gen_begin_procedure(var cc, var st.gens[i])
+    cs_put(var c, i, var cs)
+    if ok
+        return RUN_OK
+    RUN_FAULT
+
+// The next subevent of the procedure instance of the connection in slot `ls` runs: it starts at `t0_us` on the radio's timebase, lies `anchor_ns` after the start of the
+// procedure, and is anchored to the connection event `ev` (Start_ACL_Conn_Event_Counter of the result).  The series ends with the last procedure the Start named.  The answer is
+// `RUN_OK` (more subevents follow), `RUN_DONE` (the procedure is complete), `RUN_NONE` or `RUN_FAULT`.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_subevent<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
+                                                var st: ll_cs_plan.CsState, ls: Int, ev: Int,
+                                                t0_us: Int, anchor_ns: Int) -> Int [s, e]
+    let i = cs_find(var c, ls)
+    if i < 0
+        return RUN_NONE
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    if not cs.run_open or st.gens[i].done
+        return RUN_NONE
+    var local = ll_cs_pdu.cap_new()
+    cs_local(var c, var local)
+    var cfg = ll_cs_plan.cfg_new()
+    let ipt = ll_cs_hci.plan_cfg(var cs, var local, var c.links[ls].tmp, var cfg)
+    // cov: skip — a series that is open has its configuration and its Start
+    if ipt < 0
+        return RUN_NONE
+    let id = cs.series_cfg
+    let role = ll_cs_proc.cfg_role(var cs, id)
+    let last = cs.series_n != 0 and ((cs.proc_count - cs.series_start + 1) & 0xFFFF) >= cs.series_n
+    let r = cs_run(var c, var air, var cc, var st, i, var cfg, role, ipt == 1, cs_tx_dbm(cs.def_txp), false, false, local.sounding_pct == 1, c.links[ls].handle, id, ev,
+        cs.proc_count, t0_us, anchor_ns)
+    if r == RUN_DONE and last
+        ll_cs_proc.series_done(var cs)
+        cs_put(var c, i, var cs)
+    r
+
+// The next subevent of the LE CS Test the Host started runs, starting at `t0_us`.  The first call keys the generator with the key of zeros and the test's nonce.  The test ends
+// when its procedure is complete or Max_Num_Subevents subevents have run (one when Subevent_Interval is zero), and its result events carry the handle 0xFFF.  The answer is as
+// that of `ctl_cs_subevent`; `RUN_NONE` when no test is on.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_test_subevent<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
+                                                     var st: ll_cs_plan.CsState,
+                                                     t0_us: Int) -> Int [s, e]
+    if cs_gw(var c, ll_cs_proc.GW_TEST_ON) == 0
+        return RUN_NONE
+    var t = ll_cs_hci.buf_new()
+    for k in 0..ll_cs_hci.BUF_OCTETS
+        t[k] = cs_go(var c, ll_cs_proc.GO_TEST + k) as u8
+    if cs_gw(var c, ll_cs_proc.GW_TEST_BEGUN) == 0
+        ll_cs_plan.gen_instantiate_test(var st.gens[0], ll_cs_hci.g16(var t, ll_cs_hci.TEST_NONCE))
+        // cov: skip — the first procedure of a generator uses its key as it is, so the cipher is not asked and cannot fail
+        if not ll_cs_plan.gen_begin_procedure(var cc, var st.gens[0])
+            return RUN_FAULT
+        cs_gw_put(var c, ll_cs_proc.GW_TEST_BEGUN, 1)
+    var local = ll_cs_pdu.cap_new()
+    cs_local(var c, var local)
+    var cfg = ll_cs_plan.cfg_new()
+    ll_cs_hci.test_cfg(var t, var cfg)
+    let n = cs_gw(var c, ll_cs_proc.GW_TEST_N) + 1
+    cs_gw_put(var c, ll_cs_proc.GW_TEST_N, n)
+    var limit = ll_cs_hci.g8(var t, ll_cs_hci.TEST_MAX_SUB)
+    if limit != 0 and ll_cs_hci.g16(var t, ll_cs_hci.TEST_SUB_INT) == 0
+        limit = 1
+    let stop = limit != 0 and n >= limit
+    // Transmit_Power_Level: a level in dBm, or 0x7E for the least power and 0x7F for the most the radio has (the plan names -127 and +20 dBm, and the radio takes the nearest).
+    var tx = cs_tx_dbm(ll_cs_hci.g8(var t, ll_cs_hci.TEST_POWER))
+    if ll_cs_hci.g8(var t, ll_cs_hci.TEST_POWER) == 0x7E
+        tx = -127
+    else if ll_cs_hci.g8(var t, ll_cs_hci.TEST_POWER) == 0x7F
+        tx = 20
+    let r = cs_run(var c, var air, var cc, var st, 0, var cfg, ll_cs_hci.g8(var t, ll_cs_hci.TEST_ROLE), ll_cs_hci.g8(var t, ll_cs_hci.TEST_ENH) == 1, tx, true, stop,
+        local.sounding_pct == 1, ll_cs_proc.HANDLE_TEST, 0, 0, 0, t0_us, 0)
+    if r == RUN_DONE
+        cs_gw_put(var c, ll_cs_proc.GW_TEST_ON, 0)
+    r
 
 // ── Channel Sounding: the procedures of the Link Layer ──────────────
 // The procedures are in ll_cs_proc.nv, over one record `Cs` for each connection that runs them.  The Controller keeps the records as numbers and octets
@@ -8836,7 +10097,10 @@ fn cs_claim(var c: Controller, ls: Int) -> Int
     for i in 0..ctl_limits.cs_slots()
         if cs_owner(var c, i) < 0
             var cs = ll_cs_proc.cs_new()
-            ll_cs_proc.claim(var cs, ls, c.cs_host)
+            ll_cs_proc.claim(var cs, ls, cs_host_get(var c))
+            ll_cs_proc.set_sec_req(var cs, cs_gw(var c, ll_cs_proc.GW_DEF_SEC))
+            if cs_gw(var c, ll_cs_proc.GW_CLASS_T) != 0
+                ll_cs_proc.set_chm(var cs, cs_gw(var c, ll_cs_proc.GW_CLASS_LO), cs_gw(var c, ll_cs_proc.GW_CLASS_HI))
             cs_put(var c, i, var cs)
             return i
     -1
@@ -8855,19 +10119,26 @@ fn cs_release(var c: Controller, ls: Int)
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn cs_reset_all(var c: Controller)
-    c.cs_host = false
     var cs = ll_cs_proc.cs_new()
     ll_cs_proc.free(var cs)
     for i in 0..ctl_limits.cs_slots()
         cs_put(var c, i, var cs)
+    // What the Controller keeps for all connections goes, but for what describes the radio (the capabilities it was read for, whether it reports the tone quality).
+    for k in 0..ll_cs_proc.GLOBAL_WORDS
+        if k != ll_cs_proc.GW_RADIO and k != ll_cs_proc.GW_TQ
+            cs_gw_put(var c, k, 0)
+    for slot in 0..noble_controller_config.CTL_LINKS
+        ll_link.link_set_host_cs(var c.links[slot], false)
 
 // The Host sets or clears Channel Sounding (Host Support), which it does before the first connection: the records take it.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn ctl_cs_set_host(var c: Controller, on: Bool)
-    c.cs_host = on
+    cs_gw_put(var c, ll_cs_proc.GW_HOST, ll_cs_proc.b2i(on))
     for i in 0..ctl_limits.cs_slots()
         c.cs_w[i * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_HOST] = ll_cs_proc.b2i(on)
+    for slot in 0..noble_controller_config.CTL_LINKS
+        ll_link.link_set_host_cs(var c.links[slot], on)
 
 // The PHY of the link as LL_CS_REQ names it: 1 LE 1M, 2 LE 2M, 4 LE Coded S=8, 8 LE Coded S=2.
 @when(noble_controller_config.CTL_CS > 0)
@@ -8921,9 +10192,14 @@ fn cs_rx(var c: Controller, ls: Int, op: Int, var rx: Pdu)
     var en = ll_cs_proc.env_new()
     cs_env(var c, ls, var en)
     var local = ll_cs_pdu.cap_new()
-    ll_cs_proc.local_caps(var local)
+    cs_local(var c, var local)
     var cs = ll_cs_proc.cs_new()
     cs_get(var c, i, var cs)
+    if op == ll_cs.OP_CS_REQ
+        // The Host's requirements are checked against the configuration the Start names (its Config_ID is the low six bits of the first octet of CtrData).
+        var cfg = ll_cs_pdu.cfg_new()
+        if ll_cs_proc.load_config(var cs, ll_cs_pdu.ct(var rx, 0) & 0x3F, var cfg, var c.links[ls].tmp)
+            ll_cs_proc.set_sec_ok(var en, ll_cs_hci.sec_met(cs.sec_req, var cfg))
     let r = ll_cs_proc.receive(var cs, var en, var local, var rx, var c.links[ls].tmp)
     cs_put(var c, i, var cs)
     if r == ll_cs_proc.R_SEND
@@ -9036,7 +10312,7 @@ fn ctl_cs_capabilities(var c: Controller, ls: Int) -> Int
     var en = ll_cs_proc.env_new()
     cs_env(var c, ls, var en)
     var local = ll_cs_pdu.cap_new()
-    ll_cs_proc.local_caps(var local)
+    cs_local(var c, var local)
     var cs = ll_cs_proc.cs_new()
     cs_get(var c, i, var cs)
     let st = ll_cs_proc.begin_capabilities(var cs, var en, var local, var c.links[ls].tmp)
@@ -9054,7 +10330,7 @@ fn ctl_cs_config(var c: Controller, ls: Int, var cfg: CfgPdu, local_only: Bool) 
     var en = ll_cs_proc.env_new()
     cs_env(var c, ls, var en)
     var local = ll_cs_pdu.cap_new()
-    ll_cs_proc.local_caps(var local)
+    cs_local(var c, var local)
     var cs = ll_cs_proc.cs_new()
     cs_get(var c, i, var cs)
     let st = ll_cs_proc.begin_config(var cs, var en, var local, var cfg, local_only, var c.links[ls].tmp)
@@ -9088,7 +10364,7 @@ fn ctl_cs_start(var c: Controller, ls: Int, var s: StartPdu) -> Int
     var en = ll_cs_proc.env_new()
     cs_env(var c, ls, var en)
     var local = ll_cs_pdu.cap_new()
-    ll_cs_proc.local_caps(var local)
+    cs_local(var c, var local)
     var cs = ll_cs_proc.cs_new()
     cs_get(var c, i, var cs)
     let st = ll_cs_proc.begin_start(var cs, var en, var local, var s, var c.links[ls].tmp)
@@ -9905,7 +11181,7 @@ fn cmd_le_set_host_feature(var c: Controller)
 @satisfies("REQ-BLE-CTL-057")
 @tier(embedded)
 fn host_feature(var c: Controller, bit: Int, value: Int) -> Int
-    if bit != 32 and not (bit == 38 and ctl_limits.sub_on()) and not (bit == 73 and ctl_limits.rate_on()) or value > 1
+    if bit != 32 and not (bit == 38 and ctl_limits.sub_on()) and not (bit == 73 and ctl_limits.rate_on()) and not (bit == ll_cs.FEATURE_CS_HOST_SUPPORT and ctl_limits.cs_on()) or value > 1
         return STATUS_UNSUPPORTED_FEATURE
     if links_live(var c)
         return STATUS_COMMAND_DISALLOWED
@@ -9916,6 +11192,9 @@ fn host_feature(var c: Controller, bit: Int, value: Int) -> Int
     else if ctl_limits.rate_on() and bit == 73
         for slot in 0..noble_controller_config.CTL_LINKS
             ll_link.link_set_host_rate(var c.links[slot], value == 1)
+    else if ctl_limits.cs_on() and bit == ll_cs.FEATURE_CS_HOST_SUPPORT
+        if noble_controller_config.CTL_CS > 0
+            ctl_cs_set_host(var c, value == 1)
     else
         c.host_iso = value == 1
         for slot in 0..noble_controller_config.CTL_LINKS

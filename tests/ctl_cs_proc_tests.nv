@@ -281,13 +281,13 @@ fn test_the_host_support_bit_the_host_set_reaches_the_record_a_connection_claims
         return
     var c = connected()
     ctl_hci.ctl_cs_set_host(var c, true)
-    test.assert(c.cs_host)
+    test.assert(ctl_hci.cs_host_get(var c))
     var rec = ctl_hci.cs_claim(var c, 0)
     test.assert(rec >= 0)
     test.assert(snap(var c, rec).host)
     ctl_hci.ctl_cs_set_host(var c, false)
     test.assert(not snap(var c, rec).host)
-    test.assert(not c.cs_host)
+    test.assert(not ctl_hci.cs_host_get(var c))
 
 @when(noble_controller_config.CTL_PERIPHERAL > 0)
 @when(noble_controller_config.CTL_CS > 0)
@@ -570,7 +570,7 @@ fn test_a_record_is_given_back_when_the_connection_ends_and_when_the_controller_
     test.assert(ctl_hci.cs_claim(var d, 0) >= 0)
     let _r = run(var d, 0x0C03, [])
     test.assert_eq(ctl_hci.cs_find(var d, 0), -1)
-    test.assert(not d.cs_host)
+    test.assert(not ctl_hci.cs_host_get(var d))
 
 @when(noble_controller_config.CTL_PERIPHERAL > 0)
 @when(noble_controller_config.CTL_CS > 0)

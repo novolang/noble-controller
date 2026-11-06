@@ -167,10 +167,6 @@ fn test_the_commands_of_enhancement_1_need_ipt_and_the_test_commands_need_test()
         test.assert_eq(ll_cs.command_answered(op, true, false), not tst)
         test.assert_eq(ll_cs.command_answered(op, false, false), not v2 and not tst)
 
-@test
-fn test_the_status_a_stub_answers_is_unsupported_feature_or_parameter_value()
-    test.assert_eq(ll_cs.STUB_STATUS, 0x11)
-
 // ── The events ──────────────────────────────────────────────────────
 
 @test

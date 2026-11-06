@@ -86,6 +86,10 @@ const E_INSTANT_PASSED = 0x28
 const E_DIFFERENT_COLLISION = 0x2A
 const E_INSUFFICIENT_SECURITY = 0x2F
 const E_INSUFFICIENT_CHANNELS = 0x48
+const E_TERMINATED_BY_HOST = 0x16
+
+// The connection handle of the events of LE CS Test, which has no connection.
+const HANDLE_TEST = 0x0FFF
 
 // What `Cs.wait` allows a peer to leave unanswered, in microseconds ([Vol 6] Part B, Section 5.2).
 const WAIT_US = 40000000
@@ -111,8 +115,9 @@ const UNIT_US = 625
 // The octets of a connection's store, by offset.  The capabilities of the peer: the version (0 none, 1 [v1], 2 [v2]) and 31 octets of CtrData; the FAE
 // table of the peer: 72 signed octets; the security parts: CS_IV 16 octets, CS_IN 8 and CS_PV 16, the Central's part in the least significant half;
 // the CtrData of the LL_CS_REQ of the Start in flight (28) and of its LL_CS_IND (18); the CtrData of the LL_CS_CONFIG_REQ in flight with a flag octet
-// (28); and the configurations, 32 octets each: a flag octet (bit 0 the configuration exists, bit 1 this end sent the request that created it), the
-// 27 octets of the PDU and 4 octets that keep the size a multiple of 8.
+// (28); and the configurations, 56 octets each: a flag octet (bit 0 the configuration exists, bit 1 this end sent the request that created it), the
+// 27 octets of the PDU, a flag octet at 28 that says the procedure parameters of the Host are set, their 20 octets from 29 (`ll_cs_hci.PP_`), and 7 octets that
+// keep the size a multiple of 8.  After the records of the connections, in the same tables, come the words and octets of the Controller as a whole (`GW_`, `GO_`).
 const OFF_CAPS = 0
 const OFF_FAE = 32
 const OFF_SEC = 104
@@ -120,7 +125,62 @@ const OFF_REQ = 144
 const OFF_IND = 172
 const OFF_PCFG = 192
 const OFF_CFG = 224
-const CFG_OCT = 32
+const CFG_OCT = 56
+const OFF_PP_FLAG = 28
+const OFF_PP = 29
+const PP_OCTETS = 20
+
+// The words and the octets the Controller keeps for all its connections, after the records of the connections.  The words (`words[ctl_cs * CS_WORDS + GW_]`): the Host Support
+// bit set by LE Set Host Feature; the default security requirements; whether the radio's capabilities are in the local record and whether it reports the tone quality
+// (LE feature 48); the channel classification of the Host as the two halves of a channel map and the time (+1) it was set; the test (running, subevents done,
+// Test End Complete owed, generator begun); the result of a subevent that waits to be sent as events (its header from `GW_RES_STATE`, in steps and octets, how much was
+// sent) and the header alone of a result that follows it; the results dropped.
+const GW_HOST = 0
+const GW_DEF_SEC = 1
+const GW_RADIO = 2
+const GW_TQ = 3
+const GW_CLASS_LO = 4
+const GW_CLASS_HI = 5
+const GW_CLASS_T = 6
+const GW_TEST_ON = 7
+const GW_TEST_N = 8
+const GW_TEST_END = 9
+const GW_TEST_BEGUN = 10
+const GW_RES_STATE = 11
+const GW_RES_HANDLE = 12
+const GW_RES_CFG = 13
+const GW_RES_START = 14
+const GW_RES_PROC = 15
+const GW_RES_FREQ = 16
+const GW_RES_RPL = 17
+const GW_RES_PDONE = 18
+const GW_RES_SDONE = 19
+const GW_RES_ABORT = 20
+const GW_RES_NAP = 21
+const GW_RES_STEPS = 22
+const GW_RES_OCT = 23
+const GW_RES_SENT_STEPS = 24
+const GW_RES_SENT_OCT = 25
+const GW_RES_CONT = 26
+const GW_NXT_STATE = 27
+const GW_NXT_HANDLE = 28
+const GW_NXT_CFG = 29
+const GW_NXT_START = 30
+const GW_NXT_PROC = 31
+const GW_NXT_PDONE = 32
+const GW_NXT_SDONE = 33
+const GW_NXT_ABORT = 34
+const GW_DROPPED = 35
+const GLOBAL_WORDS = 40
+
+// The octets: the local capability record in the order of the HCI ([v2], 34 octets), the parameters of the LE CS Test in progress (30 and the override data), the FAE table
+// the Host wrote for LE CS Test (72), and the octets of the result of a subevent, `RES_STEP_OCT` for each step the build plans.
+const GO_CAPS = 0
+const GO_TEST = 40
+const GO_FAE = 88
+const GO_RESULT = 160
+const GLOBAL_OCTETS = 160
+const RES_STEP_OCT = 40
 
 // The configurations a connection holds: `ctl_cs_configs`, and 1 in a build without the feature.
 @tier(embedded)
@@ -199,6 +259,9 @@ fn env_at(now: Int) -> Env
 //   proc_count, term_error   CSProcCount; the ErrorCode of the last Procedure Repeat Termination
 //   chm_lo, chm_hi       the channel map of the Channel Map Update procedure in force (all allowed channels at first), `pend_*` the one waiting for its
 //                        instant
+//   def_roles, def_ant, def_txp   the default settings of the Host (LE CS Set Default Settings): the roles enabled (bit 0 initiator, bit 1 reflector), the
+//                        antenna selection for CS_SYNC and the highest transmit power in dBm (an octet, -127 to 20)
+//   sec_req              the security requirements of the Host (the bits of CS_Security_Requirements)
 //   bulk                 the store
 @value
 struct Cs
@@ -236,7 +299,11 @@ struct Cs
     pend_lo: Int
     pend_hi: Int
     pend_instant: Int
-    bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then 224 + 32 * noble_controller_config.CTL_CS_CONFIGS else 1]
+    def_roles: Int
+    def_ant: Int
+    def_txp: Int
+    sec_req: Int
+    bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then 224 + 56 * noble_controller_config.CTL_CS_CONFIGS else 1]
 
 // ── The records in the Controller ───────────────────────────────────
 // The Controller keeps the records of its connections as numbers and octets in two tables, which are `Vec` values and so need no type of their own in a
@@ -277,7 +344,11 @@ const WD_CHM_HI = 30
 const WD_PEND_LO = 31
 const WD_PEND_HI = 32
 const WD_PEND_INSTANT = 33
-const CS_WORDS = 34
+const WD_DEF_ROLES = 34
+const WD_DEF_ANT = 35
+const WD_DEF_TXP = 36
+const WD_SEC_REQ = 37
+const CS_WORDS = 38
 
 @tier(embedded)
 fn b2i(v: Bool) -> Int
@@ -288,8 +359,8 @@ fn b2i(v: Bool) -> Int
 
 // Copy the record of `slot` into `cs`.
 @tier(embedded)
-fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1],
-        var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1],
+fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
+        var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
         slot: Int, var cs: Cs)
     let w = slot * CS_WORDS
     cs.owner = words[w + WD_OWNER]
@@ -326,14 +397,18 @@ fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_con
     cs.pend_lo = words[w + WD_PEND_LO]
     cs.pend_hi = words[w + WD_PEND_HI]
     cs.pend_instant = words[w + WD_PEND_INSTANT]
+    cs.def_roles = words[w + WD_DEF_ROLES]
+    cs.def_ant = words[w + WD_DEF_ANT]
+    cs.def_txp = words[w + WD_DEF_TXP]
+    cs.sec_req = words[w + WD_SEC_REQ]
     let b = slot * bulk_octets()
     for i in 0..bulk_octets()
         cs.bulk[i] = bulk[b + i]
 
 // Copy `cs` into the record of `slot`.
 @tier(embedded)
-fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1],
-         var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1],
+fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
+         var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
          slot: Int, var cs: Cs)
     let w = slot * CS_WORDS
     words[w + WD_OWNER] = cs.owner
@@ -370,14 +445,18 @@ fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_co
     words[w + WD_PEND_LO] = cs.pend_lo
     words[w + WD_PEND_HI] = cs.pend_hi
     words[w + WD_PEND_INSTANT] = cs.pend_instant
+    words[w + WD_DEF_ROLES] = cs.def_roles
+    words[w + WD_DEF_ANT] = cs.def_ant
+    words[w + WD_DEF_TXP] = cs.def_txp
+    words[w + WD_SEC_REQ] = cs.sec_req
     let b = slot * bulk_octets()
     for i in 0..bulk_octets()
         bulk[b + i] = cs.bulk[i]
 
 // The tables of a Controller with `slots` records, each a new record that no connection owns.  `Vec.new()` has no elements; this fills them.
 @tier(embedded)
-fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 34 else 1],
-               var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 32 * noble_controller_config.CTL_CS_CONFIGS) else 1])
+fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
+               var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1])
     var cs = cs_new()
     for slot in 0..noble_controller_config.CTL_CS
         for _ in 0..CS_WORDS
@@ -385,6 +464,10 @@ fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then no
         for _ in 0..bulk_octets()
             let _b = bulk.push(0)
         store(var words, var bulk, slot, var cs)
+    for _ in 0..GLOBAL_WORDS
+        let _g = words.push(0)
+    for _ in 0..GLOBAL_OCTETS + noble_controller_config.CTL_CS_STEPS * RES_STEP_OCT
+        let _h = bulk.push(0)
 
 // A record for the connection of the link in slot `owner`, as new, with the Host Support bit as the Host set it.
 @tier(embedded)
@@ -409,7 +492,7 @@ fn cs_new() -> Cs
     var cs = Cs { owner: -1, host: false, secured: false, fresh: false, caps_air: false, fae_known: false, fae_air: false, run_open: false, start_host: false, pend_chm: false, wait: W_NONE,
                   wait_cfg: 0, t0: 0, rnd_n: 0, yield_op: 0, owed: 0, st_caps: 0, st_fae: 0, st_sec: 0, st_cfg: 0, st_proc: 0, st_term: 0, ev_cfg: 0,
                   ev_act: 0, proc_count: 0, series_cfg: 0, series_n: 0, series_start: 0, term_error: 0, chm_lo: ll_cs_pdu.CHM_LO_ALLOWED,
-                  chm_hi: ll_cs_pdu.CHM_HI_ALLOWED, pend_lo: 0, pend_hi: 0, pend_instant: 0, bulk: Vec.new() }
+                  chm_hi: ll_cs_pdu.CHM_HI_ALLOWED, pend_lo: 0, pend_hi: 0, pend_instant: 0, def_roles: 0, def_ant: 1, def_txp: 0x7F, sec_req: 0, bulk: Vec.new() }
     for _ in 0..bulk_octets()
         let _a = cs.bulk.push(0)
     cs
@@ -450,6 +533,10 @@ fn cs_reset(var cs: Cs)
     cs.pend_lo = 0
     cs.pend_hi = 0
     cs.pend_instant = 0
+    cs.def_roles = 0
+    cs.def_ant = 1
+    cs.def_txp = 0x7F
+    cs.sec_req = 0
     for i in 0..bulk_octets()
         cs.bulk[i] = 0
 
@@ -496,7 +583,8 @@ fn local_fae(i: Int) -> Int
 // phase tone of Enhancement #1 (the [v2] record) and Channel Selection Algorithm #3c.  The round trip time of the access address is mandatory (N 255), the table
 // of frequency actuation errors is absent (No_FAE), the optional step timings and the SNR levels and PHYs are not offered.
 @tier(embedded)
-fn caps_with(var c: CapPdu, roles: Int, ant: Int, configs: Int, mode3: Bool, rtt_seq: Bool, ipt: Bool, ch3c: Bool)
+fn caps_with(var c: CapPdu, roles: Int, ant: Int, configs: Int, mode3: Bool, rtt_seq: Bool,
+             ipt: Bool, ch3c: Bool)
     c.v2 = ipt
     c.mode_types = 0
     if mode3
@@ -679,6 +767,25 @@ fn store_config(var cs: Cs, id: Int, var p: Pdu, mine: Bool)
 @tier(embedded)
 fn remove_config(var cs: Cs, id: Int)
     bs(var cs, cfg_base(id), 0)
+    bs(var cs, cfg_base(id) + OFF_PP_FLAG, 0)
+
+// Whether the Host set the procedure parameters of the configuration `id` (LE CS Set Procedure Parameters).
+@tier(embedded)
+fn pp_set(var cs: Cs, id: Int) -> Bool
+    cfg_used(var cs, id) and bg(var cs, cfg_base(id) + OFF_PP_FLAG) != 0
+
+// Keep the 20 octets `pp` as the procedure parameters of the configuration `id`.
+@tier(embedded)
+fn pp_store(var cs: Cs, id: Int, var pp: Vec[u8; 48])
+    bs(var cs, cfg_base(id) + OFF_PP_FLAG, 1)
+    for i in 0..PP_OCTETS
+        bs(var cs, cfg_base(id) + OFF_PP + i, pp[i] as Int)
+
+// Read the procedure parameters of the configuration `id` into `pp`.
+@tier(embedded)
+fn pp_load(var cs: Cs, id: Int, var pp: Vec[u8; 48])
+    for i in 0..PP_OCTETS
+        pp[i] = bg(var cs, cfg_base(id) + OFF_PP + i) as u8
 
 // ── The tables of the specification ─────────────────────────────────
 
@@ -761,7 +868,8 @@ fn timing_ok(kind: Int, index: Int, mask: Int) -> Bool
 // (`have_peer` says `peer` holds the peer's), `mine` that this end sent the request.  Removing a configuration (`c.action` 0) has no parameters
 // to check.
 @tier(embedded)
-fn config_check(var c: CfgPdu, var local: CapPdu, var peer: CapPdu, have_peer: Bool, mine: Bool) -> Int
+fn config_check(var c: CfgPdu, var local: CapPdu, var peer: CapPdu, have_peer: Bool,
+                mine: Bool) -> Int
     if c.config_id > 3 or c.action > 1
         return 1
     if c.config_id >= cfg_slots() or c.config_id >= local.num_configs or have_peer and c.config_id >= peer.num_configs
@@ -850,7 +958,8 @@ fn schedule_ok(var s: StartPdu, var en: Env) -> Bool
 // specification allows, 2 when a device lacks what it names.  `local_init` says this end is the initiator of the configuration, `local_sends` that
 // this end sends the request; `local` and `peer` are the capabilities.
 @tier(embedded)
-fn start_check(var s: StartPdu, local_init: Bool, local_sends: Bool, var local: CapPdu, var peer: CapPdu, var en: Env) -> Int
+fn start_check(var s: StartPdu, local_init: Bool, local_sends: Bool, var local: CapPdu,
+               var peer: CapPdu, var en: Env) -> Int
     if not event_near(s.conn_event, en.ev_count)
         return 1
     if s.offset_min < OFFSET_MIN_US or s.offset_min >= FOUR_SECONDS_US or s.offset_max < s.offset_min or s.offset_max >= en.interval_us
@@ -1179,6 +1288,8 @@ fn rx_caps_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out:
         return reject(var out, ll_cs.OP_CS_CAPABILITIES_REQ, E_INVALID_LL)
     keep_caps(var cs, var rx)
     cs.caps_air = true
+    cs.st_caps = 0
+    cs.owed = cs.owed | OWED_CAPS
     var r = local
     ll_cs_pdu.cap_version(var r, local.v2 and c.v2)
     ll_cs_pdu.put_caps(var out, ll_cs.OP_CS_CAPABILITIES_RSP, var r)
@@ -1212,7 +1323,8 @@ fn rx_caps_rsp(var cs: Cs, var rx: Pdu) -> Int
 // forbids and a configuration to remove that does not exist, and Unsupported Feature or Parameter Value for a field a device lacks.  The PDU is in `out`
 // unless `local_only`, which completes at once.
 @tier(embedded)
-fn begin_config(var cs: Cs, var en: Env, var local: CapPdu, var c: CfgPdu, local_only: Bool, var out: Pdu) -> Int
+fn begin_config(var cs: Cs, var en: Env, var local: CapPdu, var c: CfgPdu, local_only: Bool,
+                var out: Pdu) -> Int
     let g = begin_guard(var cs, var en)
     if g != 0
         return g
@@ -1767,6 +1879,46 @@ fn receive(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu
         0x38 => rx_channel_map(var cs, var en, var rx, var out)
         // cov: skip — reached only by an opcode that is no PDU of the feature, which `len_ok` has refused before
         _    => R_UNKNOWN
+
+// The Host is owed the event `bit`, with the status `st` for the two events a request of the Host can answer from what is known already (the capabilities of the
+// peer, the FAE table of the peer).
+@tier(embedded)
+fn owe(var cs: Cs, bit: Int, st: Int)
+    if bit == OWED_CAPS
+        cs.st_caps = st
+    else if bit == OWED_FAE
+        cs.st_fae = st
+    cs.owed = cs.owed | bit
+
+// The default settings the Host gave: the roles it enabled, the antenna selection for CS_SYNC and the highest transmit power.
+@tier(embedded)
+fn set_defaults(var cs: Cs, roles: Int, ant: Int, txp: Int)
+    cs.def_roles = roles
+    cs.def_ant = ant
+    cs.def_txp = txp
+
+// The security requirements of the Host for the connection, and the channel map the Host classified.
+@tier(embedded)
+fn set_sec_req(var cs: Cs, mask: Int)
+    cs.sec_req = mask
+
+@tier(embedded)
+fn set_chm(var cs: Cs, lo: Int, hi: Int)
+    cs.chm_lo = lo
+    cs.chm_hi = hi
+
+// The Host stopped the series of one procedure (LE CS Procedure Enable with Enable 0) of the configuration `id`: it is over here, and the Host is owed the event.
+@tier(embedded)
+fn stop_series(var cs: Cs, id: Int)
+    series_done(var cs)
+    cs.wait_cfg = id
+    cs.st_term = 0
+    cs.owed = cs.owed | OWED_TERM
+
+// Whether the Host's security requirements are met by the Start in `en`.
+@tier(embedded)
+fn set_sec_ok(var en: Env, ok: Bool)
+    en.sec_ok = ok
 
 // Take the event `bit` the Host is owed: true, and the bit is cleared, when it was set.
 @tier(embedded)

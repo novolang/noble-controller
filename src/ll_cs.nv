@@ -8,10 +8,12 @@
 //
 // A build with `ctl_cs` 0 (`ctl_limits.cs_on()` false) answers none of the eighteen commands, leaves LE features 46, 47, 48 and 75 clear
 // and answers the fourteen Link Layer PDUs (opcodes 0x2D to 0x3A) with LL_UNKNOWN_RSP.  A build with it lists the commands in Supported
-// Commands and answers each with `STUB_STATUS`; the PDUs go to the procedures of `ll_cs_proc`, which write and read them with `ll_cs_pdu`.
+// Commands and answers each with the checks and the events of `ctl_hci.nv` (the semantics are `ll_cs_hci`, the result of a step `ll_cs_res`); the PDUs go to the procedures of
+// `ll_cs_proc`, which write and read them with `ll_cs_pdu`.
 //
-// NOT IMPLEMENTED: the HCI results and the radio's measurements.  The random bit generator is `ll_cs_drbg.nv`; the channel and access address selection
-// and the step timeline are `ll_cs_plan.nv`; the control PDUs and the procedures over them are `ll_cs_pdu.nv` and `ll_cs_proc.nv`.
+// The random bit generator is `ll_cs_drbg.nv`; the channel and access address selection and the step timeline are `ll_cs_plan.nv`; the control PDUs and the procedures over
+// them are `ll_cs_pdu.nv` and `ll_cs_proc.nv`; the data of a step in an HCI result is `ll_cs_res.nv`.  NOT IMPLEMENTED: the arbiter's scheduling of the subevents and the
+// call of the radio from the radio program, which the functions `ctl_cs_instance`, `ctl_cs_subevent` and `ctl_cs_test_subevent` of `ctl_hci.nv` await.
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
 
@@ -37,9 +39,6 @@ const OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES_V2 = 0x20A5
 const OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES_V2 = 0x20A6
 const OP_CS_SET_SECURITY_REQUIREMENTS = 0x20A7
 const OP_CS_SET_DEFAULT_SECURITY_REQUIREMENTS = 0x20A8
-
-// The status a build with the feature answers every command with, Unsupported Feature or Parameter Value, until the commands have bodies.
-const STUB_STATUS = 0x11
 
 // Whether `opcode` is one of the eighteen commands, the `[v2]` and security requirement ones included.
 @tier(embedded)

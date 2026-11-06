@@ -4,6 +4,8 @@
 
 use std.test
 use ll_radio
+use ctl_limits
+use noble_controller_config
 use ll_arb.{ CLASS_ACL, CLASS_ACL2, CLASS_ISO, NONE, ROOM_DUE_US, ROOM_FREE_US, arb_book, arb_booked, arb_cancel, arb_clear, arb_limit, arb_new, arb_next_start, arb_pick, arb_radio, arb_room, arb_worth_running, class_adv, class_scan, classes, lead_of }
 
 @test
@@ -41,6 +43,12 @@ fn test_a_stretch_is_clear_until_the_next_booking_of_a_higher_class()
     test.assert(arb_clear(var a, class_scan(), 22000, 30000))
     // One under way does.
     test.assert(not arb_clear(var a, class_scan(), 20500, 20600))
+
+@test
+fn test_the_arbiter_has_a_class_for_each_link_and_four_more()
+    test.assert_eq(ctl_limits.arb_classes(), noble_controller_config.CTL_LINKS)
+    // The four more: the isochronous events, the periodic trains, the advertising events and the scan windows.
+    test.assert_eq(classes(), CLASS_ACL + ctl_limits.arb_classes() + 3)
 
 @test
 fn test_capacities_match_the_constants()

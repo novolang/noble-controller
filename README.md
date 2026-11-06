@@ -22,10 +22,12 @@ implements the traits, and the same Controller then runs on it.
 | `ll_iso`, `ll_big` | connected isochronous streams and broadcast isochronous groups |
 | `ll_data`, `ll_privacy`, `ll_dtm`, `ll_policy` | the data channel PDUs, the resolving list and resolvable private addresses, Direct Test Mode, and the points where a product decides |
 | `ll_feat`, `ll_fs`, `ll_pcl`, `ll_ploss`, `ll_rate`, `ll_sca`, `ll_sub` | feature pages, frame space update, power control, path loss monitoring, connection rate, sleep clock accuracy and connection subrating |
-| `ll_cs` | Channel Sounding: the opcodes, event codes, feature bits and limits of Core 6.3 and the tables of its HCI commands; NOT IMPLEMENTED: the results and the measurements, so a build with the feature on answers each command with Unsupported Feature or Parameter Value |
+| `ll_cs` | Channel Sounding: the opcodes, event codes, feature bits and limits of Core 6.3 and the tables of its HCI commands |
 | `ll_cs_drbg` | the random bit generator of Channel Sounding: the AES-based key and nonce, the draws of bits and of a number in a range, and the ratchet between procedures |
 | `ll_cs_plan` | the plan of a Channel Sounding subevent: the channel lists, the access addresses, the sounding and random sequences, the tone extension slots, the antenna path permutations, the step timeline and the cut into subevents, held in storage the keys size, and its hand-over to a `CsRadio` |
 | `ll_cs_pdu` | Channel Sounding: the 14 control PDUs (LL_CS_SEC_REQ to LL_CS_CHANNEL_MAP_IND, 0x2D to 0x3A) written into a `Pdu` and read back, their lengths, and the conversions of the five encodings of a PHY |
+| `ll_cs_res` | Channel Sounding: the data of a step in an LE CS Subevent Result event for each mode and role, from the plan and the radio's measurements, with the time difference of a round-trip step less the delays of the antenna port and the nominal offsets |
+| `ll_cs_hci` | Channel Sounding: what the HCI commands say in the terms of the Link Layer, the capability record of the Host against the PDU's and cut down to the radio's, the parameters of Create Config, Set Procedure Parameters (the scheduling the Controller picks where the Host recommends) and LE CS Test, the Host's security requirements, and the plan a configuration gives |
 | `ll_cs_proc` | Channel Sounding: the record of a connection (`Cs`) and the seven Link Layer procedures over it, Security Start, Capabilities Exchange, Configuration, Mode-0 FAE Table Request, Start, Procedure Repeat Termination and Channel Map Update, in both roles, with the 40 second timeout and the collision rules of Section 5.3 |
 | `ll_aes`, `ll_ccm`, `ll_cmac` | AES-128, AES-CCM and AES-CMAC in software, for a chip that has no engine |
 

@@ -2,8 +2,8 @@
 // Supported Commands and the fourteen Link Layer opcodes.
 //
 // A build without the feature (`ctl_cs` 0) answers every command with Unknown HCI Command and every opcode with LL_UNKNOWN_RSP, and leaves
-// its bits clear.  A build with it lists its commands in Supported Commands and answers each with `ll_cs.STUB_STATUS`: with a Command
-// Status event for the commands whose result follows in an event of its own and a Command Complete event for the others.  The two commands
+// its bits clear.  A build with it lists its commands in Supported Commands and answers each: with a Command Status event for the commands whose result follows in an
+// event of its own and a Command Complete event for the others (their bodies are tested in tests/ctl_cs_hci_tests.nv).  The two commands
 // of Enhancement #1 with the two of the security requirements need `ctl_cs_ipt` and the two test commands need `ctl_cs_test`.  The Link
 // Layer opcodes are answered with LL_UNKNOWN_RSP in a build without the feature; a build with it answers them with the procedures of
 // tests/ctl_cs_proc_tests.nv.
@@ -164,17 +164,20 @@ fn test_the_commands_a_build_answers_are_listed_in_supported_commands_and_no_oth
         test.assert_eq(listed(sc, ll_cs.command_bit(op)), answered(op))
 
 @test
-fn test_a_build_with_the_feature_answers_the_commands_it_has_with_the_stub_status()
+fn test_a_build_with_the_feature_answers_the_commands_it_has_with_an_event_of_the_right_kind_and_a_refusal()
     if not ctl_limits.cs_on()
         return
     var c = fresh()
     for op in all_opcodes()
         if not answered(op)
             continue
+        // Parameters of zeros: no connection, no Host Support, nothing set: every command is refused, none as an unknown command.
+        var st = 0
         if ll_cs.status_reply(op)
-            test.assert_eq(cmd_status(var c, op, params_of(op)), ll_cs.STUB_STATUS)
+            st = cmd_status(var c, op, params_of(op))
         else
-            test.assert_eq(status_of(var c, op, params_of(op)), ll_cs.STUB_STATUS)
+            st = status_of(var c, op, params_of(op))
+        test.assert(st != 0 and st != ctl_hci.STATUS_UNKNOWN_COMMAND)
 
 @test
 fn test_a_build_with_the_feature_answers_the_commands_it_leaves_out_with_unknown_hci_command()

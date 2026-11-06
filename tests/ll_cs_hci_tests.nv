@@ -1,0 +1,708 @@
+// tests/ll_cs_hci_tests.nv — the unit tests of src/ll_cs_hci.nv: the capability record of the HCI against the record of the PDU, the parameters of the commands read
+// into the records of the Link Layer, the scheduling the Controller picks, the Host's security requirements and the checks of LE CS Test.  The commands themselves, with
+// their events, are in tests/ctl_cs_hci_tests.nv.
+//
+//   novo test --config configs/ctl_cs.toml tests/ll_cs_hci_tests.nv
+
+use std.test
+use ctl_limits
+use noble_controller_config
+use ctl_hci
+use ll_cs
+use ll_cs_pdu
+use ll_cs_proc
+use ll_cs_hci
+use ll_cs_plan
+use ll_cs_radio
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+// A capability record with a different value in every field.
+fn caps_set(var c: CapPdu, v2: Bool)
+    c.v2 = v2
+    c.num_configs = 3
+    c.max_procs = 0x1234
+    c.num_ant = 2
+    c.max_path = 4
+    c.role = 3
+    c.mode_types = 1
+    c.rtt_cap = 0x15
+    c.n_aa = 11
+    c.n_sound = 12
+    c.n_rand = 13
+    c.nadm_sound = 0x101
+    c.nadm_rand = 0x202
+    c.sync_phy = 6
+    c.no_fae = 1
+    c.ch3c = 1
+    c.sounding_pct = 1
+    c.ipt = 1
+    c.rtt_phy = 1
+    c.t_ip1 = 0x7F
+    c.t_ip2 = 0x55
+    c.t_fcs = 0x1AA
+    c.t_pm = 3
+    c.t_sw = 10
+    c.tx_snr = 0x1F
+    c.t_ip2_ipt = 0x33
+    c.t_sw_ipt = 4
+    c.n2_aa = 21
+    c.n2_sound = 22
+    c.n2_rand = 23
+
+fn caps_edit(var c: CapPdu, which: Int, v: Int)
+    if which == 0
+        c.num_configs = v
+    else if which == 1
+        c.num_ant = v
+    else if which == 2
+        c.max_path = v
+    else if which == 3
+        c.role = v
+    else if which == 4
+        c.mode_types = v
+    else if which == 5
+        c.sync_phy = v
+    else if which == 6
+        c.t_sw = v
+    else if which == 7
+        c.tx_snr = v
+    else if which == 8
+        c.rtt_cap = v
+    else if which == 9
+        c.t_ip1 = v
+    else if which == 10
+        c.t_ip2 = v
+    else if which == 11
+        c.t_fcs = v
+    else
+        c.t_pm = v
+
+fn radio_set(var r: CsCaps, supported: Bool)
+    r.supported = supported
+    r.roles = 2
+    r.modes = 0
+    r.rtt_types = 0x01
+    r.phys = 3
+    r.ant_elements = 1
+    r.max_paths = 2
+    r.t_ip1 = 0xFF
+    r.t_ip2 = 0xFF
+    r.t_fcs = 0xFFFF
+    r.t_pm = 0xFF
+    r.t_sw_us = 4
+    r.t_sw_ipt_us = 2
+    r.t_ip2_ipt = 0xFF
+    r.snr_mask = 0xFF
+    r.no_fae = false
+    r.ch3c = false
+    r.sounding_pct = false
+    r.ipt = false
+    r.rtt_per_phy = true
+    r.n_aa = 99
+    r.n_sound = 98
+    r.n_rand = 97
+    r.n_2m_aa = 88
+    r.n_2m_sound = 87
+    r.n_2m_rand = 86
+    r.nadm_sound = 1
+    r.nadm_rand = 2
+    r.rtt_cap = 0x3
+
+fn radio_types(var r: CsCaps, types: Int)
+    r.rtt_types = types
+
+fn radio_paths(var r: CsCaps, n: Int)
+    r.max_paths = n
+
+fn radio_ants(var r: CsCaps, n: Int)
+    r.ant_elements = n
+
+fn env_set(var en: Env, interval: Int, ev: Int)
+    en.interval_us = interval
+    en.ev_count = ev
+
+// The octets 0 to 19 of the procedure parameters of a procedure of 100 * 0.625 ms, 10 to 20 connection events apart, 5 of them, subevents of 2.5 ms, ACI 0, LE 1M.
+fn pp_ok() -> Vec[u8; 48]
+    var b = ll_cs_hci.buf_new()
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MAX_LEN, 100)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MIN_INT, 10)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MAX_INT, 20)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_COUNT, 5)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MIN_SUB, 2500)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_MIN_SUB + 2, 0)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MAX_SUB, 2500)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_MAX_SUB + 2, 0)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_ACI, 0)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_PHY, 1)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_DELTA, 0x80)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_PREF, 1)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_SNR_I, 0xFF)
+    ll_cs_hci.p8(var b, ll_cs_hci.PP_SNR_R, 0xFF)
+    b
+
+fn cfg_of(var c: CfgPdu, main: Int, sub: Int, rtt: Int)
+    c.main_mode = main
+    c.sub_mode = sub
+    c.rtt_type = rtt
+
+// ── The capability record ───────────────────────────────────────────
+
+@test
+fn test_the_capability_record_of_the_host_holds_the_fields_of_the_pdu_in_the_order_of_the_command()
+    var c = ll_cs_pdu.cap_new()
+    caps_set(var c, true)
+    var b = ll_cs_hci.buf_new()
+    test.assert_eq(ll_cs_hci.caps_put(var c, true, var b), 34)
+    let want = [3, 0x34, 0x12, 2, 4, 3, 1, 0x15, 11, 12, 13, 1, 1, 2, 2, 6]
+    for k in 0..16
+        test.assert_eq(b[k] as Int, want[k])
+    // Subfeatures_Supported: No_FAE (bit 1), #3c (2), sounding PCT (3), IPT (4) and the accuracy per PHY (5).
+    test.assert_eq(b[16] as Int, 0x3E)
+    test.assert_eq(b[17] as Int, 0)
+    test.assert_eq(ll_cs_hci.g16(var b, 18), 0x7F)
+    test.assert_eq(ll_cs_hci.g16(var b, 20), 0x55)
+    test.assert_eq(ll_cs_hci.g16(var b, 22), 0x1AA)
+    test.assert_eq(ll_cs_hci.g16(var b, 24), 3)
+    test.assert_eq(b[26] as Int, 10)
+    test.assert_eq(b[27] as Int, 0x1F)
+    test.assert_eq(ll_cs_hci.g16(var b, 28), 0x33)
+    test.assert_eq(b[30] as Int, 4)
+    test.assert_eq(b[31] as Int, 21)
+    test.assert_eq(b[32] as Int, 22)
+    test.assert_eq(b[33] as Int, 23)
+
+@test
+fn test_the_record_goes_to_the_host_and_back_whole_in_both_forms()
+    var c = ll_cs_pdu.cap_new()
+    caps_set(var c, true)
+    var b = ll_cs_hci.buf_new()
+    let _n = ll_cs_hci.caps_put(var c, true, var b)
+    var back = ll_cs_pdu.cap_new()
+    ll_cs_hci.caps_get(var b, true, var back)
+    test.assert(back.v2)
+    test.assert_eq(back.num_configs, c.num_configs)
+    test.assert_eq(back.max_procs, c.max_procs)
+    test.assert_eq(back.num_ant, c.num_ant)
+    test.assert_eq(back.max_path, c.max_path)
+    test.assert_eq(back.role, c.role)
+    test.assert_eq(back.mode_types, c.mode_types)
+    test.assert_eq(back.rtt_cap, c.rtt_cap)
+    test.assert_eq(back.n_aa, c.n_aa)
+    test.assert_eq(back.n_sound, c.n_sound)
+    test.assert_eq(back.n_rand, c.n_rand)
+    test.assert_eq(back.nadm_sound, c.nadm_sound)
+    test.assert_eq(back.nadm_rand, c.nadm_rand)
+    test.assert_eq(back.sync_phy, c.sync_phy)
+    test.assert_eq(back.no_fae, 1)
+    test.assert_eq(back.ch3c, 1)
+    test.assert_eq(back.sounding_pct, 1)
+    test.assert_eq(back.ipt, 1)
+    test.assert_eq(back.rtt_phy, 1)
+    test.assert_eq(back.t_ip1, c.t_ip1)
+    test.assert_eq(back.t_ip2, c.t_ip2)
+    test.assert_eq(back.t_fcs, c.t_fcs)
+    test.assert_eq(back.t_pm, c.t_pm)
+    test.assert_eq(back.t_sw, c.t_sw)
+    test.assert_eq(back.tx_snr, c.tx_snr)
+    test.assert_eq(back.t_ip2_ipt, c.t_ip2_ipt)
+    test.assert_eq(back.t_sw_ipt, c.t_sw_ipt)
+    test.assert_eq(back.n2_aa, 21)
+    test.assert_eq(back.n2_sound, 22)
+    test.assert_eq(back.n2_rand, 23)
+    // The [v1] form has 28 octets, leaves out the accuracy per PHY and the [v2] fields, and reads back with those fields zero.
+    var b1 = ll_cs_hci.buf_new()
+    test.assert_eq(ll_cs_hci.caps_put(var c, false, var b1), 28)
+    test.assert_eq(b1[16] as Int, 0x1E)
+    var v1 = ll_cs_pdu.cap_new()
+    ll_cs_hci.caps_get(var b1, false, var v1)
+    test.assert(not v1.v2)
+    test.assert_eq(v1.rtt_phy, 0)
+    test.assert_eq(v1.t_ip2_ipt, 0)
+    test.assert_eq(v1.n2_aa, 0)
+    test.assert_eq(v1.n2_sound, 0)
+    test.assert_eq(v1.n2_rand, 0)
+    test.assert_eq(v1.t_sw, 10)
+
+@test
+fn test_a_v1_record_given_as_a_v2_one_has_the_2m_counts_of_the_1m_ones_and_no_ipt_timings()
+    var c = ll_cs_pdu.cap_new()
+    caps_set(var c, false)
+    var b = ll_cs_hci.buf_new()
+    test.assert_eq(ll_cs_hci.caps_put(var c, true, var b), 34)
+    test.assert_eq(ll_cs_hci.g16(var b, 28), 0)
+    test.assert_eq(b[30] as Int, 0)
+    test.assert_eq(b[31] as Int, 11)
+    test.assert_eq(b[32] as Int, 12)
+    test.assert_eq(b[33] as Int, 13)
+    // The accuracy per PHY is a subfeature of the [v2] form only.
+    test.assert_eq(b[16] as Int & 0x20, 0)
+
+@test
+fn test_a_record_the_host_wrote_is_checked_against_the_specification()
+    var c = ll_cs_pdu.cap_new()
+    caps_set(var c, false)
+    caps_edit(var c, 6, 10)
+    test.assert_eq(ll_cs_hci.caps_host_check(var c), 0)
+    // 0 for the configurations, 5 for the antennas, 3 paths for 4 antennas, no role, a reserved mode bit, a PHY bit for LE 1M, a switch time of 3, 5 SNR levels... and the masks.
+    let bad = [[0, 0], [1, 5], [1, 0], [3, 0], [3, 4], [4, 2], [5, 1], [6, 3], [7, 0x20], [8, 0x40], [9, 0x80], [10, 0x80], [11, 0x200], [12, 4]]
+    for pair in bad
+        var d = ll_cs_pdu.cap_new()
+        caps_set(var d, false)
+        caps_edit(var d, pair[0], pair[1])
+        test.assert_eq(ll_cs_hci.caps_host_check(var d), 0x12)
+    var e = ll_cs_pdu.cap_new()
+    caps_set(var e, false)
+    caps_edit(var e, 2, 1)
+    test.assert_eq(ll_cs_hci.caps_host_check(var e), 0x12)
+
+@test
+fn test_the_capabilities_of_the_build_are_cut_down_to_what_the_radio_runs()
+    var r = ll_cs_radio.cs_caps_none()
+    radio_set(var r, true)
+    var c = ll_cs_pdu.cap_new()
+    caps_set(var c, true)
+    ll_cs_hci.caps_radio(var c, var r)
+    // The reflector alone, no mode 3, the radio's counts, PHYs, timings and antennas; what the radio lacks is not reported.
+    test.assert_eq(c.role, 2)
+    test.assert_eq(c.mode_types, 0)
+    test.assert_eq(c.n_aa, 99)
+    test.assert_eq(c.n_sound, 0)
+    test.assert_eq(c.n_rand, 0)
+    test.assert_eq(c.sync_phy, 2)
+    test.assert_eq(c.num_ant, 1)
+    test.assert_eq(c.max_path, 2)
+    test.assert_eq(c.t_ip1, 0x7F)
+    test.assert_eq(c.t_fcs, 0x1FF)
+    test.assert_eq(c.t_pm, 3)
+    test.assert_eq(c.t_sw, 4)
+    test.assert_eq(c.tx_snr, 0x1F)
+    test.assert_eq(c.no_fae, 0)
+    test.assert_eq(c.ch3c, 0)
+    test.assert_eq(c.sounding_pct, 0)
+    test.assert_eq(c.ipt, 0)
+    test.assert_eq(c.rtt_phy, 1)
+    test.assert_eq(c.t_sw_ipt, 2)
+    test.assert_eq(c.n2_aa, 88)
+    test.assert_eq(c.n2_sound, 87)
+    test.assert_eq(c.n2_rand, 86)
+    // A radio with the sequences keeps the build's, with its counts; a [v1] record has no per-PHY fields.
+    var r2 = ll_cs_radio.cs_caps_none()
+    radio_set(var r2, true)
+    radio_types(var r2, 0x7F)
+    var c2 = ll_cs_pdu.cap_new()
+    caps_set(var c2, false)
+    ll_cs_hci.caps_radio(var c2, var r2)
+    test.assert_eq(c2.n_sound, 98)
+    test.assert_eq(c2.n_rand, 97)
+    test.assert_eq(c2.rtt_phy, 0)
+    // A radio with more paths than the build, or fewer antennas than paths.
+    var r3 = ll_cs_radio.cs_caps_none()
+    radio_set(var r3, true)
+    radio_paths(var r3, 4)
+    var c3 = ll_cs_pdu.cap_new()
+    caps_set(var c3, true)
+    caps_edit(var c3, 2, 3)
+    ll_cs_hci.caps_radio(var c3, var r3)
+    test.assert_eq(c3.max_path, 3)
+    // A radio with fewer paths than the build has antennas: the paths are at least the antennas.
+    var r5 = ll_cs_radio.cs_caps_none()
+    radio_set(var r5, true)
+    radio_paths(var r5, 1)
+    radio_ants(var r5, 4)
+    var c5 = ll_cs_pdu.cap_new()
+    caps_set(var c5, true)
+    ll_cs_hci.caps_radio(var c5, var r5)
+    test.assert_eq(c5.num_ant, 2)
+    test.assert_eq(c5.max_path, 2)
+    // A radio that takes no part leaves no role.
+    var r4 = ll_cs_radio.cs_caps_none()
+    radio_set(var r4, false)
+    var c4 = ll_cs_pdu.cap_new()
+    caps_set(var c4, true)
+    ll_cs_hci.caps_radio(var c4, var r4)
+    test.assert_eq(c4.role, 0)
+
+// ── The phase of the commands ───────────────────────────────────────
+
+@test
+fn test_the_dbm_octets_are_minus_127_to_plus_20_and_the_snr_indices_0_to_4_or_ff()
+    test.assert(ll_cs_hci.dbm_ok(0))
+    test.assert(ll_cs_hci.dbm_ok(20))
+    test.assert(not ll_cs_hci.dbm_ok(21))
+    test.assert(not ll_cs_hci.dbm_ok(0x7F))
+    test.assert(not ll_cs_hci.dbm_ok(0x80))
+    test.assert(ll_cs_hci.dbm_ok(0x81))
+    test.assert(ll_cs_hci.dbm_ok(0xFF))
+    test.assert(ll_cs_hci.snr_ok(0))
+    test.assert(ll_cs_hci.snr_ok(4))
+    test.assert(ll_cs_hci.snr_ok(0xFF))
+    test.assert(not ll_cs_hci.snr_ok(5))
+    test.assert_eq(ll_cs_hci.snr_to_pdu(0xFF), 0xF)
+    test.assert_eq(ll_cs_hci.snr_to_pdu(3), 3)
+
+@test
+fn test_the_parameters_of_create_config_are_read_into_the_record_of_the_pdu()
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    let p = [1, 0, 3, 1, 2, 1, 4, 9, 2, 3, 1, 5, 3, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x1F, 7, 1, 1, 6, 1]
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, 0x90)
+    ctl_hci.ctl_rx(var c, 0x20)
+    ctl_hci.ctl_rx(var c, 28)
+    for b in p
+        ctl_hci.ctl_rx(var c, b)
+    var cfg = ll_cs_pdu.cfg_new()
+    ll_cs_hci.config_from_rx(var c.rx, var cfg)
+    test.assert_eq(cfg.config_id, 3)
+    test.assert_eq(cfg.action, 1)
+    test.assert_eq(cfg.main_mode, 2)
+    test.assert_eq(cfg.sub_mode, 1)
+    test.assert_eq(cfg.main_min, 4)
+    test.assert_eq(cfg.main_max, 9)
+    test.assert_eq(cfg.main_rep, 2)
+    test.assert_eq(cfg.mode0_steps, 3)
+    test.assert_eq(cfg.role, 1)
+    test.assert_eq(cfg.rtt_type, 5)
+    // LE 2M 2BT is the bit 3 of the PDU.
+    test.assert_eq(cfg.sync_phy, 8)
+    test.assert_eq(cfg.chm_lo, 0x5544332211)
+    test.assert_eq(cfg.chm_hi, 0x1F99887766)
+    test.assert_eq(cfg.chm_rep, 7)
+    test.assert_eq(cfg.chsel, 1)
+    test.assert_eq(cfg.c3_shape, 1)
+    test.assert_eq(cfg.c3_jump, 6)
+    test.assert_eq(cfg.ipt, 1)
+    // The mandatory timings: indices 7, 7, 9 and 2.
+    test.assert_eq(ll_cs.t_ip_us(cfg.t_ip1), 145)
+    test.assert_eq(ll_cs.t_ip_us(cfg.t_ip2), 145)
+    test.assert_eq(ll_cs.t_fcs_us(cfg.t_fcs), 150)
+    test.assert_eq(ll_cs.t_pm_us(cfg.t_pm), 40)
+
+// ── The scheduling the Controller picks ─────────────────────────────
+
+@test
+fn test_the_procedure_parameters_become_the_fields_of_ll_cs_req_with_the_scheduling_left_to_the_controller()
+    var b = pp_ok()
+    var en = ll_cs_proc.env_new()
+    env_set(var en, 30000, 100)
+    var s = ll_cs_pdu.start_new()
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 2, var en, var s), 0)
+    test.assert_eq(s.config_id, 2)
+    test.assert_eq(s.conn_event, 106)
+    test.assert_eq(s.offset_min, 1000)
+    test.assert_eq(s.offset_max, 3000)
+    test.assert_eq(s.max_proc_len, 100)
+    test.assert_eq(s.event_interval, 1)
+    test.assert_eq(s.subevents, 1)
+    test.assert_eq(s.subevent_interval, 0)
+    test.assert_eq(s.subevent_len, 2500)
+    test.assert_eq(s.proc_count, 5)
+    // The procedure takes 62.5 ms, the offset 3 ms and T_MES: 65.65 ms is 3 intervals of 30 ms, so the interval is 3 events, and the Host asked for at least 10.
+    test.assert_eq(s.proc_interval, 10)
+    test.assert_eq(s.aci, 0)
+    test.assert_eq(s.pref_ant, 1)
+    test.assert_eq(s.phy, 1)
+    test.assert_eq(s.pwr_delta, 0)
+    test.assert_eq(s.snr_i, 0xF)
+    test.assert_eq(s.snr_r, 0xF)
+    // A short interval of the connection: the procedure takes more events than the Host's minimum.
+    env_set(var en, 7500, 65535)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0)
+    test.assert_eq(s.conn_event, 5)
+    test.assert_eq(s.offset_max, 3000)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MIN_INT, 1)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MAX_INT, 100)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0)
+    test.assert_eq(s.proc_interval, (100 * 625 + 3000 + 150) / 7500 + 1)
+
+@test
+fn test_one_procedure_has_no_interval_and_an_interval_that_cannot_hold_the_procedure_is_refused()
+    var b = pp_ok()
+    var en = ll_cs_proc.env_new()
+    var s = ll_cs_pdu.start_new()
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_COUNT, 1)
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MIN_INT, 0)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0)
+    test.assert_eq(s.proc_interval, 0)
+    test.assert_eq(s.proc_count, 1)
+    // 5 procedures of 40 s, 5 connection events apart at most.
+    var d = pp_ok()
+    ll_cs_hci.p16(var d, ll_cs_hci.PP_MAX_LEN, 0xFFFF)
+    ll_cs_hci.p16(var d, ll_cs_hci.PP_MAX_INT, 12)
+    test.assert_eq(ll_cs_hci.start_from_pp(var d, 0, var en, var s), ll_cs_proc.E_LIMITED)
+    // A subevent of 4 s is cut to the procedure, and a procedure shorter than the shortest subevent is refused.
+    var e = pp_ok()
+    ll_cs_hci.p16(var e, ll_cs_hci.PP_MAX_LEN, 1)
+    test.assert_eq(ll_cs_hci.start_from_pp(var e, 0, var en, var s), ll_cs_proc.E_LIMITED)
+    var f = pp_ok()
+    ll_cs_hci.p16(var f, ll_cs_hci.PP_COUNT, 1)
+    ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_LEN, 2400)
+    ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_SUB, 0x4240)
+    ll_cs_hci.p8(var f, ll_cs_hci.PP_MAX_SUB + 2, 0x0F)
+    test.assert_eq(ll_cs_hci.start_from_pp(var f, 0, var en, var s), 0)
+    test.assert_eq(s.subevent_len, 1_000_000)
+    ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_LEN, 1500)
+    test.assert_eq(ll_cs_hci.start_from_pp(var f, 0, var en, var s), 0)
+    test.assert_eq(s.subevent_len, 937500)
+    // The offset is kept below the interval of a short connection.
+    env_set(var en, 2000, 0)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0)
+    test.assert_eq(s.offset_max, 1999)
+    env_set(var en, 1000, 0)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0)
+    test.assert_eq(s.offset_min, 999)
+    test.assert_eq(s.offset_max, 999)
+
+@test
+fn test_a_value_outside_the_range_of_the_command_is_invalid_hci_command_parameters()
+    var en = ll_cs_proc.env_new()
+    var s = ll_cs_pdu.start_new()
+    var a = pp_ok()
+    ll_cs_hci.p16(var a, ll_cs_hci.PP_MAX_LEN, 0)
+    test.assert_eq(ll_cs_hci.start_from_pp(var a, 0, var en, var s), 0x12)
+    var b = pp_ok()
+    ll_cs_hci.p16(var b, ll_cs_hci.PP_MIN_SUB, 1249)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0x12)
+    var c = pp_ok()
+    ll_cs_hci.p16(var c, ll_cs_hci.PP_MAX_SUB, 2499)
+    test.assert_eq(ll_cs_hci.start_from_pp(var c, 0, var en, var s), 0x12)
+    var d = pp_ok()
+    ll_cs_hci.p16(var d, ll_cs_hci.PP_MAX_SUB, 0x2400)
+    ll_cs_hci.p8(var d, ll_cs_hci.PP_MAX_SUB + 2, 0x3D)
+    test.assert_eq(ll_cs_hci.start_from_pp(var d, 0, var en, var s), 0x12)
+    var e = pp_ok()
+    ll_cs_hci.p16(var e, ll_cs_hci.PP_MIN_INT, 0)
+    test.assert_eq(ll_cs_hci.start_from_pp(var e, 0, var en, var s), 0x12)
+    var f = pp_ok()
+    ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_INT, 9)
+    test.assert_eq(ll_cs_hci.start_from_pp(var f, 0, var en, var s), 0x12)
+    var g = pp_ok()
+    ll_cs_hci.p8(var g, ll_cs_hci.PP_ACI, 8)
+    test.assert_eq(ll_cs_hci.start_from_pp(var g, 0, var en, var s), 0x12)
+    var h = pp_ok()
+    ll_cs_hci.p8(var h, ll_cs_hci.PP_PHY, 0)
+    test.assert_eq(ll_cs_hci.start_from_pp(var h, 0, var en, var s), 0x12)
+    var i = pp_ok()
+    ll_cs_hci.p8(var i, ll_cs_hci.PP_PHY, 5)
+    test.assert_eq(ll_cs_hci.start_from_pp(var i, 0, var en, var s), 0x12)
+    var j = pp_ok()
+    ll_cs_hci.p8(var j, ll_cs_hci.PP_SNR_I, 5)
+    test.assert_eq(ll_cs_hci.start_from_pp(var j, 0, var en, var s), 0x12)
+    var k = pp_ok()
+    ll_cs_hci.p8(var k, ll_cs_hci.PP_SNR_R, 6)
+    test.assert_eq(ll_cs_hci.start_from_pp(var k, 0, var en, var s), 0x12)
+    var l = pp_ok()
+    ll_cs_hci.p8(var l, ll_cs_hci.PP_PREF, 0x10)
+    test.assert_eq(ll_cs_hci.start_from_pp(var l, 0, var en, var s), 0x12)
+
+@test
+fn test_the_power_delta_the_phy_and_the_snr_indices_are_converted_to_the_encodings_of_the_pdu()
+    var en = ll_cs_proc.env_new()
+    var s = ll_cs_pdu.start_new()
+    var a = pp_ok()
+    ll_cs_hci.p8(var a, ll_cs_hci.PP_PHY, 3)
+    ll_cs_hci.p8(var a, ll_cs_hci.PP_DELTA, 0xFD)
+    ll_cs_hci.p8(var a, ll_cs_hci.PP_SNR_I, 2)
+    ll_cs_hci.p8(var a, ll_cs_hci.PP_SNR_R, 4)
+    test.assert_eq(ll_cs_hci.start_from_pp(var a, 0, var en, var s), 0)
+    test.assert_eq(s.phy, 4)
+    test.assert_eq(s.pwr_delta, 0xFD)
+    test.assert_eq(s.snr_i, 2)
+    test.assert_eq(s.snr_r, 4)
+    ll_cs_hci.p8(var a, ll_cs_hci.PP_PHY, 4)
+    test.assert_eq(ll_cs_hci.start_from_pp(var a, 0, var en, var s), 0)
+    test.assert_eq(s.phy, 8)
+
+// ── The security requirements ───────────────────────────────────────
+
+@test
+fn test_the_controller_enforces_the_tone_and_the_150_ns_accuracy_and_with_the_sequences_the_sequence()
+    let m = ll_cs_hci.sec_supported()
+    test.assert_eq(m & 3, 3)
+    test.assert_eq(m & 4, 0)
+    test.assert_eq(m & 0x10, 0)
+    if ctl_limits.cs_rtt_seq_on()
+        test.assert_eq(m & 8, 8)
+    else
+        test.assert_eq(m & 8, 0)
+
+@test
+fn test_a_configuration_meets_the_requirements_its_modes_and_its_rtt_type_give_it()
+    var tone = ll_cs_pdu.cfg_new()
+    cfg_of(var tone, 2, 0xFF, 0)
+    var rtt = ll_cs_pdu.cfg_new()
+    cfg_of(var rtt, 1, 0xFF, 0)
+    var both = ll_cs_pdu.cfg_new()
+    cfg_of(var both, 3, 0xFF, 0)
+    var seq = ll_cs_pdu.cfg_new()
+    cfg_of(var seq, 3, 0xFF, 4)
+    var sub_tone = ll_cs_pdu.cfg_new()
+    cfg_of(var sub_tone, 1, 2, 0)
+    var sub_rtt = ll_cs_pdu.cfg_new()
+    cfg_of(var sub_rtt, 2, 1, 0)
+    // No requirement: any configuration.
+    test.assert(ll_cs_hci.sec_met(0, var tone))
+    test.assert(ll_cs_hci.sec_met(0, var rtt))
+    // The tone: a main or sub mode of 2 or 3.
+    test.assert(ll_cs_hci.sec_met(1, var tone))
+    test.assert(not ll_cs_hci.sec_met(1, var rtt))
+    test.assert(ll_cs_hci.sec_met(1, var both))
+    test.assert(ll_cs_hci.sec_met(1, var sub_tone))
+    // The round-trip time: 1 or 3.
+    test.assert(not ll_cs_hci.sec_met(2, var tone))
+    test.assert(ll_cs_hci.sec_met(2, var rtt))
+    test.assert(ll_cs_hci.sec_met(2, var sub_rtt))
+    // 10 ns accuracy and the attack detector metric are never met.
+    test.assert(not ll_cs_hci.sec_met(4, var both))
+    test.assert(not ll_cs_hci.sec_met(0x10, var both))
+    // The sequence: a round-trip step with an RTT type that has one.
+    test.assert(not ll_cs_hci.sec_met(8, var both))
+    test.assert(ll_cs_hci.sec_met(8, var seq))
+    test.assert(not ll_cs_hci.sec_met(8, var tone))
+    test.assert(ll_cs_hci.sec_met(3, var both))
+
+// ── LE CS Test ──────────────────────────────────────────────────────
+
+// The 30 octets of LE CS Test and the 13 of its override data.
+fn test_ok() -> Vec[u8; 48]
+    var b = ll_cs_hci.buf_new()
+    let head = [2, 0xFF, 0, 1, 0, 0, 1, 1, 0xC4, 0x09, 0, 0, 0, 1, 0, 0x91, 0x91, 0x96, 0x28, 0, 0, 0, 0xFF, 0xFF, 0, 0, 1, 0, 0, 13]
+    for k in 0..30
+        b[k] = head[k] as u8
+    let chm = [0xFC, 0xFF, 0x7F, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F]
+    for k in 0..10
+        b[30 + k] = chm[k] as u8
+    b
+
+fn local_caps_of(sync: Int, ant: Int, seq: Bool, mode3: Bool, ipt: Bool, roles: Int) -> CapPdu
+    var c = ll_cs_pdu.cap_new()
+    ll_cs_proc.caps_with(var c, roles, ant, 1, mode3, seq, ipt, false)
+    caps_edit(var c, 5, sync)
+    c
+
+fn tb(var b: Vec[u8; 48], at: Int, v: Int)
+    ll_cs_hci.p8(var b, at, v)
+
+@test
+fn test_the_configuration_of_a_test_is_read_from_the_parameters_and_the_override()
+    var t = test_ok()
+    tb(var t, ll_cs_hci.TEST_MAIN, 3)
+    tb(var t, ll_cs_hci.TEST_SUB, 2)
+    tb(var t, ll_cs_hci.TEST_REP, 2)
+    tb(var t, ll_cs_hci.TEST_MODE0, 3)
+    tb(var t, ll_cs_hci.TEST_RTT, 4)
+    tb(var t, ll_cs_hci.TEST_PHY, 2)
+    tb(var t, ll_cs_hci.TEST_T_IP1, 30)
+    tb(var t, ll_cs_hci.TEST_T_IP2, 20)
+    tb(var t, ll_cs_hci.TEST_T_FCS, 100)
+    tb(var t, ll_cs_hci.TEST_T_PM, 20)
+    tb(var t, ll_cs_hci.TEST_T_SW, 4)
+    tb(var t, ll_cs_hci.TEST_ACI, 5)
+    tb(var t, ll_cs_hci.TEST_CH_REP, 9)
+    var cfg = ll_cs_plan.cfg_new()
+    ll_cs_hci.test_cfg(var t, var cfg)
+    test.assert_eq(cfg.main_mode, 3)
+    test.assert_eq(cfg.sub_mode, 2)
+    test.assert_eq(cfg.main_rep, 2)
+    test.assert_eq(cfg.mode0_steps, 3)
+    test.assert_eq(cfg.rtt, 4)
+    test.assert_eq(cfg.phy, 2)
+    test.assert_eq(cfg.t_ip1_us, 30)
+    test.assert_eq(cfg.t_ip2_us, 20)
+    test.assert_eq(cfg.t_fcs_us, 100)
+    test.assert_eq(cfg.t_pm_us, 20)
+    test.assert_eq(cfg.t_sw_us, 4)
+    test.assert_eq(cfg.aci, 5)
+    test.assert_eq(cfg.sub_len_us, 2500)
+    test.assert_eq(cfg.ch_rep, 9)
+    test.assert_eq(cfg.chmap[0] as Int, 0xFC)
+    test.assert_eq(cfg.chmap[9] as Int, 0x1F)
+    // The steps before a sub mode step: 6 to 10 when the override leaves them to the generator, the override's number when it gives one.
+    test.assert_eq(cfg.main_min, 6)
+    test.assert_eq(cfg.main_max, 10)
+    ll_cs_hci.p16(var t, ll_cs_hci.TEST_OVERRIDE, 4)
+    tb(var t, ll_cs_hci.TEST_DATA + ll_cs_hci.TEST_OVERRIDE_BASE, 7)
+    ll_cs_hci.test_cfg(var t, var cfg)
+    test.assert_eq(cfg.main_min, 7)
+    test.assert_eq(cfg.main_max, 7)
+    // No sub mode.
+    tb(var t, ll_cs_hci.TEST_SUB, 0xFF)
+    ll_cs_hci.test_cfg(var t, var cfg)
+    test.assert_eq(cfg.sub_mode, 0)
+
+@test
+fn test_the_override_data_of_a_test_has_the_length_its_bits_give()
+    test.assert_eq(ll_cs_hci.test_override_len(0), 13)
+    test.assert_eq(ll_cs_hci.test_override_len(4), 14)
+
+@test
+fn test_a_test_the_capabilities_allow_is_accepted_and_one_they_do_not_is_refused_as_unsupported()
+    var t = test_ok()
+    var local = local_caps_of(0, 1, false, false, false, 3)
+    test.assert_eq(ll_cs_hci.test_check(var t, var local), 0)
+    // Mode 3, a sounding or a random sequence, IPT, LE 2M and the 2BT PHY, a role: each from the capabilities.
+    var m3 = test_ok()
+    tb(var m3, ll_cs_hci.TEST_MAIN, 3)
+    test.assert_eq(ll_cs_hci.test_check(var m3, var local), 0x11)
+    var local3 = local_caps_of(0, 1, false, true, false, 3)
+    test.assert_eq(ll_cs_hci.test_check(var m3, var local3), 0)
+    var sub3 = test_ok()
+    tb(var sub3, ll_cs_hci.TEST_SUB, 3)
+    test.assert_eq(ll_cs_hci.test_check(var sub3, var local), 0x11)
+    var seq = test_ok()
+    tb(var seq, ll_cs_hci.TEST_RTT, 2)
+    test.assert_eq(ll_cs_hci.test_check(var seq, var local), 0x11)
+    var local_seq = local_caps_of(0, 1, true, false, false, 3)
+    test.assert_eq(ll_cs_hci.test_check(var seq, var local_seq), 0)
+    var rnd = test_ok()
+    tb(var rnd, ll_cs_hci.TEST_RTT, 3)
+    test.assert_eq(ll_cs_hci.test_check(var rnd, var local), 0x11)
+    test.assert_eq(ll_cs_hci.test_check(var rnd, var local_seq), 0)
+    var ipt = test_ok()
+    tb(var ipt, ll_cs_hci.TEST_ENH, 1)
+    test.assert_eq(ll_cs_hci.test_check(var ipt, var local), 0x11)
+    var local_ipt = local_caps_of(0, 1, false, false, true, 3)
+    test.assert_eq(ll_cs_hci.test_check(var ipt, var local_ipt), 0)
+    var p2 = test_ok()
+    tb(var p2, ll_cs_hci.TEST_PHY, 2)
+    test.assert_eq(ll_cs_hci.test_check(var p2, var local), 0x11)
+    var local_2m = local_caps_of(2, 1, false, false, false, 3)
+    test.assert_eq(ll_cs_hci.test_check(var p2, var local_2m), 0)
+    var p3 = test_ok()
+    tb(var p3, ll_cs_hci.TEST_PHY, 3)
+    test.assert_eq(ll_cs_hci.test_check(var p3, var local_2m), 0x11)
+    var local_2bt = local_caps_of(6, 1, false, false, false, 3)
+    test.assert_eq(ll_cs_hci.test_check(var p3, var local_2bt), 0)
+    var refl = test_ok()
+    tb(var refl, ll_cs_hci.TEST_ROLE, 1)
+    var local_init = local_caps_of(0, 1, false, false, false, 1)
+    test.assert_eq(ll_cs_hci.test_check(var refl, var local_init), 0x11)
+    test.assert_eq(ll_cs_hci.test_check(var t, var local_init), 0)
+    var local_refl = local_caps_of(0, 1, false, false, false, 2)
+    test.assert_eq(ll_cs_hci.test_check(var t, var local_refl), 0x11)
+
+@test
+fn test_a_test_with_more_antennas_than_the_build_or_a_switch_time_with_one_is_unsupported()
+    var local1 = local_caps_of(0, 1, false, false, false, 3)
+    var local2 = local_caps_of(0, 2, false, false, false, 3)
+    var a2 = test_ok()
+    tb(var a2, ll_cs_hci.TEST_ANT, 2)
+    test.assert_eq(ll_cs_hci.test_check(var a2, var local1), 0x11)
+    test.assert_eq(ll_cs_hci.test_check(var a2, var local2), 0)
+    // An antenna configuration of an initiator with two antennas needs them.
+    var aci = test_ok()
+    tb(var aci, ll_cs_hci.TEST_ACI, 1)
+    test.assert_eq(ll_cs_hci.test_check(var aci, var local1), 0x11)
+    test.assert_eq(ll_cs_hci.test_check(var aci, var local2), 0)
+    // A switch time with one antenna: the bench fact of the SoftDevice Controller.
+    var sw = test_ok()
+    tb(var sw, ll_cs_hci.TEST_T_SW, 10)
+    test.assert_eq(ll_cs_hci.test_check(var sw, var local1), 0x11)
+    test.assert_eq(ll_cs_hci.test_check(var sw, var local2), 0)
+    // The step timings the capabilities lack: T_IP1 of 30 microseconds is an optional value.
+    var ip = test_ok()
+    tb(var ip, ll_cs_hci.TEST_T_IP1, 30)
+    test.assert_eq(ll_cs_hci.test_check(var ip, var local1), 0x11)
+    var local_ip = local_caps_of(0, 1, false, false, false, 3)
+    caps_edit(var local_ip, 9, 4)
+    test.assert_eq(ll_cs_hci.test_check(var ip, var local_ip), 0)
