@@ -13,3 +13,14 @@ ctl_ploss = true
 ctl_peersca = true
 ctl_connrate = true
 ctl_framespace = true
+# Channel Sounding: the plumbing and the stub commands (ll_cs.nv), one connection, one configuration, both roles, one antenna.
+ctl_cs = 1
+ctl_cs_configs = 1
+ctl_cs_steps = 32
+ctl_cs_roles = 3
+ctl_cs_mode3 = false
+ctl_cs_rtt_seq = false
+ctl_cs_ant = 1
+ctl_cs_3c = false
+ctl_cs_ipt = false
+ctl_cs_test = true

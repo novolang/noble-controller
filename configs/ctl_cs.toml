@@ -1,0 +1,15 @@
+# The Controller's part of the profile configs/ctl_cs.toml of orbit/ble, for the tests of this package (tests/ and src/ run with
+# `novo test --config configs/ctl_cs.toml`).  orbit/ble/configs/ctl_cs.toml holds the same [noble-controller] section; tests/orbit/test_ble_config_equals_limits.sh holds the two to each other.
+
+[noble-controller]
+ctl_pcl = true
+ctl_cs = 1
+ctl_cs_configs = 1
+ctl_cs_steps = 32
+ctl_cs_roles = 3
+ctl_cs_mode3 = false
+ctl_cs_rtt_seq = false
+ctl_cs_ant = 1
+ctl_cs_3c = false
+ctl_cs_ipt = false
+ctl_cs_test = true

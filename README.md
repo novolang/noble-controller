@@ -22,6 +22,7 @@ implements the traits, and the same Controller then runs on it.
 | `ll_iso`, `ll_big` | connected isochronous streams and broadcast isochronous groups |
 | `ll_data`, `ll_privacy`, `ll_dtm`, `ll_policy` | the data channel PDUs, the resolving list and resolvable private addresses, Direct Test Mode, and the points where a product decides |
 | `ll_feat`, `ll_fs`, `ll_pcl`, `ll_ploss`, `ll_rate`, `ll_sca`, `ll_sub` | feature pages, frame space update, power control, path loss monitoring, connection rate, sleep clock accuracy and connection subrating |
+| `ll_cs` | Channel Sounding: the opcodes, event codes, feature bits and limits of Core 6.3 and the tables of its HCI commands; NOT IMPLEMENTED: the procedures, the results and the measurements, so a build with the feature on answers each command with Unsupported Feature or Parameter Value |
 | `ll_aes`, `ll_ccm`, `ll_cmac` | AES-128, AES-CCM and AES-CMAC in software, for a chip that has no engine |
 
 A Controller is generic over the traits it drives, so the program costs the

@@ -5,3 +5,14 @@
 ctl_adv_sets = 1
 ctl_per_adv = 0
 ctl_per_sync = 0
+# Channel Sounding is out of this profile.
+ctl_cs = 0
+ctl_cs_configs = 0
+ctl_cs_steps = 0
+ctl_cs_roles = 0
+ctl_cs_mode3 = false
+ctl_cs_rtt_seq = false
+ctl_cs_ant = 0
+ctl_cs_3c = false
+ctl_cs_ipt = false
+ctl_cs_test = false

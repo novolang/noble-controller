@@ -23,7 +23,7 @@ of `orbit/ble`.
 2. **State machines.**  `ll_adv`, `ll_scan`, `ll_init`, `ll_link`, `ll_xadv`,
    `ll_per`, `ll_pawr`, `ll_iso`, `ll_big` and the smaller procedure modules
    (`ll_feat`, `ll_fs`, `ll_pcl`, `ll_ploss`, `ll_rate`, `ll_sca`, `ll_sub`,
-   `ll_past`) decide what to send and when.  They hold the state and the
+   `ll_past`, `ll_cs`) decide what to send and when.  They hold the state and the
    arithmetic and call no radio.
 3. **The arbiter.**  `ll_arb` decides which activity holds the radio next
    and until when.
@@ -37,11 +37,12 @@ before it accepts a connection or a request, and the product answers.
 
 ## Configuration
 
-The schema is the `[config.<key>]` tables of `novo.toml`: 24 keys, each
+The schema is the `[config.<key>]` tables of `novo.toml`: 34 keys, each
 named `ctl_<what>` (`ctl_links`, `ctl_peripheral`, `ctl_central`, `ctl_cis`,
 `ctl_cigs`, `ctl_bigs`, `ctl_bis`, `ctl_adv_sets`, `ctl_adv_data`,
-`ctl_per_adv`, `ctl_per_sync`, `ctl_per_list`, the PAwR keys, and one
-switch for each optional LE feature).  The ranges are the bounds of the
+`ctl_per_adv`, `ctl_per_sync`, `ctl_per_list`, the PAwR keys, one
+switch for each optional LE feature, and the ten `ctl_cs*` keys of Channel
+Sounding).  The ranges are the bounds of the
 Core Specification where it states one; a relation between keys (a stream
 needs a group, a train needs an advertising set) is a field of the schema,
 and `novo config check` refuses a file that breaks it.
@@ -51,6 +52,20 @@ the feature as out, `ctl_hci` answers its commands with Unknown HCI Command
 and leaves its LE feature bit clear, and a table of the feature keeps one
 slot.  `ctl_budget` adds the storage of the tables up and an `assert_const`
 holds the sum to the total `novo config explain` prints.
+
+Channel Sounding has one count, `ctl_cs` (the connections that run it at once,
+0 for a build without it), and nine keys that describe the build the count
+switches on: `ctl_cs_configs`, `ctl_cs_steps`, `ctl_cs_roles` and `ctl_cs_ant`
+are 0 exactly when `ctl_cs` is, and `ctl_cs_mode3`, `ctl_cs_rtt_seq`,
+`ctl_cs_3c`, `ctl_cs_ipt` and `ctl_cs_test` choose among its options and need
+it.  `ctl_cs` needs `ctl_pcl`, and `ctl_cs_ipt` needs `ctl_featpages`.  The keys
+carry no storage figure, since the Controller declares no storage for the
+feature yet.  With `ctl_cs` at 0 the 18 commands are answered with Unknown HCI
+Command and LE features 46, 47, 48 and 75 stay clear; with it on, `ll_cs` lists
+the commands in Supported Commands and answers each with Unsupported Feature or
+Parameter Value, and the 14 Link Layer opcodes are still answered with
+LL_UNKNOWN_RSP.  The radio's side of the feature is `CsRadio` in `noble-radio`,
+which no module of this package calls yet.
 
 `configs/<profile>.toml` are the profiles the package's tests run under.
 The same names exist in `orbit/ble/configs/`, whose `[noble-controller]`

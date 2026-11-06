@@ -1,0 +1,308 @@
+// tests/ctl_cs_tests.nv — Channel Sounding as the Host and the peer see it in this Controller: the eighteen commands, the feature bits, the
+// Supported Commands and the fourteen Link Layer opcodes.
+//
+// A build without the feature (`ctl_cs` 0) answers every command with Unknown HCI Command and every opcode with LL_UNKNOWN_RSP, and leaves
+// its bits clear.  A build with it lists its commands in Supported Commands and answers each with `ll_cs.STUB_STATUS`: with a Command
+// Status event for the commands whose result follows in an event of its own and a Command Complete event for the others.  The two commands
+// of Enhancement #1 with the two of the security requirements need `ctl_cs_ipt` and the two test commands need `ctl_cs_test`.  The Link
+// Layer opcodes are answered with LL_UNKNOWN_RSP in both builds.
+//
+// The cases run under every configuration of the package; each reads the keys it depends on.
+
+use ctl_limits
+use std.test
+use noble_controller_config
+use ctl_hci
+use ll_pdu
+use ll_data
+use ll_link
+use ll_policy
+use ll_cs
+
+// ── The Host's side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn drain(var c: ctl_hci.Controller) -> [Int]
+    var out: [Int] = []
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(out, ctl_hci.ctl_tx_next(var c))
+    out
+
+fn run(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    send(var c, opcode, params)
+    let _ran = ctl_hci.ctl_step(var c)
+    drain(var c)
+
+fn packets_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i < list.len(bytes)
+        var n = 0
+        if bytes[i] == 0x04
+            n = 3 + bytes[i + 2]
+        else
+            n = 5 + bytes[i + 3] + ((bytes[i + 4] & 0x3F) << 8)
+        list.push(out, bytes[i:i + n])
+        i = i + n
+    out
+
+fn events_coded(bytes: [Int], code: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x04 and e[1] == code
+            list.push(out, e[:])
+    out
+
+fn zeros(n: Int) -> [Int]
+    var v: [Int] = []
+    for _ in 0..n
+        list.push(v, 0)
+    v
+
+fn fresh() -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, 0x10 + i)
+    test.assert_eq(status_of(var c, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
+    c
+
+// The Status of the Command Complete event of a command.
+fn status_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(var c, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
+    done[0][6]
+
+// The Status of the Command Status event of a command.
+fn cmd_status(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> Int
+    let r = run(var c, opcode, params)
+    test.assert_eq(list.len(events_coded(r, 0x0E)), 0)
+    let st = events_coded(r, 0x0F)
+    test.assert_eq(list.len(st), 1)
+    test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
+    st[0][3]
+
+fn complete_of(var c: ctl_hci.Controller, opcode: Int, params: [Int]) -> [Int]
+    let r = run(var c, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    done[0]
+
+// The parameters of a command with the length the tables give it; the 30 octets of LE CS Test, whose length is variable, with no override.
+fn params_of(opcode: Int) -> [Int]
+    let n = ll_cs.command_params(opcode)
+    if n == -2
+        return zeros(30)
+    zeros(n)
+
+fn all_opcodes() -> [Int]
+    [0x2089,
+        0x208A,
+        0x208B,
+        0x208C,
+        0x208D,
+        0x208E,
+        0x208F,
+        0x2090,
+        0x2091,
+        0x2092,
+        0x2093,
+        0x2094,
+        0x2095,
+        0x2096,
+        0x20A5,
+        0x20A6,
+        0x20A7,
+        0x20A8]
+
+// Whether this build answers the command: the feature, and the option the command belongs to.
+fn answered(opcode: Int) -> Bool
+    ctl_limits.cs_on() and ll_cs.command_answered(opcode, ctl_limits.cs_ipt_on(), ctl_limits.cs_test_on())
+
+// Whether the bit of Supported Commands (the octet and bit `at` of the field after the three first octets of the Command Complete event) is set.
+fn listed(sc: [Int], at: Int) -> Bool
+    (sc[7 + at / 8] & (1 << (at % 8))) != 0
+
+// ── The commands ────────────────────────────────────────────────────
+
+@test
+fn test_a_build_without_the_feature_answers_every_command_with_unknown_hci_command()
+    if ctl_limits.cs_on()
+        return
+    var c = fresh()
+    for op in all_opcodes()
+        test.assert_eq(status_of(var c, op, params_of(op)), ctl_hci.STATUS_UNKNOWN_COMMAND)
+    // The wrong length makes no difference: the command is not known.
+    test.assert_eq(status_of(var c, ll_cs.OP_CS_SET_DEFAULT_SETTINGS, []), ctl_hci.STATUS_UNKNOWN_COMMAND)
+
+@test
+fn test_a_build_without_the_feature_lists_none_of_its_commands()
+    if ctl_limits.cs_on()
+        return
+    var c = fresh()
+    let sc = complete_of(var c, 0x1002, [])
+    for op in all_opcodes()
+        test.assert(not listed(sc, ll_cs.command_bit(op)))
+
+@test
+fn test_the_commands_a_build_answers_are_listed_in_supported_commands_and_no_other_is()
+    if not ctl_limits.cs_on()
+        return
+    var c = fresh()
+    let sc = complete_of(var c, 0x1002, [])
+    for op in all_opcodes()
+        test.assert_eq(listed(sc, ll_cs.command_bit(op)), answered(op))
+
+@test
+fn test_a_build_with_the_feature_answers_the_commands_it_has_with_the_stub_status()
+    if not ctl_limits.cs_on()
+        return
+    var c = fresh()
+    for op in all_opcodes()
+        if not answered(op)
+            continue
+        if ll_cs.status_reply(op)
+            test.assert_eq(cmd_status(var c, op, params_of(op)), ll_cs.STUB_STATUS)
+        else
+            test.assert_eq(status_of(var c, op, params_of(op)), ll_cs.STUB_STATUS)
+
+@test
+fn test_a_build_with_the_feature_answers_the_commands_it_leaves_out_with_unknown_hci_command()
+    if not ctl_limits.cs_on()
+        return
+    var c = fresh()
+    for op in all_opcodes()
+        if answered(op)
+            continue
+        test.assert_eq(status_of(var c, op, params_of(op)), ctl_hci.STATUS_UNKNOWN_COMMAND)
+
+@test
+fn test_a_command_of_the_wrong_length_is_refused_with_invalid_hci_command_parameters()
+    if not ctl_limits.cs_on()
+        return
+    var c = fresh()
+    for op in all_opcodes()
+        if not answered(op)
+            continue
+        let n = ll_cs.command_params(op)
+        if n == -2
+            continue
+        test.assert_eq(status_of(var c, op, zeros(n + 1)), ctl_hci.STATUS_INVALID_PARAMETERS)
+        if n > 0
+            test.assert_eq(status_of(var c, op, zeros(n - 1)), ctl_hci.STATUS_INVALID_PARAMETERS)
+
+@test
+fn test_every_answer_leaves_the_controller_ready_for_the_next_command()
+    var c = fresh()
+    for op in all_opcodes()
+        let _r = run(var c, op, params_of(op))
+    test.assert_eq(status_of(var c, 0x0C03, []), 0)
+
+// ── The features ────────────────────────────────────────────────────
+
+@test
+fn test_the_features_of_the_controller_carry_bit_46_with_the_feature_and_never_bits_47_and_48()
+    var c = fresh()
+    let f = complete_of(var c, 0x2003, [])
+    if ctl_limits.cs_on()
+        test.assert_eq(f[7 + 5] & ll_cs.FEAT5_CS, ll_cs.FEAT5_CS)
+    else
+        test.assert_eq(f[7 + 5] & ll_cs.FEAT5_CS, 0)
+    test.assert_eq(f[7 + 5] & ll_cs.FEAT5_CS_HOST, 0)
+    test.assert_eq(f[7 + 6] & ll_cs.FEAT6_CS_TQ, 0)
+
+@test
+fn test_the_second_page_of_features_carries_bit_75_only_with_enhancement_1()
+    if not ctl_limits.feat_on()
+        return
+    var c = fresh()
+    let r = complete_of(var c, 0x2087, [])
+    // Status, Max_Page, 8 octets of page 0, then page 1: bit 75 is bit 11 of it.
+    let page1 = r[8 + 8] | (r[8 + 9] << 8)
+    if ctl_limits.cs_ipt_on()
+        test.assert_eq(page1 & ll_cs.PAGE1_CS_ENHANCEMENT_1, ll_cs.PAGE1_CS_ENHANCEMENT_1)
+    else
+        test.assert_eq(page1 & ll_cs.PAGE1_CS_ENHANCEMENT_1, 0)
+
+// ── The Link Layer opcodes ──────────────────────────────────────────
+
+fn connect_ind(interval: Int, timeout: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0x10 + i)
+    for b in [0x12, 0x5A, 0x65, 0x50, 0x11, 0x22, 0x33, 2]
+        let _c = ll_pdu.pdu_put(var p, b)
+    for v in [0, interval, 0, timeout]
+        let _d = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _e = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _f = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A Controller with a Peripheral connection of 30 ms taken at 5000.
+fn connected() -> ctl_hci.Controller
+    var c = fresh()
+    test.assert_eq(status_of(var c, 0x2006, [0x20, 0, 0x20, 0, 0, 0, 0, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 7, 0]),
+        0)
+    test.assert_eq(status_of(var c, 0x200A, [1]), 0)
+    ctl_hci.ctl_set_time(var c, 1000)
+    var pol = ll_policy.default_link_policy()
+    var p = connect_ind(24, 100)
+    test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
+    let _r = run(var c, 0x1001, [])
+    c
+
+fn queued_op(var c: ctl_hci.Controller) -> Int
+    if c.links[0].nxt_kind == ll_link.K_EMPTY
+        return -1
+    ll_data.dpdu_opcode(var c.links[0].nxt)
+
+fn queued_byte(var c: ctl_hci.Controller, i: Int) -> Int
+    ll_data.dpdu_byte(var c.links[0].nxt, i)
+
+fn pop_queued(var c: ctl_hci.Controller)
+    c.links[0].nxt_kind = ll_link.K_EMPTY
+    ll_data.dpdu_empty(var c.links[0].nxt)
+
+// An LL Control PDU with `op` and `n` zero octets of CtrData.
+fn control_pdu(op: Int, n: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_begin(var p, op)
+    for _ in 0..n
+        let _a = ll_pdu.pdu_put(var p, 0)
+    ll_data.dpdu_finish(var p)
+    p
+
+// The CtrData lengths of the fourteen PDUs, in the order of their opcodes 0x2D to 0x3A: LL_CS_SEC_RSP 20, the capabilities 25, 25,
+// LL_CS_CONFIG_REQ 27, LL_CS_CONFIG_RSP 1, LL_CS_REQ 28, LL_CS_RSP 21, LL_CS_IND 18, LL_CS_TERMINATE_REQ 4, LL_CS_FAE_REQ 0, LL_CS_FAE_RSP
+// 72, LL_CS_CHANNEL_MAP_IND 12, LL_CS_SEC_REQ 20, LL_CS_TERMINATE_RSP 4.
+fn pdu_lengths() -> [Int]
+    [20, 25, 25, 27, 1, 28, 21, 18, 4, 0, 72, 12, 20, 4]
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@test
+fn test_the_fourteen_control_opcodes_are_answered_with_unknown_response_whether_the_feature_is_in_or_not()
+    var c = connected()
+    let lens = pdu_lengths()
+    for i in 0..14
+        let op = 0x2D + i
+        test.assert(ll_cs.is_pdu(op))
+        var p = control_pdu(op, lens[i])
+        ll_link.ctrl_rx(var c.links[0], var p)
+        ll_link.link_prepare(var c.links[0])
+        test.assert_eq(queued_op(var c), ll_data.OP_UNKNOWN_RSP)
+        test.assert_eq(queued_byte(var c, 1), op)
+        pop_queued(var c)

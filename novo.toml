@@ -233,3 +233,81 @@ unit    = "buffers"
 when    = ["ctl_pawr_adv", "ctl_pawr_sync"]
 min_when = [{ when = "ctl_pawr_adv", min = 1 }, { when = "ctl_pawr_sync", min = 1 }]
 doc     = "buffers of subevent data the advertiser keeps, and of responses each synchronization keeps, 1 to 8; 0 when neither side of PAwR is on"
+
+# Channel Sounding (ll_cs.nv; Core 6.3, Vol 6 Part H).  `ctl_cs` is the count of connections that run it at once and the switch: 0 is a
+# build without it.  The keys that describe the feature are 0 or false exactly when the count is 0, and the keys that choose among its
+# options need the count.  The keys carry no `bytes`: the Controller declares no storage for the feature yet, so there is nothing for a
+# cost formula to state.
+[config.ctl_cs]
+type     = "int"
+default  = 0
+min      = 0
+max      = 2
+requires = ["ctl_pcl"]
+doc      = "connections that run Channel Sounding at once (ll_cs.nv), 0 for a build without it, which then answers its 18 commands with Unknown HCI Command, its 14 Link Layer PDUs with LL_UNKNOWN_RSP and leaves LE features 46, 47, 48 and 75 clear; needs CTL_PCL, whose power delta the Channel Sounding request names"
+
+[config.ctl_cs_configs]
+type     = "int"
+default  = 0
+min      = 0
+max      = 4
+zero_iff = "ctl_cs"
+min_when = [{ when = "ctl_cs", min = 1 }]
+doc      = "configurations a connection holds for Channel Sounding, 1 to 4 (the Num_Config_Supported the capabilities answer); 0 exactly when CTL_CS is 0"
+
+[config.ctl_cs_steps]
+type     = "int"
+default  = 0
+min      = 0
+max      = 160
+unit     = "steps"
+zero_iff = "ctl_cs"
+min_when = [{ when = "ctl_cs", min = 8 }]
+doc      = "steps one Channel Sounding subevent holds in its plan and its results, 8 to 160; 0 exactly when CTL_CS is 0"
+
+[config.ctl_cs_roles]
+type     = "int"
+default  = 0
+min      = 0
+max      = 3
+zero_iff = "ctl_cs"
+doc      = "the Channel Sounding roles the build has, 1 initiator, 2 reflector, 3 both (the Roles_Supported the capabilities answer, cut down by what the radio runs); 0 exactly when CTL_CS is 0"
+
+[config.ctl_cs_mode3]
+type     = "bool"
+default  = false
+requires = ["ctl_cs"]
+doc      = "on when the build has Channel Sounding step mode 3, which measures the round-trip time and a tone together, off for a build whose Modes_Supported leaves its bit clear; needs CTL_CS"
+
+[config.ctl_cs_rtt_seq]
+type     = "bool"
+default  = false
+requires = ["ctl_cs"]
+doc      = "on when the build has the round-trip time with a sounding or a random sequence and the phase measurement from the sounding sequence, off for a build that keeps the round-trip time of the access address alone; needs CTL_CS"
+
+[config.ctl_cs_ant]
+type     = "int"
+default  = 0
+min      = 0
+max      = 4
+zero_iff = "ctl_cs"
+min_when = [{ when = "ctl_cs", min = 1 }]
+doc      = "antenna elements the build may use for Channel Sounding, 1 to 4 (the Num_Antennae_Supported the capabilities answer, the antenna paths following); 0 exactly when CTL_CS is 0"
+
+[config.ctl_cs_3c]
+type     = "bool"
+default  = false
+requires = ["ctl_cs"]
+doc      = "on when the build has Channel Selection Algorithm #3c for Channel Sounding; needs CTL_CS"
+
+[config.ctl_cs_ipt]
+type     = "bool"
+default  = false
+requires = ["ctl_cs", "ctl_featpages"]
+doc      = "on when the build has Channel Sounding Enhancement #1, the initiator phase tone and the accuracy counts of LE 2M (the [v2] records with their two commands, and LE feature 75), and the two commands of the security requirements; needs CTL_CS and CTL_FEATPAGES, which carries feature 75"
+
+[config.ctl_cs_test]
+type     = "bool"
+default  = false
+requires = ["ctl_cs"]
+doc      = "on when the build has the Channel Sounding test commands, LE CS Test and LE CS Test End, and the event that ends the test, off for a build that saves their text; needs CTL_CS"

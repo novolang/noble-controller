@@ -1,0 +1,293 @@
+// src/ll_cs.nv — Channel Sounding of the Link Layer: the opcodes, event codes, feature bits and limits Core 6.3 gives it, and the tables of
+// the HCI commands a build with the feature answers.
+//
+// [Vol 1] Part A, Section 9; [Vol 4] Part E, Sections 6.27, 7.7.65.39 to 7.7.65.46, 7.8.1, 7.8.130 to 7.8.143, 7.8.157 and 7.8.158;
+// [Vol 6] Part B, Sections 2.4.2.42 to 2.4.2.53, 4.5.18 and 4.6; [Vol 6] Part H, Section 4.3.  Two connected devices measure the channel
+// between them in procedures of events, subevents and steps; the Controller reports the measurements to the Host, which computes a
+// distance.
+//
+// A build with `ctl_cs` 0 (`ctl_limits.cs_on()` false) answers none of the eighteen commands, leaves LE features 46, 47, 48 and 75 clear
+// and answers the fourteen Link Layer PDUs (opcodes 0x2D to 0x3A) with LL_UNKNOWN_RSP.  A build with it lists the commands in Supported
+// Commands and answers each with `STUB_STATUS`; the PDUs are still answered with LL_UNKNOWN_RSP.
+//
+// NOT IMPLEMENTED: the random bit generator, the channel and access address selection, the step timeline, the control PDUs and the
+// procedures over them, the HCI results, and the radio's measurements.
+//
+// This module holds no radio and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
+
+// ── The HCI commands ────────────────────────────────────────────────
+// The opcode is 0x2000 and the OCF.  The `[v1]` and `[v2]` records of a command are two commands; the `[v2]` ones belong to Enhancement #1
+// and, with the two commands of the security requirements, to a build with `ctl_cs_ipt`.
+
+const OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES = 0x2089
+const OP_CS_READ_REMOTE_SUPPORTED_CAPABILITIES = 0x208A
+const OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES = 0x208B
+const OP_CS_SECURITY_ENABLE = 0x208C
+const OP_CS_SET_DEFAULT_SETTINGS = 0x208D
+const OP_CS_READ_REMOTE_FAE_TABLE = 0x208E
+const OP_CS_WRITE_CACHED_REMOTE_FAE_TABLE = 0x208F
+const OP_CS_CREATE_CONFIG = 0x2090
+const OP_CS_REMOVE_CONFIG = 0x2091
+const OP_CS_SET_CHANNEL_CLASSIFICATION = 0x2092
+const OP_CS_SET_PROCEDURE_PARAMETERS = 0x2093
+const OP_CS_PROCEDURE_ENABLE = 0x2094
+const OP_CS_TEST = 0x2095
+const OP_CS_TEST_END = 0x2096
+const OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES_V2 = 0x20A5
+const OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES_V2 = 0x20A6
+const OP_CS_SET_SECURITY_REQUIREMENTS = 0x20A7
+const OP_CS_SET_DEFAULT_SECURITY_REQUIREMENTS = 0x20A8
+
+// The status a build with the feature answers every command with, Unsupported Feature or Parameter Value, until the commands have bodies.
+const STUB_STATUS = 0x11
+
+// Whether `opcode` is one of the eighteen commands, the `[v2]` and security requirement ones included.
+@tier(embedded)
+fn is_command(opcode: Int) -> Bool
+    opcode >= 0x2089 and opcode <= 0x2096 or opcode >= 0x20A5 and opcode <= 0x20A8
+
+// Whether `opcode` is one of the four commands of Enhancement #1 and of the security requirements, which a build with `ctl_cs_ipt` answers
+// in addition to the other fourteen.
+@tier(embedded)
+fn is_v2_command(opcode: Int) -> Bool
+    opcode >= 0x20A5 and opcode <= 0x20A8
+
+// The position of the command in Supported Commands, octet times 8 plus bit ([Vol 4] Part E, Section 6.27); -1 for an opcode that is no
+// command of the feature.
+@tier(embedded)
+fn command_bit(opcode: Int) -> Int
+    match opcode
+        0x2089 => 20 * 8 + 5
+        0x208a => 20 * 8 + 6
+        0x208b => 20 * 8 + 7
+        0x208c => 24 * 8 + 1
+        0x208d => 24 * 8 + 7
+        0x208e => 12 * 8 + 2
+        0x208f => 12 * 8 + 3
+        0x2090 => 16 * 8 + 6
+        0x2091 => 16 * 8 + 7
+        0x2092 => 29 * 8 + 0
+        0x2093 => 29 * 8 + 1
+        0x2094 => 29 * 8 + 2
+        0x2095 => 23 * 8 + 3
+        0x2096 => 23 * 8 + 4
+        0x20a5 => 49 * 8 + 2
+        0x20a6 => 49 * 8 + 3
+        0x20a7 => 49 * 8 + 4
+        0x20a8 => 49 * 8 + 5
+        _      => -1
+
+// The number of parameter octets of the command; -2 for LE CS Test, whose parameters are 30 octets and the overrides they announce; -1 for
+// an opcode that is no command of the feature.
+@tier(embedded)
+fn command_params(opcode: Int) -> Int
+    match opcode
+        0x2089 => 0
+        0x208a => 2
+        0x208b => 2 + 28
+        0x208c => 2
+        0x208d => 5
+        0x208e => 2
+        0x208f => 2 + 72
+        0x2090 => 28
+        0x2091 => 3
+        0x2092 => 10
+        0x2093 => 23
+        0x2094 => 4
+        0x2095 => -2
+        0x2096 => 0
+        0x20a5 => 0
+        0x20a6 => 2 + 34
+        0x20a7 => 2 + 8
+        0x20a8 => 8
+        _      => -1
+
+// Whether the Controller answers the command with a Command Status event, the result following in an event of its own, and not with a
+// Command Complete event.
+@tier(embedded)
+fn status_reply(opcode: Int) -> Bool
+    opcode == 0x208a or opcode == 0x208c or opcode == 0x208e or opcode == 0x2090 or opcode == 0x2091 or opcode == 0x2094 or opcode == 0x2096
+
+// Whether `opcode` is one of the two test commands, LE CS Test (0x2095) and LE CS Test End (0x2096), which a build with `ctl_cs_test` answers.
+@tier(embedded)
+fn is_test_command(opcode: Int) -> Bool
+    opcode == 0x2095 or opcode == 0x2096
+
+// Whether a build with the feature on answers the command, given its `ctl_cs_ipt` (`ipt`) and `ctl_cs_test` (`test`): the commands of the
+// first records always, the four of Enhancement #1 and the security requirements only with `ipt`, the two test commands only with `test`.
+@tier(embedded)
+fn command_answered(opcode: Int, ipt: Bool, test: Bool) -> Bool
+    if not is_command(opcode)
+        return false
+    if is_v2_command(opcode) and not ipt
+        return false
+    test or not is_test_command(opcode)
+
+// ── The HCI events ──────────────────────────────────────────────────
+// All are LE Meta events; the subevent code is the first octet after the length.  The mask bit is the bit of LE Set Event Mask ([Vol 4]
+// Part E, Section 7.8.1), which holds 64 bits and so reaches every one of these.
+
+const SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE = 0x2C
+const SUB_CS_READ_REMOTE_FAE_TABLE_COMPLETE = 0x2D
+const SUB_CS_SECURITY_ENABLE_COMPLETE = 0x2E
+const SUB_CS_CONFIG_COMPLETE = 0x2F
+const SUB_CS_PROCEDURE_ENABLE_COMPLETE = 0x30
+const SUB_CS_SUBEVENT_RESULT = 0x31
+const SUB_CS_SUBEVENT_RESULT_CONTINUE = 0x32
+const SUB_CS_TEST_END_COMPLETE = 0x33
+const SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE_V2 = 0x38
+
+// The bit of LE Set Event Mask that enables the event with the subevent code `sub`; -1 for a code that is no event of the feature.
+@tier(embedded)
+fn event_mask_bit(sub: Int) -> Int
+    match sub
+        0x2c => 43
+        0x2d => 44
+        0x2e => 45
+        0x2f => 46
+        0x30 => 47
+        0x31 => 48
+        0x32 => 49
+        0x33 => 50
+        0x38 => 55
+        _    => -1
+
+// ── The LE features ─────────────────────────────────────────────────
+// The bits of the Link Layer feature set ([Vol 6] Part B, Table 4.9): Channel Sounding (46), its Host Support (47, set by the Host with LE
+// Set Host Feature), the Tone Quality Indication (48, not sent to the peer) and Channel Sounding Enhancement #1 (75, bit 11 of page 1).
+
+const FEATURE_CS = 46
+const FEATURE_CS_HOST_SUPPORT = 47
+const FEATURE_CS_TONE_QUALITY = 48
+const FEATURE_CS_ENHANCEMENT_1 = 75
+
+// Octet 5 of page 0 holds bits 46 and 47, octet 6 holds bit 48, and page 1 holds bit 75 as bit 11.
+const FEAT5_CS = 0x40
+const FEAT5_CS_HOST = 0x80
+const FEAT6_CS_TQ = 0x01
+const PAGE1_CS_ENHANCEMENT_1 = 0x800
+
+// ── The Link Layer PDUs ─────────────────────────────────────────────
+// The control opcodes of Table 2.22 of [Vol 6] Part B.
+
+const OP_CS_SEC_RSP = 0x2D
+const OP_CS_CAPABILITIES_REQ = 0x2E
+const OP_CS_CAPABILITIES_RSP = 0x2F
+const OP_CS_CONFIG_REQ = 0x30
+const OP_CS_CONFIG_RSP = 0x31
+const OP_CS_REQ = 0x32
+const OP_CS_RSP = 0x33
+const OP_CS_IND = 0x34
+const OP_CS_TERMINATE_REQ = 0x35
+const OP_CS_FAE_REQ = 0x36
+const OP_CS_FAE_RSP = 0x37
+const OP_CS_CHANNEL_MAP_IND = 0x38
+const OP_CS_SEC_REQ = 0x39
+const OP_CS_TERMINATE_RSP = 0x3A
+
+// Whether `op` is a control opcode of the feature.
+@tier(embedded)
+fn is_pdu(op: Int) -> Bool
+    op >= 0x2D and op <= 0x3A
+
+// ── The limits of a procedure ───────────────────────────────────────
+// [Vol 6] Part B, Sections 4.1.4 and 4.5.18.1, and Part H, Section 4.3.
+
+// A procedure holds at most 32 subevents and 256 steps; a subevent holds 2 to 160 steps.
+const SUBEVENTS_MAX = 32
+const STEPS_PER_PROCEDURE_MAX = 256
+const STEPS_PER_SUBEVENT_MIN = 2
+const STEPS_PER_SUBEVENT_MAX = 160
+
+// The configurations a connection holds, Config_ID 0 to 3.
+const CONFIGS_MAX = 4
+
+// The least space between two subevents, two events and two procedures, in microseconds.
+const T_MES_US = 150
+
+// The guard time (T_GD), the ramp-down window (T_RD) and the frequency measurement window of mode 0 (T_FM), in microseconds.
+const T_GD_US = 10
+const T_RD_US = 5
+const T_FM_US = 80
+
+// The mandatory step timings in microseconds, and their indices in the tables below.
+const T_IP_MANDATORY_US = 145
+const T_FCS_MANDATORY_US = 150
+const T_PM_MANDATORY_US = 40
+
+// The CS channels: 2 to 22 and 26 to 76, 72 of the 79 (channels 0, 1, 23, 24, 25, 77 and 78 are never used).
+const CHANNEL_COUNT = 72
+
+// Whether `ch` is a channel a step may use.
+@tier(embedded)
+fn channel_ok(ch: Int) -> Bool
+    ch >= 2 and ch <= 22 or ch >= 26 and ch <= 76
+
+// ── The step timings ────────────────────────────────────────────────
+// Tables 4.3, 4.5, 4.8 and 4.9 of [Vol 6] Part H: the value in microseconds of each index the control PDUs carry, -1 for an index
+// beyond the table, and the index of each value, -1 for a value the table lacks.  T_IP1 and T_IP2 share one table.
+
+// T_IP1 and T_IP2: 10, 20, 30, 40, 50, 60, 80 and 145 microseconds.
+@tier(embedded)
+fn t_ip_us(index: Int) -> Int
+    match index
+        0 => 10
+        1 => 20
+        2 => 30
+        3 => 40
+        4 => 50
+        5 => 60
+        6 => 80
+        7 => 145
+        _ => -1
+
+@tier(embedded)
+fn t_ip_index(us: Int) -> Int
+    for i in 0..8
+        if t_ip_us(i) == us
+            return i
+    -1
+
+// T_FCS: 15, 20, 30, 40, 50, 60, 80, 100, 120 and 150 microseconds.
+@tier(embedded)
+fn t_fcs_us(index: Int) -> Int
+    match index
+        0 => 15
+        1 => 20
+        2 => 30
+        3 => 40
+        4 => 50
+        5 => 60
+        6 => 80
+        7 => 100
+        8 => 120
+        9 => 150
+        _ => -1
+
+@tier(embedded)
+fn t_fcs_index(us: Int) -> Int
+    for i in 0..10
+        if t_fcs_us(i) == us
+            return i
+    -1
+
+// T_PM: 10, 20 and 40 microseconds.
+@tier(embedded)
+fn t_pm_us(index: Int) -> Int
+    match index
+        0 => 10
+        1 => 20
+        2 => 40
+        _ => -1
+
+@tier(embedded)
+fn t_pm_index(us: Int) -> Int
+    for i in 0..3
+        if t_pm_us(i) == us
+            return i
+    -1
+
+// Whether `us` is a switching time T_SW the capabilities may name: 0 (no antenna switching), 1, 2, 4 or 10 microseconds.
+@tier(embedded)
+fn t_sw_ok(us: Int) -> Bool
+    us == 0 or us == 1 or us == 2 or us == 4 or us == 10

@@ -1,0 +1,362 @@
+// tests/ll_cs_tests.nv — the unit tests of src/ll_cs.nv: the opcodes, event codes, feature bits and limits of Channel Sounding, the tables of
+// its HCI commands, and the keys of the configuration that switch it and its options.
+//
+// Each literal below is written from [Vol 4] Part E (Sections 6.27, 7.7.65.39 to 7.7.65.46, 7.8.1, 7.8.130 to 7.8.143, 7.8.157 and 7.8.158),
+// [Vol 6] Part B (Table 2.22, Table 4.9) and [Vol 6] Part H (Tables 4.3, 4.5, 4.8, 4.9), and is held to the table of the module.
+//
+//   novo test tests/ll_cs_tests.nv
+
+use std.test
+use ctl_limits
+use noble_controller_config
+use ll_cs
+
+// ── The commands ────────────────────────────────────────────────────
+
+// The commands in the order of their OCFs of the specification, with the opcode, the octet and bit of Supported Commands, the parameter
+// octets and whether the answer is a Command Status event.
+fn opcodes() -> [Int]
+    [0x2089,
+        0x208A,
+        0x208B,
+        0x208C,
+        0x208D,
+        0x208E,
+        0x208F,
+        0x2090,
+        0x2091,
+        0x2092,
+        0x2093,
+        0x2094,
+        0x2095,
+        0x2096,
+        0x20A5,
+        0x20A6,
+        0x20A7,
+        0x20A8]
+
+fn octets() -> [Int]
+    [20, 20, 20, 24, 24, 12, 12, 16, 16, 29, 29, 29, 23, 23, 49, 49, 49, 49]
+
+fn bits() -> [Int]
+    [5, 6, 7, 1, 7, 2, 3, 6, 7, 0, 1, 2, 3, 4, 2, 3, 4, 5]
+
+fn params() -> [Int]
+    [0, 2, 30, 2, 5, 2, 74, 28, 3, 10, 23, 4, -2, 0, 0, 36, 10, 8]
+
+fn status_replies() -> [Bool]
+    [false,
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+        true,
+        false,
+        false,
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false]
+
+@test
+fn test_the_opcode_constants_are_the_ocfs_of_the_specification()
+    test.assert_eq(ll_cs.OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES, 0x2000 + 0x0089)
+    test.assert_eq(ll_cs.OP_CS_READ_REMOTE_SUPPORTED_CAPABILITIES, 0x2000 + 0x008A)
+    test.assert_eq(ll_cs.OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES, 0x2000 + 0x008B)
+    test.assert_eq(ll_cs.OP_CS_SECURITY_ENABLE, 0x2000 + 0x008C)
+    test.assert_eq(ll_cs.OP_CS_SET_DEFAULT_SETTINGS, 0x2000 + 0x008D)
+    test.assert_eq(ll_cs.OP_CS_READ_REMOTE_FAE_TABLE, 0x2000 + 0x008E)
+    test.assert_eq(ll_cs.OP_CS_WRITE_CACHED_REMOTE_FAE_TABLE, 0x2000 + 0x008F)
+    test.assert_eq(ll_cs.OP_CS_CREATE_CONFIG, 0x2000 + 0x0090)
+    test.assert_eq(ll_cs.OP_CS_REMOVE_CONFIG, 0x2000 + 0x0091)
+    test.assert_eq(ll_cs.OP_CS_SET_CHANNEL_CLASSIFICATION, 0x2000 + 0x0092)
+    test.assert_eq(ll_cs.OP_CS_SET_PROCEDURE_PARAMETERS, 0x2000 + 0x0093)
+    test.assert_eq(ll_cs.OP_CS_PROCEDURE_ENABLE, 0x2000 + 0x0094)
+    test.assert_eq(ll_cs.OP_CS_TEST, 0x2000 + 0x0095)
+    test.assert_eq(ll_cs.OP_CS_TEST_END, 0x2000 + 0x0096)
+    test.assert_eq(ll_cs.OP_CS_READ_LOCAL_SUPPORTED_CAPABILITIES_V2, 0x2000 + 0x00A5)
+    test.assert_eq(ll_cs.OP_CS_WRITE_CACHED_REMOTE_SUPPORTED_CAPABILITIES_V2, 0x2000 + 0x00A6)
+    test.assert_eq(ll_cs.OP_CS_SET_SECURITY_REQUIREMENTS, 0x2000 + 0x00A7)
+    test.assert_eq(ll_cs.OP_CS_SET_DEFAULT_SECURITY_REQUIREMENTS, 0x2000 + 0x00A8)
+
+@test
+fn test_the_tables_name_the_same_eighteen_commands()
+    test.assert_eq(list.len(opcodes()), 18)
+    test.assert_eq(list.len(octets()), 18)
+    test.assert_eq(list.len(bits()), 18)
+    test.assert_eq(list.len(params()), 18)
+    test.assert_eq(list.len(status_replies()), 18)
+    var n = 0
+    for op in 0..0x10000
+        if ll_cs.is_command(op)
+            n = n + 1
+    test.assert_eq(n, 18)
+    var m = 0
+    for op in 0..0x10000
+        if ll_cs.is_v2_command(op)
+            m = m + 1
+    test.assert_eq(m, 4)
+    var t = 0
+    for op in 0..0x10000
+        if ll_cs.is_test_command(op)
+            t = t + 1
+    test.assert_eq(t, 2)
+
+@test
+fn test_every_command_is_at_its_position_in_supported_commands()
+    let ops = opcodes()
+    let o = octets()
+    let b = bits()
+    for i in 0..18
+        test.assert(ll_cs.is_command(ops[i]))
+        test.assert_eq(ll_cs.command_bit(ops[i]), o[i] * 8 + b[i])
+
+@test
+fn test_no_two_commands_share_a_position_and_all_are_inside_the_command_field()
+    let ops = opcodes()
+    for i in 0..18
+        let bi = ll_cs.command_bit(ops[i])
+        test.assert(bi >= 0 and bi < 64 * 8)
+        for j in i + 1..18
+            test.assert(bi != ll_cs.command_bit(ops[j]))
+
+@test
+fn test_every_command_takes_the_parameters_the_tables_give_it()
+    let ops = opcodes()
+    let p = params()
+    for i in 0..18
+        test.assert_eq(ll_cs.command_params(ops[i]), p[i])
+
+@test
+fn test_the_commands_with_a_status_reply_are_the_seven_whose_result_is_an_event()
+    let ops = opcodes()
+    let s = status_replies()
+    var n = 0
+    for i in 0..18
+        test.assert_eq(ll_cs.status_reply(ops[i]), s[i])
+        if s[i]
+            n = n + 1
+    test.assert_eq(n, 7)
+
+@test
+fn test_an_opcode_that_is_no_command_of_the_feature_has_no_position_and_no_parameters()
+    for op in [0x0000, 0x2088, 0x2097, 0x20A4, 0x20A9, 0x2087, 0x209D, 0x20FF, 0x0C01, 0x1001]
+        test.assert(not ll_cs.is_command(op))
+        test.assert_eq(ll_cs.command_bit(op), -1)
+        test.assert_eq(ll_cs.command_params(op), -1)
+        test.assert(not ll_cs.status_reply(op))
+        test.assert(not ll_cs.command_answered(op, true, true))
+
+@test
+fn test_the_commands_of_enhancement_1_need_ipt_and_the_test_commands_need_test()
+    let ops = opcodes()
+    for i in 0..18
+        let op = ops[i]
+        let v2 = i >= 14
+        let tst = i == 12 or i == 13
+        test.assert_eq(ll_cs.is_v2_command(op), v2)
+        test.assert_eq(ll_cs.is_test_command(op), tst)
+        test.assert_eq(ll_cs.command_answered(op, true, true), true)
+        test.assert_eq(ll_cs.command_answered(op, false, true), not v2)
+        test.assert_eq(ll_cs.command_answered(op, true, false), not tst)
+        test.assert_eq(ll_cs.command_answered(op, false, false), not v2 and not tst)
+
+@test
+fn test_the_status_a_stub_answers_is_unsupported_feature_or_parameter_value()
+    test.assert_eq(ll_cs.STUB_STATUS, 0x11)
+
+// ── The events ──────────────────────────────────────────────────────
+
+@test
+fn test_the_event_codes_and_mask_bits_are_those_of_the_specification()
+    test.assert_eq(ll_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE, 0x2C)
+    test.assert_eq(ll_cs.SUB_CS_READ_REMOTE_FAE_TABLE_COMPLETE, 0x2D)
+    test.assert_eq(ll_cs.SUB_CS_SECURITY_ENABLE_COMPLETE, 0x2E)
+    test.assert_eq(ll_cs.SUB_CS_CONFIG_COMPLETE, 0x2F)
+    test.assert_eq(ll_cs.SUB_CS_PROCEDURE_ENABLE_COMPLETE, 0x30)
+    test.assert_eq(ll_cs.SUB_CS_SUBEVENT_RESULT, 0x31)
+    test.assert_eq(ll_cs.SUB_CS_SUBEVENT_RESULT_CONTINUE, 0x32)
+    test.assert_eq(ll_cs.SUB_CS_TEST_END_COMPLETE, 0x33)
+    test.assert_eq(ll_cs.SUB_CS_READ_REMOTE_SUPPORTED_CAPABILITIES_COMPLETE_V2, 0x38)
+    let codes = [0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x38]
+    let masks = [43, 44, 45, 46, 47, 48, 49, 50, 55]
+    for i in 0..9
+        test.assert_eq(ll_cs.event_mask_bit(codes[i]), masks[i])
+        test.assert(masks[i] < 64)
+
+@test
+fn test_a_subevent_code_that_is_no_event_of_the_feature_has_no_mask_bit()
+    for code in [0x00, 0x2B, 0x34, 0x37, 0x39, 0x3F, 0xFF]
+        test.assert_eq(ll_cs.event_mask_bit(code), -1)
+
+// ── The feature bits ────────────────────────────────────────────────
+
+@test
+fn test_the_feature_bits_sit_in_the_octets_and_the_page_the_specification_names()
+    test.assert_eq(ll_cs.FEATURE_CS, 46)
+    test.assert_eq(ll_cs.FEATURE_CS_HOST_SUPPORT, 47)
+    test.assert_eq(ll_cs.FEATURE_CS_TONE_QUALITY, 48)
+    test.assert_eq(ll_cs.FEATURE_CS_ENHANCEMENT_1, 75)
+    test.assert_eq(ll_cs.FEAT5_CS, 1 << (46 - 5 * 8))
+    test.assert_eq(ll_cs.FEAT5_CS_HOST, 1 << (47 - 5 * 8))
+    test.assert_eq(ll_cs.FEAT6_CS_TQ, 1 << (48 - 6 * 8))
+    test.assert_eq(ll_cs.PAGE1_CS_ENHANCEMENT_1, 1 << (75 - 64))
+
+// ── The Link Layer PDUs ─────────────────────────────────────────────
+
+@test
+fn test_the_control_opcodes_are_those_of_table_2_22()
+    test.assert_eq(ll_cs.OP_CS_SEC_RSP, 0x2D)
+    test.assert_eq(ll_cs.OP_CS_CAPABILITIES_REQ, 0x2E)
+    test.assert_eq(ll_cs.OP_CS_CAPABILITIES_RSP, 0x2F)
+    test.assert_eq(ll_cs.OP_CS_CONFIG_REQ, 0x30)
+    test.assert_eq(ll_cs.OP_CS_CONFIG_RSP, 0x31)
+    test.assert_eq(ll_cs.OP_CS_REQ, 0x32)
+    test.assert_eq(ll_cs.OP_CS_RSP, 0x33)
+    test.assert_eq(ll_cs.OP_CS_IND, 0x34)
+    test.assert_eq(ll_cs.OP_CS_TERMINATE_REQ, 0x35)
+    test.assert_eq(ll_cs.OP_CS_FAE_REQ, 0x36)
+    test.assert_eq(ll_cs.OP_CS_FAE_RSP, 0x37)
+    test.assert_eq(ll_cs.OP_CS_CHANNEL_MAP_IND, 0x38)
+    test.assert_eq(ll_cs.OP_CS_SEC_REQ, 0x39)
+    test.assert_eq(ll_cs.OP_CS_TERMINATE_RSP, 0x3A)
+
+@test
+fn test_the_fourteen_control_opcodes_are_one_run_from_0x2d_to_0x3a()
+    var n = 0
+    for op in 0..0x100
+        if ll_cs.is_pdu(op)
+            n = n + 1
+            test.assert(op >= 0x2D and op <= 0x3A)
+    test.assert_eq(n, 14)
+    test.assert(not ll_cs.is_pdu(0x2C))
+    test.assert(not ll_cs.is_pdu(0x3B))
+
+// ── The limits of a procedure ───────────────────────────────────────
+
+@test
+fn test_the_counts_of_a_procedure_are_those_of_the_specification()
+    test.assert_eq(ll_cs.SUBEVENTS_MAX, 32)
+    test.assert_eq(ll_cs.STEPS_PER_PROCEDURE_MAX, 256)
+    test.assert_eq(ll_cs.STEPS_PER_SUBEVENT_MIN, 2)
+    test.assert_eq(ll_cs.STEPS_PER_SUBEVENT_MAX, 160)
+    test.assert_eq(ll_cs.CONFIGS_MAX, 4)
+    test.assert_eq(ll_cs.T_MES_US, 150)
+    test.assert_eq(ll_cs.T_GD_US, 10)
+    test.assert_eq(ll_cs.T_RD_US, 5)
+    test.assert_eq(ll_cs.T_FM_US, 80)
+
+@test
+fn test_the_channels_are_2_to_22_and_26_to_76()
+    var n = 0
+    for ch in 0..79
+        if ll_cs.channel_ok(ch)
+            n = n + 1
+    test.assert_eq(n, ll_cs.CHANNEL_COUNT)
+    test.assert_eq(n, 72)
+    for ch in [0, 1, 23, 24, 25, 77, 78]
+        test.assert(not ll_cs.channel_ok(ch))
+    for ch in [2, 22, 26, 76, 40]
+        test.assert(ll_cs.channel_ok(ch))
+    test.assert(not ll_cs.channel_ok(-1))
+    test.assert(not ll_cs.channel_ok(79))
+
+// ── The step timings ────────────────────────────────────────────────
+
+@test
+fn test_the_ip_table_holds_the_eight_values_of_tables_4_5_and_4_9()
+    let want = [10, 20, 30, 40, 50, 60, 80, 145]
+    for i in 0..8
+        test.assert_eq(ll_cs.t_ip_us(i), want[i])
+        test.assert_eq(ll_cs.t_ip_index(want[i]), i)
+    test.assert_eq(ll_cs.t_ip_us(8), -1)
+    test.assert_eq(ll_cs.t_ip_us(-1), -1)
+    test.assert_eq(ll_cs.t_ip_index(70), -1)
+    test.assert_eq(ll_cs.t_ip_index(0), -1)
+
+@test
+fn test_the_fcs_table_holds_the_ten_values_of_table_4_3()
+    let want = [15, 20, 30, 40, 50, 60, 80, 100, 120, 150]
+    for i in 0..10
+        test.assert_eq(ll_cs.t_fcs_us(i), want[i])
+        test.assert_eq(ll_cs.t_fcs_index(want[i]), i)
+    test.assert_eq(ll_cs.t_fcs_us(10), -1)
+    test.assert_eq(ll_cs.t_fcs_us(-1), -1)
+    test.assert_eq(ll_cs.t_fcs_index(145), -1)
+
+@test
+fn test_the_pm_table_holds_the_three_values_of_table_4_8()
+    let want = [10, 20, 40]
+    for i in 0..3
+        test.assert_eq(ll_cs.t_pm_us(i), want[i])
+        test.assert_eq(ll_cs.t_pm_index(want[i]), i)
+    test.assert_eq(ll_cs.t_pm_us(3), -1)
+    test.assert_eq(ll_cs.t_pm_us(-1), -1)
+    test.assert_eq(ll_cs.t_pm_index(30), -1)
+
+@test
+fn test_the_mandatory_timings_are_the_last_row_of_their_tables()
+    test.assert_eq(ll_cs.T_IP_MANDATORY_US, 145)
+    test.assert_eq(ll_cs.T_FCS_MANDATORY_US, 150)
+    test.assert_eq(ll_cs.T_PM_MANDATORY_US, 40)
+    test.assert_eq(ll_cs.t_ip_index(ll_cs.T_IP_MANDATORY_US), 7)
+    test.assert_eq(ll_cs.t_fcs_index(ll_cs.T_FCS_MANDATORY_US), 9)
+    test.assert_eq(ll_cs.t_pm_index(ll_cs.T_PM_MANDATORY_US), 2)
+
+@test
+fn test_the_switch_times_are_0_1_2_4_and_10()
+    for us in [0, 1, 2, 4, 10]
+        test.assert(ll_cs.t_sw_ok(us))
+    for us in [-1, 3, 5, 8, 20]
+        test.assert(not ll_cs.t_sw_ok(us))
+
+// ── The keys ────────────────────────────────────────────────────────
+// Each switch of ctl_limits answers what its key says, in whichever configuration the suite runs under; the keys that count are 0 exactly
+// when the feature is off and inside their range when it is on.
+
+@test
+fn test_each_switch_follows_its_key()
+    let on = noble_controller_config.CTL_CS > 0
+    test.assert_eq(ctl_limits.cs_on(), on)
+    test.assert_eq(ctl_limits.cs_initiator_on(), on and (noble_controller_config.CTL_CS_ROLES & 1) != 0)
+    test.assert_eq(ctl_limits.cs_reflector_on(), on and (noble_controller_config.CTL_CS_ROLES & 2) != 0)
+    test.assert_eq(ctl_limits.cs_mode3_on(), on and noble_controller_config.CTL_CS_MODE3)
+    test.assert_eq(ctl_limits.cs_rtt_seq_on(), on and noble_controller_config.CTL_CS_RTT_SEQ)
+    test.assert_eq(ctl_limits.cs_3c_on(), on and noble_controller_config.CTL_CS_3C)
+    test.assert_eq(ctl_limits.cs_ipt_on(), on and noble_controller_config.CTL_CS_IPT and ctl_limits.feat_on())
+    test.assert_eq(ctl_limits.cs_test_on(), on and noble_controller_config.CTL_CS_TEST)
+
+@test
+fn test_the_keys_that_count_are_zero_with_the_feature_off_and_inside_their_range_with_it_on()
+    if not ctl_limits.cs_on()
+        test.assert_eq(noble_controller_config.CTL_CS, 0)
+        test.assert_eq(noble_controller_config.CTL_CS_CONFIGS, 0)
+        test.assert_eq(noble_controller_config.CTL_CS_STEPS, 0)
+        test.assert_eq(noble_controller_config.CTL_CS_ROLES, 0)
+        test.assert_eq(noble_controller_config.CTL_CS_ANT, 0)
+        test.assert(not noble_controller_config.CTL_CS_MODE3)
+        test.assert(not noble_controller_config.CTL_CS_RTT_SEQ)
+        test.assert(not noble_controller_config.CTL_CS_3C)
+        test.assert(not noble_controller_config.CTL_CS_IPT)
+        test.assert(not noble_controller_config.CTL_CS_TEST)
+        return
+    test.assert(noble_controller_config.CTL_CS >= 1 and noble_controller_config.CTL_CS <= 2)
+    test.assert(noble_controller_config.CTL_CS_CONFIGS >= 1 and noble_controller_config.CTL_CS_CONFIGS <= ll_cs.CONFIGS_MAX)
+    test.assert(noble_controller_config.CTL_CS_STEPS >= 8 and noble_controller_config.CTL_CS_STEPS <= ll_cs.STEPS_PER_SUBEVENT_MAX)
+    test.assert(noble_controller_config.CTL_CS_ROLES >= 1 and noble_controller_config.CTL_CS_ROLES <= 3)
+    test.assert(noble_controller_config.CTL_CS_ANT >= 1 and noble_controller_config.CTL_CS_ANT <= 4)
+    test.assert(ctl_limits.pcl_on())
+
+@test
+fn test_the_feature_octets_carry_the_bits_of_the_build()
+    let on = ctl_limits.cs_on()
+    test.assert_eq(ctl_limits.features_octet5() & ll_cs.FEAT5_CS, (if on then ll_cs.FEAT5_CS else 0))
+    test.assert_eq(ctl_limits.features_octet5() & ll_cs.FEAT5_CS_HOST, 0)
+    test.assert_eq(ctl_limits.page1_bits() & ll_cs.PAGE1_CS_ENHANCEMENT_1,
+        (if ctl_limits.cs_ipt_on() then ll_cs.PAGE1_CS_ENHANCEMENT_1 else 0))

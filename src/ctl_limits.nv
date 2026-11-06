@@ -17,6 +17,7 @@
 // compares the capacity with the function here.
 
 use noble_controller_config
+use ll_cs
 
 // The larger of `n` and 1: a table of an absent feature keeps one record.
 @tier(embedded)
@@ -102,6 +103,40 @@ const fn sca_on() -> Bool
 @tier(embedded)
 const fn fs_on() -> Bool
     noble_controller_config.CTL_FRAMESPACE
+
+// Channel Sounding (ll_cs.nv): a build with `ctl_cs` above 0 (the schema holds it to a build with LE Power Control).  The options follow their
+// keys, which the schema holds to `ctl_cs`; the initiator phase tone and Enhancement #1 also follow the feature pages that carry feature 75.
+@tier(embedded)
+const fn cs_on() -> Bool
+    noble_controller_config.CTL_CS > 0
+
+@tier(embedded)
+const fn cs_initiator_on() -> Bool
+    cs_on() and (noble_controller_config.CTL_CS_ROLES & 1) != 0
+
+@tier(embedded)
+const fn cs_reflector_on() -> Bool
+    cs_on() and (noble_controller_config.CTL_CS_ROLES & 2) != 0
+
+@tier(embedded)
+const fn cs_mode3_on() -> Bool
+    cs_on() and noble_controller_config.CTL_CS_MODE3
+
+@tier(embedded)
+const fn cs_rtt_seq_on() -> Bool
+    cs_on() and noble_controller_config.CTL_CS_RTT_SEQ
+
+@tier(embedded)
+const fn cs_3c_on() -> Bool
+    cs_on() and noble_controller_config.CTL_CS_3C
+
+@tier(embedded)
+const fn cs_ipt_on() -> Bool
+    cs_on() and noble_controller_config.CTL_CS_IPT and feat_on()
+
+@tier(embedded)
+const fn cs_test_on() -> Bool
+    cs_on() and noble_controller_config.CTL_CS_TEST
 
 // ── The Controller's tables: the slots of each, at least 1 ──────────────────────────────────────────
 // The slots of the table of connected isochronous streams: `ctl_cis`, and 1 when the build has none.
@@ -269,12 +304,14 @@ const fn features_octet3() -> Int
 const fn features_octet4() -> Int
     (if pcl_on() then 0x06 else 0) + (if ploss_on() then 0x08 else 0) + (if sub_on() then 0x20 else 0)
 
-// Octet 5: ISOAL Unsegmented Framed Mode (45) and periodic advertising with responses, advertiser (43) and synchronizer (44).
+// Octet 5: ISOAL Unsegmented Framed Mode (45), periodic advertising with responses, advertiser (43) and synchronizer (44), and Channel
+// Sounding (46).  Bit 47, Channel Sounding (Host Support), is the Host's to set.
 @tier(embedded)
 const fn features_octet5() -> Int
-    (if iso_on() then 0x20 else 0) + (if pawr_adv_on() then 0x08 else 0) + (if pawr_sync_on() then 0x10 else 0)
+    (if iso_on() then 0x20 else 0) + (if pawr_adv_on() then 0x08 else 0) + (if pawr_sync_on() then 0x10 else 0) + (if cs_on() then ll_cs.FEAT5_CS else 0)
 
-// Feature page 1 (ll_feat.nv): Shorter Connection Intervals (bit 72) of a build with Connection Rate, Frame Space Update (bit 65).
+// Feature page 1 (ll_feat.nv): Shorter Connection Intervals (bit 72) of a build with Connection Rate, Frame Space Update (bit 65), Channel
+// Sounding Enhancement #1 (bit 75).
 @tier(embedded)
 const fn page1_bits() -> Int
-    (if rate_on() then 0x100 else 0) + (if fs_on() then 0x2 else 0)
+    (if rate_on() then 0x100 else 0) + (if fs_on() then 0x2 else 0) + (if cs_ipt_on() then ll_cs.PAGE1_CS_ENHANCEMENT_1 else 0)

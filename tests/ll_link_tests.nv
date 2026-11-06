@@ -3268,6 +3268,9 @@ fn test_the_local_page_1_bit_72_follows_the_build()
     // Bit 65, Frame Space Update, is bit 1 of page 1.
     if ctl_limits.fs_on()
         want = want | 0x2
+    // Bit 75, Channel Sounding Enhancement #1, is bit 11 of page 1.
+    if ctl_limits.cs_ipt_on()
+        want = want | 0x800
     test.assert_eq(fx_get(l, FX_LOCAL, 0xFFFF), want)
     test.assert_eq(ctl_limits.page1_bits(), want)
 

@@ -68,6 +68,7 @@ use ll_per
 use ll_past
 use ll_pcl
 use ll_ploss
+use ll_cs
 use ll_sub
 use ll_rate
 use ll_fs
@@ -1107,6 +1108,8 @@ fn command_bit(opcode: Int) -> Int
         return 43 * 8 + 2
     if ctl_limits.ploss_on() and ploss_command(opcode)
         return 44 * 8 + (opcode - 0x2078) + 5
+    if cs_command_on(opcode)
+        return ll_cs.command_bit(opcode)
     if ctl_limits.rate_on()
         let r = rate_bit(opcode)
         if r >= 0
@@ -1129,6 +1132,8 @@ fn command_needs(opcode: Int) -> Int
         return CAP_LL
     if ctl_limits.ploss_on() and ploss_command(opcode)
         return CAP_LL
+    if cs_command_on(opcode)
+        return CAP_LL
     if ctl_limits.rate_on() and rate_command(opcode)
         return CAP_LL
     if ctl_limits.fs_on() and fs_command(opcode)
@@ -1145,6 +1150,8 @@ fn command_params(opcode: Int) -> Int
         return 2
     if ctl_limits.ploss_on() and ploss_command(opcode)
         return if opcode == OP_LE_SET_PATH_LOSS_REPORTING_PARAMETERS then 8 else 3
+    if cs_command_on(opcode)
+        return ll_cs.command_params(opcode)
     if ctl_limits.rate_on()
         let r = rate_params(opcode)
         if r != -1
@@ -1176,6 +1183,12 @@ fn pcl_command(opcode: Int) -> Bool
 @tier(embedded)
 fn ploss_command(opcode: Int) -> Bool
     opcode == 0x2078 or opcode == 0x2079
+
+// Whether this build answers the Channel Sounding command with `opcode`: the build has the feature, and the option the command belongs to
+// (Enhancement #1 and the security requirements, the test commands) when it has one.  The tables of those commands are in `ll_cs`.
+@tier(embedded)
+fn cs_command_on(opcode: Int) -> Bool
+    ctl_limits.cs_on() and ll_cs.command_answered(opcode, ctl_limits.cs_ipt_on(), ctl_limits.cs_test_on())
 
 // Whether `opcode` is a command of Connection Subrating: the default (0x207D) and the request (0x207E).
 @tier(embedded)
@@ -4537,6 +4550,10 @@ fn dispatch(var c: Controller)
     // And for path loss monitoring.
     if ctl_limits.ploss_on() and ploss_command(opcode)
         ploss_dispatch(var c, opcode)
+        return
+    // And for Channel Sounding.
+    if cs_command_on(opcode)
+        cs_dispatch(var c, opcode)
         return
     // And for Connection Subrating.
     if ctl_limits.sub_on() and sub_command(opcode)
@@ -8726,6 +8743,17 @@ fn pcl_dispatch(var c: Controller, opcode: Int)
         0x2076 => cmd_le_enhanced_read_transmit_power_level(var c)
         0x2077 => cmd_le_read_remote_transmit_power_level(var c)
         _      => cmd_le_set_transmit_power_reporting_enable(var c)
+
+// ── Channel Sounding ────────────────────────────────────────────────
+
+// The Channel Sounding commands of a build that has the feature: each answers `ll_cs.STUB_STATUS`, with a Command Status event where the
+// command's result would follow in an event of its own and a Command Complete event otherwise.
+@tier(embedded)
+fn cs_dispatch(var c: Controller, opcode: Int)
+    if ll_cs.status_reply(opcode)
+        answer_command_status(var c, opcode, ll_cs.STUB_STATUS)
+    else
+        answer_status(var c, opcode, ll_cs.STUB_STATUS)
 
 // ── The Sleep Clock Accuracy request ────────────────────────────────
 
