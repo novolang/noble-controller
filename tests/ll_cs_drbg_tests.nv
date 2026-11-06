@@ -1,0 +1,317 @@
+// tests/ll_cs_drbg_tests.nv — the unit tests of src/ll_cs_drbg.nv: the random bit generator against the sample data of [Vol 6] Part C,
+// Section 7 (the instantiation, the blocks of four procedures and the backtracking between them) and the rules of the draws.
+//
+//   novo test tests/ll_cs_drbg_tests.nv
+
+use std.test
+use ll_cs_drbg
+use ll_ccm
+use ll_cipher
+use ll_pdu
+
+// The octets of `a` as a 16-octet block.
+fn t_v16(a: [Int]) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+fn t_v8(a: [Int]) -> Vec[u8; 8]
+    var b: Vec[u8; 8] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+fn t_v32(a: [Int]) -> Vec[u8; 32]
+    var b: Vec[u8; 32] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+// The 16 octets of `want` are the octets of `got`.
+fn t_same16(var got: Vec[u8; 16], want: [Int])
+    for i in 0..16
+        test.assert_eq(got[i] as Int, want[i])
+
+// The octets `at` to `at + 15` of the bits buffers of the generator, the block the identifier `tid` last drew from.
+fn t_block(var d: CsDrbg, tid: Int) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for i in 0..16
+        let _p = b.push(d.bits[tid * 16 + i])
+    b
+
+fn t_same_block(var d: CsDrbg, tid: Int, want: [Int])
+    var b = t_block(var d, tid)
+    t_same16(var b, want)
+
+// The generator of the sample data: the Peripheral's and the Central's values of CS_IV, CS_IN and CS_PV.
+fn t_instantiate(var cc: ll_ccm.SoftCipher, var d: CsDrbg)
+    var iv = t_v16([0xE1, 0x0B, 0xC2, 0x8A, 0x0B, 0xFD, 0xDF, 0xE9, 0x3E, 0x7F, 0x51, 0x86, 0xE0, 0xCA, 0x0B, 0x3B])
+    var nc = t_v8([0x9F, 0xF4, 0x77, 0xC1, 0x86, 0x73, 0x84, 0x0D])
+    var pv = t_v16([0xC9, 0x80, 0xDE, 0xDF, 0x98, 0x82, 0xED, 0x44, 0x64, 0xA6, 0x74, 0x96, 0x78, 0x68, 0xF1, 0x43])
+    test.assert(ll_cs_drbg.drbg_instantiate(var cc, var d, var iv, var nc, var pv))
+
+@test
+fn test_f8_derives_the_seed_material_of_the_sample_data()
+    var cc = ll_ccm.soft_cipher_new()
+    var iv = t_v16([0xE1, 0x0B, 0xC2, 0x8A, 0x0B, 0xFD, 0xDF, 0xE9, 0x3E, 0x7F, 0x51, 0x86, 0xE0, 0xCA, 0x0B, 0x3B])
+    var nc = t_v8([0x9F, 0xF4, 0x77, 0xC1, 0x86, 0x73, 0x84, 0x0D])
+    var pv = t_v16([0xC9, 0x80, 0xDE, 0xDF, 0x98, 0x82, 0xED, 0x44, 0x64, 0xA6, 0x74, 0x96, 0x78, 0x68, 0xF1, 0x43])
+    var sm = t_v32([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert(ll_cs_drbg.f8(var cc, var iv, var nc, var pv, var sm))
+    let want = [0xB6, 0x02, 0xB1, 0xB2, 0x8C, 0x6F, 0x0A, 0x3D, 0xDA, 0xE6, 0x37, 0xB4, 0x84, 0x25, 0x08, 0x7D,
+                0xDC, 0x18, 0x8C, 0x89, 0xA1, 0xB0, 0xCD, 0xFD, 0xA1, 0xE8, 0xFC, 0x66, 0xC9, 0x99, 0x97, 0x50]
+    for i in 0..32
+        test.assert_eq(sm[i] as Int, want[i])
+
+@test
+fn test_the_instantiation_gives_the_key_and_the_nonce_of_the_first_procedure()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    t_same16(var d.k,
+        [0xEE, 0xE0, 0x4D, 0x7C, 0x76, 0x11, 0x3A, 0x5C, 0xEC, 0x99, 0x2A, 0xE3, 0x20, 0xC2, 0x4D, 0x27])
+    t_same16(var d.v,
+        [0xDF, 0x90, 0x56, 0x47, 0xC1, 0x06, 0x6E, 0x6F, 0x52, 0xC0, 0x3E, 0xDF, 0xB8, 0x2B, 0x69, 0x28])
+    test.assert_eq(d.count, 0)
+    test.assert(not d.fault)
+
+@test
+fn test_the_blocks_of_the_first_procedure_follow_the_transaction_counter_and_the_step_and_identifier_offsets()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    // Step 0, identifier 0: three blocks of the one step take the counters 0, 1 and 2.
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x79, 0x74, 0x1F, 0xD1, 0x8F, 0x57, 0x7B, 0x45, 0xD0, 0x9A, 0x66, 0x5A, 0x7F, 0x1F, 0x28, 0x58])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0xD1, 0xC1, 0xD0, 0x5A, 0x40, 0xB4, 0xC4, 0x81, 0xEF, 0xBB, 0x39, 0xB2, 0x61, 0xD2, 0x9C, 0x4E])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x71, 0xFD, 0xE8, 0x68, 0xE8, 0xCA, 0xCA, 0xD1, 0x18, 0xE5, 0x9B, 0x18, 0x5C, 0xEE, 0xFC, 0x17])
+    test.assert_eq(d.tc[0] as Int, 2)
+    // Step 10, identifier 4: the step counter and the identifier are added to octets 13 and 14 of the nonce.
+    ll_cs_drbg.drbg_refill(var cc, var d, 4, 10)
+    t_same_block(var d,
+        4,
+        [0xFF, 0xF8, 0x74, 0x38, 0x4E, 0x1C, 0xB9, 0xD3, 0xE6, 0x9F, 0x1F, 0x2C, 0x2A, 0x22, 0xCF, 0x63])
+    test.assert_eq(d.tc[4] as Int, 0)
+
+@test
+fn test_the_backtracking_between_procedures_gives_the_keys_and_blocks_of_the_sample_data()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    // Procedure 1.
+    test.assert(ll_cs_drbg.drbg_backtrack(var cc, var d))
+    test.assert_eq(d.count, 1)
+    t_same16(var d.k,
+        [0xF3, 0xF4, 0xCF, 0x24, 0x5F, 0xCE, 0x86, 0xB3, 0xC6, 0x9F, 0xAE, 0x60, 0x28, 0x7E, 0xB5, 0xAE])
+    t_same16(var d.v,
+        [0x08, 0x56, 0x98, 0x94, 0x89, 0x1F, 0x2F, 0x30, 0x1E, 0xEC, 0xDB, 0x38, 0xB6, 0xED, 0x54, 0xB1])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x5F, 0x1B, 0x11, 0x5A, 0x00, 0x40, 0xB4, 0x2C, 0x2F, 0x8F, 0xB1, 0x0C, 0x9B, 0x6F, 0xD7, 0xAC])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x55, 0x73, 0xA6, 0xA5, 0x20, 0x91, 0xB1, 0x58, 0x99, 0xC8, 0x64, 0xAB, 0x2F, 0xB0, 0xE2, 0x02])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x46, 0x20, 0xD2, 0x01, 0xB7, 0x41, 0x9D, 0x82, 0x48, 0x68, 0xD5, 0xA7, 0xC8, 0x20, 0xBA, 0x2C])
+    ll_cs_drbg.drbg_refill(var cc, var d, 4, 14)
+    t_same_block(var d,
+        4,
+        [0xB4, 0x20, 0x00, 0x40, 0x63, 0xB1, 0x13, 0xA2, 0x3E, 0xD0, 0x43, 0xD0, 0x3B, 0x6E, 0xE7, 0x34])
+    // Procedure 2.
+    test.assert(ll_cs_drbg.drbg_backtrack(var cc, var d))
+    test.assert_eq(d.count, 2)
+    t_same16(var d.k,
+        [0xA9, 0xAA, 0x68, 0xC2, 0x1D, 0xF4, 0x09, 0x00, 0x1A, 0xF9, 0x27, 0xAC, 0x14, 0xC8, 0x18, 0x96])
+    t_same16(var d.v,
+        [0x16, 0x07, 0xDE, 0x6C, 0xFC, 0x80, 0xD2, 0x18, 0x64, 0xF7, 0x08, 0xA9, 0x9C, 0x49, 0x39, 0x96])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x6A, 0xEA, 0xB7, 0x5D, 0x82, 0x52, 0x58, 0x31, 0x42, 0x2C, 0xE2, 0xF4, 0x2E, 0x85, 0x07, 0x88])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 1)
+    t_same_block(var d,
+        0,
+        [0x14, 0x40, 0xEF, 0x44, 0x74, 0xAF, 0xD8, 0x49, 0x32, 0xFE, 0x37, 0xB0, 0xA4, 0x10, 0xF2, 0x3A])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 2)
+    t_same_block(var d,
+        0,
+        [0x2A, 0x83, 0xEF, 0x11, 0xCC, 0xE5, 0x99, 0x31, 0x4E, 0xFB, 0x29, 0x03, 0xF4, 0xDF, 0xD4, 0xB8])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 3)
+    t_same_block(var d,
+        0,
+        [0x19, 0x6B, 0xE2, 0xB6, 0x43, 0x98, 0x53, 0xFE, 0xD4, 0x96, 0x67, 0x54, 0xE1, 0x40, 0x15, 0x1E])
+    // Procedure 3.
+    test.assert(ll_cs_drbg.drbg_backtrack(var cc, var d))
+    t_same16(var d.k,
+        [0x77, 0x71, 0x3B, 0xB1, 0x81, 0xC3, 0xB6, 0x44, 0x29, 0xE8, 0x98, 0xB8, 0x65, 0x9B, 0x85, 0xA9])
+    t_same16(var d.v,
+        [0xD5, 0x88, 0x73, 0x99, 0x44, 0x68, 0x36, 0x96, 0xA9, 0x3D, 0x36, 0x19, 0x3C, 0xDA, 0xBA, 0x11])
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x58, 0x04, 0xC1, 0x73, 0x69, 0xC5, 0x64, 0xDC, 0x73, 0xD6, 0xE7, 0x4E, 0xA0, 0xC6, 0xE1, 0x66])
+
+// A cipher that does what the software one does for the first `ok` blocks and fails after.
+struct Flaky
+    var ok: Int
+    var n: Int
+
+impl Cipher[] for Flaky
+    fn seal(var self, var ek: EncKey, ctr: Int, dir: Int, var p: Pdu)
+        self.n = self.n
+
+    fn open(var self, var ek: EncKey, ctr: Int, dir: Int, var p: Pdu) -> Bool
+        false
+
+    fn block(var self, var key: Vec[u8; 16], var blk: Vec[u8; 16]) -> Bool
+        self.n = self.n + 1
+        self.n <= self.ok
+
+    fn faults(var self) -> Int
+        0
+
+@test
+fn test_an_instantiation_whose_cipher_fails_at_any_of_its_fourteen_blocks_reports_it()
+    // f8 takes five blocks for each of the two chains and two more, f9 takes two: fourteen in all.
+    for ok in 0..14
+        var bad = Flaky { ok: ok, n: 0 }
+        var d = ll_cs_drbg.drbg_new()
+        var iv = t_v16([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+        var nc = t_v8([1, 2, 3, 4, 5, 6, 7, 8])
+        var pv = t_v16([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+        test.assert(not ll_cs_drbg.drbg_instantiate(var bad, var d, var iv, var nc, var pv))
+        test.assert(d.fault)
+    var good = Flaky { ok: 14, n: 0 }
+    var e = ll_cs_drbg.drbg_new()
+    var iv2 = t_v16([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    var nc2 = t_v8([1, 2, 3, 4, 5, 6, 7, 8])
+    var pv2 = t_v16([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    test.assert(ll_cs_drbg.drbg_instantiate(var good, var e, var iv2, var nc2, var pv2))
+    test.assert(not e.fault)
+    test.assert_eq(good.n, 14)
+
+@test
+fn test_a_backtracking_or_a_block_whose_cipher_fails_sets_the_fault()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    var bad = Flaky { ok: 0, n: 0 }
+    test.assert(not ll_cs_drbg.drbg_backtrack(var bad, var d))
+    test.assert(d.fault)
+    var e = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var e)
+    ll_cs_drbg.drbg_refill(var bad, var e, 0, 0)
+    test.assert(e.fault)
+
+@test
+fn test_bits_are_drawn_most_significant_first_from_the_block_of_the_identifier_and_the_rest_stays_for_the_next_draw()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    // The block of step 0, identifier 0, counter 0 is 79 74 1F D1 8F 57 7B 45 D0 9A 66 5A 7F 1F 28 58.
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 8), 0x79)
+    test.assert_eq(d.left[0] as Int, 120)
+    // 0x74 is 01 11 01 00: two bits, one bit, then five bits.
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 2), 1)
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 1), 1)
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 5), 0x14)
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 32), 0x1FD18F57)
+    test.assert_eq(d.left[0] as Int, 128 - 8 - 8 - 32)
+    // The identifiers keep their own buffers.
+    test.assert_eq(d.left[4] as Int, 0)
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 4, 10, 8), 0xFF)
+
+@test
+fn test_a_draw_that_needs_more_bits_than_are_left_discards_them_and_takes_the_next_block_of_the_step()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    for _ in 0..15
+        let _x = ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 8)
+    test.assert_eq(d.left[0] as Int, 8)
+    // 16 bits do not fit in the 8 left: the block with counter 1, D1 C1 D0 5A, gives them.
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 0, 0, 16), 0xD1C1)
+    test.assert_eq(d.tc[0] as Int, 1)
+    test.assert_eq(d.left[0] as Int, 112)
+    // At another step the counter starts again at 0: the block of step 3, counter 0.
+    ll_cs_drbg.drbg_need(var cc, var d, 0, 3, 128)
+    test.assert_eq(d.tc[0] as Int, 0)
+    test.assert_eq(d.at[0], 3)
+    // A draw of all 128 bits takes a block of its own and leaves nothing.
+    test.assert_eq(ll_cs_drbg.drbg_bits(var cc, var d, 5, 4, 32) != 0, true)
+    ll_cs_drbg.drbg_need(var cc, var d, 5, 4, 128)
+    test.assert_eq(d.left[5] as Int, 128)
+
+@test
+fn test_hr1_of_a_range_of_one_draws_nothing_and_otherwise_scales_the_octet_to_the_range()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    t_instantiate(var cc, var d)
+    test.assert_eq(ll_cs_drbg.drbg_hr1(var cc, var d, 0, 0, 1), 0)
+    test.assert_eq(d.left[0] as Int, 0)
+    // 0x79 * 24 is 0xB58 and its low octet 0x58 is not below 256 modulo 24, so the answer is the high octet, 11.
+    test.assert_eq(ll_cs_drbg.drbg_hr1(var cc, var d, 0, 0, 24), 11)
+    test.assert_eq(d.left[0] as Int, 120)
+    // The next octet 0x74 gives 0x74 * 255 over 256.
+    test.assert_eq(ll_cs_drbg.drbg_hr1(var cc, var d, 0, 0, 255), 115)
+
+fn t_set(var d: CsDrbg, tid: Int, a: Int, b: Int)
+    for i in 0..16
+        d.bits[tid * 16 + i] = 0
+    d.bits[tid * 16] = a as u8
+    d.bits[tid * 16 + 1] = b as u8
+    d.left[tid] = 128
+
+@test
+fn test_hr1_extends_an_octet_whose_product_may_be_biased_with_a_second_octet()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    // 0x0B * 24 is 0x108, whose low octet 0x08 is below 256 modulo 24, which is 16: a second octet y gives (256 * y * 24 + 0x108) / 65536.
+    t_set(var d, 4, 0x0B, 0x05)
+    test.assert_eq(ll_cs_drbg.drbg_hr1(var cc, var d, 4, 0, 24), 0)
+    test.assert_eq(d.left[4] as Int, 112)
+    t_set(var d, 4, 0x0B, 0xFF)
+    test.assert_eq(ll_cs_drbg.drbg_hr1(var cc, var d, 4, 0, 24), 23)
+    // A product that is not biased draws no second octet.
+    t_set(var d, 4, 0x0C, 0xFF)
+    test.assert_eq(ll_cs_drbg.drbg_hr1(var cc, var d, 4, 0, 24), 1)
+    test.assert_eq(d.left[4] as Int, 120)
+
+@test
+fn test_the_test_key_is_zeros_with_the_nonce_in_octets_14_and_15()
+    var cc = ll_ccm.soft_cipher_new()
+    var d = ll_cs_drbg.drbg_new()
+    ll_cs_drbg.drbg_load_test(var d, 0x1234)
+    for i in 0..16
+        test.assert_eq(d.k[i] as Int, 0)
+    for i in 0..14
+        test.assert_eq(d.v[i] as Int, 0)
+    test.assert_eq(d.v[14] as Int, 0x12)
+    test.assert_eq(d.v[15] as Int, 0x34)
+    // The first block is the AES-128 encryption of the nonce under the zero key.
+    var key = t_v16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    var blk = t_v16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34])
+    test.assert(cc.block(var key, var blk))
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same16(var blk, [d.bits[0] as Int, d.bits[1] as Int, d.bits[2] as Int, d.bits[3] as Int, d.bits[4] as Int, d.bits[5] as Int,
+                       d.bits[6] as Int, d.bits[7] as Int, d.bits[8] as Int, d.bits[9] as Int, d.bits[10] as Int, d.bits[11] as Int,
+                       d.bits[12] as Int, d.bits[13] as Int, d.bits[14] as Int, d.bits[15] as Int])
+    // With the nonce 0 the block is the encryption of zero under the zero key, 66E94BD4 EF8A2C3B 884CFA59 CA342B2E.
+    ll_cs_drbg.drbg_load_test(var d, 0)
+    ll_cs_drbg.drbg_refill(var cc, var d, 0, 0)
+    t_same_block(var d,
+        0,
+        [0x66, 0xE9, 0x4B, 0xD4, 0xEF, 0x8A, 0x2C, 0x3B, 0x88, 0x4C, 0xFA, 0x59, 0xCA, 0x34, 0x2B, 0x2E])

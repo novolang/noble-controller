@@ -236,14 +236,16 @@ doc     = "buffers of subevent data the advertiser keeps, and of responses each 
 
 # Channel Sounding (ll_cs.nv; Core 6.3, Vol 6 Part H).  `ctl_cs` is the count of connections that run it at once and the switch: 0 is a
 # build without it.  The keys that describe the feature are 0 or false exactly when the count is 0, and the keys that choose among its
-# options need the count.  The keys carry no `bytes`: the Controller declares no storage for the feature yet, so there is nothing for a
-# cost formula to state.
+# options need the count.  Two keys state the storage of the planning (`CsState` of ll_cs_plan.nv): `ctl_cs` the generator of each connection
+# that runs the feature, 712 B, and `ctl_cs_steps` the plan of one subevent, 40 B and 56 B a step.  A build without the feature makes none of
+# it, so the keys have no floor.
 [config.ctl_cs]
 type     = "int"
 default  = 0
 min      = 0
 max      = 2
 requires = ["ctl_pcl"]
+bytes_expr = "(ctl_cs * 712 + 15) / 8 * 8"
 doc      = "connections that run Channel Sounding at once (ll_cs.nv), 0 for a build without it, which then answers its 18 commands with Unknown HCI Command, its 14 Link Layer PDUs with LL_UNKNOWN_RSP and leaves LE features 46, 47, 48 and 75 clear; needs CTL_PCL, whose power delta the Channel Sounding request names"
 
 [config.ctl_cs_configs]
@@ -263,7 +265,8 @@ max      = 160
 unit     = "steps"
 zero_iff = "ctl_cs"
 min_when = [{ when = "ctl_cs", min = 8 }]
-doc      = "steps one Channel Sounding subevent holds in its plan and its results, 8 to 160; 0 exactly when CTL_CS is 0"
+bytes_expr = "ctl_cs_steps * 56 + 40"
+doc      = "steps one Channel Sounding subevent holds in its plan, 8 to 160; 0 exactly when CTL_CS is 0; the Controller's storage (ll_cs_plan.nv)"
 
 [config.ctl_cs_roles]
 type     = "int"

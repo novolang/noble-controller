@@ -10,8 +10,8 @@
 // and answers the fourteen Link Layer PDUs (opcodes 0x2D to 0x3A) with LL_UNKNOWN_RSP.  A build with it lists the commands in Supported
 // Commands and answers each with `STUB_STATUS`; the PDUs are still answered with LL_UNKNOWN_RSP.
 //
-// NOT IMPLEMENTED: the random bit generator, the channel and access address selection, the step timeline, the control PDUs and the
-// procedures over them, the HCI results, and the radio's measurements.
+// NOT IMPLEMENTED: the control PDUs and the procedures over them, the HCI results, and the radio's measurements.  The random bit generator is
+// `ll_cs_drbg.nv`; the channel and access address selection and the step timeline are `ll_cs_plan.nv`.
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
 

@@ -29,6 +29,10 @@ const CTL_PCL_RECORD = 192
 const CTL_PAWR_ADV_RECORD = 144
 const CTL_PAWR_SYNC_RECORD = 64
 const CTL_PAWR_BUF_RECORD = 56
+// Channel Sounding (ll_cs_plan.nv): the generator of one connection, the plan's head and count, and one step.
+const CTL_CS_GEN_RECORD = 712
+const CTL_CS_PLAN_FIXED = 32
+const CTL_CS_STEP_RECORD = 56
 
 // The larger of `n` and 1: a table of an absent feature keeps one record.  A `const fn` of another module cannot take part in
 // the `assert_const` below, so this module keeps its own copy of the one in ctl_limits.nv.
@@ -104,10 +108,19 @@ const fn controller_pawr_bytes() -> Int
     let sync = (if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1) * (CTL_PAWR_SYNC_RECORD + bufs * one)
     adv + sync
 
+// Channel Sounding (`CsState` of ll_cs_plan.nv): a generator for each connection that runs it and the plan of one subevent, which holds as many
+// steps as `ctl_cs_steps`.  A build without the feature makes none of it.
+@tier(embedded)
+const fn controller_cs_bytes() -> Int
+    if noble_controller_config.CTL_CS > 0
+        vec_bytes(noble_controller_config.CTL_CS, CTL_CS_GEN_RECORD) + CTL_CS_PLAN_FIXED + vec_bytes(noble_controller_config.CTL_CS_STEPS, CTL_CS_STEP_RECORD)
+    else
+        0
+
 // The Controller's storage, in bytes.
 @tier(embedded)
 const fn controller_bytes() -> Int
-    controller_iso_bytes() + controller_adv_bytes() + controller_pawr_bytes()
+    controller_iso_bytes() + controller_adv_bytes() + controller_pawr_bytes() + controller_cs_bytes()
 
 // The Controller's storage is the total the schema's `bytes_expr` fields give, so the schema and this module agree on the size rule.
 assert_const(controller_bytes() == noble_controller_config.budget_bytes(),

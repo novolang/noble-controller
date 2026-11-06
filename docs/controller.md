@@ -58,14 +58,27 @@ Channel Sounding has one count, `ctl_cs` (the connections that run it at once,
 switches on: `ctl_cs_configs`, `ctl_cs_steps`, `ctl_cs_roles` and `ctl_cs_ant`
 are 0 exactly when `ctl_cs` is, and `ctl_cs_mode3`, `ctl_cs_rtt_seq`,
 `ctl_cs_3c`, `ctl_cs_ipt` and `ctl_cs_test` choose among its options and need
-it.  `ctl_cs` needs `ctl_pcl`, and `ctl_cs_ipt` needs `ctl_featpages`.  The keys
-carry no storage figure, since the Controller declares no storage for the
-feature yet.  With `ctl_cs` at 0 the 18 commands are answered with Unknown HCI
+it.  `ctl_cs` needs `ctl_pcl`, and `ctl_cs_ipt` needs `ctl_featpages`.  Two keys
+state storage: `ctl_cs` the generator of each connection that runs the feature
+(`CsGen` of `ll_cs_plan`, 712 bytes) and `ctl_cs_steps` the plan of one subevent
+(`CsSubevent`, 40 bytes and 56 for each step); `CsState` holds both.  A build
+without the feature makes none of it and links neither `ll_cs_drbg` nor
+`ll_cs_plan`, so the keys have no floor.  With `ctl_cs` at 0 the 18 commands are answered with Unknown HCI
 Command and LE features 46, 47, 48 and 75 stay clear; with it on, `ll_cs` lists
 the commands in Supported Commands and answers each with Unsupported Feature or
 Parameter Value, and the 14 Link Layer opcodes are still answered with
 LL_UNKNOWN_RSP.  The radio's side of the feature is `CsRadio` in `noble-radio`,
-which no module of this package calls yet.
+which no module of the radio program calls yet; `ll_cs_plan.plan_arm` is the
+function that hands a `CsSubevent` to one.
+
+The plan of a subevent is a function of the generator's key, the configuration
+and the step counter, so two Controllers that hold the same key make the same
+plan (`ll_cs_drbg` and `ll_cs_plan`).  `plan_next` makes one step and
+`plan_subevent` makes a subevent: the steps, with their channels, access
+addresses, sequences, tone extension slots, antenna path permutations and times,
+in the `CsSubevent` the Controller holds.  The tests hold the generator and the
+channel selection, the access addresses and the sequences to the sample data of
+Core 6.3 Vol 6 Part C, Sections 7 and 8.1.
 
 `configs/<profile>.toml` are the profiles the package's tests run under.
 The same names exist in `orbit/ble/configs/`, whose `[noble-controller]`

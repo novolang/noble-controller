@@ -1,0 +1,1012 @@
+// tests/ll_cs_plan_tests.nv — the unit tests of src/ll_cs_plan.nv: the timeline of a step, the access address score, the sequences, the
+// channel lists, the subevents a procedure is cut into and the end of a procedure, the plan a build stores and its hand-over to a radio.
+// The plan against the sample data of the specification is tests/ll_cs_vectors_tests.nv.
+//
+// The tests are written for every value of the keys: the plan a build stores holds as many steps as `ctl_cs_steps` (one in a build without
+// the feature), so the tests of `plan_subevent` read the capacity, and the tests of the steps use `plan_next`, which does not depend on it.
+//
+//   novo test tests/ll_cs_plan_tests.nv
+
+use std.test
+use ll_ccm
+use ll_cipher
+use ll_cs
+use ll_cs_drbg
+use ll_cs_plan
+use ll_cs_radio
+use ctl_budget
+use noble_controller_config
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn t_v16(a: [Int]) -> Vec[u8; 16]
+    var b: Vec[u8; 16] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+fn t_v8(a: [Int]) -> Vec[u8; 8]
+    var b: Vec[u8; 8] = Vec.new()
+    for x in a
+        let _p = b.push(x as u8)
+    b
+
+// Key a generator with the values of [Vol 6] Part C, Section 7, and begin its first procedure.
+fn t_begin(var cc: ll_ccm.SoftCipher, var g: CsGen)
+    var iv = t_v16([0xE1, 0x0B, 0xC2, 0x8A, 0x0B, 0xFD, 0xDF, 0xE9, 0x3E, 0x7F, 0x51, 0x86, 0xE0, 0xCA, 0x0B, 0x3B])
+    var nc = t_v8([0x9F, 0xF4, 0x77, 0xC1, 0x86, 0x73, 0x84, 0x0D])
+    var pv = t_v16([0xC9, 0x80, 0xDE, 0xDF, 0x98, 0x82, 0xED, 0x44, 0x64, 0xA6, 0x74, 0x96, 0x78, 0x68, 0xF1, 0x43])
+    test.assert(ll_cs_plan.gen_instantiate(var cc, var g, var iv, var nc, var pv))
+    test.assert(ll_cs_plan.gen_begin_procedure(var cc, var g))
+
+// The setters of a configuration: a `@value` record is written through a `var` parameter.
+fn t_main(var c: CsCfg, main: Int, sub: Int, mn: Int, mx: Int, rep: Int)
+    c.main_mode = main
+    c.sub_mode = sub
+    c.main_min = mn
+    c.main_max = mx
+    c.main_rep = rep
+
+fn t_time(var c: CsCfg, sub_len_us: Int, proc_len_us: Int)
+    c.sub_len_us = sub_len_us
+    c.proc_len_us = proc_len_us
+
+fn t_rtt(var c: CsCfg, phy: Int, rtt: Int)
+    c.phy = phy
+    c.rtt = rtt
+
+fn t_reps(var c: CsCfg, ch_rep: Int, mode0: Int)
+    c.ch_rep = ch_rep
+    c.mode0_steps = mode0
+
+fn t_timing(var c: CsCfg, ip: Int, fcs: Int, pm: Int, sw: Int, aci: Int)
+    c.t_ip1_us = ip
+    c.t_ip2_us = ip
+    c.t_fcs_us = fcs
+    c.t_pm_us = pm
+    c.t_sw_us = sw
+    c.aci = aci
+
+// The channels `first` to `last` and no others.
+fn t_chm(var c: CsCfg, first: Int, last: Int)
+    for i in 0..10
+        c.chmap[i] = 0
+    for ch in first..last + 1
+        c.chmap[ch / 8] = (c.chmap[ch / 8] as Int | (1 << (ch % 8))) as u8
+
+fn t_bits(var c: CsCfg, i: Int, v: Int)
+    c.chmap[i] = v as u8
+
+fn t_fill(var d: CsDrbg, tid: Int, octets: [Int])
+    for i in 0..16
+        d.bits[tid * 16 + i] = octets[i] as u8
+    d.left[tid] = 128
+
+// A cipher that does what the software one does for `ok` blocks and fails after.
+struct Flaky
+    var ok: Int
+    var n: Int
+
+impl Cipher[] for Flaky
+    fn seal(var self, var ek: EncKey, ctr: Int, dir: Int, var p: Pdu)
+        self.n = self.n
+
+    fn open(var self, var ek: EncKey, ctr: Int, dir: Int, var p: Pdu) -> Bool
+        false
+
+    fn block(var self, var key: Vec[u8; 16], var blk: Vec[u8; 16]) -> Bool
+        self.n = self.n + 1
+        self.n <= self.ok
+
+    fn faults(var self) -> Int
+        0
+
+// The steps of a procedure as `plan_next` makes them, subevent after subevent: every step, the steps of each subevent and the answer that
+// ended the last one.
+struct Run
+    var steps: Vec[CsStep; 320]
+    var subs: Vec[Int; 40]
+    var last: Int
+
+fn t_run(var cc: ll_ccm.SoftCipher, var g: CsGen, var c: CsCfg, steps_max: Int,
+         anchor_ns: Int) -> Run
+    var r = Run { steps: Vec.new(), subs: Vec.new(), last: 0 }
+    var step = ll_cs_radio.cs_step_new()
+    for _ in 0..40
+        ll_cs_plan.gen_begin_subevent(var g, var c, steps_max, anchor_ns)
+        var n = 0
+        for _ in 0..steps_max + 1
+            let code = ll_cs_plan.plan_next(var cc, var g, var c, var step)
+            r.last = code
+            if code != ll_cs_plan.PLAN_STEP
+                break
+            let _a = r.steps.push(step)
+            n = n + 1
+        let _b = r.subs.push(n)
+        if g.done
+            break
+    r
+
+// The channels of the steps from `from` to `to` (exclusive) that have `mode`, each once.
+fn t_distinct(var r: Run, from: Int, to: Int, mode: Int) -> Int
+    var seen: Vec[Bool; 80] = Vec.new()
+    for _ in 0..80
+        let _a = seen.push(false)
+    var n = 0
+    for i in from..to
+        if (r.steps[i].mode as Int) == mode
+            let ch = r.steps[i].ch as Int
+            test.assert(ll_cs.channel_ok(ch))
+            test.assert(not seen[ch])
+            seen[ch] = true
+            n = n + 1
+    n
+
+fn t_count(var r: Run, mode: Int) -> Int
+    var n = 0
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) == mode
+            n = n + 1
+    n
+
+// ── The timeline of a step ──────────────────────────────────────────
+
+@test
+fn test_the_bits_of_each_rtt_type_are_those_of_the_sequences()
+    test.assert_eq(ll_cs_plan.rtt_bits(0), 0)
+    test.assert_eq(ll_cs_plan.rtt_bits(1), 32)
+    test.assert_eq(ll_cs_plan.rtt_bits(2), 96)
+    test.assert_eq(ll_cs_plan.rtt_bits(3), 32)
+    test.assert_eq(ll_cs_plan.rtt_bits(4), 64)
+    test.assert_eq(ll_cs_plan.rtt_bits(5), 96)
+    test.assert_eq(ll_cs_plan.rtt_bits(6), 128)
+
+@test
+fn test_a_cs_sync_packet_takes_44_microseconds_on_le_1m_and_26_on_le_2m_without_a_sequence()
+    test.assert_eq(ll_cs_plan.sync_ns(1, 0), 44_000)
+    test.assert_eq(ll_cs_plan.sync_ns(2, 0), 26_000)
+    test.assert_eq(ll_cs_plan.sync_ns(3, 0), 26_000)
+    test.assert_eq(ll_cs_plan.sync_ns(1, 128), 172_000)
+    test.assert_eq(ll_cs_plan.sync_ns(2, 96), 74_000)
+
+@test
+fn test_the_antenna_paths_of_each_configuration_index_follow_table_5_3_of_part_a()
+    test.assert_eq(ll_cs_plan.aci_paths(0), 1)
+    test.assert_eq(ll_cs_plan.aci_paths(1), 2)
+    test.assert_eq(ll_cs_plan.aci_paths(2), 3)
+    test.assert_eq(ll_cs_plan.aci_paths(3), 4)
+    test.assert_eq(ll_cs_plan.aci_paths(4), 2)
+    test.assert_eq(ll_cs_plan.aci_paths(5), 3)
+    test.assert_eq(ll_cs_plan.aci_paths(6), 4)
+    test.assert_eq(ll_cs_plan.aci_paths(7), 4)
+    test.assert_eq(ll_cs_plan.aci_paths(8), 1)
+
+@test
+fn test_the_permutations_of_n_paths_are_n_factorial()
+    test.assert_eq(ll_cs_plan.perm_count(1), 1)
+    test.assert_eq(ll_cs_plan.perm_count(2), 2)
+    test.assert_eq(ll_cs_plan.perm_count(3), 6)
+    test.assert_eq(ll_cs_plan.perm_count(4), 24)
+
+@test
+fn test_the_steps_with_the_mandatory_timings_last_the_figures_of_the_specification()
+    var c = ll_cs_plan.cfg_new()
+    // LE 2M: 447 and 357 microseconds for modes 0 and 1, 465 and 705 for mode 2 with one and with four paths, 537 and 777 for mode 3.
+    t_rtt(var c, 2, 0)
+    test.assert_eq(ll_cs_plan.step_ns(c, 0), 447_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 1), 357_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 2), 465_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 3), 537_000)
+    t_timing(var c, 145, 150, 40, 0, 3)
+    test.assert_eq(ll_cs_plan.step_ns(c, 2), 705_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 3), 777_000)
+    // LE 1M is 18 microseconds longer for each packet of a mode 0 or mode 1 step.
+    t_rtt(var c, 1, 0)
+    test.assert_eq(ll_cs_plan.step_ns(c, 0), 483_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 1), 393_000)
+
+@test
+fn test_the_steps_with_the_shortest_timings_last_the_figures_of_the_specification()
+    var c = ll_cs_plan.cfg_new()
+    t_rtt(var c, 2, 0)
+    t_timing(var c, 10, 15, 10, 0, 0)
+    test.assert_eq(ll_cs_plan.step_ns(c, 0), 177_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 1), 87_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 2), 75_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 3), 147_000)
+    t_timing(var c, 10, 15, 10, 0, 3)
+    test.assert_eq(ll_cs_plan.step_ns(c, 2), 135_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 3), 207_000)
+
+@test
+fn test_a_sequence_and_a_switch_time_lengthen_the_steps_that_carry_them()
+    var c = ll_cs_plan.cfg_new()
+    // Set 4 of the sample data: LE 2M, a 96-bit sounding sequence, T_PM and T_SW of 10 microseconds, four antenna paths.
+    t_rtt(var c, 2, 2)
+    t_timing(var c, 145, 150, 10, 10, 7)
+    test.assert_eq(ll_cs_plan.step_ns(c, 0), 447_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 2), 505_000)
+    test.assert_eq(ll_cs_plan.step_ns(c, 3), 673_000)
+    t_rtt(var c, 1, 6)
+    t_timing(var c, 145, 150, 40, 0, 0)
+    // 150 + 2 * 172 + 10 + 145 on LE 1M with a 128-bit random sequence.
+    test.assert_eq(ll_cs_plan.step_ns(c, 1), 649_000)
+
+// ── The access address and the sequences ───────────────────────────
+
+@test
+fn test_the_autocorrelation_score_of_the_candidates_of_the_sample_data()
+    test.assert_eq(ll_cs_plan.aa_score(0x0C00E4AA), 12)
+    test.assert_eq(ll_cs_plan.aa_score(0x6C376AB8), 8)
+    test.assert_eq(ll_cs_plan.aa_score(0x00B8C55D), 16)
+    test.assert_eq(ll_cs_plan.aa_score(0xF079BC3A), 16)
+    test.assert_eq(ll_cs_plan.aa_score(0x011CAE4E), 6)
+    test.assert_eq(ll_cs_plan.aa_score(0xC7F8F937), 14)
+
+@test
+fn test_the_access_address_is_the_candidate_with_the_lower_score_and_the_second_when_they_tie()
+    test.assert_eq(ll_cs_plan.aa_pick(0x0C00E4AA, 0x6C376AB8), 0x6C376AB8)
+    test.assert_eq(ll_cs_plan.aa_pick(0x00B8C55D, 0xF079BC3A), 0xF079BC3A)
+    test.assert_eq(ll_cs_plan.aa_pick(0x011CAE4E, 0x9947D1B5), 0x011CAE4E)
+    test.assert_eq(ll_cs_plan.aa_pick(0xD06ACDDA, 0xC7F8F937), 0xD06ACDDA)
+
+@test
+fn test_a_sounding_sequence_alternates_from_a_zero_and_a_marker_overwrites_four_bits()
+    let b32 = ll_cs_plan.sounding_base(32)
+    test.assert_eq(b32.w0, 0xAAAAAAAA)
+    test.assert_eq(b32.w1, 0)
+    let b96 = ll_cs_plan.sounding_base(96)
+    test.assert_eq(b96.w0, (0xAAAAAAAA << 32) | 0xAAAAAAAA)
+    test.assert_eq(b96.w1, 0xAAAAAAAA)
+    // The signal 1 sends 0011, the signal 0 sends 1100.
+    test.assert_eq(ll_cs_plan.marker_put(b32, 11, 1).w0, 0xAAAAE2AA)
+    test.assert_eq(ll_cs_plan.marker_put(b32, 0, 0).w0, 0xAAAAAAA3)
+    test.assert_eq(ll_cs_plan.marker_put(b32, 28, 0).w0, 0x3AAAAAAA)
+    // A marker at 62 runs into the second word.
+    let m = ll_cs_plan.marker_put(b96, 62, 0)
+    test.assert_eq(m.w0, (0xEAAAAAAA << 32) | 0xAAAAAAAA)
+    test.assert_eq(m.w1, 0xAAAAAAA8)
+    let e = ll_cs_plan.marker_put(b96, 92, 1)
+    test.assert_eq(e.w0, (0xAAAAAAAA << 32) | 0xAAAAAAAA)
+    test.assert_eq(e.w1, 0xCAAAAAAA)
+
+@test
+fn test_a_random_sequence_is_the_bits_drawn_with_the_first_bit_the_most_significant_and_the_last_bit_sent_last()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    let blk = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+    t_fill(var g.d, ll_cs_drbg.TID_RANDOM_SEQUENCE, blk)
+    let s32 = ll_cs_plan.random_seq(var cc, var g.d, 0, 32)
+    test.assert_eq(s32.w0, 0x00112233)
+    test.assert_eq(s32.w1, 0)
+    t_fill(var g.d, ll_cs_drbg.TID_RANDOM_SEQUENCE, blk)
+    let s64 = ll_cs_plan.random_seq(var cc, var g.d, 0, 64)
+    test.assert_eq(s64.w0, (0x00112233 << 32) | 0x44556677)
+    test.assert_eq(s64.w1, 0)
+    t_fill(var g.d, ll_cs_drbg.TID_RANDOM_SEQUENCE, blk)
+    let s96 = ll_cs_plan.random_seq(var cc, var g.d, 0, 96)
+    test.assert_eq(s96.w0, (0x44556677 << 32) | 0x8899AABB)
+    test.assert_eq(s96.w1, 0x00112233)
+    t_fill(var g.d, ll_cs_drbg.TID_RANDOM_SEQUENCE, blk)
+    let s128 = ll_cs_plan.random_seq(var cc, var g.d, 0, 128)
+    test.assert_eq(s128.w0, (0x88 << 56) | (0x99AABBCC << 24) | 0xDDEEFF)
+    test.assert_eq(s128.w1, (0x00112233 << 32) | 0x44556677)
+
+@test
+fn test_the_initiator_and_the_reflector_draw_their_random_sequences_one_after_the_other_from_the_same_block()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_fill(var g.d,
+        ll_cs_drbg.TID_RANDOM_SEQUENCE,
+        [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+    let i = ll_cs_plan.step_seq(var cc, var g.d, 0, 3)
+    let r = ll_cs_plan.step_seq(var cc, var g.d, 0, 3)
+    test.assert_eq(i.w0, 0x00112233)
+    test.assert_eq(r.w0, 0x44556677)
+    test.assert_eq(g.d.left[ll_cs_drbg.TID_RANDOM_SEQUENCE] as Int, 64)
+
+@test
+fn test_a_step_sequence_of_rtt_type_1_or_2_is_a_sounding_sequence_and_of_3_to_6_a_random_one()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    let s = ll_cs_plan.step_seq(var cc, var g.d, 5, 1)
+    // A sounding sequence of 32 bits has bits 32 and above clear, and the marker leaves 28 of its alternating bits.
+    test.assert_eq(s.w1, 0)
+    test.assert_eq(s.w0 >>> 32, 0)
+    let t = ll_cs_plan.step_seq(var cc, var g.d, 5, 2)
+    test.assert_eq(t.w1 >>> 32, 0)
+    let r = ll_cs_plan.step_seq(var cc, var g.d, 5, 4)
+    test.assert_eq(r.w1, 0)
+
+// ── The generator of a procedure ───────────────────────────────────
+
+@test
+fn test_a_generator_with_no_procedure_is_done_and_holds_no_list()
+    let g = ll_cs_plan.gen_new()
+    test.assert(g.done)
+    test.assert(not g.started)
+    test.assert(not g.in_sub)
+    test.assert_eq(g.step, 0)
+    test.assert_eq(g.h0.len(), 72)
+    test.assert_eq(g.hn.len(), 72)
+    test.assert_eq(g.cur_ch.len(), 3)
+    test.assert_eq(g.prev_ch.len(), 3)
+
+@test
+fn test_the_filtered_list_holds_the_allowed_channels_of_the_map_in_ascending_order()
+    var c = ll_cs_plan.cfg_new()
+    var out: Vec[u8; 72] = Vec.new()
+    test.assert_eq(ll_cs_plan.filtered_list(var c, var out), 72)
+    test.assert_eq(out[0] as Int, 2)
+    test.assert_eq(out[20] as Int, 22)
+    test.assert_eq(out[21] as Int, 26)
+    test.assert_eq(out[71] as Int, 76)
+    // All 80 bits set: the seven channels that are never used stay out.
+    for i in 0..10
+        t_bits(var c, i, 0xFF)
+    test.assert_eq(ll_cs_plan.filtered_list(var c, var out), 72)
+    test.assert_eq(out[71] as Int, 76)
+    // Only the channels that are never used: an empty list.
+    for i in 0..10
+        t_bits(var c, i, 0)
+    t_bits(var c, 0, 0x03)
+    t_bits(var c, 2, 0x80)
+    t_bits(var c, 3, 0x03)
+    t_bits(var c, 9, 0x60)
+    test.assert_eq(ll_cs_plan.filtered_list(var c, var out), 0)
+    // Channels 10 to 12 and 40.
+    t_chm(var c, 10, 12)
+    t_bits(var c, 5, 0x01)
+    test.assert_eq(ll_cs_plan.filtered_list(var c, var out), 4)
+    test.assert_eq(out[3] as Int, 40)
+
+@test
+fn test_the_shuffle_of_a_list_is_a_permutation_of_the_filtered_channels()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_chm(var c, 20, 24)
+    // The channels 20, 21, 22 and 26 are allowed: the list holds four.
+    t_bits(var c, 3, 0x04)
+    let n = ll_cs_plan.shuffle(var cc, var g.d, var c, ll_cs_drbg.TID_HOP_NON0, 7, var g.hn)
+    test.assert_eq(n, 4)
+    var sum = 0
+    for i in 0..4
+        sum = sum + g.hn[i] as Int
+    test.assert_eq(sum, 20 + 21 + 22 + 26)
+    // A list of one channel is that channel, and draws nothing.
+    t_chm(var c, 30, 30)
+    let left = g.d.left[ll_cs_drbg.TID_HOP_MODE0] as Int
+    test.assert_eq(ll_cs_plan.shuffle(var cc, var g.d, var c, ll_cs_drbg.TID_HOP_MODE0, 7, var g.h0), 1)
+    test.assert_eq(g.h0[0] as Int, 30)
+    test.assert_eq(g.d.left[ll_cs_drbg.TID_HOP_MODE0] as Int, left)
+
+@test
+fn test_a_generator_whose_cipher_fails_does_not_begin_a_procedure_or_make_a_step()
+    var good = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var good, var g)
+    var bad = Flaky { ok: 0, n: 0 }
+    var iv = t_v16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    var nc = t_v8([0, 0, 0, 0, 0, 0, 0, 0])
+    var pv = t_v16([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    test.assert(not ll_cs_plan.gen_instantiate(var bad, var g, var iv, var nc, var pv))
+    test.assert(g.d.fault)
+    // A series that was keyed and has begun a procedure ratchets its key at the next, and that fails with the cipher.
+    t_begin(var good, var g)
+    test.assert(not ll_cs_plan.gen_begin_procedure(var bad, var g))
+    // A step whose blocks fail answers `PLAN_FAULT`.
+    t_begin(var good, var g)
+    var c = ll_cs_plan.cfg_new()
+    ll_cs_plan.gen_begin_subevent(var g, var c, 10, 0)
+    var step = ll_cs_radio.cs_step_new()
+    test.assert_eq(ll_cs_plan.plan_next(var bad, var g, var c, var step), ll_cs_plan.PLAN_FAULT)
+
+@test
+fn test_a_generator_keyed_for_the_test_command_plans_from_its_first_procedure_on()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    ll_cs_plan.gen_instantiate_test(var g, 0x0102)
+    test.assert(g.done)
+    test.assert(ll_cs_plan.gen_begin_procedure(var cc, var g))
+    test.assert_eq(g.d.count, 0)
+    var c = ll_cs_plan.cfg_new()
+    var r = t_run(var cc, var g, var c, 160, 0)
+    test.assert_eq(t_count(var r, 2), 72)
+    test.assert_eq(t_distinct(var r, 0, r.steps.len(), 2), 72)
+
+@test
+fn test_each_procedure_after_the_first_ratchets_the_key_and_starts_the_step_count_again()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    let first = t_run(var cc, var g, var c, 160, 0)
+    test.assert(g.done)
+    test.assert_eq(g.d.count, 0)
+    test.assert(ll_cs_plan.gen_begin_procedure(var cc, var g))
+    test.assert_eq(g.d.count, 1)
+    test.assert_eq(g.step, 0)
+    test.assert_eq(g.subs, 0)
+    test.assert(not g.done)
+    var second = t_run(var cc, var g, var c, 160, 0)
+    test.assert_eq(second.steps.len(), first.steps.len())
+    // The ratcheted key gives other channels.
+    var same = 0
+    for i in 0..first.steps.len()
+        if first.steps[i].ch == second.steps[i].ch and first.steps[i].aa_i == second.steps[i].aa_i
+            same = same + 1
+    test.assert(same < first.steps.len())
+
+@test
+fn test_two_generators_with_one_key_make_the_same_plan_and_another_key_makes_another()
+    var cc = ll_ccm.soft_cipher_new()
+    var a = ll_cs_plan.gen_new()
+    var b = ll_cs_plan.gen_new()
+    var o = ll_cs_plan.gen_new()
+    t_begin(var cc, var a)
+    t_begin(var cc, var b)
+    var iv = t_v16([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    var nc = t_v8([1, 2, 3, 4, 5, 6, 7, 8])
+    var pv = t_v16([9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9])
+    test.assert(ll_cs_plan.gen_instantiate(var cc, var o, var iv, var nc, var pv))
+    test.assert(ll_cs_plan.gen_begin_procedure(var cc, var o))
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 3, 0, 1, 1, 0)
+    t_rtt(var c, 2, 5)
+    let ra = t_run(var cc, var a, var c, 160, 0)
+    let rb = t_run(var cc, var b, var c, 160, 0)
+    let ro = t_run(var cc, var o, var c, 160, 0)
+    test.assert_eq(ra.steps.len(), rb.steps.len())
+    var other = 0
+    for i in 0..ra.steps.len()
+        test.assert_eq(ra.steps[i].ch as Int, rb.steps[i].ch as Int)
+        test.assert_eq(ra.steps[i].aa_i as Int, rb.steps[i].aa_i as Int)
+        test.assert_eq(ra.steps[i].seq_r0, rb.steps[i].seq_r0)
+        test.assert_eq(ra.steps[i].perm as Int, rb.steps[i].perm as Int)
+        if ra.steps[i].aa_r != ro.steps[i].aa_r
+            other = other + 1
+    test.assert(other > 0)
+
+// ── The steps of a subevent ────────────────────────────────────────
+
+@test
+fn test_a_subevent_holds_its_mode_0_step_and_as_many_steps_as_fit_in_its_length()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    var r = t_run(var cc, var g, var c, 160, 0)
+    // 483 microseconds for the mode 0 step, 465 for each mode 2 step, in 5,000: nine of them fit.
+    test.assert_eq(r.subs[0], 10)
+    test.assert_eq(r.steps[0].mode as Int, 0)
+    test.assert_eq(r.steps[0].start_ns as Int, 150_000)
+    test.assert_eq(r.steps[0].len_ns as Int, 483_000)
+    test.assert_eq(r.steps[1].mode as Int, 2)
+    test.assert_eq(r.steps[1].start_ns as Int, 633_000)
+    test.assert_eq(r.steps[1].len_ns as Int, 465_000)
+    test.assert_eq(r.steps[9].start_ns as Int, 633_000 + 8 * 465_000)
+    // The procedure uses the 72 channels once: eight subevents of nine steps and a last of nine again.
+    test.assert_eq(t_count(var r, 2), 72)
+    test.assert_eq(t_distinct(var r, 0, r.steps.len(), 2), 72)
+    test.assert_eq(t_count(var r, 0), r.subs.len())
+    test.assert_eq(r.subs.len(), 8)
+    test.assert(g.done)
+    test.assert_eq(r.last, ll_cs_plan.PLAN_PROCEDURE_END)
+
+@test
+fn test_the_steps_of_a_main_mode_with_tones_carry_extension_slots_and_a_path_permutation()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_timing(var c, 145, 150, 40, 0, 3)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    var perms = 0
+    var ext = 0
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) == 2
+            test.assert((r.steps[i].perm as Int) < 24)
+            if r.steps[i].perm != 0
+                perms = perms + 1
+            if r.steps[i].ext_i or r.steps[i].ext_r
+                ext = ext + 1
+            test.assert_eq(r.steps[i].aa_i as Int, 0)
+            test.assert_eq(r.steps[i].seq_bits as Int, 0)
+        else
+            test.assert(not r.steps[i].ext_i)
+            test.assert((r.steps[i].aa_i as Int) != 0)
+    test.assert(perms > 0)
+    test.assert(ext > 0)
+
+@test
+fn test_a_single_antenna_path_has_no_permutation_to_draw()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    var r = t_run(var cc, var g, var c, 160, 0)
+    for i in 0..r.steps.len()
+        test.assert_eq(r.steps[i].perm as Int, 0)
+    test.assert_eq(g.d.left[ll_cs_drbg.TID_ANTENNA] as Int, 0)
+
+@test
+fn test_a_step_of_mode_1_or_3_carries_a_random_sequence_of_its_rtt_type_for_each_direction()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 1, 0, 1, 1, 0)
+    t_rtt(var c, 1, 6)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    var moved = 0
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) == 1
+            test.assert_eq(r.steps[i].seq_bits as Int, 128)
+            if r.steps[i].seq_i0 != r.steps[i].seq_r0
+                moved = moved + 1
+        else
+            test.assert_eq(r.steps[i].seq_bits as Int, 0)
+            test.assert_eq(r.steps[i].seq_i0, 0)
+    test.assert(moved > 0)
+    // A 32-bit random sequence leaves the bits above 32 clear, and the AA-only RTT type leaves a mode 1 step with no sequence.
+    var h = ll_cs_plan.gen_new()
+    t_begin(var cc, var h)
+    t_rtt(var c, 1, 3)
+    var q = t_run(var cc, var h, var c, 160, 0)
+    test.assert_eq(q.steps[1].seq_bits as Int, 32)
+    test.assert_eq(q.steps[1].seq_i0 >>> 32, 0)
+    test.assert_eq(q.steps[1].seq_i1, 0)
+    var k = ll_cs_plan.gen_new()
+    t_begin(var cc, var k)
+    t_rtt(var c, 1, 0)
+    var p = t_run(var cc, var k, var c, 160, 0)
+    test.assert_eq(p.steps[1].seq_bits as Int, 0)
+
+@test
+fn test_a_sub_mode_of_mode_1_reuses_the_channel_of_the_main_step_before_it_and_takes_none_from_the_list()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 2, 1, 2, 2, 0)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    // Every third step after the mode 0 step is the sub step: two main steps, one of mode 1, as the minimum and the maximum of 2 say.
+    var subs = 0
+    var same = 0
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) == 1
+            subs = subs + 1
+            if (r.steps[i - 1].mode as Int) == 2
+                same = same + 1
+                test.assert_eq(r.steps[i].ch as Int, r.steps[i - 1].ch as Int)
+    test.assert(subs > 5)
+    test.assert(same > 5)
+    test.assert_eq(t_count(var r, 2), 72)
+    test.assert_eq(t_distinct(var r, 0, r.steps.len(), 2), 72)
+
+@test
+fn test_a_sub_mode_of_another_mode_takes_a_channel_from_the_list()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 2, 3, 3, 3, 0)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    test.assert(t_count(var r, 3) > 5)
+    // The main steps and the sub steps together use each of the 72 channels once.
+    var seen: Vec[Bool; 80] = Vec.new()
+    for _ in 0..80
+        let _a = seen.push(false)
+    var uses = 0
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) != 0
+            let ch = r.steps[i].ch as Int
+            test.assert(not seen[ch])
+            seen[ch] = true
+            uses = uses + 1
+    test.assert_eq(uses, 72)
+
+@test
+fn test_the_number_of_main_steps_before_a_sub_step_is_drawn_between_the_minimum_and_the_maximum()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 2, 3, 1, 4, 0)
+    t_time(var c, 100_000, 40_000_000)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    // Within a subevent the runs of mode 2 steps between two mode 3 steps are 1 to 4 long.
+    var run = 0
+    var longest = 0
+    var shortest = 99
+    for i in 0..r.steps.len()
+        let m = r.steps[i].mode as Int
+        if m == 2
+            run = run + 1
+        else if m == 3
+            test.assert(run >= 1)
+            test.assert(run <= 4)
+            if run > longest
+                longest = run
+            if run < shortest
+                shortest = run
+            run = 0
+        else
+            run = 0
+    test.assert(longest > shortest)
+
+@test
+fn test_the_steps_the_repetition_repeats_are_the_last_main_steps_of_the_subevent_before_in_their_order()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 3, 0, 1, 1, 3)
+    // A subevent of the mode 0 step and four main steps.
+    var r = t_run(var cc, var g, var c, 5, 0)
+    test.assert_eq(r.subs[0], 5)
+    // The second begins with the mode 0 step and the last three of the four, which are the channels of steps 2, 3 and 4.
+    test.assert_eq(r.steps[5].mode as Int, 0)
+    test.assert_eq(r.steps[6].ch as Int, r.steps[2].ch as Int)
+    test.assert_eq(r.steps[7].ch as Int, r.steps[3].ch as Int)
+    test.assert_eq(r.steps[8].ch as Int, r.steps[4].ch as Int)
+    // The repeated steps are made again: their draws are new.
+    test.assert(r.steps[6].aa_i != r.steps[2].aa_i)
+    // The step that follows them is a channel the list has not given before: the repeated steps took none from it.
+    test.assert_eq(t_distinct(var r, 0, 5, 3), 4)
+    for j in 1..5
+        test.assert(r.steps[9].ch != r.steps[j].ch)
+
+@test
+fn test_a_subevent_with_fewer_main_steps_than_the_repetition_asks_for_repeats_those_it_has()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 2, 0, 1, 1, 3)
+    var r = t_run(var cc, var g, var c, 3, 0)
+    test.assert_eq(r.subs[0], 3)
+    test.assert_eq(r.steps[3].mode as Int, 0)
+    test.assert_eq(r.steps[4].ch as Int, r.steps[1].ch as Int)
+    test.assert_eq(r.steps[5].ch as Int, r.steps[2].ch as Int)
+
+@test
+fn test_a_repetition_of_one_keeps_only_the_latest_main_step()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 2, 0, 1, 1, 1)
+    var r = t_run(var cc, var g, var c, 4, 0)
+    test.assert_eq(r.steps[4].mode as Int, 0)
+    test.assert_eq(r.steps[5].ch as Int, r.steps[3].ch as Int)
+
+@test
+fn test_the_mode_0_channels_are_taken_from_their_own_list_and_a_list_used_up_is_shuffled_again()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_chm(var c, 2, 16)
+    t_reps(var c, 3, 1)
+    var r = t_run(var cc, var g, var c, 3, 0)
+    // 15 channels, used three times, two to a subevent: 23 subevents; the mode 0 steps use the 15 channels once and begin the list again.
+    test.assert_eq(r.subs.len(), 23)
+    test.assert_eq(t_count(var r, 0), 23)
+    var first: Vec[Int; 16] = Vec.new()
+    for _ in 0..16
+        let _a = first.push(0)
+    var n = 0
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) == 0
+            if n < 15
+                let ch = r.steps[i].ch as Int
+                for j in 0..n
+                    test.assert(first[j] != ch)
+                first[n] = ch
+            n = n + 1
+    test.assert_eq(n, 23)
+    test.assert(g.done)
+    test.assert_eq(g.uses, 45)
+
+@test
+fn test_the_list_of_the_other_modes_is_shuffled_again_when_it_is_used_up_for_each_repetition()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_chm(var c, 2, 11)
+    t_reps(var c, 2, 1)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    test.assert_eq(t_count(var r, 2), 20)
+    // The main steps use the ten channels twice: each run of ten is a permutation.
+    var mains: Vec[Int; 32] = Vec.new()
+    for i in 0..r.steps.len()
+        if (r.steps[i].mode as Int) == 2
+            let _a = mains.push(r.steps[i].ch as Int)
+    for i in 0..10
+        for j in 0..10
+            if i != j
+                test.assert(mains[i] != mains[j])
+                test.assert(mains[10 + i] != mains[10 + j])
+    test.assert_eq(g.nl, 10)
+
+// ── The end of a subevent and of a procedure ─────────────────────
+
+@test
+fn test_a_subevent_closes_at_the_number_of_steps_it_may_hold()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    ll_cs_plan.gen_begin_subevent(var g, var c, 3, 0)
+    var step = ll_cs_radio.cs_step_new()
+    for _ in 0..3
+        test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_STEP)
+    test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_SUBEVENT_END)
+    test.assert(not g.done)
+    test.assert(not g.in_sub)
+    // With no subevent open `plan_next` makes no step either.
+    test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_SUBEVENT_END)
+
+@test
+fn test_a_subevent_that_cannot_hold_its_first_step_answers_no_fit()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_time(var c, 400, 40_000_000)
+    ll_cs_plan.gen_begin_subevent(var g, var c, 10, 0)
+    var step = ll_cs_radio.cs_step_new()
+    test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_NO_FIT)
+    test.assert(not g.in_sub)
+    test.assert(not g.done)
+
+@test
+fn test_a_step_that_would_end_after_the_longest_procedure_ends_the_procedure()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    // The mode 0 step ends at 1,983 microseconds after a subevent that begins at 1,500; a mode 2 step of 465 would end at 2,448.
+    t_time(var c, 5000, 2000)
+    ll_cs_plan.gen_begin_subevent(var g, var c, 10, 1_500_000)
+    var step = ll_cs_radio.cs_step_new()
+    test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_STEP)
+    test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_PROCEDURE_END)
+    test.assert(g.done)
+    test.assert_eq(ll_cs_plan.plan_next(var cc, var g, var c, var step), ll_cs_plan.PLAN_PROCEDURE_END)
+    // A subevent begun after the end holds nothing.
+    ll_cs_plan.gen_begin_subevent(var g, var c, 10, 0)
+    test.assert(not g.in_sub)
+
+@test
+fn test_a_procedure_ends_after_256_steps()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_reps(var c, 10, 1)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    test.assert_eq(r.steps.len(), 256)
+    test.assert(g.done)
+    test.assert_eq(r.last, ll_cs_plan.PLAN_PROCEDURE_END)
+    test.assert_eq(g.step, 256)
+
+@test
+fn test_a_procedure_ends_after_32_subevents_and_the_last_subevent_says_so()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_reps(var c, 10, 1)
+    t_time(var c, 1500, 40_000_000)
+    var r = t_run(var cc, var g, var c, 160, 0)
+    // 483 microseconds for the mode 0 step and two of 465 in 1,500: three steps in each of 32 subevents.
+    test.assert_eq(r.subs.len(), 32)
+    test.assert_eq(r.steps.len(), 96)
+    test.assert(g.done)
+    test.assert_eq(r.last, ll_cs_plan.PLAN_SUBEVENT_END)
+    test.assert_eq(g.subs, 32)
+
+@test
+fn test_a_subevent_begun_after_the_32nd_holds_nothing()
+    var g = ll_cs_plan.gen_new()
+    var c = ll_cs_plan.cfg_new()
+    var cc = ll_ccm.soft_cipher_new()
+    t_begin(var cc, var g)
+    for _ in 0..33
+        ll_cs_plan.gen_begin_subevent(var g, var c, 1, 0)
+    test.assert(g.done)
+    test.assert(not g.in_sub)
+    test.assert_eq(g.subs, 32)
+
+// ── The plan a build stores ────────────────────────────────────────
+
+@test
+fn test_a_table_of_an_absent_feature_keeps_one_record_and_one_of_a_present_one_keeps_its_count()
+    test.assert_eq(ll_cs_plan.max1(0), 1)
+    test.assert_eq(ll_cs_plan.max1(1), 1)
+    test.assert_eq(ll_cs_plan.max1(2), 2)
+    test.assert_eq(ll_cs_plan.max1(160), 160)
+
+@test
+fn test_a_new_plan_holds_no_step_and_as_many_as_ctl_cs_steps_allow()
+    let p = ll_cs_plan.plan_new()
+    test.assert_eq(p.n, 0)
+    test.assert_eq(p.steps.len(), 0)
+    test.assert_eq(p.steps.capacity(), ll_cs_plan.max1(noble_controller_config.CTL_CS_STEPS))
+    test.assert_eq(p.head.n_steps as Int, 0)
+
+@test
+fn test_the_plan_of_a_subevent_holds_the_steps_of_the_subevent_up_to_its_capacity_and_names_them_in_its_head()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_rtt(var c, 2, 1)
+    t_timing(var c, 145, 150, 40, 10, 3)
+    var p = ll_cs_plan.plan_new()
+    let code = ll_cs_plan.plan_subevent(var cc, var g, var c, var p, 1, 0)
+    let cap = p.steps.capacity()
+    test.assert_eq(code, ll_cs_plan.PLAN_SUBEVENT_END)
+    // 447 microseconds for the mode 0 step and 805 for each step of mode 2 with four paths and a 10 microsecond switch (150 + 2 * 50 * 5 + 10
+    // + 145): in 5,000 the subevent holds the mode 0 step and five more.
+    var want = 6
+    if cap < want
+        want = cap
+    test.assert_eq(p.n, want)
+    test.assert_eq(p.steps.len(), want)
+    test.assert_eq(p.head.n_steps as Int, want)
+    test.assert_eq(p.head.n_mode0 as Int, 1)
+    test.assert_eq(p.head.role as Int, 1)
+    test.assert_eq(p.head.phy as Int, 2)
+    test.assert_eq(p.head.rtt as Int, 1)
+    test.assert_eq(p.head.t_ip1_us as Int, 145)
+    test.assert_eq(p.head.t_ip2_us as Int, 145)
+    test.assert_eq(p.head.t_fcs_us as Int, 150)
+    test.assert_eq(p.head.t_pm_us as Int, 40)
+    test.assert_eq(p.head.t_sw_us as Int, 10)
+    test.assert_eq(p.head.n_ap as Int, 4)
+    test.assert_eq(p.head.aci as Int, 3)
+    test.assert(not p.head.ipt)
+    test.assert_eq(p.steps[0].mode as Int, 0)
+    test.assert_eq(p.steps[0].start_ns as Int, 150_000)
+
+@test
+fn test_the_plans_of_a_procedure_use_each_channel_once_whatever_the_capacity()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    var p = ll_cs_plan.plan_new()
+    var seen: Vec[Bool; 80] = Vec.new()
+    for _ in 0..80
+        let _a = seen.push(false)
+    var steps = 0
+    var subs = 0
+    for _ in 0..40
+        let _code = ll_cs_plan.plan_subevent(var cc, var g, var c, var p, 0, subs * 5_000_000)
+        subs = subs + 1
+        steps = steps + p.n
+        for i in 0..p.n
+            if (p.steps[i].mode as Int) == 2
+                test.assert(not seen[p.steps[i].ch as Int])
+                seen[p.steps[i].ch as Int] = true
+        if g.done
+            break
+    test.assert(g.done)
+    test.assert(steps <= 256)
+    if p.steps.capacity() == 1
+        // A plan of one step holds the mode 0 step alone, so the procedure ends with its 32 subevents.
+        test.assert_eq(subs, 32)
+        test.assert_eq(steps, 32)
+
+// A radio that takes a plan of up to 40 steps and refuses the step with the index `bad`.
+struct LimitedCs
+    var armed: Bool
+    var loaded: Int
+    var modes: Int
+    var bad: Int
+
+impl CsRadio[] for LimitedCs
+    fn supports_cs(var self) -> Bool
+        true
+
+    fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
+        if t0_us < 100
+            return ll_cs_radio.CS_LATE
+        if (plan.n_steps as Int) > 40
+            return ll_cs_radio.CS_RESOURCES
+        self.armed = true
+        self.loaded = 0
+        self.modes = 0
+        ll_cs_radio.CS_OK
+
+    fn cs_load(var self, i: Int, var step: CsStep) -> Int
+        if not self.armed or i != self.loaded
+            return ll_cs_radio.CS_UNSUPPORTED
+        if i == self.bad
+            return ll_cs_radio.CS_UNSUPPORTED
+        self.loaded = self.loaded + 1
+        self.modes = self.modes + step.mode as Int
+        ll_cs_radio.CS_OK
+
+@test
+fn test_a_plan_is_handed_to_a_radio_as_a_head_and_a_step_at_a_time()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    var p = ll_cs_plan.plan_new()
+    let _code = ll_cs_plan.plan_subevent(var cc, var g, var c, var p, 0, 0)
+    var air = LimitedCs { armed: false, loaded: 0, modes: 0, bad: -1 }
+    test.assert_eq(ll_cs_plan.plan_arm(var air, var p, 1_000), ll_cs_radio.CS_OK)
+    test.assert_eq(air.loaded, p.n)
+    // The mode 0 step and the mode 2 steps of the subevent: 2 for each of the others.
+    test.assert_eq(air.modes, 2 * (p.n - 1))
+
+@test
+fn test_a_radio_that_refuses_the_head_or_a_step_stops_the_hand_over_with_its_answer()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    var p = ll_cs_plan.plan_new()
+    let _code = ll_cs_plan.plan_subevent(var cc, var g, var c, var p, 0, 0)
+    var air = LimitedCs { armed: false, loaded: 0, modes: 0, bad: -1 }
+    test.assert_eq(ll_cs_plan.plan_arm(var air, var p, 50), ll_cs_radio.CS_LATE)
+    test.assert_eq(air.loaded, 0)
+    // A step the radio does not run stops the hand-over at that step.
+    air.bad = 0
+    test.assert_eq(ll_cs_plan.plan_arm(var air, var p, 1_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(air.loaded, 0)
+
+@test
+fn test_a_radio_without_the_feature_refuses_the_plan_at_the_head()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    var p = ll_cs_plan.plan_new()
+    let _code = ll_cs_plan.plan_subevent(var cc, var g, var c, var p, 0, 0)
+    var air = NoCs { unused: 0 }
+    test.assert_eq(ll_cs_plan.plan_arm(var air, var p, 1_000_000), ll_cs_radio.CS_UNSUPPORTED)
+
+struct NoCs
+    var unused: Int
+
+impl CsRadio[] for NoCs
+
+// ── The storage of the planning ────────────────────────────────────
+
+@test
+fn test_the_storage_of_the_planning_holds_a_generator_for_each_connection_that_runs_the_feature_and_one_plan()
+    let s = ll_cs_plan.state_new(noble_controller_config.CTL_CS)
+    test.assert_eq(s.gens.capacity(), ll_cs_plan.max1(noble_controller_config.CTL_CS))
+    test.assert_eq(s.gens.len(), noble_controller_config.CTL_CS)
+    test.assert_eq(s.plan.steps.capacity(), ll_cs_plan.max1(noble_controller_config.CTL_CS_STEPS))
+    test.assert_eq(s.plan.n, 0)
+    for i in 0..s.gens.len()
+        test.assert(s.gens[i].done)
+        test.assert(not s.gens[i].started)
+
+@test
+fn test_the_storage_of_the_planning_makes_the_generators_it_is_asked_for()
+    let s = ll_cs_plan.state_new(1)
+    test.assert_eq(s.gens.len(), 1)
+    test.assert(s.gens[0].done)
+
+@test
+fn test_the_storage_of_the_planning_is_the_figure_the_keys_state()
+    let gens = noble_controller_config.CTL_CS
+    let steps = noble_controller_config.CTL_CS_STEPS
+    // Eight octets of length and 712 for each generator, 32 for the plan's head and count, and eight octets of length and 56 for each step;
+    // none for a build without the feature.
+    if gens > 0
+        test.assert_eq(ctl_budget.controller_cs_bytes(), 8 + 712 * gens + 32 + (8 + 56 * steps))
+    else
+        test.assert_eq(ctl_budget.controller_cs_bytes(), 0)

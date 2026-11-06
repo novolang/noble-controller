@@ -1,0 +1,758 @@
+// src/ll_cs_plan.nv — the plan of a Channel Sounding subevent: which steps it holds, on which channels, with which access addresses and
+// sequences, which tone extension slots and antenna paths, and when each step starts.
+//
+// [Vol 6] Part H, Sections 2 and 4.  Both devices of a procedure compute the plan from the same generator (`ll_cs_drbg.nv`), the
+// configuration and the step counter, so the plan is a deterministic function of them and the two stay in step without a message about
+// it.  A step that the radio did not execute still advances the counter.
+//
+// A subevent holds the mode 0 steps of the configuration, the steps of the previous subevent a repetition repeats, and then the steps of
+// the main mode with a step of the sub mode inserted after a random number of them.  It closes when the next step would end after
+// `sub_len_us`, when it holds `steps_max` steps, or when the procedure is complete: the channel list has been used `ch_rep` times, 256
+// steps were made, 32 subevents ran, or the next step would end after `proc_len_us`.
+//
+// The channels are drawn as Channel Selection Algorithm #3a (mode 0) and #3b (the other modes) give them: the channels of the filtered map
+// in ascending order, shuffled by `cr1` over the generator.  Algorithm #3c is not built.  A sub mode of mode 1 reuses the channel of the
+// main step before it; every other step takes the next entry of its list, and a list that is used up is shuffled again at the step that
+// needs it.
+//
+// `plan_next` makes one step and `plan_subevent` makes a subevent into a `CsSubevent`, whose storage the keys size.  `plan_arm` hands a `CsSubevent`
+// to a radio through the `CsRadio` trait.  No function here allocates.
+
+use noble_controller_config
+use ll_cipher
+use ll_cs
+use ll_cs_drbg
+use ll_cs_radio
+
+// The larger of `n` and 1: a table of an absent feature keeps one record.
+@tier(embedded)
+const fn max1(n: Int) -> Int
+    if n > 1
+        n
+    else
+        1
+
+// What `plan_next` answers.
+// A step was made.
+const PLAN_STEP = 0
+// The subevent is closed and the procedure goes on in the next.
+const PLAN_SUBEVENT_END = 1
+// The procedure is complete; no step was made.
+const PLAN_PROCEDURE_END = 2
+// The first step of the subevent does not fit in its length, so no subevent could hold a step.
+const PLAN_NO_FIT = 3
+// The cipher failed.
+const PLAN_FAULT = 4
+
+// The kinds of step a subevent holds.
+const KIND_MODE0 = 0
+const KIND_REPEAT = 1
+const KIND_MAIN = 2
+const KIND_SUB = 3
+
+// ── The configuration ───────────────────────────────────────────────
+
+// What a plan reads of a configuration and of the parameters of the procedure that runs it.
+//
+//   chmap           the filtered channel map, 10 octets, the least significant first: bit n is channel n; the channels that may not be used
+//                   are ignored
+//   ch_rep          how many times the channel list is used before the procedure is complete (ChM_Repetition)
+//   main_mode       the mode of the main steps, 1, 2 or 3
+//   sub_mode        the mode of the steps inserted among them, 0 for none
+//   main_min, main_max   the fewest and the most main steps before a sub step
+//   main_rep        the main steps of a subevent that the next repeats, 0 to 3
+//   mode0_steps     the mode 0 steps that open a subevent
+//   phy             the CS_SYNC PHY as the HCI names it: 1 LE 1M, 2 LE 2M, 3 LE 2M 2BT
+//   rtt             the RTT_Type: 0 access address only, 1 and 2 a sounding sequence of 32 and 96 bits, 3 to 6 a random sequence of 32, 64,
+//                   96 and 128 bits
+//   t_ip1_us, t_ip2_us, t_fcs_us, t_pm_us, t_sw_us   the step timings in microseconds
+//   aci             the antenna configuration index, 0 to 7
+//   sub_len_us      the length of a subevent in microseconds
+//   proc_len_us     the longest a procedure may last in microseconds
+@value
+struct CsCfg
+    chmap: [u8; 10]
+    ch_rep: Int
+    main_mode: Int
+    sub_mode: Int
+    main_min: Int
+    main_max: Int
+    main_rep: Int
+    mode0_steps: Int
+    phy: Int
+    rtt: Int
+    t_ip1_us: Int
+    t_ip2_us: Int
+    t_fcs_us: Int
+    t_pm_us: Int
+    t_sw_us: Int
+    aci: Int
+    sub_len_us: Int
+    proc_len_us: Int
+
+// A configuration of all 72 channels once, mode 2 steps with no sub mode, one mode 0 step, LE 1M, access address only, the mandatory
+// timings, one antenna and a subevent of 5 ms in a procedure of 40 seconds.
+@tier(embedded)
+@no_alloc
+fn cfg_new() -> CsCfg
+    CsCfg { chmap: [0xFC, 0xFF, 0x7F, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F],
+        ch_rep: 1,
+        main_mode: 2,
+        sub_mode: 0,
+        main_min: 1,
+        main_max: 1,
+        main_rep: 0,
+        mode0_steps: 1,
+        phy: 1,
+        rtt: 0,
+        t_ip1_us: ll_cs.T_IP_MANDATORY_US,
+        t_ip2_us: ll_cs.T_IP_MANDATORY_US,
+        t_fcs_us: ll_cs.T_FCS_MANDATORY_US,
+        t_pm_us: ll_cs.T_PM_MANDATORY_US,
+        t_sw_us: 0,
+        aci: 0,
+        sub_len_us: 5000,
+        proc_len_us: 40_000_000 }
+
+// The antenna paths of the antenna configuration index `aci` ([Vol 6] Part A, Table 5.3): 1, then 2, 3 and 4 for an initiator with that many
+// antennae, then 2, 3 and 4 for a reflector with that many, then 4 for two antennae on each side.
+@tier(embedded)
+@no_alloc
+fn aci_paths(aci: Int) -> Int
+    match aci
+        0 => 1
+        1 => 2
+        2 => 3
+        3 => 4
+        4 => 2
+        5 => 3
+        6 => 4
+        7 => 4
+        _ => 1
+
+// The n! of 1 to 4 antenna paths: the permutations a step chooses from.
+@tier(embedded)
+@no_alloc
+fn perm_count(paths: Int) -> Int
+    match paths
+        2 => 2
+        3 => 6
+        4 => 24
+        _ => 1
+
+// ── The timeline ────────────────────────────────────────────────────
+
+// The bits an RTT_Type adds to a CS_SYNC packet: 0 for the access address alone, the sounding sequences of 32 and 96 bits, the random
+// sequences of 32, 64, 96 and 128 bits.
+@tier(embedded)
+@no_alloc
+fn rtt_bits(rtt: Int) -> Int
+    match rtt
+        1 => 32
+        2 => 96
+        3 => 32
+        4 => 64
+        5 => 96
+        6 => 128
+        _ => 0
+
+// The nanoseconds a CS_SYNC packet takes on `phy` with `bits` of sequence ([Vol 6] Part H, Section 2): the preamble (8 bits on LE 1M,
+// 16 on the other two), the 32-bit access address, the 4-bit trailer and the sequence, at 1 microsecond a bit on LE 1M and half of that on
+// LE 2M and LE 2M 2BT.
+@tier(embedded)
+@no_alloc
+fn sync_ns(phy: Int, bits: Int) -> Int
+    if phy == 1
+        (8 + 32 + 4 + bits) * 1000
+    else
+        (16 + 32 + 4 + bits) * 500
+
+// The nanoseconds of a step of `mode`, from the start of its T_FCS to the start of the next step's ([Vol 6] Part H, Sections 4.3.1 to
+// 4.3.4).  The packets of a mode 0 step carry no sequence.  The `n_ap` antenna paths and the tone extension slot each take a T_PM and a
+// T_SW in each direction.
+@tier(embedded)
+@no_alloc
+fn step_ns(c: CsCfg, mode: Int) -> Int
+    let ramp = 2 * ll_cs.T_RD_US * 1000
+    let guard = ll_cs.T_GD_US * 1000
+    let tones = 2 * (c.t_pm_us + c.t_sw_us) * (aci_paths(c.aci) + 1) * 1000
+    let fcs = c.t_fcs_us * 1000
+    match mode
+        0 => fcs + 2 * sync_ns(c.phy, 0) + ramp + guard + ll_cs.T_FM_US * 1000 + c.t_ip1_us * 1000
+        1 => fcs + 2 * sync_ns(c.phy, rtt_bits(c.rtt)) + ramp + c.t_ip1_us * 1000
+        2 => fcs + tones + ramp + c.t_ip2_us * 1000
+        _ => fcs + 2 * (sync_ns(c.phy, rtt_bits(c.rtt)) + guard) + tones + ramp + c.t_ip2_us * 1000
+
+// ── Access addresses and sequences ──────────────────────────────────
+
+// |n|.
+@tier(embedded)
+@no_alloc
+fn absi(n: Int) -> Int
+    if n < 0
+        -n
+    else
+        n
+
+// The bits of `s` that differ from the bit `lag` places above them, over the 32 - `lag` pairs.
+@tier(embedded)
+@no_alloc
+fn lag_count(s: Int, lag: Int) -> Int
+    var c = 0
+    for i in 0..32 - lag
+        c = c + (((s >>> i) ^ (s >>> (i + lag))) & 1)
+    c
+
+// The autocorrelation score of the 32-bit candidate `s` for an access address ([Vol 6] Part H, Section 2.2.1): the distances of 2 C1, 2 C2
+// and 2 C3 from 31, 30 and 29, where Ck counts the bits that differ from the bit k places on.  A low score is a good address.
+@tier(embedded)
+@no_alloc
+fn aa_score(s: Int) -> Int
+    absi(2 * lag_count(s, 1) - 31) + absi(2 * lag_count(s, 2) - 30) + absi(2 * lag_count(s, 3) - 29)
+
+// The access address of two candidates: the one with the lower score, the second when the scores are equal.
+@tier(embedded)
+@no_alloc
+fn aa_pick(a: Int, b: Int) -> Int
+    if aa_score(a) < aa_score(b)
+        a
+    else
+        b
+
+// A sequence of up to 128 bits as two words: bit n of the first word is the n-th bit sent, bit n of the second the (64 + n)-th.
+@value
+struct CsSeq
+    w0: Int
+    w1: Int
+
+// `w` with bit `n` (0 to 63) set to `v` (0 or 1).
+@tier(embedded)
+@no_alloc
+fn bit_put(w: Int, n: Int, v: Int) -> Int
+    (w | (1 << n)) ^ ((1 - v) << n)
+
+// The bits sent for a marker of `sig` at position `p` of a sounding sequence ([Vol 6] Part H, Section 2.4), laid over the words: signal 0
+// sends 1100, signal 1 sends 0011.
+@tier(embedded)
+@no_alloc
+fn marker_put(s: CsSeq, p: Int, sig: Int) -> CsSeq
+    var w0 = s.w0
+    var w1 = s.w1
+    for k in 0..4
+        let v = if (k < 2) == (sig == 0)
+            1
+        else
+            0
+        let n = p + k
+        if n < 64
+            w0 = bit_put(w0, n, v)
+        else
+            w1 = bit_put(w1, n - 64, v)
+    CsSeq { w0: w0, w1: w1 }
+
+// A sounding sequence of `bits` (32 or 96) with no marker: the bits alternate, starting with 0.
+@tier(embedded)
+@no_alloc
+fn sounding_base(bits: Int) -> CsSeq
+    let alt = 0xAAAAAAAA
+    if bits == 32
+        CsSeq { w0: alt, w1: 0 }
+    else
+        CsSeq { w0: alt | (alt << 32), w1: alt }
+
+// The sounding sequence of one direction at `step`: the marker positions and signals drawn from the generator.  A sequence of 32 bits holds
+// one marker at the position hr1(29); one of 96 bits holds a marker at hr1(64) and a second at hr1(75) + 67, which is left out when it
+// would run past the end.
+@tier(embedded)
+fn sounding_seq<C: Cipher[e]>(var cc: C, var d: CsDrbg, step: Int, bits: Int) -> CsSeq [e]
+    var p1 = 0
+    var p2 = -1
+    if bits == 32
+        p1 = ll_cs_drbg.drbg_hr1(var cc, var d, ll_cs_drbg.TID_MARKER_POSITION, step, 29)
+    else
+        p1 = ll_cs_drbg.drbg_hr1(var cc, var d, ll_cs_drbg.TID_MARKER_POSITION, step, 64)
+        let q = ll_cs_drbg.drbg_hr1(var cc, var d, ll_cs_drbg.TID_MARKER_POSITION, step, 75) + 67
+        if q <= 92
+            p2 = q
+    var s = marker_put(sounding_base(bits),
+        p1,
+        ll_cs_drbg.drbg_bits(var cc, var d, ll_cs_drbg.TID_MARKER_SIGNAL, step, 1))
+    if p2 >= 0
+        s = marker_put(s, p2, ll_cs_drbg.drbg_bits(var cc, var d, ll_cs_drbg.TID_MARKER_SIGNAL, step, 1))
+    s
+
+// The random sequence of one direction at `step` ([Vol 6] Part H, Section 2.5): `bits` bits (32, 64, 96 or 128) from the generator, the
+// first bit drawn the most significant and the last bit sent last.
+@tier(embedded)
+fn random_seq<C: Cipher[e]>(var cc: C, var d: CsDrbg, step: Int, bits: Int) -> CsSeq [e]
+    ll_cs_drbg.drbg_need(var cc, var d, ll_cs_drbg.TID_RANDOM_SEQUENCE, step, bits)
+    let m = bits / 32
+    var c: Vec[Int; 4] = Vec.new()
+    for _ in 0..4
+        let _a = c.push(0)
+    for j in 0..m
+        c[j] = ll_cs_drbg.drbg_take(var d, ll_cs_drbg.TID_RANDOM_SEQUENCE, 32)
+    // c[0] was drawn first and is the most significant of the m words; word j from the bottom is c[m - 1 - j].
+    let w0 = c[m - 1] | (if m > 1 then c[m - 2] << 32 else 0)
+    let w1 = (if m > 2 then c[m - 3] else 0) | (if m > 3 then c[m - 4] << 32 else 0)
+    CsSeq { w0: w0, w1: w1 }
+
+// The sequence of one direction of a step of mode 1 or 3, by the RTT_Type: a sounding or a random sequence.
+@tier(embedded)
+fn step_seq<C: Cipher[e]>(var cc: C, var d: CsDrbg, step: Int, rtt: Int) -> CsSeq [e]
+    if rtt <= 2
+        return sounding_seq(var cc, var d, step, rtt_bits(rtt))
+    random_seq(var cc, var d, step, rtt_bits(rtt))
+
+// ── The generator of a procedure ────────────────────────────────────
+
+// What the Controller keeps of a procedure while it plans its subevents.
+//
+//   d               the random bit generator
+//   started         whether a procedure has begun since the generator was instantiated
+//   step            CSStepCount: the number of the next step, from 0 in each procedure
+//   subs            the subevents begun
+//   done            whether the procedure is complete
+//   h0, n0, p0      the shuffled mode 0 channels, how many, and the next to use
+//   hn, nl, pn      the same for the other modes
+//   uses            the channels taken from `hn` in the procedure
+//   list_n          the channels the filtered map holds, 0 until the first list is made
+//   in_sub          whether a subevent is open
+//   sub_steps, cum_ns, anchor_ns, steps_max   the steps made in the subevent, their length so far, where the subevent begins in the
+//                   procedure and how many it may hold
+//   left0, rep_left, rep_at   the mode 0 steps and the repeated steps still to place, and the next repeated step's place in `prev_ch`
+//   main_left       the main steps before the next sub step, -1 when it is to be drawn at the next main step
+//   cur_ch, cur_n   the channels of the last main steps of the subevent that are not repetitions, as many as `main_rep` keeps
+//   prev_ch, prev_n the same for the subevent before
+//   last_ch         the channel of the last main step that is not a repetition
+@value
+struct CsGen
+    d: CsDrbg
+    started: Bool
+    step: Int
+    subs: Int
+    done: Bool
+    h0: Vec[u8; 72]
+    n0: Int
+    p0: Int
+    hn: Vec[u8; 72]
+    nl: Int
+    pn: Int
+    uses: Int
+    list_n: Int
+    in_sub: Bool
+    sub_steps: Int
+    cum_ns: Int
+    anchor_ns: Int
+    steps_max: Int
+    left0: Int
+    rep_left: Int
+    rep_at: Int
+    main_left: Int
+    cur_ch: Vec[u8; 3]
+    cur_n: Int
+    prev_ch: Vec[u8; 3]
+    prev_n: Int
+    last_ch: Int
+
+// A generator with no key and no procedure.
+@tier(embedded)
+@no_alloc
+fn gen_new() -> CsGen
+    var g = CsGen { d: ll_cs_drbg.drbg_new(),
+        started: false,
+        step: 0,
+        subs: 0,
+        done: true,
+        h0: Vec.new(),
+        n0: 0,
+        p0: 0,
+        hn: Vec.new(),
+        nl: 0,
+        pn: 0,
+        uses: 0,
+        list_n: 0,
+        in_sub: false,
+        sub_steps: 0,
+        cum_ns: 0,
+        anchor_ns: 0,
+        steps_max: 0,
+        left0: 0,
+        rep_left: 0,
+        rep_at: 0,
+        main_left: -1,
+        cur_ch: Vec.new(),
+        cur_n: 0,
+        prev_ch: Vec.new(),
+        prev_n: 0,
+        last_ch: 2 }
+    for _ in 0..72
+        let _a = g.h0.push(0)
+        let _b = g.hn.push(0)
+    for _ in 0..3
+        let _c = g.cur_ch.push(0)
+        let _d = g.prev_ch.push(0)
+    g
+
+// Key the generator with the values of the Security Start procedure; the procedure series starts at its first procedure.
+@tier(embedded)
+fn gen_instantiate<C: Cipher[e]>(var cc: C, var g: CsGen, var iv: Vec[u8; 16], var nc: Vec[u8; 8],
+                                 var pv: Vec[u8; 16]) -> Bool [e]
+    g.started = false
+    g.done = true
+    g.in_sub = false
+    ll_cs_drbg.drbg_instantiate(var cc, var g.d, var iv, var nc, var pv)
+
+// Key the generator as LE CS Test does, with the key of zeros and the 16 bits `nonce` in octets 14 and 15 of the nonce.
+@tier(embedded)
+@no_alloc
+fn gen_instantiate_test(var g: CsGen, nonce: Int)
+    g.started = false
+    g.done = true
+    g.in_sub = false
+    ll_cs_drbg.drbg_load_test(var g.d, nonce)
+
+// Begin a procedure: the first after `gen_instantiate` uses the key as it is, each later one ratchets it first.  The step counter, the
+// channel lists and the subevent state start again.  False when the cipher failed.
+@tier(embedded)
+fn gen_begin_procedure<C: Cipher[e]>(var cc: C, var g: CsGen) -> Bool [e]
+    if g.started
+        if not ll_cs_drbg.drbg_backtrack(var cc, var g.d)
+            return false
+    else
+        g.started = true
+        ll_cs_drbg.drbg_forget(var g.d)
+    g.step = 0
+    g.subs = 0
+    g.done = false
+    g.n0 = 0
+    g.p0 = 0
+    g.nl = 0
+    g.pn = 0
+    g.uses = 0
+    g.list_n = 0
+    g.in_sub = false
+    g.main_left = -1
+    g.cur_n = 0
+    g.prev_n = 0
+    g.last_ch = 2
+    true
+
+// Begin the next subevent of the procedure, which starts `anchor_ns` after the procedure and may hold `steps_max` steps.  The main steps of
+// the subevent that ended become those the repetition repeats.  A procedure that has run its 32 subevents is complete.
+@tier(embedded)
+@no_alloc
+fn gen_begin_subevent(var g: CsGen, var c: CsCfg, steps_max: Int, anchor_ns: Int)
+    if g.done or g.subs >= ll_cs.SUBEVENTS_MAX
+        g.done = true
+        g.in_sub = false
+        return
+    g.prev_n = g.cur_n
+    for i in 0..3
+        g.prev_ch[i] = g.cur_ch[i]
+    g.cur_n = 0
+    g.rep_left = g.prev_n
+    g.rep_at = 0
+    g.left0 = c.mode0_steps
+    g.in_sub = true
+    g.sub_steps = 0
+    g.cum_ns = 0
+    g.anchor_ns = anchor_ns
+    g.steps_max = steps_max
+    g.subs = g.subs + 1
+
+// ── The channels ────────────────────────────────────────────────────
+
+// The channels of the filtered map in ascending order, written to `out`; how many.
+@tier(embedded)
+@no_alloc
+fn filtered_list(var c: CsCfg, var out: Vec[u8; 72]) -> Int
+    out.clear()
+    for ch in 2..77
+        if ll_cs.channel_ok(ch) and ((c.chmap[ch / 8] as Int >>> (ch % 8)) & 1) == 1
+            let _a = out.push(ch as u8)
+    out.len()
+
+// The channel shuffle cr1 ([Vol 6] Part H, Section 4.1.2) of the filtered channels of `c` into `dst`, which holds the shuffled list: for
+// each position `i` a number `j` from 0 to `i` is drawn with hr1, the entry at `j` moves to `i` and the channel goes to `j`.  `tid` is
+// the identifier of the draws.  The count.
+@tier(embedded)
+fn shuffle<C: Cipher[e]>(var cc: C, var d: CsDrbg, var c: CsCfg, tid: Int, step: Int,
+                         var dst: Vec[u8; 72]) -> Int [e]
+    var src: Vec[u8; 72] = Vec.new()
+    let n = filtered_list(var c, var src)
+    dst.clear()
+    for i in 0..n
+        let _a = dst.push(0)
+        let j = ll_cs_drbg.drbg_hr1(var cc, var d, tid, step, i + 1)
+        if i != j
+            dst[i] = dst[j]
+        dst[j] = src[i]
+    n
+
+// The next channel of the mode 0 list, which is shuffled again at `step` when it is used up.
+@tier(embedded)
+fn take_mode0<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, step: Int) -> Int [e]
+    if g.p0 >= g.n0
+        g.n0 = shuffle(var cc, var g.d, var c, ll_cs_drbg.TID_HOP_MODE0, step, var g.h0)
+        g.p0 = 0
+    let ch = g.h0[g.p0] as Int
+    g.p0 = g.p0 + 1
+    ch
+
+// The next channel of the list of the other modes, which is shuffled again at `step` when it is used up.
+@tier(embedded)
+fn take_hop<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, step: Int) -> Int [e]
+    if g.pn >= g.nl
+        g.nl = shuffle(var cc, var g.d, var c, ll_cs_drbg.TID_HOP_NON0, step, var g.hn)
+        g.pn = 0
+        g.list_n = g.nl
+    let ch = g.hn[g.pn] as Int
+    g.pn = g.pn + 1
+    g.uses = g.uses + 1
+    ch
+
+// ── The steps ───────────────────────────────────────────────────────
+
+// The kind of the next step of the subevent: the mode 0 steps first, then the repeated steps, then a sub step when its turn has come, and
+// the main steps otherwise.
+@tier(embedded)
+@no_alloc
+fn next_kind(var g: CsGen, var c: CsCfg) -> Int
+    if g.left0 > 0
+        return KIND_MODE0
+    if g.rep_left > 0
+        return KIND_REPEAT
+    if c.sub_mode != 0 and g.main_left == 0
+        return KIND_SUB
+    KIND_MAIN
+
+// The mode of a step of `kind`.
+@tier(embedded)
+@no_alloc
+fn kind_mode(kind: Int, c: CsCfg) -> Int
+    match kind
+        0 => 0
+        3 => c.sub_mode
+        _ => c.main_mode
+
+// Add `ch` to the main steps the next subevent repeats, keeping the last `main_rep` of them.
+@tier(embedded)
+@no_alloc
+fn carry_put(var g: CsGen, var c: CsCfg, ch: Int)
+    if c.main_rep == 0
+        return
+    if g.cur_n < c.main_rep
+        g.cur_ch[g.cur_n] = ch as u8
+        g.cur_n = g.cur_n + 1
+    else
+        for i in 1..3
+            g.cur_ch[i - 1] = g.cur_ch[i]
+        g.cur_ch[c.main_rep - 1] = ch as u8
+
+// The generator's draws that a step of `mode` needs, written to `out` with the channel `ch`: the access addresses of a step with CS_SYNC
+// packets, the sequences of a step of mode 1 or 3, and the tone extension slots and the antenna path permutation of a step with tones.
+@tier(embedded)
+fn step_draws<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, mode: Int, ch: Int,
+                            var out: CsStep) [e]
+    let st = g.step
+    out.mode = mode as u8
+    out.ch = ch as u8
+    out.ext_i = false
+    out.ext_r = false
+    out.perm = 0
+    out.seq_bits = 0
+    out.aa_i = 0
+    out.aa_r = 0
+    out.seq_i0 = 0
+    out.seq_i1 = 0
+    out.seq_r0 = 0
+    out.seq_r1 = 0
+    if mode != 2
+        ll_cs_drbg.drbg_need(var cc, var g.d, ll_cs_drbg.TID_ACCESS_ADDRESS, st, 128)
+        let s0 = ll_cs_drbg.drbg_take(var g.d, ll_cs_drbg.TID_ACCESS_ADDRESS, 32)
+        let s1 = ll_cs_drbg.drbg_take(var g.d, ll_cs_drbg.TID_ACCESS_ADDRESS, 32)
+        let s2 = ll_cs_drbg.drbg_take(var g.d, ll_cs_drbg.TID_ACCESS_ADDRESS, 32)
+        let s3 = ll_cs_drbg.drbg_take(var g.d, ll_cs_drbg.TID_ACCESS_ADDRESS, 32)
+        out.aa_i = aa_pick(s0, s1) as u32
+        out.aa_r = aa_pick(s2, s3) as u32
+    if (mode == 1 or mode == 3) and c.rtt != 0
+        out.seq_bits = rtt_bits(c.rtt) as u8
+        let si = step_seq(var cc, var g.d, st, c.rtt)
+        let sr = step_seq(var cc, var g.d, st, c.rtt)
+        out.seq_i0 = si.w0
+        out.seq_i1 = si.w1
+        out.seq_r0 = sr.w0
+        out.seq_r1 = sr.w1
+    if mode >= 2
+        let paths = aci_paths(c.aci)
+        if paths > 1
+            out.perm = ll_cs_drbg.drbg_hr1(var cc, var g.d, ll_cs_drbg.TID_ANTENNA, st, perm_count(paths)) as u8
+        let ext = ll_cs_drbg.drbg_bits(var cc, var g.d, ll_cs_drbg.TID_TONE_EXT, st, 2)
+        out.ext_i = ((ext >>> 1) & 1) == 1
+        out.ext_r = (ext & 1) == 1
+
+// Close the open subevent; the procedure is complete when it was the last it may hold.
+@tier(embedded)
+@no_alloc
+fn close_subevent(var g: CsGen)
+    g.in_sub = false
+    if g.subs >= ll_cs.SUBEVENTS_MAX
+        g.done = true
+
+// Make the next step of the open subevent into `out`.  `PLAN_STEP` when one was made; `PLAN_SUBEVENT_END` when the next step does not
+// fit in the subevent, which then closes, or when no subevent is open; `PLAN_PROCEDURE_END` when the procedure is complete, `PLAN_NO_FIT`
+// when not even the first step fits in the subevent and `PLAN_FAULT` when the cipher failed.  `g.done` says whether the procedure is
+// complete: it is set with the last step, and by the close of the last subevent the procedure may hold.
+@tier(embedded)
+fn plan_next<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, var out: CsStep) -> Int [e]
+    if g.done
+        return PLAN_PROCEDURE_END
+    if not g.in_sub
+        return PLAN_SUBEVENT_END
+    let kind = next_kind(var g, var c)
+    let mode = kind_mode(kind, c)
+    let len = step_ns(c, mode)
+    if g.sub_steps >= g.steps_max
+        close_subevent(var g)
+        return PLAN_SUBEVENT_END
+    if g.anchor_ns + g.cum_ns + len > c.proc_len_us * 1000
+        g.done = true
+        g.in_sub = false
+        return PLAN_PROCEDURE_END
+    if g.cum_ns + len > c.sub_len_us * 1000
+        if g.sub_steps == 0
+            g.in_sub = false
+            return PLAN_NO_FIT
+        close_subevent(var g)
+        return PLAN_SUBEVENT_END
+    let st = g.step
+    var ch = 0
+    if kind == KIND_MODE0
+        ch = take_mode0(var cc, var g, var c, st)
+        g.left0 = g.left0 - 1
+    else if kind == KIND_REPEAT
+        ch = g.prev_ch[g.rep_at] as Int
+        g.rep_at = g.rep_at + 1
+        g.rep_left = g.rep_left - 1
+    else if kind == KIND_SUB and c.sub_mode == 1
+        ch = g.last_ch
+        g.main_left = -1
+    else
+        ch = take_hop(var cc, var g, var c, st)
+        if kind == KIND_SUB
+            g.main_left = -1
+        else
+            g.last_ch = ch
+            carry_put(var g, var c, ch)
+            if c.sub_mode != 0
+                if g.main_left < 0
+                    g.main_left = ll_cs_drbg.drbg_hr1(var cc, var g.d, ll_cs_drbg.TID_SUBMODE, st, c.main_max - c.main_min + 1) + c.main_min
+                g.main_left = g.main_left - 1
+    step_draws(var cc, var g, var c, mode, ch, var out)
+    out.start_ns = (g.cum_ns + c.t_fcs_us * 1000) as u32
+    out.len_ns = len as u32
+    g.cum_ns = g.cum_ns + len
+    g.sub_steps = g.sub_steps + 1
+    g.step = g.step + 1
+    if g.step >= ll_cs.STEPS_PER_PROCEDURE_MAX or g.list_n > 0 and g.uses >= c.ch_rep * g.list_n
+        g.done = true
+    if g.d.fault
+        return PLAN_FAULT
+    PLAN_STEP
+
+// ── The plan of a subevent ──────────────────────────────────────────
+
+// The plan of a subevent: the head the radio takes, and the steps in the storage the keys size.
+//
+//   head            the plan's head, with `n_steps` and `n_mode0` filled by `plan_subevent`
+//   n               the steps held
+//   steps           the steps; the build's `ctl_cs_steps` is their capacity
+@value
+struct CsSubevent
+    head: CsPlan
+    n: Int
+    steps: Vec[CsStep; max1(noble_controller_config.CTL_CS_STEPS)]
+
+// A plan with no step.
+@tier(embedded)
+@no_alloc
+fn plan_new() -> CsSubevent
+    CsSubevent { head: ll_cs_radio.cs_plan_new(), n: 0, steps: Vec.new() }
+
+// The storage of the planning that a build with Channel Sounding holds: a generator for each of the connections that run it (`ctl_cs`) and the
+// plan of one subevent, which the connections share (`ctl_cs_steps` steps).  A build without the feature never makes one, so a program that
+// has the feature off holds none of it and links none of this module.
+@value
+struct CsState
+    gens: Vec[CsGen; max1(noble_controller_config.CTL_CS)]
+    plan: CsSubevent
+
+// The storage of the planning with a generator for each of `n` connections (`ctl_cs`), none of them keyed, and an empty plan.
+@tier(embedded)
+@no_alloc
+fn state_new(n: Int) -> CsState
+    var s = CsState { gens: Vec.new(), plan: plan_new() }
+    for _ in 0..n
+        let _a = s.gens.push(gen_new())
+    s
+
+// The head of a plan of `n` steps, `n0` of them mode 0, for the device in `role` (0 initiator, 1 reflector) under the configuration `c`.
+@tier(embedded)
+@no_alloc
+fn plan_head(c: CsCfg, role: Int, n: Int, n0: Int) -> CsPlan
+    CsPlan { role: role as u8,
+        phy: c.phy as u8,
+        rtt: c.rtt as u8,
+        n_steps: n as u8,
+        n_mode0: n0 as u8,
+        t_ip1_us: c.t_ip1_us as u8,
+        t_ip2_us: c.t_ip2_us as u8,
+        t_fcs_us: c.t_fcs_us as u8,
+        t_pm_us: c.t_pm_us as u8,
+        t_sw_us: c.t_sw_us as u8,
+        ipt: false,
+        n_ap: aci_paths(c.aci) as u8,
+        aci: c.aci as u8,
+        tx_dbm: 0,
+        snr_i: 0,
+        snr_r: 0,
+        window_us: 0,
+        test: 0 }
+
+// Plan the next subevent of the procedure into `p`: its steps, as many as `p` holds (`ctl_cs_steps`, at most 160), and its head.  `anchor_ns` is where
+// the subevent begins in the procedure.  The answer is the code that ended the subevent: `PLAN_SUBEVENT_END`, `PLAN_PROCEDURE_END` (the
+// procedure is complete, with or without a step in this subevent: `g.done` says which), `PLAN_NO_FIT` or `PLAN_FAULT`.
+@tier(embedded)
+fn plan_subevent<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, var p: CsSubevent, role: Int,
+                               anchor_ns: Int) -> Int [e]
+    p.steps.clear()
+    p.n = 0
+    let cap = p.steps.capacity()
+    gen_begin_subevent(var g, var c, cap, anchor_ns)
+    var step = ll_cs_radio.cs_step_new()
+    var n0 = 0
+    var code = PLAN_SUBEVENT_END
+    for _ in 0..cap + 1
+        code = plan_next(var cc, var g, var c, var step)
+        if code != PLAN_STEP
+            break
+        let _a = p.steps.push(step)
+        if (step.mode as Int) == 0
+            n0 = n0 + 1
+    p.n = p.steps.len()
+    p.head = plan_head(c, role, p.n, n0)
+    code
+
+// Hand the plan to a radio: the head with the start time `t0_us` on the radio's timebase, then each step.  The first answer that is not
+// `CS_OK`, or `CS_OK`.
+@tier(embedded)
+fn plan_arm<S: CsRadio[s]>(var air: S, var p: CsSubevent, t0_us: Int) -> Int [s]
+    let a = air.cs_arm(var p.head, t0_us)
+    if a != ll_cs_radio.CS_OK
+        return a
+    for i in 0..p.n
+        let l = air.cs_load(i, var p.steps[i])
+        if l != ll_cs_radio.CS_OK
+            return l
+    ll_cs_radio.CS_OK
