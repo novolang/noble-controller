@@ -26,7 +26,8 @@ of `orbit/ble`.
    `ll_past`, `ll_cs`) decide what to send and when.  They hold the state and the
    arithmetic and call no radio.
 3. **The arbiter.**  `ll_arb` decides which activity holds the radio next
-   and until when.
+   and until when.  A build with Channel Sounding has two classes more, for the
+   first and for the later subevents of an event.
 4. **The radio program.**  `ll_air` turns the decisions into events on a
    `Radio` and a `Timebase`: the order of the PDUs of an advertising event,
    the T_IFS turn-arounds, the scan, initiating and connection exchanges.

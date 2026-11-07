@@ -206,7 +206,7 @@ fn config_pdu(role: Int) -> Pdu
 
 // The Start of one procedure in the event `ev` that the peer asks for.
 fn start_req_pdu(ev: Int) -> Pdu
-    var s = ll_cs_pdu.StartPdu { config_id: 0, conn_event: ev, offset_min: 1000, offset_max: 2000, max_proc_len: 100, event_interval: 1, subevents: 1,
+    var s = ll_cs_pdu.StartPdu { config_id: 0, conn_event: ev, offset_min: 1000, offset_max: 8000, max_proc_len: 100, event_interval: 1, subevents: 1,
                                  subevent_interval: 0, subevent_len: 2500, proc_interval: 0, proc_count: 1, aci: 0, pref_ant: 1, phy: 1, pwr_delta: 0, snr_i: 0xF, snr_r: 0xF }
     var p = ll_pdu.pdu_new()
     ll_cs_pdu.put_req(var p, var s)

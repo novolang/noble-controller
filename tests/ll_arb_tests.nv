@@ -6,7 +6,7 @@ use std.test
 use ll_radio
 use ctl_limits
 use noble_controller_config
-use ll_arb.{ CLASS_ACL, CLASS_ACL2, CLASS_ISO, NONE, ROOM_DUE_US, ROOM_FREE_US, arb_book, arb_booked, arb_cancel, arb_clear, arb_limit, arb_new, arb_next_start, arb_pick, arb_radio, arb_room, arb_worth_running, class_adv, class_scan, classes, lead_of }
+use ll_arb.{ CLASS_ISO, NONE, ROOM_DUE_US, ROOM_FREE_US, arb_book, arb_book_cs, arb_booked, arb_cancel, arb_clear, arb_clear_class, arb_cs_fits, arb_limit, arb_new, arb_next_start, arb_pick, arb_radio, arb_room, arb_worth_running, class_acl, class_adv, class_cs, class_cs_next, class_per, class_scan, classes, cs_class, lead_of }
 
 @test
 fn test_the_room_before_a_booking_stops_a_guard_short_of_its_start()
@@ -27,19 +27,19 @@ fn test_the_room_is_the_least_of_the_bookings()
     arb_book(var a, class_adv(), 30000, 31000)
     arb_book(var a, class_scan(), 25000, 26000)
     test.assert_eq(arb_room(var a, 10000, 350), 14650)
-    arb_book(var a, CLASS_ACL, 12000, 13000)
+    arb_book(var a, class_acl(), 12000, 13000)
     test.assert_eq(arb_room(var a, 10000, 350), 1650)
 
 @test
 fn test_a_stretch_is_clear_until_the_next_booking_of_a_higher_class()
     var a = arb_new()
     test.assert(arb_clear(var a, class_scan(), 1000, 9000))
-    arb_book(var a, CLASS_ACL, 20000, 21000)
+    arb_book(var a, class_acl(), 20000, 21000)
     test.assert(arb_clear(var a, class_scan(), 1000, 19000))
     test.assert(not arb_clear(var a, class_scan(), 1000, 19401))
     // A booking of a class below does not count, nor one that has ended.
     arb_book(var a, class_scan(), 2000, 3000)
-    test.assert(arb_clear(var a, CLASS_ACL, 1000, 25000))
+    test.assert(arb_clear(var a, class_acl(), 1000, 25000))
     test.assert(arb_clear(var a, class_scan(), 22000, 30000))
     // One under way does.
     test.assert(not arb_clear(var a, class_scan(), 20500, 20600))
@@ -48,12 +48,13 @@ fn test_a_stretch_is_clear_until_the_next_booking_of_a_higher_class()
 fn test_the_arbiter_has_a_class_for_each_link_and_four_more()
     test.assert_eq(ctl_limits.arb_classes(), noble_controller_config.CTL_LINKS)
     // The four more: the isochronous events, the periodic trains, the advertising events and the scan windows.
-    test.assert_eq(classes(), CLASS_ACL + ctl_limits.arb_classes() + 3)
+    test.assert_eq(classes(), class_acl() + ctl_limits.arb_classes() + 3 + ctl_limits.arb_cs_classes() / 2)
 
 @test
 fn test_capacities_match_the_constants()
     let a = arb_new()
     test.assert_eq(a.on.capacity(), classes())
+    test.assert_eq(a.on.capacity(), ctl_limits.arb_cols())
     test.assert_eq(a.start.capacity(), classes())
     test.assert_eq(a.end.capacity(), classes())
 
@@ -85,8 +86,8 @@ fn test_the_higher_priority_class_wins_when_both_are_due()
     test.assert_eq(arb_pick(var a, 49500), class_adv())
     test.assert_eq(arb_pick(var a, 51000), class_adv())
     test.assert_eq(arb_pick(var a, 53000), class_scan())
-    arb_book(var a, CLASS_ACL, 51000, 51500)
-    test.assert_eq(arb_pick(var a, 51200), CLASS_ACL)
+    arb_book(var a, class_acl(), 51000, 51500)
+    test.assert_eq(arb_pick(var a, 51200), class_acl())
     arb_book(var a, CLASS_ISO, 51100, 51300)
     test.assert_eq(arb_pick(var a, 51200), CLASS_ISO)
 
@@ -139,10 +140,10 @@ fn test_a_class_number_out_of_range_is_ignored()
 @test
 fn test_a_connection_event_is_granted_the_radio_a_longer_lead_ahead()
     var a = arb_new()
-    arb_book(var a, CLASS_ACL, 10000, 12000)
-    test.assert_eq(lead_of(var a, CLASS_ACL), 1000)
+    arb_book(var a, class_acl(), 10000, 12000)
+    test.assert_eq(lead_of(var a, class_acl()), 1000)
     test.assert_eq(arb_pick(var a, 8999), NONE)
-    test.assert_eq(arb_pick(var a, 9000), CLASS_ACL)
+    test.assert_eq(arb_pick(var a, 9000), class_acl())
     // An advertising event that would run into it is cut short a guard before.
     arb_book(var a, class_adv(), 0, 20000)
     test.assert_eq(arb_limit(var a, class_adv(), 100), 10000 - a.guard)
@@ -151,20 +152,20 @@ fn test_a_connection_event_is_granted_the_radio_a_longer_lead_ahead()
 @test
 fn test_the_connection_event_due_first_has_the_radio()
     var a = arb_new()
-    arb_book(var a, CLASS_ACL, 10000, 13000)
-    arb_book(var a, CLASS_ACL2, 11000, 14000)
+    arb_book(var a, class_acl(), 10000, 13000)
+    arb_book(var a, class_acl() + 1, 11000, 14000)
     // Both have begun at 11500; the first booking is the earlier.
-    test.assert_eq(arb_pick(var a, 11500), CLASS_ACL)
-    arb_book(var a, CLASS_ACL, 12000, 15000)
-    test.assert_eq(arb_pick(var a, 12500), CLASS_ACL2)
+    test.assert_eq(arb_pick(var a, 11500), class_acl())
+    arb_book(var a, class_acl(), 12000, 15000)
+    test.assert_eq(arb_pick(var a, 12500), class_acl() + 1)
     // The second link alone is granted at its lead.
-    arb_cancel(var a, CLASS_ACL)
-    test.assert_eq(lead_of(var a, CLASS_ACL2), 1000)
-    test.assert_eq(arb_pick(var a, 10000), CLASS_ACL2)
+    arb_cancel(var a, class_acl())
+    test.assert_eq(lead_of(var a, class_acl() + 1), 1000)
+    test.assert_eq(arb_pick(var a, 10000), class_acl() + 1)
     // The second booking has ended: the first is run, late as it is.
-    arb_book(var a, CLASS_ACL, 12000, 15000)
-    arb_book(var a, CLASS_ACL2, 9000, 12100)
-    test.assert_eq(arb_pick(var a, 12150), CLASS_ACL)
+    arb_book(var a, class_acl(), 12000, 15000)
+    arb_book(var a, class_acl() + 1, 9000, 12100)
+    test.assert_eq(arb_pick(var a, 12150), class_acl())
 
 @test
 fn test_the_lead_and_the_guards_follow_the_ramp_up_of_the_radio()
@@ -173,7 +174,7 @@ fn test_the_lead_and_the_guards_follow_the_ramp_up_of_the_radio()
     test.assert_eq(a.stream_guard, 350)
     arb_radio(var a, ll_radio.profile_new(false, 300, 0))
     test.assert_eq(lead_of(var a, CLASS_ISO), 755)
-    test.assert_eq(lead_of(var a, CLASS_ACL), 1155)
+    test.assert_eq(lead_of(var a, class_acl()), 1155)
     test.assert_eq(lead_of(var a, class_scan()), 0)
     test.assert_eq(a.guard, 755)
     test.assert_eq(a.stream_guard, 505)
@@ -182,3 +183,166 @@ fn test_the_lead_and_the_guards_follow_the_ramp_up_of_the_radio()
     test.assert_eq(arb_pick(var a, 19300), CLASS_ISO)
     arb_book(var a, class_adv(), 0, 40000)
     test.assert_eq(arb_limit(var a, class_adv(), 0), 19245)
+
+// ── The classes of Channel Sounding ─────────────────────────────────
+
+@test
+fn test_a_build_without_channel_sounding_has_neither_class_and_the_others_keep_their_numbers()
+    if ctl_limits.cs_on()
+        return
+    test.assert_eq(class_cs(), -1)
+    test.assert_eq(class_cs_next(), -1)
+    test.assert_eq(class_acl(), 1)
+    test.assert_eq(ctl_limits.arb_cs_classes(), 0)
+    test.assert_eq(class_per(), 1 + ctl_limits.arb_classes())
+    // A booking in a class that is not there does nothing.
+    var a = arb_new()
+    arb_book(var a, class_cs(), 10000, 12500)
+    arb_book(var a, class_cs_next(), 10000, 12500)
+    test.assert_eq(arb_next_start(var a), NONE)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_classes_of_a_subevent_lie_between_the_stream_and_the_connection_classes_and_between_the_connection_classes_and_the_trains()
+    if not ctl_limits.cs_on()
+        return
+    test.assert_eq(CLASS_ISO, 0)
+    test.assert_eq(class_cs_next(), 1)
+    test.assert_eq(class_acl(), 2)
+    test.assert_eq(class_cs(), class_acl() + ctl_limits.arb_classes())
+    test.assert_eq(class_per(), class_cs() + 1)
+    test.assert_eq(class_adv(), class_per() + 1)
+    test.assert_eq(class_scan(), class_adv() + 1)
+    test.assert_eq(classes(), class_scan() + 1)
+    test.assert_eq(ctl_limits.arb_cols(), classes())
+    // The first subevent of an event and a later one of an event that never began take the lower class; a later subevent of an event under way the upper.
+    test.assert_eq(cs_class(true, false), class_cs())
+    test.assert_eq(cs_class(true, true), class_cs())
+    test.assert_eq(cs_class(false, false), class_cs())
+    test.assert_eq(cs_class(false, true), class_cs_next())
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_subevent_is_booked_from_its_lead_to_its_finish_and_taken_whole_or_not_at_all()
+    if not ctl_limits.cs_on()
+        return
+    var a = arb_new()
+    arb_book_cs(var a, class_cs(), 50000, 2000, 2500, 600)
+    test.assert(arb_booked(var a, class_cs()))
+    test.assert_eq(a.start[class_cs()], 48000)
+    test.assert_eq(a.end[class_cs()], 53100)
+    // The booking begins at the start of its lead: it is due then and not before, and has no lead of its own.
+    test.assert_eq(lead_of(var a, class_cs()), 0)
+    test.assert_eq(lead_of(var a, class_cs_next()), 0)
+    test.assert_eq(arb_pick(var a, 47999), NONE)
+    test.assert_eq(arb_pick(var a, 48000), class_cs())
+    test.assert_eq(arb_pick(var a, 53099), class_cs())
+    test.assert_eq(arb_pick(var a, 53100), NONE)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_first_subevent_yields_to_every_connection_event_and_a_later_one_takes_the_radio_from_the_events_of_other_links()
+    if not ctl_limits.cs_on() or noble_controller_config.CTL_LINKS < 2
+        return
+    var a = arb_new()
+    // The span of a subevent at 50000: from 47000 (the lead and the reserve) to 53100.  A connection event of the link in the second slot at 51000 is inside it.
+    arb_book(var a, class_acl() + 1, 51000, 54000)
+    test.assert(not arb_cs_fits(var a, cs_class(true, false), class_acl(), 40000, 50000, 2000, 2500, 600))
+    // A later subevent of an event under way is above the connection classes, so the other link's event does not stop it...
+    test.assert(arb_cs_fits(var a, cs_class(false, true), class_acl(), 40000, 50000, 2000, 2500, 600))
+    // ...but the events of the link that carries the procedure do.
+    test.assert(not arb_cs_fits(var a, cs_class(false, true), class_acl() + 1, 40000, 50000, 2000, 2500, 600))
+    // And a stream's event stops both.
+    arb_cancel(var a, class_acl() + 1)
+    arb_book(var a, CLASS_ISO, 52000, 53000)
+    test.assert(not arb_cs_fits(var a, cs_class(true, false), class_acl(), 40000, 50000, 2000, 2500, 600))
+    test.assert(not arb_cs_fits(var a, cs_class(false, true), class_acl(), 40000, 50000, 2000, 2500, 600))
+    // A test, which has no link, is stopped by the same.
+    test.assert(not arb_cs_fits(var a, cs_class(true, false), -1, 40000, 50000, 2000, 2500, 600))
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_connection_event_that_is_under_way_stops_a_subevent_that_would_start_before_it_ends_and_one_after_it_does_not()
+    if not ctl_limits.cs_on()
+        return
+    var a = arb_new()
+    // The event of the link began at 40000 and its booking runs to 44000; a subevent whose span is 47000 to 53100 is after it.
+    arb_book(var a, class_acl(), 40000, 44000)
+    test.assert(arb_cs_fits(var a, cs_class(true, false), class_acl(), 45000, 50000, 2000, 2500, 600))
+    // Asked at 43000, the event is under way and the span is not yet its own: the booking ends after 'now', and does not overlap the span, so it fits.
+    test.assert(arb_cs_fits(var a, cs_class(true, false), class_acl(), 43000, 50000, 2000, 2500, 600))
+    // A span that begins before the event ends does not.
+    test.assert(not arb_cs_fits(var a, cs_class(true, false), class_acl(), 43000, 44500, 2000, 2500, 600))
+    // The next event of the link, booked with its guard before the span ends, stops it too.
+    arb_cancel(var a, class_acl())
+    arb_book(var a, class_acl(), 53000, 56000)
+    test.assert(not arb_cs_fits(var a, cs_class(true, false), class_acl(), 45000, 50000, 2000, 2500, 600))
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_connection_event_that_is_due_is_granted_the_radio_before_a_subevent_and_a_booked_subevent_before_the_classes_below()
+    if not ctl_limits.cs_on()
+        return
+    var a = arb_new()
+    arb_book_cs(var a, class_cs(), 50000, 2000, 2500, 600)
+    arb_book(var a, class_adv(), 47000, 49000)
+    arb_book(var a, class_scan(), 47000, 60000)
+    // At 48000 the subevent is due and the advertising event and the scan window are too: the subevent has the radio.
+    test.assert_eq(arb_pick(var a, 48000), class_cs())
+    // A connection event due at the same time comes first, whichever began first.
+    arb_book(var a, class_acl(), 48500, 51000)
+    test.assert_eq(arb_pick(var a, 48500), class_acl())
+    // The subevent that began first does not take a connection event's turn among the connection classes.
+    test.assert_eq(arb_pick(var a, 49000), class_acl())
+    // A later subevent of an event under way is granted the radio before a connection event that is due.
+    var b = arb_new()
+    arb_book(var b, class_acl(), 48500, 51000)
+    arb_book_cs(var b, class_cs_next(), 50000, 2000, 2500, 600)
+    test.assert_eq(arb_pick(var b, 49000), class_cs_next())
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_classes_below_a_booked_subevent_let_go_a_guard_before_it_and_the_trains_do_not_start_in_it()
+    if not ctl_limits.cs_on()
+        return
+    var a = arb_new()
+    arb_book_cs(var a, class_cs(), 50000, 2000, 2500, 600)
+    arb_book(var a, class_adv(), 40000, 60000)
+    arb_book(var a, class_scan(), 40000, 70000)
+    arb_book(var a, class_per(), 40000, 60000)
+    // The span begins at 48000: the classes below let go a guard (the radio's ramp-up) before it.
+    test.assert_eq(arb_limit(var a, class_adv(), 40000), 48000 - a.guard)
+    test.assert_eq(arb_limit(var a, class_scan(), 40000), 48000 - a.guard)
+    test.assert_eq(arb_limit(var a, class_per(), 40000), 48000 - a.guard)
+    test.assert(arb_worth_running(var a, class_adv(), 40000))
+    test.assert(not arb_clear(var a, class_scan(), 40000, 49000))
+    test.assert(not arb_clear(var a, class_per(), 40000, 49000))
+    // The subevent is not limited by them, and a connection class is not limited by it (it is below the connection classes).
+    test.assert_eq(arb_limit(var a, class_cs(), 40000), 53100)
+    arb_book(var a, class_acl(), 60000, 63000)
+    test.assert_eq(arb_limit(var a, class_acl(), 40000), 63000)
+    test.assert_eq(arb_limit(var a, class_cs(), 40000), 53100)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_stream_is_held_back_in_the_room_the_arbiter_gives_while_a_subevent_is_booked()
+    if not ctl_limits.cs_on()
+        return
+    var a = arb_new()
+    arb_book_cs(var a, class_cs(), 50000, 2000, 2500, 600)
+    // The room runs out a guard before the start of the booking, as for any class, and is a few microseconds while it is due.
+    test.assert_eq(arb_room(var a, 40000, 350), 48000 - 350 - 40000)
+    test.assert_eq(arb_room(var a, 48000, 350), ROOM_DUE_US)
+    test.assert_eq(arb_room(var a, 53100, 350), ROOM_FREE_US)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_connection_class_is_not_taken_over_by_a_subevent_booking_that_began_earlier()
+    if not ctl_limits.cs_on()
+        return
+    var a = arb_new()
+    arb_book_cs(var a, class_cs(), 50000, 2000, 2500, 600)
+    arb_book(var a, class_acl(), 49000, 52000)
+    arb_book(var a, class_acl() + 1, 49500, 52000)
+    // The connection event whose booking began first among the connection classes has the radio, and the subevent, which began earlier still, does not count among them.
+    test.assert_eq(arb_pick(var a, 49600), class_acl())

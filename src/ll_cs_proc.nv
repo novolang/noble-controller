@@ -41,6 +41,7 @@ use ll_pdu
 use ll_data
 use ll_cs
 use ll_cs_pdu
+use ll_cs_fit
 use ctl_limits
 use noble_controller_config
 
@@ -112,9 +113,6 @@ const EVENT_HALF = 32768
 // length, in microseconds, and the unit of the lengths in 625 microseconds.
 const OFFSET_MIN_US = 500
 
-// The offset the Central picks for the first subevent in the window a Start names, when the window allows: 3 milliseconds after the anchor point, so that the
-// connection event the subevent is offset from has ended (a short exchange takes about a millisecond) and the radio has its lead before the subevent.
-const OFFSET_PICK_US = 3000
 const SUBEVENT_LEN_MIN_US = 1250
 const FOUR_SECONDS_US = 4000000
 const UNIT_US = 625
@@ -179,6 +177,8 @@ const GW_NXT_PDONE = 32
 const GW_NXT_SDONE = 33
 const GW_NXT_ABORT = 34
 const GW_DROPPED = 35
+const GW_ARM_LEAD = 36
+const GW_QUIET = 37
 const GLOBAL_WORDS = 40
 
 // The octets: the local capability record in the order of the HCI ([v2], 34 octets), the parameters of the LE CS Test in progress (30 and the override data), the FAE table
@@ -223,6 +223,8 @@ const fn bulk_octets() -> Int
 //                        S=8, 8 LE Coded S=2)
 //   sec_ok               the security requirements of the Host are met
 //   max_tx               the most octets of payload a PDU sent now may carry
+//   fit                  what the Controller serves beside Channel Sounding (`ll_cs_fit.Busy`): the carrying link's subrated grid and the other bookings, empty when the caller
+//                        does not schedule (every Start then fits)
 @value
 struct Env
     central: Bool
@@ -237,18 +239,19 @@ struct Env
     managed: Int
     sec_ok: Bool
     max_tx: Int
+    fit: ll_cs_fit.Busy
 
 // An environment for a Peripheral of 30 ms on an encrypted link, at time 0, whose peer has the feature; the PHY of the ACL is LE 1M.
 @tier(embedded)
 fn env_new() -> Env
     Env { central: false, encrypted: true, peer_cs: true, peer_v2: false, ev_count: 0, interval_us: 30000, now: 0, busy: false, phy: 1, managed: 0,
-          sec_ok: true, max_tx: 251 }
+          sec_ok: true, max_tx: 251, fit: ll_cs_fit.busy_new() }
 
 // An environment that carries the time alone, for the calls that read nothing else (`poll`, `feed_random`).
 @tier(embedded)
 fn env_at(now: Int) -> Env
     Env { central: false, encrypted: true, peer_cs: true, peer_v2: false, ev_count: 0, interval_us: 30000, now: now, busy: false, phy: 1, managed: 0,
-          sec_ok: true, max_tx: 251 }
+          sec_ok: true, max_tx: 251, fit: ll_cs_fit.busy_new() }
 
 // ── The record of a connection ──────────────────────────────────────
 
@@ -952,10 +955,47 @@ fn pick_event(a: Int, now: Int) -> Int
         return (now + EVENT_AHEAD) & 0xFFFF
     a
 
-// What the scheduling of the Controller leaves of a Start: whether the Link Layer finds room for the subevents `s` asks for among the connection
-// events and the other bookings, so that the Start may go on.  The answer of a build that has not the scheduling is yes.
+// What the scheduling of the Controller leaves of a Start: whether the Link Layer finds room for the subevents `s` asks for among the connection events, the streams and
+// the subrated grid of the link (`ll_cs_fit.start_fits`), so that the Start may go on as it stands.  The answer is yes when `en` carries no scheduling (`ll_cs_fit.busy_on` false).
 @tier(embedded)
 fn schedule_ok(var s: StartPdu, var en: Env) -> Bool
+    if not ll_cs_fit.busy_on(var en.fit)
+        return true
+    var q = start_req(var s)
+    ll_cs_fit.start_fits(var en.fit, var q)
+
+// The scheduling of the Controller joins the environment: the carrying link's event `ev0` is due at `due`, its interval is `iv`, its subrate grid is `factor` and `res`, a subevent
+// holds the radio `lead` before its start and `finish` after its end, and the program takes `plan` to plan one (`ll_cs_fit.busy_link`, `busy_set_plan`).  The Controller calls these
+// two and not `ll_cs_fit` itself, so that a build without the feature does not load the module.
+@tier(embedded)
+fn fit_link(var en: Env, due: Int, ev0: Int, iv: Int, factor: Int, res: Int, lead: Int, finish: Int, plan: Int)
+    en.fit = ll_cs_fit.busy_link(due, ev0, iv, factor, res, lead, finish)
+    ll_cs_fit.busy_set_plan(var en.fit, plan)
+
+// Add a periodic booking to the scheduling of the environment (`ll_cs_fit.busy_add`).
+@tier(embedded)
+fn fit_add(var en: Env, first: Int, period: Int, len: Int, ahead: Int, hard: Bool)
+    let _a = ll_cs_fit.busy_add(var en.fit, first, period, len, ahead, hard)
+
+// The parameters of the Start `s` that the placing reads, as `ll_cs_fit.Req` has them.
+@tier(embedded)
+fn start_req(var s: StartPdu) -> ll_cs_fit.Req
+    ll_cs_fit.req_with(s.conn_event, s.offset_min, s.offset_max, s.max_proc_len, s.event_interval, s.subevents, s.subevent_interval, s.subevent_len, s.proc_interval)
+
+// Place the Start `s` among the connection events and the streams of `en.fit` (`ll_cs_fit.place`): what the placing changes is put back in `s`.  False when nothing fits; `s` is
+// then unchanged.  A record with no scheduling leaves `s` as it was.
+@tier(embedded)
+fn place_start(var en: Env, var s: StartPdu) -> Bool
+    if not ll_cs_fit.busy_on(var en.fit)
+        return true
+    var q = start_req(var s)
+    if not ll_cs_fit.place(var en.fit, var q)
+        return false
+    s.conn_event = q[ll_cs_fit.Q_CONN]
+    s.offset_min = q[ll_cs_fit.Q_OMIN]
+    s.offset_max = q[ll_cs_fit.Q_OMAX]
+    s.event_interval = q[ll_cs_fit.Q_EINT]
+    s.subevent_len = q[ll_cs_fit.Q_SLEN]
     true
 
 // The verdict on the parameters of an LL_CS_REQ: 0 when they are ones the specification allows and both devices run, 1 when a field is outside what the
@@ -1641,7 +1681,6 @@ fn begin_start(var cs: Cs, var en: Env, var local: CapPdu, var s: StartPdu, var 
         return E_INVALID_PARAMS
     if k == 2
         return E_LIMITED
-    // cov: skip — `schedule_ok` answers yes until the scheduling of the arbiter joins it
     if not schedule_ok(var s, var en)
         return E_LIMITED
     ll_cs_pdu.put_req(var out, var s)
@@ -1654,15 +1693,11 @@ fn begin_start(var cs: Cs, var en: Env, var local: CapPdu, var s: StartPdu, var 
     cs.t0 = en.now
     0
 
-// The offset the Central picks in the window from `lo` to `hi`: `OFFSET_PICK_US` when the window holds it, otherwise the end of the window nearest to it.  The Peripheral
-// answers the request with the window from that offset to the request's end, so the Central's pick is the one the Peripheral wants too.
+// The offset the Central picks in the window from `lo` to `hi`: `ll_cs_fit.OFFSET_PICK_US` when the window holds it, otherwise the end of the window nearest to it.  The Peripheral
+// answers the request with the one offset it placed, so the Central's pick is the one the Peripheral wants too.
 @tier(embedded)
 fn pick_offset(lo: Int, hi: Int) -> Int
-    if lo >= OFFSET_PICK_US
-        return lo
-    if hi < OFFSET_PICK_US
-        return hi
-    OFFSET_PICK_US
+    ll_cs_fit.pick_offset(lo, hi)
 
 // LL_CS_REQ: the Central answers with LL_CS_IND and the procedures start; the Peripheral answers LL_CS_RSP and waits for the Central's LL_CS_IND.  Rejected
 // with Unsupported Remote Feature (the Host has not set the feature), Insufficient Security, Command Disallowed (a Security Start under way), Invalid LL
@@ -1694,23 +1729,29 @@ fn rx_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu)
     if not have
         return reject(var out, ll_cs.OP_CS_REQ, E_DISALLOWED)
     let initiator = cfg_role(var cs, s.config_id) == 0
-    if start_check(var s, initiator, false, var local, var peer, var en) != 0 or not schedule_ok(var s, var en)
+    // The answer is the request with what this end chooses over it: the Central picks the event (`pick_event`), and the placing moves the Start to where it fits (a later
+    // event of the subrated grid, a shorter subevent, one offset); a request that nothing fits is refused.
+    var a = s
+    if en.central
+        ll_cs_pdu.start_answer(var a, pick_event(s.conn_event, en.ev_count), en.phy, 0)
+    if start_check(var s, initiator, false, var local, var peer, var en) != 0 or not place_start(var en, var a)
         return reject(var out, ll_cs.OP_CS_REQ, E_UNSUPPORTED_LL)
     keep(var cs, OFF_REQ, var rx, 28)
     cs.start_host = false
     if en.central
-        var ind = s
-        ll_cs_pdu.start_answer(var ind, pick_event(s.conn_event, en.ev_count), en.phy, 0)
-        ll_cs_pdu.start_offset(var ind, pick_offset(s.offset_min, s.offset_max))
+        var ind = a
+        ll_cs_pdu.start_offset(var ind, pick_offset(a.offset_min, a.offset_max))
         ll_cs_pdu.put_ind(var out, var ind)
         if not fits(var en, var out)
             return no_room(var out, ll_cs.OP_CS_REQ)
         start_done(var cs, var out, var ind, var s)
         return R_SEND
-    var r = s
-    ll_cs_pdu.start_answer(var r, s.conn_event, en.phy, 0)
-    // The window of the answer is the part of the request's the Peripheral prefers: the Central picks the offset in it.
-    ll_cs_pdu.start_window(var r, pick_offset(s.offset_min, s.offset_max), s.offset_max)
+    var r = a
+    ll_cs_pdu.start_answer(var r, a.conn_event, en.phy, 0)
+    if not ll_cs_fit.busy_on(var en.fit)
+        // The window of the answer is the part of the request's the Peripheral prefers: the Central picks the offset in it.  With the placing (`en.fit`) the window
+        // is already the offsets that fit.
+        ll_cs_pdu.start_window(var r, pick_offset(s.offset_min, s.offset_max), s.offset_max)
     ll_cs_pdu.put_rsp(var out, var r)
     if not fits(var en, var out)
         return no_room(var out, ll_cs.OP_CS_REQ)
@@ -1734,7 +1775,11 @@ fn rx_rsp(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
         return reject(var out, ll_cs.OP_CS_RSP, E_UNSUPPORTED_LL)
     var ind = a
     ll_cs_pdu.start_answer(var ind, pick_event(a.conn_event, en.ev_count), req.phy, req.pwr_delta)
-    ll_cs_pdu.start_offset(var ind, pick_offset(a.offset_min, a.offset_max))
+    if not place_start(var en, var ind)
+        // Nothing in the Peripheral's window leaves room for the subevents among this end's events: the Start ends.
+        fail_wait(var cs, E_UNSUPPORTED_LL)
+        return reject(var out, ll_cs.OP_CS_RSP, E_UNSUPPORTED_LL)
+    ll_cs_pdu.start_offset(var ind, pick_offset(ind.offset_min, ind.offset_max))
     ll_cs_pdu.put_ind(var out, var ind)
     if not fits(var en, var out)
         fail_wait(var cs, E_LIMITED)

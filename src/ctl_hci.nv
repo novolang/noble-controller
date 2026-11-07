@@ -3484,7 +3484,7 @@ fn handle_slot(var c: Controller, handle: Int) -> Int
 // The arbiter class that books the connection events of the link in `slot`.
 @tier(embedded)
 fn slot_class(slot: Int) -> Int
-    ll_arb.CLASS_ACL + slot
+    ll_arb.class_acl() + slot
 
 // The access address of the connection in `slot`, 0 for a link that is not on
 // (which no connection has) and for a slot the build does not have: a build with
@@ -5156,7 +5156,7 @@ fn book_link(var c: Controller, slot: Int)
     else
         ll_arb.arb_cancel(var c.arb, slot_class(slot))
 
-// The class that holds the radio now: `ll_arb.CLASS_ACL` (a connection event),
+// The class that holds the radio now: `ll_arb.class_acl()` (a connection event),
 // `CLASS_ADV`, `CLASS_SCAN` or `ll_arb.NONE`.  A scan window with too little time before the next
 // advertising event is not started; one that runs (`scan_running`) goes on
 // to its limit.
@@ -7211,8 +7211,8 @@ fn ctl_privacy_poll<C: Cipher[e]>(var c: Controller, var cc: C) -> Bool [e]
 // The slot of the arbiter class that books connection events, -1 for another.
 @tier(embedded)
 fn ctl_class_slot(cls: Int) -> Int
-    if cls >= ll_arb.CLASS_ACL and cls < ll_arb.CLASS_ACL + noble_controller_config.CTL_LINKS
-        cls - ll_arb.CLASS_ACL
+    if cls >= ll_arb.class_acl() and cls < ll_arb.class_acl() + noble_controller_config.CTL_LINKS
+        cls - ll_arb.class_acl()
     else
         -1
 
@@ -8862,6 +8862,11 @@ fn ctl_cs_radio_init<S: CsRadio[s]>(var c: Controller, var air: S) [s]
         cs_go_put(var c, ll_cs_proc.GO_CAPS + k, b[k] as Int)
     cs_gw_put(var c, ll_cs_proc.GW_RADIO, 1)
     cs_gw_put(var c, ll_cs_proc.GW_TQ, ll_cs_proc.b2i(rc.supported and rc.tq))
+    // The time the radio needs between `cs_arm` and the start of a run: the lead of a booking of the arbiter has it (`cs_lead_us`).
+    var timing = ll_cs_radio.cs_timing_none()
+    if rc.supported
+        timing = air.cs_timing()
+    cs_gw_put(var c, ll_cs_proc.GW_ARM_LEAD, timing.arm_lead_us)
     // The table of frequency actuation errors the peer asks for with LL_CS_FAE_REQ: the radio's, for each allowed channel in index order.  A radio that needs none has no table
     // to report, and the Controller says so with No_FAE.
     for k in 0..ll_cs.CHANNEL_COUNT
@@ -9928,12 +9933,15 @@ fn cs_plan_part<C: Cipher[e]>(var c: Controller, var cc: C, var st: ll_cs_plan.C
 @tier(embedded)
 fn cs_run_part<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_cs_plan.CsState, gen: Int, code: Int,
                               test: Bool, proc_last: Bool, pct: Bool, handle: Int, cfg_id: Int,
-                              start_ev: Int, proc: Int, t0_us: Int, window_us: Int) -> Int [s]
+                              start_ev: Int, proc: Int, t0_us: Int, window_us: Int, skip: Bool) -> Int [s]
     if test
         st.plan.head.test = 1
     st.plan.head.window_us = window_us as u32
     var raw = ll_cs_radio.cs_raw_new()
-    let armed = ll_cs_plan.plan_arm(var air, var st.plan, t0_us)
+    // A subevent that is skipped is not handed to the radio: it is reported as the one that arrives too late for it (a scheduling conflict).
+    var armed = ll_cs_radio.CS_LATE
+    if not skip
+        armed = ll_cs_plan.plan_arm(var air, var st.plan, t0_us)
     var status = armed
     if armed == ll_cs_radio.CS_OK
         status = air.cs_run(var raw)
@@ -9993,7 +10001,7 @@ fn cs_run<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
     if code == ll_cs_plan.PLAN_FAULT
         return RUN_FAULT
     // Only a test runs the planning and the subevent in one call, and its peer starts when its Host says so: the receiver waits for it.
-    cs_run_part(var c, var air, var st, gen, code, test, proc_last, pct, handle, cfg_id, start_ev, proc, t0_us, 0)
+    cs_run_part(var c, var air, var st, gen, code, test, proc_last, pct, handle, cfg_id, start_ev, proc, t0_us, 0, false)
 
 // A procedure instance of the series of the connection in slot `ls` begins in the connection event `ev`: the channel map of a Channel Map Update whose instant has come takes
 // effect, CSProcCount is incremented (except for the first instance after Security Start), and the generator of the connection is keyed from the values of the Security Start
@@ -10166,6 +10174,19 @@ fn ctl_cs_subevent_plan<C: Cipher[e]>(var c: Controller, var cc: C, var st: ll_c
 @when(noble_controller_config.CTL_CS > 0)
 pub @tier(embedded)
 fn ctl_cs_subevent_run<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_cs_plan.CsState, ls: Int, ev: Int, t0_us: Int) -> Int [s]
+    cs_subevent_finish(var c, var air, var st, ls, ev, t0_us, false)
+
+// Give up the subevent that `ctl_cs_subevent_plan` planned without handing it to the radio, because the arbiter has no room for it (`ctl_cs_fits`) or its connection event is not
+// a subrated event: the Host reads it as a subevent aborted for a scheduling conflict (Subevent_Abort_Reason 0x3), and the generator, which the plan advanced, stays in step with
+// the peer's.  The answer is that of `ctl_cs_subevent_run`.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_subevent_skip<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_cs_plan.CsState, ls: Int, ev: Int) -> Int [s]
+    cs_subevent_finish(var c, var air, var st, ls, ev, 0, true)
+
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_subevent_finish<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_cs_plan.CsState, ls: Int, ev: Int, t0_us: Int, skip: Bool) -> Int [s]
     let i = cs_find(var c, ls)
     if i < 0
         return RUN_NONE
@@ -10176,7 +10197,7 @@ fn ctl_cs_subevent_run<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_
     var local = ll_cs_pdu.cap_new()
     cs_local(var c, var local)
     let last = cs.series_n != 0 and ((cs.proc_count - cs.series_start + 1) & 0xFFFF) >= cs.series_n
-    let r = cs_run_part(var c, var air, var st, i, st.plan.code, false, false, local.sounding_pct == 1, c.links[ls].handle, cs.series_cfg, ev, cs.proc_count, t0_us, CS_LISTEN_US)
+    let r = cs_run_part(var c, var air, var st, i, st.plan.code, false, false, local.sounding_pct == 1, c.links[ls].handle, cs.series_cfg, ev, cs.proc_count, t0_us, CS_LISTEN_US, skip)
     if r == RUN_DONE and last
         ll_cs_proc.series_done(var cs)
         cs_put(var c, i, var cs)
@@ -10265,6 +10286,98 @@ pub @tier(embedded)
 fn ctl_cs_result_waiting(var c: Controller) -> Bool
     cs_gw(var c, ll_cs_proc.GW_RES_STATE) != 0
 
+// ── Channel Sounding: the arbiter and the placing ───────────────────
+// A subevent is booked in the arbiter as `[t0 - lead, t0 + length + finish]` in one of two classes (`ll_arb.cs_class`), tested whole against the classes above it before the radio is
+// armed, and given up as a subevent aborted for a scheduling conflict when it does not fit.  The Start is placed beforehand among the connection events and the streams the
+// Controller serves (`ll_cs_fit`, filled by `cs_busy` into the environment of the procedures), and the radio program holds the HCI stream back for `ll_cs.QUIET_US` after a run.
+
+// The time before the start of a subevent that the radio is booked: the program's work (`ll_cs.WORK_US`) and the radio's arming lead (`CsTiming.arm_lead_us`, read by `ctl_cs_radio_init`).
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_lead_us(var c: Controller) -> Int
+    ll_cs.WORK_US + cs_gw(var c, ll_cs_proc.GW_ARM_LEAD)
+
+// Add the booking of the periodic events of the link in slot `slot` to `b`: its subrated events, from the first at or after the one it runs next; `hard` is set for the link
+// that carries the procedure.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_busy_link(var c: Controller, slot: Int, hard: Bool, var en: ll_cs_proc.Env)
+    if not (ll_link.link_live(var c.links[slot]) and not c.links[slot].closing)
+        return
+    let iv = ll_link.interval_us(var c.links[slot])
+    let factor = c.links[slot].sub_factor as Int
+    let res = c.links[slot].sub_res as Int
+    var d = 0
+    for k in 0..factor
+        if ll_sub.on_grid((c.links[slot].ev_count + k) & 0xFFFF, res, factor)
+            d = k
+            break
+    ll_cs_proc.fit_add(var en, c.links[slot].due + d * iv, iv * factor, ll_cs.CONN_FIT_US, c.arb.lead + ll_radio.ACL_EXTRA_US, hard)
+
+// Fill `b` with what the Controller serves beside Channel Sounding, seen from the link in slot `ls`: the subrated events of every link, the events of the connected isochronous
+// streams and of the broadcast groups.  The record is `ll_cs_fit.busy_link`'s for the carrying link.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_busy(var c: Controller, ls: Int, var en: ll_cs_proc.Env)
+    ll_cs_proc.fit_link(var en, c.links[ls].due, c.links[ls].ev_count, ll_link.interval_us(var c.links[ls]), c.links[ls].sub_factor as Int, c.links[ls].sub_res as Int,
+        ctl_cs_lead_us(var c), ll_cs.FINISH_US, ll_cs.PLAN_FIT_US)
+    for slot in 0..noble_controller_config.CTL_LINKS
+        cs_busy_link(var c, slot, slot == ls, var en)
+    if ctl_limits.iso_on()
+        for i in 0..ctl_limits.cis_slots()
+            if cis_running(var c, i)
+                var first = c.cis[i].anchor
+                let len = ll_iso.event_len_us(var c.cis[i]) + CIS_BOOK_MARGIN_US
+                if first + len <= c.now
+                    first = first + ll_iso.iso_us(var c.cis[i])
+                ll_cs_proc.fit_add(var en, first, ll_iso.iso_us(var c.cis[i]), len, c.arb.lead, true)
+    if ctl_limits.big_on()
+        for g in 0..ctl_limits.big_slots()
+            if big_runs(var c, g)
+                ll_cs_proc.fit_add(var en, ctl_big_start(var c, g), ll_big.iso_us(var c.bigs[g]), ctl_big_book_us(var c, g), c.arb.lead, true)
+
+// Whether the connection event `ev` of the link in slot `ls` is a subrated event of the grid in force, the only kind a Channel Sounding event may be offset from.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_event_on_grid(var c: Controller, ls: Int, ev: Int) -> Bool
+    ll_link.sub_grid(var c.links[ls], ev)
+
+// Whether a subevent that starts at `t0` and lasts `len` microseconds may run: the arbiter has no booking of the classes above its own inside the stretch it holds the radio,
+// and the connection events of the link in slot `ls` that carries the procedure (-1 for a test) are not inside it either.  `first` says it is the first subevent of an event, and
+// `under_way` that an earlier subevent of the event ran.  The bookings are made again first, as the radio program's turn that ran a connection event has not asked the arbiter
+// what is due next.  A build whose arbiter has no class for the feature never fits.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_fits(var c: Controller, ls: Int, first: Bool, under_way: Bool, now: Int, t0: Int, len: Int) -> Bool
+    let _next = ctl_ll_next_start(var c)
+    var link_cls = -1
+    if ls >= 0
+        link_cls = slot_class(ls)
+    ll_arb.arb_cs_fits(var c.arb, ll_arb.cs_class(first, under_way), link_cls, now, t0, ctl_cs_lead_us(var c), len, ll_cs.FINISH_US)
+
+// Book the radio for the subevent that starts at `t0` and lasts `len`, in the class `ll_arb.cs_class` gives, and hold the HCI stream back until `ll_cs.QUIET_US` after `now`.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_book(var c: Controller, first: Bool, under_way: Bool, now: Int, t0: Int, len: Int)
+    ll_arb.arb_book_cs(var c.arb, ll_arb.cs_class(first, under_way), t0, ctl_cs_lead_us(var c), len, ll_cs.FINISH_US)
+    cs_gw_put(var c, ll_cs_proc.GW_QUIET, t0 + len + ll_cs.QUIET_US)
+
+// The booking of the subevent is over: both classes are cancelled.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_unbook(var c: Controller)
+    ll_arb.arb_cancel(var c.arb, ll_arb.class_cs())
+    ll_arb.arb_cancel(var c.arb, ll_arb.class_cs_next())
+
+// The microseconds the main loop may spend on the HCI stream: `room` (`ctl_ll_room`), or none while the stream is held back for a subevent (the UARTE sends garbled octets within
+// about 2 ms of a radio operation of Channel Sounding).  Connection events are served meanwhile.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_room(var c: Controller, now: Int, room: Int) -> Int
+    if now < cs_gw(var c, ll_cs_proc.GW_QUIET)
+        return 0
+    room
+
 // ── Channel Sounding: the procedures of the Link Layer ──────────────
 // The procedures are in ll_cs_proc.nv, over one record `Cs` for each connection that runs them.  The Controller keeps the records as numbers and octets
 // in its two tables `cs_w` and `cs_b` (`ctl_cs` records, claimed by the first request of the Host or the peer and given back when the connection ends) and
@@ -10350,7 +10463,7 @@ fn cs_reset_all(var c: Controller)
         cs_put(var c, i, var cs)
     // What the Controller keeps for all connections goes, but for what describes the radio (the capabilities it was read for, whether it reports the tone quality).
     for k in 0..ll_cs_proc.GLOBAL_WORDS
-        if k != ll_cs_proc.GW_RADIO and k != ll_cs_proc.GW_TQ
+        if k != ll_cs_proc.GW_RADIO and k != ll_cs_proc.GW_TQ and k != ll_cs_proc.GW_ARM_LEAD
             cs_gw_put(var c, k, 0)
     for slot in 0..noble_controller_config.CTL_LINKS
         ll_link.link_set_host_cs(var c.links[slot], false)
@@ -10399,6 +10512,7 @@ fn cs_env(var c: Controller, ls: Int, var en: ll_cs_proc.Env)
     en.managed = 0xF
     en.sec_ok = true
     en.max_tx = ll_link.tx_limit(var c.links[ls])
+    cs_busy(var c, ls, var en)
 
 // A control PDU of Channel Sounding, or a refusal of one of its requests, arrived on the link in slot `ls` (`Link.ctl_in`): the procedure answers.  A request
 // of the peer for which every record is taken is refused with Rejected Due To Limited Resources.

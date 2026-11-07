@@ -593,9 +593,9 @@ fn test_the_connect_ind_opens_the_central_link_and_ends_the_initiating_state()
     // The event is booked at its anchor in the connection class, and the Initiating
     // state's window is not.
     let _p = ctl_hci.ctl_ll_pick(var c, false)
-    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_acl()))
     test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
-    test.assert_eq(c.arb.start[ll_arb.CLASS_ACL], 5000 + 1250)
+    test.assert_eq(c.arb.start[ll_arb.class_acl()], 5000 + 1250)
     // The Host is told nothing until the Peripheral has answered.
     test.assert_eq(list.len(events_coded(run(var c, 0x1001, []), 0x3E)), 0)
 
@@ -814,7 +814,7 @@ fn test_a_central_that_gets_no_answer_fails_to_establish_and_the_host_is_told()
     test.assert_eq(ev[0][7], 0)
     test.assert_eq(list.len(events_coded(host, 0x05)), 0)
     test.assert(not ll_link.link_live(var c.links[0]))
-    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_acl()))
     // The slot is free for the next connection.
     assert_slot_free(var c)
 
@@ -973,10 +973,10 @@ fn test_a_peripheral_link_opens_beside_the_central_link()
     test.assert(not c.adv.enabled)
     // The two bookings are in their own classes.
     let _p = ctl_hci.ctl_ll_pick(var c, false)
-    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
-    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL2))
-    test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.CLASS_ACL), 0)
-    test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.CLASS_ACL2), 1)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_acl()))
+    test.assert(ll_arb.arb_booked(var c.arb, (ll_arb.class_acl() + 1)))
+    test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.class_acl()), 0)
+    test.assert_eq(ctl_hci.ctl_class_slot((ll_arb.class_acl() + 1)), 1)
     test.assert_eq(ctl_hci.ctl_class_slot(ll_arb.class_adv()), -1)
     // The Peripheral's LE Connection Complete names handle 2 and role 1.
     var host: [Int] = []
@@ -1198,7 +1198,7 @@ fn test_the_second_slot_reports_its_events_and_ends_on_its_own()
     test.assert_eq(list.len(ds), 1)
     test.assert_eq(ds[0][4] | (ds[0][5] << 8), 2)
     test.assert(ll_link.link_live(var c.links[0]))
-    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL2))
+    test.assert(not ll_arb.arb_booked(var c.arb, (ll_arb.class_acl() + 1)))
     // The slot is free once the event is sent, and a Central can use it.
     test.assert_eq(ctl_hci.free_slot(var c), 1)
 
@@ -1234,7 +1234,7 @@ fn test_the_second_slot_is_caught_up_and_queried_by_slot()
     test.assert(not ctl_hci.slot_central(var c, 1))
     test.assert(ctl_hci.slot_central(var c, 0))
     test.assert_eq(ctl_hci.handle_slot(var c, 2), 1)
-    test.assert_eq(ctl_hci.slot_class(1), ll_arb.CLASS_ACL2)
+    test.assert_eq(ctl_hci.slot_class(1), (ll_arb.class_acl() + 1))
     test.assert_eq(ctl_hci.slot_aa(var c, 1), 0x50655A12)
     let skipped = ctl_hci.ctl_conn_catch_up(var c, 1, 9000 + 1250 + 2500 + 24 * 1250 * 2 + 100)
     test.assert(skipped >= 2)
@@ -1434,14 +1434,14 @@ fn test_a_link_whose_booking_ran_out_while_the_program_was_away_is_run_again()
     // The first event was due at 6250 and its booking covered 3 ms past it.  The
     // program comes back 20 ms later: the link must still be granted the radio.
     ctl_hci.ctl_set_time(var c, 6250 + 20000)
-    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.CLASS_ACL)
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.class_acl())
     // The event skips the windows that closed and moves the schedule past now.
     let skipped = ctl_hci.ctl_conn_catch_up(var c, 0, 6250 + 20000)
     test.assert(skipped >= 1)
     test.assert(c.links[0].due > 6250 + 20000)
     test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.NONE)
     ctl_hci.ctl_set_time(var c, c.links[0].due)
-    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.CLASS_ACL)
+    test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.class_acl())
 
 @when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
 @test
@@ -1449,7 +1449,7 @@ fn test_a_peripheral_link_is_run_again_after_the_program_was_away_too()
     var c = two_links()
     ctl_hci.ctl_set_time(var c, 9000 + 1250 + 2500 + 5 * 24 * 1250)
     var picked = ctl_hci.ctl_ll_pick(var c, false)
-    test.assert(picked == ll_arb.CLASS_ACL or picked == ll_arb.CLASS_ACL2)
+    test.assert(picked == ll_arb.class_acl() or picked == (ll_arb.class_acl() + 1))
     let a = ctl_hci.ctl_conn_catch_up(var c, 1, c.now)
     test.assert(a >= 1)
     let b = ctl_hci.ctl_conn_catch_up(var c, 0, c.now)

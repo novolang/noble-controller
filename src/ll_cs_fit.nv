@@ -1,0 +1,417 @@
+// src/ll_cs_fit.nv — the placing of Channel Sounding on the radio's time: whether the subevents a Start names fit among the events the Controller serves, and where the
+// Controller puts them when it may choose.
+//
+// A subevent is all or nothing on the radio and is offset from a connection event of the subrated grid of the link that carries the procedure ([Vol 6] Part B, Section 4.5.7.1).
+// The Link Layer therefore books a subevent as `[t0 - lead - reserve, t0 + length + finish]` and the placing tests that stretch against everything else that is periodic: the
+// used connection events of every link (the subrated grid of each), the events of the connected isochronous streams and of the broadcast groups.  Advertising events, scan windows and
+// the events of periodic trains are not tested: their classes are below Channel Sounding's in the arbiter, so they give way.  The Controller fills a `Busy` from its links
+// and streams (`ctl_hci.cs_busy`, through `ll_cs_proc.fit_link` and `fit_add`); this module holds the arithmetic and no state of the Controller, so the tests build a `Busy` by hand.
+//
+// Which events matter depends on the subevent.  The first subevent of an event is booked in the class below the connection classes, so every connection event and every stream
+// event counts.  The later subevents of an event take the class above the connection classes (D5 of the design), so only the events of the link that carries the procedure and the
+// streams count: a connection event of another link that falls in the event is the one that waits.  A booking is hard when it counts for every subevent (`B_HARD`).
+//
+// What the placing may change follows Section 5.1.26: connEventCount (to a later event of the grid), the window of offsets (narrowed to the offsets that fit), Event_Interval (up to
+// a multiple of the subrate factor, and further when the program needs the time to plan between two events) and Subevent_Len (down to 1,250 microseconds, never above the request's).
+// Subevents_Per_Event and Subevent_Interval are not re-suggested.  Procedure_Interval is not in the list, so a request whose
+// interval is not a multiple of the factor is refused.  The times are on the radio's timebase, in microseconds.
+
+use noble_controller_config
+use ll_cs
+use ll_sub
+
+// The events of a procedure the placing tests, and the offsets it tries in a window, in microseconds apart.  The tests look at the first events only: a later one
+// is met by the arbiter at run time, which skips a subevent that does not fit.
+const CHECK_EVENTS = 4
+const OFFSET_STEP_US = 250
+const OFFSET_PICK_US = 3000
+
+// How many later events of the grid are tried when the first does not fit, and how many shorter subevents.
+const EVENT_TRIES = 3
+const LENGTH_TRIES = 3
+const INTERVAL_TRIES = 3
+
+// How many bookings a stretch of time is moved past before it is given up.
+const STRETCH_TRIES = 12
+
+// What is booked beside Channel Sounding, seen from the link that carries the procedure.  The record is a table of integers, not a struct, so that this module declares no type of
+// its own (the images without the feature load it and must not change).  The table (`Busy`, `BUSY_SIZE` entries, one entry where the build has no feature) holds, by index:
+//
+//   B_ON            1 when the Controller filled the record; 0 is a build or a test with no scheduling, for which every Start fits
+//   B_DUE, B_EV0    the time of the connection event ev0 of the carrying link (the one it is to run next), on the radio's timebase, and its counter
+//   B_IV            its connection interval
+//   B_FACTOR, B_RES its subrate factor and the residue of the base event (`ll_sub.residue`): the events with counter minus residue a multiple of the factor are subrated
+//   B_LEAD          the time before a subevent's start that the radio is held: the program's work and the radio's arming lead
+//   B_FINISH        the time after the end of the subevent the radio is held
+//   B_PLAN          the time the program takes to plan a subevent, which it does after the one before has run and which holds the main loop: no connection event or stream
+//                   event is served meanwhile, so the planning needs that much time clear between two subevents (0 for a program that plans ahead)
+//   B_N             the periodic bookings beside Channel Sounding, and for each of them `BOOKINGS` entries of
+//   B_FIRST         the start of its next event
+//   B_PERIOD        the time between two events, 0 for one event
+//   B_LEN           the time an event holds the radio
+//   B_AHEAD         the time before an event that the arbiter grants it the radio
+//   B_HARD          1 when it counts for every subevent, 0 when for the first subevent of an event alone
+//
+// A booking is added with `busy_add`: the carrying link first, then the other links, the streams and the groups, as many as `BOOKINGS`; a booking beyond them is not seen by
+// the placing, and the arbiter meets it at run time.
+pub alias Busy = Vec[Int; if noble_controller_config.CTL_CS > 0 then 130 else 1]
+
+const BOOKINGS = 24
+const B_ON = 0
+const B_DUE = 1
+const B_EV0 = 2
+const B_IV = 3
+const B_FACTOR = 4
+const B_RES = 5
+const B_LEAD = 6
+const B_FINISH = 7
+const B_PLAN = 8
+const B_N = 9
+const B_FIRST = 10
+const B_PERIOD = 34
+const B_LEN = 58
+const B_AHEAD = 82
+const B_HARD = 106
+const BUSY_SIZE = 130
+
+// A record with the carrying link described and no other booking.
+@tier(embedded)
+fn busy_with(on: Int, due: Int, ev0: Int, iv: Int, factor: Int, res: Int, lead: Int, finish: Int) -> Busy
+    var b: Busy = Vec.new()
+    for _ in 0..b.capacity()
+        let _z = b.push(0)
+    if b.capacity() >= BUSY_SIZE
+        b[B_ON] = on
+        b[B_DUE] = due
+        b[B_EV0] = ev0
+        b[B_IV] = iv
+        b[B_FACTOR] = factor
+        b[B_RES] = res
+        b[B_LEAD] = lead
+        b[B_FINISH] = finish
+    b
+
+// A record that places nothing: every Start fits.
+@tier(embedded)
+fn busy_new() -> Busy
+    busy_with(0, 0, 0, 0, 1, 0, 0, 0)
+
+// A record for the carrying link: its event `ev0` is due at `due`, its interval is `iv`, its subrate grid is `factor` and `res`, and a subevent holds the radio `lead` before
+// its start and `finish` after its end.
+@tier(embedded)
+fn busy_link(due: Int, ev0: Int, iv: Int, factor: Int, res: Int, lead: Int, finish: Int) -> Busy
+    busy_with(1, due, ev0, iv, factor, res, lead, finish)
+
+// Set the time the program takes to plan a subevent.
+@tier(embedded)
+fn busy_set_plan(var b: Busy, plan: Int)
+    if b.capacity() >= BUSY_SIZE
+        b[B_PLAN] = plan
+
+// Whether the record was filled.
+@tier(embedded)
+fn busy_on(var b: Busy) -> Bool
+    b.capacity() >= BUSY_SIZE and b[B_ON] != 0
+
+// The number of bookings besides the carrying link's own record.
+@tier(embedded)
+fn busy_n(var b: Busy) -> Int
+    b[B_N]
+
+// Add a periodic booking: events from `first` every `period` microseconds (0 for one event), each holding the radio `len` and granted it `ahead` early.  False when the table is full.
+@tier(embedded)
+fn busy_add(var b: Busy, first: Int, period: Int, len: Int, ahead: Int, hard: Bool) -> Bool
+    if b.capacity() < BUSY_SIZE or b[B_N] >= BOOKINGS
+        return false
+    let n = b[B_N]
+    b[B_FIRST + n] = first
+    b[B_PERIOD + n] = period
+    b[B_LEN + n] = len
+    b[B_AHEAD + n] = ahead
+    var h = 0
+    if hard
+        h = 1
+    b[B_HARD + n] = h
+    b[B_N] = n + 1
+    true
+
+// The parameters of a Start the placing reads and may change, as a table of integers (`Q_` indices, as `Busy` is one): connEventCount, Offset_Min and Offset_Max
+// (microseconds), Max_Procedure_Len (units of 625 microseconds), Event_Interval (connection events), Subevents_Per_Event, Subevent_Interval (units of 625 microseconds),
+// Subevent_Len (microseconds) and Procedure_Interval (connection events).  `ll_cs_proc.start_req` makes one from an LL_CS_REQ and `ll_cs_proc.place_start` puts the result back.
+pub alias Req = Vec[Int; if noble_controller_config.CTL_CS > 0 then 9 else 1]
+
+const Q_CONN = 0
+const Q_OMIN = 1
+const Q_OMAX = 2
+const Q_MAXLEN = 3
+const Q_EINT = 4
+const Q_SUBS = 5
+const Q_SINT = 6
+const Q_SLEN = 7
+const Q_PINT = 8
+const Q_SIZE = 9
+
+// A table with the parameters of a Start.
+@tier(embedded)
+fn req_with(conn: Int, omin: Int, omax: Int, max_len: Int, ev_int: Int, subs: Int, sub_int: Int, sub_len: Int, proc_int: Int) -> Req
+    var q: Req = Vec.new()
+    for _ in 0..q.capacity()
+        let _z = q.push(0)
+    if q.capacity() >= Q_SIZE
+        q[Q_CONN] = conn
+        q[Q_OMIN] = omin
+        q[Q_OMAX] = omax
+        q[Q_MAXLEN] = max_len
+        q[Q_EINT] = ev_int
+        q[Q_SUBS] = subs
+        q[Q_SINT] = sub_int
+        q[Q_SLEN] = sub_len
+        q[Q_PINT] = proc_int
+    q
+
+// ── The grid of the carrying link ───────────────────────────────────
+
+// The signed distance in events from `ev0` to the counter `ev` (16 bits, modulo 65536).
+@tier(embedded)
+fn event_distance(var b: Busy, ev: Int) -> Int
+    let d = (ev - b[B_EV0]) & 0xFFFF
+    if d >= 0x8000
+        return d - 0x10000
+    d
+
+// The time of the anchor point of the carrying link's connection event `ev`.
+@tier(embedded)
+fn event_time(var b: Busy, ev: Int) -> Int
+    b[B_DUE] + event_distance(var b, ev) * b[B_IV]
+
+// Whether the connection event `ev` is a subrated event of the carrying link: the grid of a counter that has wrapped since `ev0` has the residue the wrap gives (Section 4.5.1).
+@tier(embedded)
+fn on_grid(var b: Busy, ev: Int) -> Bool
+    if b[B_FACTOR] <= 1
+        return true
+    var res = b[B_RES]
+    if event_distance(var b, ev) > 0 and (ev & 0xFFFF) < b[B_EV0]
+        res = ll_sub.wrap(res, b[B_FACTOR])
+    ll_sub.on_grid(ev & 0xFFFF, res, b[B_FACTOR])
+
+// The first subrated event at or after `ev`.
+@tier(embedded)
+fn grid_event(var b: Busy, ev: Int) -> Int
+    var e = ev & 0xFFFF
+    for _ in 0..b[B_FACTOR]
+        if on_grid(var b, e)
+            return e
+        e = (e + 1) & 0xFFFF
+    e
+
+// ── The bookings beside Channel Sounding ────────────────────────────
+
+// Whether an event of the booking `i` holds the radio at some time in `s` to `e` (a stretch of microseconds): from `ahead` before its start to `len` after it.
+@tier(embedded)
+fn booking_hits(var b: Busy, i: Int, s: Int, e: Int) -> Bool
+    let first = b[B_FIRST + i]
+    let period = b[B_PERIOD + i]
+    let len = b[B_LEN + i]
+    var k = 0
+    if period > 0
+        // The first event that ends after `s`: first + k * period + len > s.
+        let d = s - len - first
+        if d >= 0
+            k = d / period + 1
+    else if first + len <= s
+        return false
+    first + k * period - b[B_AHEAD + i] < e
+
+// Whether nothing beside Channel Sounding holds the radio in `s` to `e`; `hard_only` leaves out the bookings that count for the first subevent of an event alone.
+@tier(embedded)
+fn span_free(var b: Busy, s: Int, e: Int, hard_only: Bool) -> Bool
+    for i in 0..b[B_N]
+        if (b[B_HARD + i] != 0 or not hard_only) and booking_hits(var b, i, s, e)
+            return false
+    true
+
+// The stretch the radio is held for a subevent that starts at `t0` and lasts `len`, `after` microseconds from the connection event it is offset from (the widening of
+// the offset): from the lead and the reserve before the start to the finish after the end.
+@tier(embedded)
+fn subevent_free(var b: Busy, t0: Int, len: Int, after: Int, hard_only: Bool) -> Bool
+    let widen = after * ll_cs.WIDEN_PPM / 1000000
+    span_free(var b, t0 - b[B_LEAD] - ll_cs.RESERVE_US - widen, t0 + len + b[B_FINISH] + widen, hard_only)
+
+// The end of the first event of the booking `i` that holds the radio in `s` to `e`, -1 when none does.
+@tier(embedded)
+fn booking_end(var b: Busy, i: Int, s: Int, e: Int) -> Int
+    if not booking_hits(var b, i, s, e)
+        return -1
+    let first = b[B_FIRST + i]
+    let period = b[B_PERIOD + i]
+    var k = 0
+    if period > 0
+        let d = s - b[B_LEN + i] - first
+        if d >= 0
+            k = d / period + 1
+    first + k * period + b[B_LEN + i]
+
+// Whether the program has `need` microseconds clear of every booking somewhere in `from` to `until`: the planning of a subevent between two runs.  The stretch moves past
+// each booking in the way.
+@tier(embedded)
+fn stretch_free(var b: Busy, from: Int, until: Int, need: Int) -> Bool
+    if need <= 0
+        return true
+    var at = from
+    for _ in 0..STRETCH_TRIES
+        if at + need > until
+            return false
+        var moved = false
+        for i in 0..b[B_N]
+            let end = booking_end(var b, i, at, at + need)
+            if end >= 0 and end > at
+                at = end
+                moved = true
+        if not moved
+            return true
+    false
+
+// ── Whether a Start fits ────────────────────────────────────────────
+
+// The events of the procedure the placing tests: at most `CHECK_EVENTS`, and no more than the procedure holds.
+@tier(embedded)
+fn events_checked(var b: Busy, ev_int: Int, max_proc_len: Int) -> Int
+    var n = 1
+    let span = ev_int * b[B_IV]
+    if span > 0
+        n = (max_proc_len * ll_cs.UNIT_US + span - 1) / span
+    if n > CHECK_EVENTS
+        n = CHECK_EVENTS
+    if n < 1
+        n = 1
+    n
+
+// Whether the subevents of the Start `s` fit with the first of them `offset` after the connection event `s[Q_CONN]`, an interval of events `ev_int`, `subevents` subevents of
+// the length `len` and the spacing `s[Q_SINT]`: every subevent of the events tested clears the bookings that count for it.
+@tier(embedded)
+fn offset_fits(var b: Busy, var s: Req, offset: Int, ev_int: Int, len: Int) -> Bool
+    let n = events_checked(var b, ev_int, s[Q_MAXLEN])
+    let gap = s[Q_SINT] * ll_cs.UNIT_US
+    var prev_end = -1
+    for k in 0..n
+        let anchor = event_time(var b, s[Q_CONN] + k * ev_int)
+        for j in 0..s[Q_SUBS]
+            let after = offset + j * gap
+            let t0 = anchor + after
+            if not subevent_free(var b, t0, len, after, j > 0)
+                return false
+            // The planning of this subevent is made after the one before ran, in the time between them.
+            if prev_end >= 0 and not stretch_free(var b, prev_end, t0 - b[B_LEAD] - ll_cs.RESERVE_US, b[B_PLAN])
+                return false
+            prev_end = t0 + len + b[B_FINISH]
+    true
+
+// The interval of events a Start may use: the request's, up to a multiple of the factor when the procedure holds more than one event (every connection event the events are offset
+// from is then a subrated event).
+@tier(embedded)
+fn event_interval_for(var b: Busy, s: Req) -> Int
+    let ev_int = s[Q_EINT]
+    if b[B_FACTOR] <= 1 or ev_int % b[B_FACTOR] == 0
+        return ev_int
+    if s[Q_MAXLEN] * ll_cs.UNIT_US <= ev_int * b[B_IV]
+        // One event in the procedure: the interval is never used.
+        return ev_int
+    (ev_int / b[B_FACTOR] + 1) * b[B_FACTOR]
+
+// The offset in the window `lo` to `hi` that the Central picks when it may choose: `OFFSET_PICK_US` when the window holds it, else the end of the window nearest to it.
+@tier(embedded)
+fn pick_offset(lo: Int, hi: Int) -> Int
+    if lo >= OFFSET_PICK_US
+        return lo
+    if hi < OFFSET_PICK_US
+        return hi
+    OFFSET_PICK_US
+
+// The first offset in the window of the Start `s` at which its subevents fit, the one the Central would pick first, then upwards from the window's start; -1 when none does.
+@tier(embedded)
+fn offset_for(var b: Busy, var s: Req, ev_int: Int, len: Int) -> Int
+    let pick = pick_offset(s[Q_OMIN], s[Q_OMAX])
+    if offset_fits(var b, var s, pick, ev_int, len)
+        return pick
+    var off = s[Q_OMIN]
+    while off <= s[Q_OMAX]
+        if off != pick and offset_fits(var b, var s, off, ev_int, len)
+            return off
+        off = off + OFFSET_STEP_US
+    -1
+
+// Whether a Start as it stands fits: its connection event is a subrated event, its events are offset from subrated events, its procedure interval keeps them there, and some
+// offset in its window leaves its subevents clear.  A record with no scheduling (`on` false) fits everything.
+@tier(embedded)
+fn start_fits(var b: Busy, var s: Req) -> Bool
+    if not busy_on(var b)
+        return true
+    if not on_grid(var b, s[Q_CONN]) or event_interval_for(var b, s) != s[Q_EINT]
+        return false
+    if b[B_FACTOR] > 1 and s[Q_PINT] % b[B_FACTOR] != 0
+        return false
+    offset_for(var b, var s, s[Q_EINT], s[Q_SLEN]) >= 0
+
+// ── Placing a Start ─────────────────────────────────────────────────
+
+// Place the Start `s` among the bookings, re-suggesting what Section 5.1.26 lets the answering Link Layer change: the connection event moves to a later event of the
+// subrated grid, the events are spaced a multiple of the factor, and the subevent is shortened (to the least length, never below the PDU's 1250 microseconds) until its
+// subevents leave the bookings clear.  The window of offsets of `s` is narrowed to the offsets that fit, from the first that does (`offset_min`) to the end of the run of
+// offsets that do, at the steps the placing tries (`offset_max`); a Central picks one in it, and `s[Q_OMIN]` is then the Offset of an LL_CS_IND.  False when nothing fits or Procedure_Interval is not a multiple of the factor (the specification does not let the answerer change it); `s` is then unchanged.
+// A record with no scheduling leaves `s` as it was.
+@tier(embedded)
+fn place(var b: Busy, var s: Req) -> Bool
+    if not busy_on(var b)
+        return true
+    if b[B_FACTOR] > 1 and s[Q_PINT] % b[B_FACTOR] != 0
+        return false
+    let ev_min = event_interval_for(var b, s)
+    var step = b[B_FACTOR]
+    if step < 1
+        step = 1
+    var ev = grid_event(var b, s[Q_CONN])
+    var t = s
+    for _ in 0..EVENT_TRIES
+        move_to(var t, ev)
+        // A longer interval of events leaves the program the time to plan between two events.
+        var ev_int = ev_min
+        for _ in 0..INTERVAL_TRIES
+            var len = s[Q_SLEN]
+            for _ in 0..LENGTH_TRIES
+                let off = offset_for(var b, var t, ev_int, len)
+                if off >= 0
+                    s[Q_CONN] = ev
+                    s[Q_EINT] = ev_int
+                    s[Q_SLEN] = len
+                    s[Q_OMIN] = off
+                    s[Q_OMAX] = run_end(var b, var t, off, ev_int, len)
+                    return true
+                len = shorter(len)
+            ev_int = ev_int + step
+        ev = grid_event(var b, ev + b[B_FACTOR])
+    false
+
+// Put the Start `t` at the connection event `ev`.
+@tier(embedded)
+fn move_to(var t: Req, ev: Int)
+    t[Q_CONN] = ev
+
+// The end of the run of offsets from `off` at which the subevents fit, stepping `OFFSET_STEP_US`, inside the window of `s`: the offset the Controller wants the peer to choose
+// from.  An offset between two steps that fit is taken to fit.
+@tier(embedded)
+fn run_end(var b: Busy, var s: Req, off: Int, ev_int: Int, len: Int) -> Int
+    var last = off
+    while last + OFFSET_STEP_US <= s[Q_OMAX] and offset_fits(var b, var s, last + OFFSET_STEP_US, ev_int, len)
+        last = last + OFFSET_STEP_US
+    last
+
+// The next shorter subevent: the middle between `len` and the least the PDU carries, and that least.
+@tier(embedded)
+fn shorter(len: Int) -> Int
+    let least = ll_cs.SUBEVENT_LEN_MIN_US
+    if len <= least
+        return least
+    let m = (len + least) / 2
+    if m < least
+        return least
+    m

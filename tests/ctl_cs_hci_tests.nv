@@ -17,6 +17,7 @@ use ll_link
 use ll_policy
 use ll_cs
 use ll_cs_pdu
+use ll_cs_fit
 use ll_cs_proc
 use ll_cs_hci
 use ll_cs_res
@@ -3448,6 +3449,9 @@ impl CsRadio[] for AirSim
     fn cs_caps(var self) -> CsCaps
         self.f.cs_caps()
 
+    fn cs_timing(var self) -> CsTiming
+        CsTiming { arm_lead_us: 150, rx_window_us: 0, turn_us: 0, finish_us: 0, max_steps: 160, max_run_us: 16000 }
+
     fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
         self.arms = self.arms + 1
         self.last_t0 = t0_us
@@ -3497,7 +3501,10 @@ fn test_the_slot_runs_an_le_cs_test_when_the_radio_is_clear_and_gives_the_radio_
     test.assert_eq(air.releases, 1)
     test.assert_eq(air.configs, 1)
     test.assert_eq(air.last_t0, 1_000_000 + 20000)
-    test.assert_eq(air.now, 1_000_000 + 3000 + 2500)
+    // The program does not wait for the UARTE after the run: it holds the HCI stream back for `ll_cs.QUIET_US` instead, and serves the connection events meanwhile.
+    test.assert_eq(air.now, 1_000_000 + 3000)
+    test.assert_eq(ctl_hci.ctl_cs_room(var c, air.now, 777), 0)
+    test.assert_eq(ctl_hci.ctl_cs_room(var c, 1_000_000 + 20000 + 5000 + ll_cs.QUIET_US, 777), 777)
     test.assert_eq(ctl_hci.ctl_cs_test_count(var c), -1)
     // The result waits for the Host; the slot does nothing while it does, and the events go out.
     test.assert(ctl_hci.ctl_cs_result_waiting(var c))
@@ -3543,7 +3550,7 @@ fn test_the_slot_starts_the_later_subevents_of_a_test_an_interval_after_the_one_
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert_eq(a.runs, 3)
     test.assert_eq(a.late, 1)
-    test.assert_eq(air.last_t0, air.now - 3000 - 2500 + 6000)
+    test.assert_eq(air.last_t0, air.now - 3000 + 6000)
     test.assert_eq(a.last, ctl_hci.RUN_DONE)
 
 // A scan window's receiver is on.
@@ -3606,7 +3613,9 @@ fn test_the_schedule_of_a_series_and_the_anchor_of_its_events_are_read_from_the_
     test.assert(not ctl_hci.ctl_cs_series_open(var c, 1))
     let sc = sched_of(var c)
     test.assert_eq(sc.conn_event, (c.links[0].ev_count + 6) & 0xFFFF)
-    test.assert_eq(sc.offset_us, 1000)
+    // The Controller places the first subevent after the connection event it is offset from: the event (`ll_cs.CONN_FIT_US`), the lead of the booking and the reserve before it
+    // (`ll_cs.WORK_US`, `ll_cs.RESERVE_US`) are 3850 microseconds, and the offsets are tried 250 apart from the 1000 of the window.
+    test.assert_eq(sc.offset_us, 4000)
     test.assert_eq(sc.event_interval, 1)
     test.assert_eq(sc.subevents, 1)
     test.assert_eq(sc.subevent_interval_us, 0)
@@ -3648,7 +3657,7 @@ fn test_the_slot_plans_a_procedure_ahead_and_runs_each_subevent_after_the_event_
     test.assert(a.begun)
     test.assert(a.prepared)
     test.assert_eq(a.runs, 0)
-    test.assert_eq(a.off_us, 1000)
+    test.assert_eq(a.off_us, 4000)
     // It is not time yet: the slot does nothing more.
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert_eq(a.runs, 0)
@@ -3658,12 +3667,15 @@ fn test_the_slot_plans_a_procedure_ahead_and_runs_each_subevent_after_the_event_
         let ta = 1_000_000 + (3 + k) * 30000
         link_at(var c, e0 + k, ta + 30000)
         air.now = ta + 500
-        for _ in 0..3
+        // The first poll books the subevent in the arbiter; the program hands it over when its lead begins.
+        ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+        air.now = ta + 4000 - ctl_hci.ctl_cs_lead_us(var c) - 100
+        for _ in 0..2
             ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
         let r = results(flush(var c))
         if a.done > done
             done = a.done
-            test.assert_eq(air.last_t0, ta + 1000)
+            test.assert_eq(air.last_t0, ta + 4000)
             test.assert(list.len(r) >= 1)
         if a.ls < 0
             break
@@ -3691,17 +3703,20 @@ fn test_the_slot_waits_for_the_event_the_subevent_is_offset_from_and_hands_a_sub
     var air = air_sim(2_000_000 - 50000)
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert(a.prepared)
-    // The event e0 has not run: it is booked at 2_090_000, before the subevent (1 ms after it), 4 ms from now.  The slot waits for the event to pass.
+    // The event e0 has not run: it is booked at 2_090_000, before the subevent (4 ms after it), 5 ms from now.  The slot waits for the event to pass.
     link_at(var c, e0, 2_090_000)
     air.now = 2_090_000 - 3000
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert_eq(a.runs, 0)
     test.assert_eq(a.waits, 1)
-    // Within the lead of the radio the booking is still there: the subevent is a conflict, handed to the radio with a start in the past and reported as aborted (abort 0x30).
-    air.now = 2_090_000 - 500
+    // The booking is still there when the lead of the subevent begins: the subevent is given up whole.  The radio is handed nothing, the Host reads a subevent aborted for
+    // a scheduling conflict (abort 0x30), and the generator stays in step.
+    air.now = 2_090_000 + 4000 - ctl_hci.ctl_cs_lead_us(var c) + 100
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
-    test.assert_eq(a.runs, 1)
-    test.assert_eq(a.missed, 1)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(a.skips, 1)
+    test.assert_eq(air.holds, 0)
+    test.assert_eq(air.arms, 0)
     let r = results(flush(var c))
     test.assert_eq(list.len(r), 1)
     test.assert_eq(r[0][3 + 12], 0xF)
@@ -3727,7 +3742,8 @@ fn test_the_slot_reports_a_subevent_whose_connection_event_cannot_be_placed_as_a
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert(a.prepared)
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
-    test.assert_eq(a.runs, 1)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(a.skips, 1)
     test.assert_eq(a.missed, 1)
     let r = results(flush(var c))
     test.assert_eq(r[0][3 + 12], 0xF)
@@ -3767,9 +3783,9 @@ fn test_the_slot_plans_only_when_the_radio_is_idle_for_as_long_as_the_planning_t
     var a = ll_cs_air.cs_air_new()
     var rf = ll_air.rf_new()
     let e0 = sched_of(var c).conn_event
-    // The next connection event is 5 ms away: the planning (12 ms before it is timed) waits.
+    // The next connection event is 3 ms away: the planning (`ll_cs.PLAN_FIT_US` and the margin before it is timed) waits.
     link_at(var c, e0 - 3, 4_000_000)
-    var air = air_sim(4_000_000 - 5000)
+    var air = air_sim(4_000_000 - 3000)
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert(not a.prepared)
     test.assert_eq(a.waits, 1)
@@ -3837,17 +3853,24 @@ fn test_the_slot_times_the_planning_and_waits_for_a_run_that_is_between_the_lead
     test.assert(a.prepared)
     // The planning read the clock twice, 7 microseconds apart.
     test.assert_eq(a.plan_us, 7)
-    // The run is 3 ms away (between the 2 ms of the lead and the 4 ms of the poll): the program waits for 2 ms before it, then hands the subevent over.
+    // The run is 3 ms away (inside the 8 ms of `BOOK_AHEAD_US`, beyond the lead): the subevent is booked and the program waits.  Within 0.5 ms of the lead it hands the
+    // subevent over, after the wait that brings the clock to the lead.
     let ta = 6_000_000 + 3 * 30000
     link_at(var c, e0 + 1, ta + 30000)
-    air.now = ta + 1000 - 3000
+    air.now = ta + 4000 - 3000
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 0)
+    test.assert(a.booked)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_cs()))
+    air.now = ta + 4000 - ctl_hci.ctl_cs_lead_us(var c) - 300
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert_eq(a.runs, 1)
     test.assert_eq(a.missed, 0)
-    test.assert(a.lead_us >= 1900)
-    test.assert(a.lead_us <= 2000)
+    test.assert(not a.booked)
+    test.assert(a.lead_us >= ctl_hci.ctl_cs_lead_us(var c) - 10)
+    test.assert(a.lead_us <= ctl_hci.ctl_cs_lead_us(var c) + 300)
     let _r = flush(var c)
-    // The next subevent is planned with the time the longest took in view (the room the arbiter must leave is that and 2 ms more, and there are 30 ms).
+    // The next subevent is planned with the time the longest took in view (the room the arbiter must leave is that and 0.5 ms more, and there are 30 ms).
     ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
     test.assert(a.prepared)
     test.assert_eq(a.plan_us, 7)
@@ -3924,3 +3947,208 @@ fn test_the_program_gives_up_a_series_whose_instance_or_planning_fails_and_a_run
     exchange_caps(var h)
     test.assert_eq(ctl_hci.ctl_cs_subevent_run(var h, var air2, var stg, 0, 5, 100000), ctl_hci.RUN_NONE)
     test.assert_eq(ctl_hci.ctl_cs_subevent_plan(var h, var cc, var stg, 0, 0, -1), ctl_hci.RUN_NONE)
+
+// ── The arbiter and the placing, in the Controller ──────────────────
+
+// The link in slot 0 has the subrate factor `factor` and the base event `base`.
+@when(noble_controller_config.CTL_CS > 0)
+fn link_subrated(var c: ctl_hci.Controller, factor: Int, base: Int)
+    c.links[0].sub_factor = factor as u16
+    c.links[0].sub_res = (base % factor) as u16
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_placing_is_given_the_events_of_the_link_with_its_subrated_grid_and_the_lead_of_the_radio()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var c = ready()
+    link_at(var c, 100, 1_000_000)
+    link_subrated(var c, 3, 100)
+    var e1 = ll_cs_proc.env_new()
+    ctl_hci.cs_busy(var c, 0, var e1)
+    var b = e1.fit
+    test.assert(ll_cs_fit.busy_on(var b))
+    test.assert_eq(b[ll_cs_fit.B_DUE], 1_000_000)
+    test.assert_eq(b[ll_cs_fit.B_EV0], 100)
+    test.assert_eq(b[ll_cs_fit.B_IV], 30000)
+    test.assert_eq(b[ll_cs_fit.B_FACTOR], 3)
+    test.assert_eq(b[ll_cs_fit.B_LEAD], ll_cs.WORK_US)
+    test.assert_eq(b[ll_cs_fit.B_FINISH], ll_cs.FINISH_US)
+    test.assert_eq(b[ll_cs_fit.B_PLAN], ll_cs.PLAN_FIT_US)
+    // The link's used events: from the event 100, on the grid, every three intervals.  It carries the procedure, so it counts for every subevent.
+    test.assert_eq(ll_cs_fit.busy_n(var b), 1)
+    test.assert_eq(b[ll_cs_fit.B_FIRST], 1_000_000)
+    test.assert_eq(b[ll_cs_fit.B_PERIOD], 90000)
+    test.assert_eq(b[ll_cs_fit.B_LEN], ll_cs.CONN_FIT_US)
+    test.assert_eq(b[ll_cs_fit.B_HARD], 1)
+    // The event the link runs next is not on the grid: the first used event is the next that is.
+    link_at(var c, 101, 1_030_000)
+    var e2 = ll_cs_proc.env_new()
+    ctl_hci.cs_busy(var c, 0, var e2)
+    var d = e2.fit
+    test.assert_eq(d[ll_cs_fit.B_FIRST], 1_030_000 + 2 * 30000)
+    test.assert(ctl_hci.ctl_cs_event_on_grid(var c, 0, 103))
+    test.assert(not ctl_hci.ctl_cs_event_on_grid(var c, 0, 104))
+    // The radio's arming lead joins the program's work in the lead of a subevent.
+    var air = air_sim(1_000_000)
+    ctl_hci.ctl_cs_radio_init(var c, var air)
+    test.assert_eq(ctl_hci.ctl_cs_lead_us(var c), ll_cs.WORK_US + air.cs_timing().arm_lead_us)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_subevent_is_booked_and_tested_against_the_events_of_the_link_that_carries_the_procedure_in_either_class()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var c = ready()
+    // The link runs its next event at 2_000_000 (booked from its listen start to its end and the tail of the booking), the one after 30 ms later.
+    link_at(var c, 100, 2_000_000)
+    let lead = ctl_hci.ctl_cs_lead_us(var c)
+    // A subevent that begins well after the event it is offset from and ends before the next fits, in the first class and in the later class.
+    let t0 = 2_000_000 + 20000
+    test.assert(ctl_hci.ctl_cs_fits(var c, 0, true, false, 1_990_000, t0, 2500))
+    test.assert(ctl_hci.ctl_cs_fits(var c, 0, false, true, 1_990_000, t0, 2500))
+    // One that is inside the event's booking (the booking runs 3 ms past the end of the listening window) does not, in either class: the connection events of the link that
+    // carries the procedure keep their priority.
+    let early = 2_000_000 + lead + 500
+    test.assert(not ctl_hci.ctl_cs_fits(var c, 0, true, false, 1_990_000, early, 2500))
+    test.assert(not ctl_hci.ctl_cs_fits(var c, 0, false, true, 1_990_000, early, 2500))
+    // The arbiter books the next event of each link only, so one that reaches the event after it is met when that event is booked: once the first has run, a subevent that
+    // reaches the next does not fit.
+    link_at(var c, 101, 2_030_000)
+    let late = 2_030_000 - 3000
+    test.assert(not ctl_hci.ctl_cs_fits(var c, 0, true, false, 2_015_000, late, 2500))
+    link_at(var c, 100, 2_000_000)
+    // Booking takes the class by the subevent's place in its event, replaces the earlier booking and holds the stream back for the quiet time after it.
+    ctl_hci.ctl_cs_book(var c, true, false, 1_990_000, t0, 2500)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_cs()))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_cs_next()))
+    test.assert_eq(c.arb.start[ll_arb.class_cs()], t0 - lead)
+    test.assert_eq(c.arb.end[ll_arb.class_cs()], t0 + 2500 + ll_cs.FINISH_US)
+    test.assert_eq(ctl_hci.ctl_cs_room(var c, t0 + 2500 + ll_cs.QUIET_US - 1, 9999), 0)
+    test.assert_eq(ctl_hci.ctl_cs_room(var c, t0 + 2500 + ll_cs.QUIET_US, 9999), 9999)
+    ctl_hci.ctl_cs_unbook(var c)
+    ctl_hci.ctl_cs_book(var c, false, true, 1_990_000, t0, 2500)
+    test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_cs_next()))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_cs()))
+    ctl_hci.ctl_cs_unbook(var c)
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_cs_next()))
+    // A test has no link: its booking is tested against the classes above alone.
+    test.assert(ctl_hci.ctl_cs_fits(var c, -1, true, false, 1_990_000, 2_000_000 + 100000, 2500))
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_subevent_offset_from_an_event_that_is_not_a_subrated_event_is_given_up_and_counted()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    let e0 = sched_of(var c).conn_event
+    link_at(var c, e0 - 3, 1_000_000)
+    // The grid has a factor of 2 and the first event of the series is not on it.
+    link_subrated(var c, 2, e0 + 1)
+    var air = air_sim(1_000_000 - 50000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.prepared)
+    air.now = 1_000_000 + 3 * 30000 + 1000
+    link_at(var c, e0, 1_000_000 + 3 * 30000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(a.skips, 1)
+    test.assert_eq(a.grid_skips, 1)
+    test.assert_eq(air.holds, 0)
+    let r = results(flush(var c))
+    test.assert_eq(list.len(r), 1)
+    test.assert_eq(r[0][3 + 12], 0xF)
+    test.assert_eq(r[0][3 + 13], 0x30)
+    // The generator stayed in step: the procedure is over after this subevent, as it would have been had the subevent run.
+    test.assert_eq(a.last, ctl_hci.RUN_OK)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_subevent_that_is_given_up_does_not_make_the_event_one_that_is_under_way_and_one_that_ran_does()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var a = ll_cs_air.cs_air_new()
+    var s = ctl_hci.CsSched { conn_event: 100, offset_us: 4250, event_interval: 2, subevents: 2, subevent_interval_us: 10000, subevent_len_us: 2500, proc_interval: 0, proc_count: 1,
+                              proc_us: 200000, interval_us: 30000 }
+    // The first subevent ran: the event is under way for the second.  The next event begins afresh.
+    ll_cs_air.under_way_set(var a, true)
+    ll_cs_air.advance(var a, var s, false)
+    test.assert(a.under_way)
+    test.assert_eq(a.sub_i, 1)
+    ll_cs_air.advance(var a, var s, false)
+    test.assert(not a.under_way)
+    test.assert_eq(a.ev_i, 1)
+
+// The Controller with the configuration and the procedure parameters of series_of, the procedures not enabled.
+@when(noble_controller_config.CTL_CS > 0)
+fn configured_for_start() -> ctl_hci.Controller
+    var c = ready()
+    exchange_caps(var c)
+    secure(var c)
+    test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
+    test.assert_eq(cmd_status(run(var c, 0x2090, with(with(create_params(0, 1, 0), CC_MAIN, 2), CC_MODE0, 1)), 0x2090), 0)
+    pop_queued(var c)
+    var rsp = config_rsp_pdu(0)
+    peer_sends(var c, var rsp)
+    let _e = flush(var c)
+    pp(var c, "set", pp_params(0, 1), 0)
+    c
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_start_waits_for_a_power_control_or_a_subrate_procedure_that_is_out_and_goes_when_it_is_over()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on() or not ctl_limits.pcl_on() or not ctl_limits.sub_on()
+        return
+    // A Power Control Request that waits for its answer: Command Disallowed (Section 5.1.26: the Start is not begun until it has completed).
+    var c = configured_for_start()
+    c.pcl[0].wait = true
+    test.assert_eq(cmd_status(run(var c, 0x2094, [1, 0, 0, 1]), 0x2094), 0x0C)
+    c.pcl[0].wait = false
+    // A Connection Subrate request out is the same.
+    c.sub[0].wait = true
+    test.assert_eq(cmd_status(run(var c, 0x2094, [1, 0, 0, 1]), 0x2094), 0x0C)
+    c.sub[0].wait = false
+    test.assert_eq(cmd_status(run(var c, 0x2094, [1, 0, 0, 1]), 0x2094), 0)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_transmit_level_of_a_procedure_is_the_hosts_and_does_not_follow_the_power_control_of_the_acl()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on() or not ctl_limits.pcl_on()
+        return
+    // The level the plan carries is the Host's highest (LE CS Set Default Settings), read from the record of the procedures: a change of the ACL's level, which Power Control
+    // makes in the middle of a procedure instance, does not reach it (Section 5.1.26).
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var cc = ll_ccm.soft_cipher_new()
+    let e0 = sched_of(var c).conn_event
+    test.assert_eq(ctl_hci.ctl_cs_instance(var c, var cc, var st, 0, e0), ctl_hci.RUN_OK)
+    test.assert_eq(ctl_hci.ctl_cs_subevent_plan(var c, var cc, var st, 0, 0, -1), ctl_hci.RUN_OK)
+    let before = st.plan.head.tx_dbm as Int
+    c.pcl[0].lvl[0] = 3
+    c.pcl[0].lvl[1] = -20
+    test.assert_eq(st.plan.head.tx_dbm as Int, before)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_peripheral_with_latency_uses_the_subrated_event_a_channel_sounding_event_is_offset_from()
+    if not ctl_limits.cs_on() or not ctl_limits.sub_on()
+        return
+    // Section 4.5.7.1: a Peripheral that is the initiator listens to the connection event a CS event is offset from even if its latency would let it skip it.  This
+    // Controller does not skip events by latency (the README lists it as NOT IMPLEMENTED), so every event of the grid is used, and the event a subevent is offset from is
+    // always one of them (`ctl_cs_event_on_grid`).
+    var c = connected()
+    c.links[0].latency = 4
+    link_subrated(var c, 3, 100)
+    link_at(var c, 100, 1_000_000)
+    for k in 0..12
+        let ev = 100 + k
+        test.assert_eq(ll_link.sub_active(var c.links[0], ev), (k % 3) == 0)
+        test.assert_eq(ctl_hci.ctl_cs_event_on_grid(var c, 0, ev), (k % 3) == 0)
+    // With no subrating every event is used whatever the latency.
+    link_subrated(var c, 1, 0)
+    for k in 0..6
+        test.assert(ll_link.sub_active(var c.links[0], 100 + k))

@@ -406,7 +406,7 @@ fn conn_run(var c: ctl_hci.Controller, var cen: Cen, start: Int, until: Int, var
         host_read(var c, var host)
         ctl_hci.ctl_set_time(var c, now)
         let cls = ctl_hci.ctl_ll_pick(var c, false)
-        if cls == ll_arb.CLASS_ACL
+        if cls == ll_arb.class_acl()
             if ctl_hci.ctl_conn_active(var c, 0)
                 if now < cen.anchor
                     now = cen.anchor
@@ -660,7 +660,7 @@ fn test_a_central_that_goes_quiet_ends_the_connection_with_a_supervision_timeout
     test.assert_eq(list.len(ds), 1)
     test.assert_eq(ds[0][6], 0x08)
     // The link is off the arbiter: nothing else is booked.
-    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_acl()))
 
 // ── Data ────────────────────────────────────────────────────────────
 
@@ -1144,7 +1144,7 @@ fn conn_run_adv(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start:
         host_read(var c, var host)
         ctl_hci.ctl_set_time(var c, now)
         let cls = ctl_hci.ctl_ll_pick(var c, false)
-        if cls == ll_arb.CLASS_ACL
+        if cls == ll_arb.class_acl()
             if now < cen.anchor
                 now = cen.anchor
             ctl_hci.ctl_set_time(var c, now)
@@ -1292,7 +1292,7 @@ fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
     let skipped = ctl_hci.ctl_conn_catch_up(var c, 0, 2000000)
     test.assert_eq(skipped, 1)
     test.assert(not ll_link.link_live(var c.links[0]))
-    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.CLASS_ACL))
+    test.assert(not ll_arb.arb_booked(var c.arb, ll_arb.class_acl()))
     let r = run(var c, 0x1001, [])
     let ds = events_coded(r, 0x05)
     test.assert_eq(list.len(ds), 1)

@@ -9,10 +9,20 @@
 // highest priority: isochronous events, connection events, advertising
 // events, scan windows.  A scan window is also the Initiating state's window.
 // Advertising events, scan windows and the connection events of both roles are
-// booked, each link its own class (`CLASS_ACL` plus the slot, `ACL_CLASSES` of them, all
+// booked, each link its own class (`class_acl()` plus the slot, `ACL_CLASSES` of them, all
 // of the same priority: the one whose booking began first has the radio);
 // the isochronous class is in the interface for the stage that follows, and booking
 // it needs no change here.
+//
+// A build with Channel Sounding (`ctl_limits.cs_on()`) has two classes more, as the SoftDevice Controller has: `class_cs_next()`
+// between the isochronous class and the connection classes, and `class_cs()` between the connection classes and the periodic trains.
+// A subevent is all or nothing on the radio, so it is booked whole, from its lead to the end of the run (`arb_book_cs`), and
+// tested whole against the classes above it (`arb_clear`) before it is armed.  The first subevent of an event takes
+// `class_cs()`: it yields to every connection event, which carry the control PDUs of Channel Sounding itself and the supervision
+// of every link.  The later subevents of an event that is under way take `class_cs_next()`: an event that has begun is finished, and
+// a connection event of another link that falls in it is the one that waits.  The connection events of the link that carries the
+// procedure keep their priority in either case (`arb_clear_class`).  A build without the feature has neither class, and the functions
+// that book them do nothing.
 //
 // The arbiter keeps no radio and no clock: the caller gives the time.
 //
@@ -32,13 +42,37 @@ use ll_radio
 // listens for, so they come before the advertising events and the scan windows, which can move,
 // and after the connection events and the isochronous events, which a lost event costs more.
 const CLASS_ISO = 0
-const CLASS_ACL = 1
-const CLASS_ACL2 = 2
-const CLASS_ACL3 = 3
+
+// The class of the later subevents of a Channel Sounding event, above the connection classes; -1 in a build without the feature.
+pub @tier(embedded)
+const fn class_cs_next() -> Int
+    if ctl_limits.cs_on()
+        1
+    else
+        -1
+
+// The first connection class: the classes of the links are `class_acl()` plus the slot.
+pub @tier(embedded)
+const fn class_acl() -> Int
+    if ctl_limits.cs_on()
+        2
+    else
+        1
+
+// The class of the first subevent of a Channel Sounding event, below the connection classes; -1 in a build without the feature.
+pub @tier(embedded)
+const fn class_cs() -> Int
+    if ctl_limits.cs_on()
+        class_acl() + ctl_limits.arb_classes()
+    else
+        -1
 
 @tier(embedded)
 const fn class_per() -> Int
-    CLASS_ACL + ctl_limits.arb_classes()
+    if ctl_limits.cs_on()
+        class_cs() + 1
+    else
+        class_acl() + ctl_limits.arb_classes()
 
 // The class of the advertising events, the one after `class_per()`.
 pub @tier(embedded)
@@ -71,9 +105,9 @@ const MIN_SLOT_US = 1000
 // `on` says the class has a booking, `start` and `end` are its times.
 @value
 struct Arb
-    on: Vec[Bool; noble_controller_config.CTL_LINKS + 4]
-    start: Vec[Int; noble_controller_config.CTL_LINKS + 4]
-    end: Vec[Int; noble_controller_config.CTL_LINKS + 4]
+    on: Vec[Bool; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_LINKS + 6 else noble_controller_config.CTL_LINKS + 4]
+    start: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_LINKS + 6 else noble_controller_config.CTL_LINKS + 4]
+    end: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_LINKS + 6 else noble_controller_config.CTL_LINKS + 4]
     lead: Int
     guard: Int
     stream_guard: Int
@@ -127,7 +161,10 @@ fn arb_start(var a: Arb, cls: Int) -> Int
 fn lead_of(var a: Arb, cls: Int) -> Int
     if cls == class_scan()
         LEAD_SCAN_US
-    else if cls >= CLASS_ACL and cls < class_adv()
+    else if ctl_limits.cs_on() and (cls == class_cs() or cls == class_cs_next())
+        // The booking of a subevent begins at the start of its lead (`arb_book_cs`).
+        0
+    else if cls >= class_acl() and cls < class_adv()
         a.lead + ll_radio.ACL_EXTRA_US
     else
         a.lead
@@ -148,11 +185,11 @@ fn arb_pick(var a: Arb, now: Int) -> Int
 // began before `cls` does is granted the radio instead, whichever slot it is.
 @tier(embedded)
 fn earliest_acl(var a: Arb, cls: Int, now: Int) -> Int
-    if cls < CLASS_ACL or cls >= class_adv()
+    if cls < class_acl() or cls >= class_adv() or (ctl_limits.cs_on() and cls == class_cs())
         return cls
     var best = cls
     for other in cls + 1..class_adv()
-        if a.on[other] and a.start[other] < a.start[best]
+        if not (ctl_limits.cs_on() and other == class_cs()) and a.on[other] and a.start[other] < a.start[best]
             if a.start[other] - lead_of(var a, other) <= now and now < a.end[other]
                 best = other
     best
@@ -181,6 +218,46 @@ fn arb_clear(var a: Arb, cls: Int, now: Int, until: Int) -> Bool
         if a.on[other] and a.end[other] > now and a.start[other] - a.guard < until
             return false
     true
+
+// Whether the class `cls` alone has no booking inside the stretch from `from` to `until` (less the guard): the test of a subevent against the connection events
+// of the link that carries the procedure, whose class it is.  A class that is out of range is clear.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn arb_clear_class(var a: Arb, cls: Int, from: Int, until: Int) -> Bool
+    if cls < 0 or cls >= classes()
+        return true
+    not (a.on[cls] and a.end[cls] > from and a.start[cls] - a.guard < until)
+
+// The class a subevent of a Channel Sounding event takes: `class_cs_next()` for a later subevent of an event that is under way (`under_way`), `class_cs()` for the first
+// subevent of an event, and for a later one whose event never began.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_class(first: Bool, under_way: Bool) -> Int
+    if not first and under_way
+        return class_cs_next()
+    class_cs()
+
+// Whether a subevent that starts at `t0` and lasts `len` may run: the radio is booked from `t0 - lead` until `t0 + len + finish`, and no class above `cls` (the class
+// `cs_class` gave) is booked to begin inside that stretch or is under way at `now`, and the connection events of the link in the class `link_cls` that carries the
+// procedure are not inside it either, whatever the class.  A build without the feature never fits.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn arb_cs_fits(var a: Arb, cls: Int, link_cls: Int, now: Int, t0: Int, lead: Int, len: Int, finish: Int) -> Bool
+    if cls < 0 or cls >= classes()
+        return false
+    // A booking that is over before the stretch begins does not count: the connection event the subevent is offset from, which is under way or due, ends first.
+    var from = t0 - lead
+    if from < now
+        from = now
+    let until = t0 + len + finish
+    arb_clear(var a, cls, from, until) and arb_clear_class(var a, link_cls, from, until)
+
+// Book the radio for a subevent in the class `cls`: from `lead` before `t0` until `finish` after the end of its `len`, replacing the class's earlier booking.  The
+// booking is made after `arb_cs_fits` agreed, and stays until it ends or `arb_cancel` takes it away.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn arb_book_cs(var a: Arb, cls: Int, t0: Int, lead: Int, len: Int, finish: Int)
+    arb_book(var a, cls, t0 - lead, t0 + len + finish)
 
 // Whether `cls` has at least `MIN_SLOT_US` of radio time from `now`.
 @tier(embedded)

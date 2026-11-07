@@ -251,11 +251,24 @@ const fn cs_slots() -> Int
     max1(noble_controller_config.CTL_CS)
 
 // The classes of the arbiter of ll_arb.nv that belong to a connection: one for each link.  The arbiter holds
-// four more (the isochronous events, the periodic trains, the advertising events and the scan windows), so its columns have
-// `noble_controller_config.CTL_LINKS + 4` elements.
+// four more (the isochronous events, the periodic trains, the advertising events and the scan windows) and, in a build with Channel Sounding, two
+// (the first and the later subevents of an event), so its columns have `arb_cols()` elements.
 pub @tier(embedded)
 const fn arb_classes() -> Int
     noble_controller_config.CTL_LINKS
+
+// The classes of the arbiter that belong to Channel Sounding: two in a build with the feature, none in one without.
+pub @tier(embedded)
+const fn arb_cs_classes() -> Int
+    if cs_on()
+        2
+    else
+        0
+
+// The columns of the arbiter's tables: the connection classes, the four others and the classes of Channel Sounding.
+pub @tier(embedded)
+const fn arb_cols() -> Int
+    noble_controller_config.CTL_LINKS + 4 + arb_cs_classes()
 
 // The buffers of ll_iso.nv: the transmit data, the Host's fragments and the SDUs for the Host.
 @tier(embedded)

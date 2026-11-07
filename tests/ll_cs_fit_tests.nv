@@ -1,0 +1,333 @@
+// tests/ll_cs_fit_tests.nv — the placing of Channel Sounding on the radio's time (src/ll_cs_fit.nv), layer L6 of planning/BLE-CHANNEL-SOUNDING.md section 12.1 with no board:
+// where the first subevent of a Start goes among the connection events of ACL grids of 7.5, 10, 20 and 50 ms, with Connection Subrating, with a second link, with a connected
+// isochronous stream, and what the answering end re-suggests when the request does not fit.
+//
+// The figures come from the constants of `ll_cs`: a subevent holds the radio from `lead` (the test uses 2000: the program's work of 1850 and the radio's arming lead of 150)
+// and the reserve of 500 before its start to the finish of 600 after its end, a connection event holds it 1500 from its anchor and is granted it 1000 early, and the planning of
+// a subevent takes 3500 between two runs.  A subevent at offset `o` after an anchor at 0 therefore needs `o >= 4004` (1500 for the event, 2000 and 500 for the lead and the
+// reserve, and the widening of the offset, 4 microseconds for 4 ms), which the offsets 250 apart reach at 4250, and ends 600 after its length.
+//
+//   novo test --config configs/ctl_cs.toml tests/ll_cs_fit_tests.nv
+
+use std.test
+use ctl_limits
+use ll_cs
+use ll_cs_fit
+
+// The carrying link: its event 100 is at time 0, its interval is `iv`, its subrate grid is `factor` with the event 100 on it.  The record holds its events too, as the
+// Controller's `cs_busy` fills them.
+fn carrier(iv: Int, factor: Int) -> ll_cs_fit.Busy
+    var b = ll_cs_fit.busy_link(0, 100, iv, factor, 100 % factor, 2000, ll_cs.FINISH_US)
+    ll_cs_fit.busy_set_plan(var b, ll_cs.PLAN_FIT_US)
+    let _a = ll_cs_fit.busy_add(var b, 0, iv * factor, ll_cs.CONN_FIT_US, 1000, true)
+    b
+
+// A Start for the event 100: the offsets from 1000 to `hi`, one subevent of `len`, an event every `ev_int` connection events, a procedure of 62.5 ms.
+fn start(hi: Int, len: Int, ev_int: Int) -> ll_cs_fit.Req
+    ll_cs_fit.req_with(100, 1000, hi, 100, ev_int, 1, 0, len, 0)
+
+// A Start with every field that the tests vary.
+fn st(conn: Int, lo: Int, hi: Int, len: Int, ev_int: Int, subs: Int, sub_int: Int, max_proc: Int, proc_int: Int, count: Int) -> ll_cs_fit.Req
+    ll_cs_fit.req_with(conn, lo, hi, max_proc, ev_int, subs, sub_int, len, proc_int)
+
+@test
+fn test_a_record_with_no_scheduling_fits_everything_and_changes_nothing()
+    if not ctl_limits.cs_on()
+        return
+    var b = ll_cs_fit.busy_new()
+    var s = start(1500, 2500, 1)
+    test.assert(ll_cs_fit.start_fits(var b, var s))
+    test.assert(ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 1000)
+    test.assert_eq(s[ll_cs_fit.Q_OMAX], 1500)
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 2500)
+
+@test
+fn test_the_first_subevent_goes_after_the_connection_event_its_lead_and_its_reserve()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(50000, 1)
+    // The Central's pick of 3 ms is inside the event's hold (1500 and the lead and reserve of 2500: the subevent may begin at 4000 at the soonest), so the pick is not the
+    // offset; the window holds offsets that fit, and the placing narrows it to them.
+    var s = start(6000, 2500, 1)
+    test.assert(ll_cs_fit.start_fits(var b, var s))
+    test.assert(not ll_cs_fit.offset_fits(var b, var s, 3000, 1, 2500))
+    test.assert(ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 4250)
+    // The window that results is the run of offsets that fit, 250 apart, up to the end of the request's window: 4250 to 6000.
+    test.assert_eq(s[ll_cs_fit.Q_OMAX], 6000)
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 2500)
+    test.assert_eq(s[ll_cs_fit.Q_EINT], 1)
+    test.assert_eq(s[ll_cs_fit.Q_CONN], 100)
+    // A request whose window begins late enough fits as it stands.
+    var t = st(100, 4250, 6000, 2500, 1, 1, 0, 100, 0, 1)
+    test.assert(ll_cs_fit.start_fits(var b, var t))
+    // The edge: the widening of 4 microseconds puts 4000 inside the event's hold, and 4010 is the first offset clear of it.
+    test.assert(not ll_cs_fit.offset_fits(var b, var t, 4000, 1, 2500))
+    test.assert(not ll_cs_fit.offset_fits(var b, var t, 4003, 1, 2500))
+    test.assert(ll_cs_fit.offset_fits(var b, var t, 4010, 1, 2500))
+
+@test
+fn test_a_window_that_ends_before_the_first_free_offset_has_no_fit()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(50000, 1)
+    var s = start(3500, 2500, 1)
+    test.assert(not ll_cs_fit.start_fits(var b, var s))
+    test.assert(not ll_cs_fit.place(var b, var s))
+    // The request is unchanged by a placing that fails.
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 1000)
+    test.assert_eq(s[ll_cs_fit.Q_OMAX], 3500)
+
+@test
+fn test_the_acl_grid_of_20_ms_takes_a_subevent_of_2_5_ms_an_event_at_a_time()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(20000, 1)
+    var s = start(8000, 2500, 1)
+    test.assert(ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 4250)
+    test.assert_eq(s[ll_cs_fit.Q_EINT], 1)
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 2500)
+
+@test
+fn test_the_acl_grid_of_10_ms_leaves_no_time_to_plan_between_events_so_the_events_are_spaced_two_apart()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(10000, 1)
+    // The subevent fits beside the event at 10000 (7100 is before 9000), but the planning of the next (3500) finds the stretch from 7100 to 11500 broken by that event.
+    var s = start(8000, 2500, 1)
+    test.assert(not ll_cs_fit.start_fits(var b, var s))
+    test.assert(ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_EINT], 2)
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 2500)
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 4250)
+    // Without the planning in the way (a program that plans ahead) the request fits as it stands.
+    var a = carrier(10000, 1)
+    ll_cs_fit.busy_set_plan(var a, 0)
+    var t = st(100, 4250, 8000, 2500, 1, 1, 0, 100, 0, 1)
+    test.assert(ll_cs_fit.start_fits(var a, var t))
+
+@test
+fn test_the_acl_grid_of_7_5_ms_takes_a_shorter_subevent_and_events_two_apart()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(7500, 1)
+    var s = start(8000, 2500, 1)
+    test.assert(ll_cs_fit.place(var b, var s))
+    // 2500 from 4250 ends at 7354, past the start of the next event's hold (6500); the middle between 2500 and the least of 1250, 1875, ends at 6729 and still meets it;
+    // the one after, 1562, ends at 6412.
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 1562)
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 4250)
+    test.assert_eq(s[ll_cs_fit.Q_EINT], 2)
+    // The answer is a valid answer to the request (Section 5.1.26): no sooner, window inside, length not above.
+    test.assert(s[ll_cs_fit.Q_SLEN] <= 2500)
+    test.assert(s[ll_cs_fit.Q_OMIN] >= 1000 and s[ll_cs_fit.Q_OMAX] <= 8000)
+
+@test
+fn test_a_long_subevent_that_nothing_shortens_enough_is_refused_at_7_5_ms()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(7500, 1)
+    // The least subevent is 1250: 4000 + 1250 + 600 = 5850 ends before 6500, but a request with the subevent interval fixed by two subevents of 2.5 ms does not.
+    var s = st(100, 1000, 8000, 2500, 1, 2, 8, 100, 0, 1)
+    test.assert(not ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_SUBS], 2)
+
+@test
+fn test_subrating_spaces_the_events_on_the_grid_and_moves_the_connection_event_to_it()
+    if not ctl_limits.cs_on()
+        return
+    // Interval 7.5 ms, factor 2, the event 100 on the grid: the used events are 15 ms apart.
+    var b = carrier(7500, 2)
+    test.assert(ll_cs_fit.on_grid(var b, 100))
+    test.assert(not ll_cs_fit.on_grid(var b, 101))
+    test.assert(ll_cs_fit.on_grid(var b, 102))
+    test.assert_eq(ll_cs_fit.grid_event(var b, 101), 102)
+    test.assert_eq(ll_cs_fit.grid_event(var b, 102), 102)
+    // A request for the event 101 moves to 102, and an interval of 1 event to 2 (a multiple of the factor); with events 15 ms apart a subevent of 2.5 ms fits.
+    var s = st(101, 1000, 8000, 2500, 1, 1, 0, 100, 0, 1)
+    test.assert(not ll_cs_fit.start_fits(var b, var s))
+    test.assert(ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_CONN], 102)
+    test.assert_eq(s[ll_cs_fit.Q_EINT], 2)
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 2500)
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 4250)
+    // The time of event 102 is two intervals on.
+    test.assert_eq(ll_cs_fit.event_time(var b, 102), 15000)
+
+@test
+fn test_a_procedure_interval_that_is_not_a_multiple_of_the_factor_is_refused_and_not_changed()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(30000, 3)
+    var s = st(100, 1000, 8000, 2500, 3, 1, 0, 100, 4, 5)
+    test.assert(not ll_cs_fit.start_fits(var b, var s))
+    test.assert(not ll_cs_fit.place(var b, var s))
+    test.assert_eq(s[ll_cs_fit.Q_PINT], 4)
+    var t = st(103, 4250, 8000, 2500, 3, 1, 0, 100, 6, 5)
+    test.assert(ll_cs_fit.start_fits(var b, var t))
+
+@test
+fn test_one_event_in_the_procedure_needs_no_interval_multiple_of_the_factor()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(30000, 3)
+    // The procedure is shorter than the interval of the events: the interval is never used.
+    let one = st(100, 1000, 8000, 2500, 1, 1, 0, 20, 0, 1)
+    test.assert_eq(ll_cs_fit.event_interval_for(var b, one), 1)
+    let long = st(100, 1000, 8000, 2500, 1, 1, 0, 200, 0, 1)
+    test.assert_eq(ll_cs_fit.event_interval_for(var b, long), 3)
+
+@test
+fn test_the_events_of_a_second_link_keep_the_first_subevent_away_and_a_later_one_may_take_them()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(50000, 1)
+    // A second link, 10 ms apart, with an event at 3000: it holds the radio from 2000 to 4500.
+    let _a = ll_cs_fit.busy_add(var b, 3000, 10000, ll_cs.CONN_FIT_US, 1000, false)
+    var s = start(9000, 2500, 1)
+    test.assert(ll_cs_fit.place(var b, var s))
+    // The span must begin after 4500: 7250 is the first offset (7250 - 2500 - 7 = 4743), and it ends at 10350, before the event at 13000 is granted the radio (12000).
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 7250)
+    // Two subevents: the second begins 10000 after the first, and the second link's event at 13000 holds the radio around the planning of it.  The later subevent is above the connection classes, so only the
+    // carrying link's events and the streams stop it.
+    var t = st(100, 1000, 9000, 2500, 1, 2, 16, 20, 0, 1)
+    // The program plans the second subevent while the second link has its event, so the test leaves the planning out.
+    ll_cs_fit.busy_set_plan(var b, 0)
+    test.assert(ll_cs_fit.offset_fits(var b, var t, 7250, 1, 2500))
+    // The second subevent is 10000 after the first, at 17250.  Put a second link's event under it (at 18000).
+    var c = carrier(50000, 1)
+    ll_cs_fit.busy_set_plan(var c, 0)
+    let _b = ll_cs_fit.busy_add(var c, 18000, 100000, ll_cs.CONN_FIT_US, 1000, false)
+    test.assert(ll_cs_fit.offset_fits(var c, var t, 7250, 1, 2500))
+    // As a booking that counts for every subevent (a stream, or the carrying link) it does not.
+    var d = carrier(50000, 1)
+    ll_cs_fit.busy_set_plan(var d, 0)
+    let _c = ll_cs_fit.busy_add(var d, 18000, 100000, ll_cs.CONN_FIT_US, 1000, true)
+    test.assert(not ll_cs_fit.offset_fits(var d, var t, 7250, 1, 2500))
+    // And the first subevent of a Start is held away from it as from any other: an event under the first subevent at 8000.
+    var e = carrier(50000, 1)
+    ll_cs_fit.busy_set_plan(var e, 0)
+    let _d = ll_cs_fit.busy_add(var e, 8000, 100000, ll_cs.CONN_FIT_US, 1000, false)
+    test.assert(not ll_cs_fit.offset_fits(var e, var t, 7250, 1, 2500))
+
+@test
+fn test_a_connected_isochronous_stream_keeps_every_subevent_out_of_its_events()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(50000, 1)
+    // A stream of 10 ms: its event begins at 2000 and holds the radio for 4000 (granted 800 early).
+    let _a = ll_cs_fit.busy_add(var b, 2000, 10000, 4000, 800, true)
+    var s = start(12000, 2500, 1)
+    test.assert(ll_cs_fit.place(var b, var s))
+    // The span begins after the stream's event (6000), at 8750 (8750 - 2500 - 9 = 6241); 2500 ends at 11850, which meets the next event's hold (from 11200): the length
+    // is shortened to 1875 (11235) and then to 1562 (10923).
+    test.assert_eq(s[ll_cs_fit.Q_OMIN], 8750)
+    test.assert_eq(s[ll_cs_fit.Q_SLEN], 1562)
+
+@test
+fn test_when_the_streams_and_the_links_leave_no_gap_the_start_is_refused()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(7500, 1)
+    // A stream whose events fill the gap between the connection events.
+    let _a = ll_cs_fit.busy_add(var b, 2500, 7500, 3000, 500, true)
+    var s = start(7000, 2500, 1)
+    test.assert(not ll_cs_fit.place(var b, var s))
+    test.assert(not ll_cs_fit.start_fits(var b, var s))
+
+@test
+fn test_the_connection_event_counter_wraps_at_65536()
+    if not ctl_limits.cs_on()
+        return
+    // The event 65535 is at time 1_000_000; 1 is 2 intervals on, and 65534 is one before.
+    var b = ll_cs_fit.busy_link(1_000_000, 65535, 30000, 1, 0, 2000, 600)
+    test.assert_eq(ll_cs_fit.event_distance(var b, 1), 2)
+    test.assert_eq(ll_cs_fit.event_distance(var b, 65534), -1)
+    test.assert_eq(ll_cs_fit.event_time(var b, 1), 1_060_000)
+    test.assert_eq(ll_cs_fit.event_time(var b, 65534), 970_000)
+    // The subrate grid after the wrap: the residue of the base event follows the counter (Section 4.5.1).  Factor 4, event 65535 is on the grid with residue 3; the counter 3
+    // after the wrap is 3 events on, 65536 % 4 = 0, so the residue stays 3.
+    var g = ll_cs_fit.busy_link(1_000_000, 65535, 30000, 4, 3, 2000, 600)
+    test.assert(ll_cs_fit.on_grid(var g, 65535))
+    test.assert(ll_cs_fit.on_grid(var g, 3))
+    test.assert(not ll_cs_fit.on_grid(var g, 2))
+    // Factor 3: 65536 % 3 = 1, so after the wrap the residue 0 becomes 2 and the events 2, 5, ... are subrated.
+    var h = ll_cs_fit.busy_link(1_000_000, 65534, 30000, 3, 65534 % 3, 2000, 600)
+    test.assert(ll_cs_fit.on_grid(var h, 65534))
+    test.assert(ll_cs_fit.on_grid(var h, 65537 & 0xFFFF))
+
+@test
+fn test_a_booking_hits_a_stretch_by_its_events_from_the_first_to_the_periodic_ones()
+    if not ctl_limits.cs_on()
+        return
+    var b = ll_cs_fit.busy_link(0, 0, 10000, 1, 0, 2000, 600)
+    // One event at 5000, 1000 long, granted 500 early.
+    test.assert(ll_cs_fit.busy_add(var b, 5000, 0, 1000, 500, true))
+    test.assert(ll_cs_fit.booking_hits(var b, 0, 4400, 4600))
+    test.assert(not ll_cs_fit.booking_hits(var b, 0, 4000, 4500))
+    test.assert(ll_cs_fit.booking_hits(var b, 0, 5900, 7000))
+    test.assert(not ll_cs_fit.booking_hits(var b, 0, 6000, 7000))
+    // Every 10000 from 5000: the event at 25000 is hit by a stretch there, none of the ones between.
+    test.assert(ll_cs_fit.busy_add(var b, 5000, 10000, 1000, 500, true))
+    test.assert(ll_cs_fit.booking_hits(var b, 1, 25200, 25300))
+    test.assert(not ll_cs_fit.booking_hits(var b, 1, 26000, 34400))
+    test.assert(ll_cs_fit.booking_hits(var b, 1, 26000, 34600))
+    test.assert_eq(ll_cs_fit.booking_end(var b, 1, 26000, 35000), 36000)
+    test.assert_eq(ll_cs_fit.booking_end(var b, 1, 26000, 30000), -1)
+    // The table holds `BOOKINGS` and says no to the next.
+    var full = ll_cs_fit.busy_link(0, 0, 10000, 1, 0, 2000, 600)
+    var added = 0
+    for _ in 0..40
+        if ll_cs_fit.busy_add(var full, 0, 0, 1, 0, false)
+            added = added + 1
+    test.assert_eq(added, ll_cs_fit.BOOKINGS)
+
+@test
+fn test_the_planning_needs_a_stretch_clear_of_every_booking_and_moves_past_them()
+    if not ctl_limits.cs_on()
+        return
+    var b = ll_cs_fit.busy_link(0, 0, 10000, 1, 0, 2000, 600)
+    test.assert(ll_cs_fit.busy_add(var b, 5000, 10000, 1500, 1000, true))
+    // From 6500 on, 3500 are clear until 14000 (the next event holds the radio from 14000), and the stretch must end before `until`.
+    test.assert(ll_cs_fit.stretch_free(var b, 6500, 14000, 3500))
+    test.assert(ll_cs_fit.stretch_free(var b, 6500, 10000, 3500))
+    test.assert(not ll_cs_fit.stretch_free(var b, 6500, 9900, 3500))
+    // From 4000 the stretch moves past the event (to 6500) and then fits.
+    test.assert(ll_cs_fit.stretch_free(var b, 4000, 14000, 3500))
+    test.assert(not ll_cs_fit.stretch_free(var b, 4000, 9900, 3500))
+    // Nothing to plan: always free.
+    test.assert(ll_cs_fit.stretch_free(var b, 4000, 4001, 0))
+    // A second booking, one event at 7000, pushes it again: to 7500.
+    test.assert(ll_cs_fit.busy_add(var b, 7000, 0, 500, 0, false))
+    test.assert(ll_cs_fit.stretch_free(var b, 4000, 11000, 3500))
+    test.assert(not ll_cs_fit.stretch_free(var b, 4000, 10900, 3500))
+
+@test
+fn test_the_offset_the_central_picks_and_the_shorter_subevents_and_the_events_checked()
+    if not ctl_limits.cs_on()
+        return
+    test.assert_eq(ll_cs_fit.pick_offset(1000, 5000), 3000)
+    test.assert_eq(ll_cs_fit.pick_offset(3500, 9000), 3500)
+    test.assert_eq(ll_cs_fit.pick_offset(500, 2900), 2900)
+    test.assert_eq(ll_cs_fit.shorter(2500), 1875)
+    test.assert_eq(ll_cs_fit.shorter(1875), 1562)
+    test.assert_eq(ll_cs_fit.shorter(1300), 1275)
+    test.assert_eq(ll_cs_fit.shorter(1250), 1250)
+    test.assert_eq(ll_cs_fit.shorter(1000), 1250)
+    var b = carrier(30000, 1)
+    // 62.5 ms over events 30 ms apart: three events; over 90 ms apart: one; a long procedure is tested for four.
+    test.assert_eq(ll_cs_fit.events_checked(var b, 1, 100), 3)
+    test.assert_eq(ll_cs_fit.events_checked(var b, 3, 100), 1)
+    test.assert_eq(ll_cs_fit.events_checked(var b, 1, 60000), 4)
+
+@test
+fn test_the_widening_of_the_offset_grows_the_stretch_with_the_time_from_the_event()
+    if not ctl_limits.cs_on()
+        return
+    var b = carrier(500000, 1)
+    // 1000 ppm of an offset of 400 ms is 400 microseconds: a booking granted its radio 300 after the end of a subevent at 400 ms is clear without it, in the way with it.
+    let _a = ll_cs_fit.busy_add(var b, 400_000 + 2500 + 600 + 200, 0, 1000, 0, true)
+    test.assert(not ll_cs_fit.subevent_free(var b, 400_000, 2500, 400_000, false))
+    test.assert(ll_cs_fit.subevent_free(var b, 400_000, 2500, 0, false))

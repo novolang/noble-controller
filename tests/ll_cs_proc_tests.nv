@@ -15,6 +15,7 @@ use ll_pdu
 use ll_data
 use ll_cs
 use ll_cs_pdu
+use ll_cs_fit
 use ll_cs_proc
 use ctl_budget
 
@@ -46,7 +47,7 @@ fn envf(central: Bool, flags: Int, now: Int) -> ll_cs_proc.Env
     if (flags & E_SMALL) != 0
         max_tx = 27
     ll_cs_proc.Env { central: central, encrypted: (flags & E_PLAIN) == 0, peer_cs: (flags & E_NOPEER) == 0, peer_v2: (flags & E_V1) == 0, ev_count: 100,
-                     interval_us: 30000, now: now, busy: (flags & E_BUSY) != 0, phy: 1, managed: 0xF, sec_ok: (flags & E_NOSEC) == 0, max_tx: max_tx }
+                     interval_us: 30000, now: now, busy: (flags & E_BUSY) != 0, phy: 1, managed: 0xF, sec_ok: (flags & E_NOSEC) == 0, max_tx: max_tx, fit: ll_cs_fit.busy_new() }
 
 fn env(central: Bool, now: Int) -> ll_cs_proc.Env
     envf(central, 0, now)
@@ -54,7 +55,7 @@ fn env(central: Bool, now: Int) -> ll_cs_proc.Env
 // The same with the ACL on `phy` and the PHYs in `managed` managed.
 fn env_phy(central: Bool, phy: Int, managed: Int) -> ll_cs_proc.Env
     ll_cs_proc.Env { central: central, encrypted: true, peer_cs: true, peer_v2: true, ev_count: 100, interval_us: 30000, now: 10, busy: false, phy: phy,
-                     managed: managed, sec_ok: true, max_tx: 251 }
+                     managed: managed, sec_ok: true, max_tx: 251, fit: ll_cs_fit.busy_new() }
 
 fn rnd12(seed: Int) -> Vec[u8; 12]
     var v: Vec[u8; 12] = Vec.new()
@@ -3554,7 +3555,7 @@ fn test_the_filtered_map_is_the_configurations_and_the_updates_and_a_new_connect
 // The environment of an end whose packets carry 3 octets of payload at most, so that no PDU of Channel Sounding but a rejection fits.
 fn env_tiny(central: Bool) -> ll_cs_proc.Env
     ll_cs_proc.Env { central: central, encrypted: true, peer_cs: true, peer_v2: true, ev_count: 100, interval_us: 30000, now: 20, busy: false, phy: 1, managed: 0xF,
-                     sec_ok: true, max_tx: 3 }
+                     sec_ok: true, max_tx: 3, fit: ll_cs_fit.busy_new() }
 
 @test
 fn test_an_indication_that_does_not_fit_a_packet_is_refused_as_limited_resources_and_starts_nothing()
@@ -3817,13 +3818,135 @@ fn test_the_requests_the_peer_may_refuse_are_the_opcodes_this_end_sends_as_reque
     for op in [0x2D, 0x2F, 0x31, 0x34, 0x37, 0x38, 0x3A]
         test.assert(not ll_cs.refusable(op))
 
+// The environment with the scheduling of a link whose event 100 is at time 0 and whose interval is 30 ms (`factor` the subrate factor, the event 100 on its grid), and with
+// `plan` microseconds of planning between two subevents.
+fn env_fit(central: Bool, factor: Int, plan: Int) -> ll_cs_proc.Env
+    var b = ll_cs_fit.busy_link(0, 100, 30000, factor, 100 % factor, 2000, ll_cs.FINISH_US)
+    ll_cs_fit.busy_set_plan(var b, plan)
+    let _a = ll_cs_fit.busy_add(var b, 0, 30000 * factor, ll_cs.CONN_FIT_US, 1000, true)
+    ll_cs_proc.Env { central: central, encrypted: true, peer_cs: true, peer_v2: true, ev_count: 100, interval_us: 30000, now: 20, busy: false, phy: 1, managed: 0xF,
+                     sec_ok: true, max_tx: 251, fit: b }
+
 @test
-fn test_the_scheduling_hook_agrees_to_every_start_until_the_arbiter_joins_it()
+fn test_the_scheduling_hook_agrees_to_every_start_when_the_environment_carries_no_scheduling_and_checks_the_window_when_it_does()
     if skip()
         return
     var s = start_ok(0)
     var e = env(true, 10)
     test.assert(ll_cs_proc.schedule_ok(var s, var e))
+    // With the scheduling of a link: the window 1000 to 2000 lies in the hold of the connection event it is offset from (event, lead and reserve make 4 ms).
+    var f = env_fit(true, 1, 3500)
+    var t = start_set(S_EVENT, 100)
+    test.assert(not ll_cs_proc.schedule_ok(var t, var f))
+    var w = start_set2(S_EVENT, 100, S_OMAX, 6000)
+    test.assert(ll_cs_proc.schedule_ok(var w, var f))
+
+@test
+fn test_a_start_the_host_asks_for_that_does_not_fit_is_refused_as_limited_resources_and_one_that_does_is_sent()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var caps = caps_full()
+    var ec = env_fit(true, 1, 3500)
+    var out = ll_pdu.pdu_new()
+    var bad = start_set2(S_EVENT, 110, S_OMAX, 3000)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var bad, var out), ll_cs_proc.E_LIMITED)
+    test.assert_eq(cen.wait, ll_cs_proc.W_NONE)
+    var good = start_set2(S_EVENT, 110, S_OMAX, 6000)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var good, var out), 0)
+    test.assert_eq(cen.wait, ll_cs_proc.W_START)
+
+@test
+fn test_the_peripheral_places_the_start_among_its_events_and_answers_with_the_offsets_that_fit()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_set2(S_OMIN, 1000, S_OMAX, 8000)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env_fit(false, 1, 3500)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var rsp = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_rsp(var b, var rsp))
+    // The offsets that fit begin after the connection event, the lead and the reserve (4250 with the widening) and run to the end of the request's window.
+    test.assert_eq(rsp.offset_min, 4250)
+    test.assert_eq(rsp.offset_max, 8000)
+    test.assert_eq(rsp.subevent_len, 2500)
+    // The Central picks in it, and the indication names the offset.
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_SEND)
+    var ind = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_ind(var a, var ind))
+    test.assert_eq(ind.offset_min, 4250)
+
+@test
+fn test_the_peripheral_refuses_a_start_that_fits_nowhere_among_its_events_with_unsupported_ll_parameter_value()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_set2(S_OMIN, 1000, S_OMAX, 3000)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env_fit(false, 1, 3500)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert(rejects(var b, ll_cs.OP_CS_REQ, ll_cs_proc.E_UNSUPPORTED_LL))
+    test.assert_eq(per.wait, ll_cs_proc.W_NONE)
+
+@test
+fn test_the_central_answers_a_request_with_the_event_on_the_subrated_grid_and_the_offset_that_fits()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    // The Peripheral asks for the event 111; the link is subrated by 2 with the event 100 on its grid, so the Central moves the Start to the event 112 and spaces the events
+    // two connection events apart.
+    var s = start_set2(S_EVENT, 111, S_OMAX, 8000)
+    var caps = caps_full()
+    var ep = env(false, 20)
+    var ec = env_fit(true, 2, 3500)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var per, var ep, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var ind = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_ind(var b, var ind))
+    test.assert_eq(ind.conn_event, 112)
+    test.assert_eq(ind.event_interval, 2)
+    test.assert_eq(ind.offset_min, 4250)
+    test.assert(cen.run_open)
+
+@test
+fn test_the_central_refuses_an_answer_whose_window_fits_nowhere_among_its_events_and_the_start_ends()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_set2(S_OMIN, 1000, S_OMAX, 3000)
+    var caps = caps_full()
+    var ec = env_fit(true, 1, 3500)
+    var ep = env(false, 20)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    // The request goes out without the scheduling; the Peripheral (no scheduling either) answers with the window it prefers; the Central cannot place it.
+    var sc = env(true, 20)
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var sc, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_SEND)
+    test.assert(rejects(var a, ll_cs.OP_CS_RSP, ll_cs_proc.E_UNSUPPORTED_LL))
+    test.assert(not cen.run_open)
 
 // ── The record and its storage ──────────────────────────────────────
 
@@ -3970,7 +4093,8 @@ fn test_the_storage_of_a_connection_is_its_words_and_its_store_in_the_budget_of_
     let store = ctl_budget.CTL_CS_STORE + ctl_budget.CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS
     // The planning (`ll_cs_plan`) is the other part of the figure: a generator for each connection, the plan's head and its steps.
     let planning = ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_GEN_RECORD) + ctl_budget.CTL_CS_PLAN_FIXED + ctl_budget.vec_bytes(noble_controller_config.CTL_CS_STEPS, ctl_budget.CTL_CS_STEP_RECORD)
-    test.assert_eq(ctl_budget.controller_cs_bytes(), planning + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.CTL_CS_GLOBAL_WORDS + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, store) + ctl_budget.CTL_CS_GLOBAL_OCTETS + ctl_budget.CTL_CS_RESULT_STEP * noble_controller_config.CTL_CS_STEPS)
+    test.assert_eq(ctl_budget.controller_cs_bytes(), planning + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.CTL_CS_GLOBAL_WORDS + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, store) + ctl_budget.CTL_CS_GLOBAL_OCTETS + ctl_budget.CTL_CS_RESULT_STEP * noble_controller_config.CTL_CS_STEPS + ctl_budget.CTL_CS_ARB)
+    test.assert_eq(ctl_budget.CTL_CS_ARB, 32)
     test.assert_eq(ctl_limits.cs_slots(), noble_controller_config.CTL_CS)
     test.assert_eq(ll_cs_proc.bulk_octets(), store)
     test.assert_eq(store % 8, 0)

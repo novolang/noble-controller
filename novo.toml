@@ -238,7 +238,8 @@ doc     = "buffers of subevent data the advertiser keeps, and of responses each 
 # build without it.  The keys that describe the feature are 0 or false exactly when the count is 0, and the keys that choose among its
 # options need the count.  Three keys state the storage.  `ctl_cs`: for each connection that runs the feature, the generator of the planning
 # (`CsState` of ll_cs_plan.nv, 712 B) and one record of the procedures (ll_cs_proc.nv) in two tables of the Controller, 38 words of 8 B and a store of 224 B, and,
-# once for the Controller, 40 words and 232 B of store after the records (the Host Support bit, the test, the capabilities, the table of frequency actuation errors of the radio, the header of the result of a subevent);
+# once for the Controller, 40 words and 232 B of store after the records (the Host Support bit, the test, the capabilities, the table of frequency actuation errors of the radio, the header of the result of a subevent),
+# and 32 B for the two classes the arbiter books a subevent in (ll_arb.nv);
 # a build without the feature keeps those two tables at one element each, which is the floor.  `ctl_cs_configs`: 56 B more of store for each configuration a
 # connection holds (the 27 octets of the PDU and the 20 of the procedure parameters of the Host).  `ctl_cs_steps`: the plan of one subevent, 136 B (the head of 112 B, which holds the antenna selection of CS_SYNC and the peer's table of 72 frequency actuation errors, the count of steps and the code the planning ended with) and 56 B a step,
 # and 40 B a step for the result of a subevent that waits to go to the Host.
@@ -248,7 +249,7 @@ default  = 0
 min      = 0
 max      = 2
 requires = ["ctl_pcl"]
-bytes_expr = "(ctl_cs * 712 + 15) / 8 * 8 + (ctl_cs * 304 + 320 + 15) / 8 * 8 + (ctl_cs * 224 + 232 + 15) / 8 * 8"
+bytes_expr = "(ctl_cs * 712 + 15) / 8 * 8 + (ctl_cs * 304 + 320 + 15) / 8 * 8 + (ctl_cs * 224 + 232 + 15) / 8 * 8 + min(ctl_cs, 1) * 32"
 floor    = 32
 doc      = "connections that run Channel Sounding at once (ll_cs.nv), 0 for a build without it, which then answers its 18 commands with Unknown HCI Command, its 14 Link Layer PDUs with LL_UNKNOWN_RSP and leaves LE features 46, 47, 48 and 75 clear; needs CTL_PCL, whose power delta the Channel Sounding request names"
 

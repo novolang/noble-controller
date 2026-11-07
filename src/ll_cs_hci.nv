@@ -15,6 +15,7 @@
 use h4_rx
 use ll_cs
 use ll_cs_pdu
+use ll_cs_fit
 use ll_cs_proc
 use ll_cs_plan
 use ll_cs_radio
@@ -282,6 +283,10 @@ const PP_SNR_R = 19
 const OFFSET_MIN_US = 1000
 const OFFSET_SPAN_US = 2000
 
+// The latest Offset_Max the Controller names when it places the Start among the connection events (`ll_cs_fit`): a connection interval of 7.5 milliseconds leaves the
+// first subevent room only late in the interval, after the connection event, the lead and the reserve.
+const OFFSET_FIT_MAX_US = 6000
+
 // Whether `v` is a Tx_Power_Delta, Max_TX_Power or Selected_TX_Power the HCI allows: a signed value from -127 to +20 dBm.
 @tier(embedded)
 @no_alloc
@@ -334,7 +339,12 @@ fn start_from_pp(var pp: Vec[u8; 48], id: Int, var en: ll_cs_proc.Env,
     s.event_interval = 1
     s.subevents = 1
     s.subevent_interval = 0
-    var len = max_sub
+    // The length the Controller proposes is at most `ll_cs.PROPOSE_LEN_US` (decision D6), inside the Host's range.
+    var len = ll_cs.PROPOSE_LEN_US
+    if len > max_sub
+        len = max_sub
+    if len < min_sub
+        len = min_sub
     if len > max_len * ll_cs_proc.UNIT_US
         len = max_len * ll_cs_proc.UNIT_US
     if len < ll_cs_proc.SUBEVENT_LEN_MIN_US
@@ -348,6 +358,13 @@ fn start_from_pp(var pp: Vec[u8; 48], id: Int, var en: ll_cs_proc.Env,
         var p = min_int
         if p < need
             p = need
+        // The events of the procedures are offset from subrated connection events, and the interval is not one the answering end may change.
+        let on = ll_cs_fit.busy_on(var en.fit)
+        var factor = 1
+        if on
+            factor = en.fit[ll_cs_fit.B_FACTOR]
+        if on and factor > 1
+            p = (p + factor - 1) / factor * factor
         if p > max_int
             return ll_cs_proc.E_LIMITED
         s.proc_interval = p
@@ -359,6 +376,15 @@ fn start_from_pp(var pp: Vec[u8; 48], id: Int, var en: ll_cs_proc.Env,
         s.pwr_delta = g8(var pp, PP_DELTA)
     s.snr_i = snr_to_pdu(g8(var pp, PP_SNR_I))
     s.snr_r = snr_to_pdu(g8(var pp, PP_SNR_R))
+    if not ll_cs_fit.busy_on(var en.fit)
+        return 0
+    // The Start is placed among the connection events and the streams: the first event on the subrated grid, events spaced a multiple of the factor, the offsets that leave
+    // the subevents clear.  A Start that does not fit anywhere is refused for lack of resources.
+    s.offset_max = OFFSET_FIT_MAX_US
+    if s.offset_max >= en.interval_us
+        s.offset_max = en.interval_us - 1
+    if not ll_cs_proc.place_start(var en, var s)
+        return ll_cs_proc.E_LIMITED
     0
 
 // ── The plan of a configuration ─────────────────────────────────────

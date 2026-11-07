@@ -12,8 +12,8 @@
 // `ll_cs_proc`, which write and read them with `ll_cs_pdu`.
 //
 // The random bit generator is `ll_cs_drbg.nv`; the channel and access address selection and the step timeline are `ll_cs_plan.nv`; the control PDUs and the procedures over
-// them are `ll_cs_pdu.nv` and `ll_cs_proc.nv`; the data of a step in an HCI result is `ll_cs_res.nv`.  NOT IMPLEMENTED: the arbiter's scheduling of the subevents and the
-// call of the radio from the radio program, which the functions `ctl_cs_instance`, `ctl_cs_subevent` and `ctl_cs_test_subevent` of `ctl_hci.nv` await.
+// them are `ll_cs_pdu.nv` and `ll_cs_proc.nv`; the data of a step in an HCI result is `ll_cs_res.nv`; the placing of a Start among the connection events and the streams is
+// `ll_cs_fit.nv`, and the classes of the arbiter that book a subevent are in `ll_arb.nv`.
 //
 // This module holds no radio and no queue.  The configuration (`ctl_limits.cs_on()`) says whether the build has the feature.
 
@@ -239,6 +239,10 @@ const CONFIGS_MAX = 4
 // The least space between two subevents, two events and two procedures, in microseconds.
 const T_MES_US = 150
 
+// The unit of Subevent_Interval and Max_Procedure_Len, and the least Subevent_Len, in microseconds.
+const UNIT_US = 625
+const SUBEVENT_LEN_MIN_US = 1250
+
 // The guard time (T_GD), the ramp-down window (T_RD) and the frequency measurement window of mode 0 (T_FM), in microseconds.
 const T_GD_US = 10
 const T_RD_US = 5
@@ -248,6 +252,30 @@ const T_FM_US = 80
 const T_IP_MANDATORY_US = 145
 const T_FCS_MANDATORY_US = 150
 const T_PM_MANDATORY_US = 40
+
+// ── The time a subevent takes from the radio ────────────────────────
+// The Link Layer books a subevent as [t0 - lead, t0 + length + finish] (`ll_arb.arb_book_cs`), and the placing of a Start (`ll_cs_fit.nv`) tests the same stretch against
+// the connection events and the streams.  All in microseconds.
+//
+//   WORK_US       the program's own work between the hand-over of a subevent to the radio and `cs_arm`: the Controller reads the record of the connection and the capabilities.  The
+//                 lead of a booking is this and the radio's `CsTiming.arm_lead_us`.
+//   RESERVE_US    the time kept clear before the lead: the SoftDevice Controller documents about 0.5 ms before each subevent.
+//   FINISH_US     the turn-round of the radio after the last step and the program's work when it gives the radio back (the configuration of the advertising channels).
+//   QUIET_US      the time after the start of a run during which the Controller does not move octets of the HCI stream to the UARTE, which sends garbled bytes within about 2 ms of a
+//                 radio operation of Channel Sounding on the nRF54 (planning/BLE-CS-NRF54-BRINGUP.md, Section 3.5); connection events are served meanwhile.
+//   WIDEN_PPM     the window widening of the offset, per million: both devices' sleep clocks over the time from the connection event to the subevent.
+//   CONN_FIT_US   the time a connection event is expected to last when the placing predicts one: a few exchanges of both devices.  A longer event is waited for at run time.
+//   PLAN_FIT_US   the time the program takes to plan a subevent on the nRF54LM20 (the engine draws the channels and the access addresses), between the one before and the next:
+//                 3.2 ms for 31 steps was measured, and the placing keeps that clear of connection events
+//   PROPOSE_LEN_US   the longest Subevent_Len the Controller proposes when the Host leaves the choice to it (decision D6), above the 2.5 ms that Core 6.3 requires.
+const WORK_US = 1850
+const RESERVE_US = 500
+const FINISH_US = 600
+const QUIET_US = 2500
+const WIDEN_PPM = 1000
+const CONN_FIT_US = 1500
+const PLAN_FIT_US = 3500
+const PROPOSE_LEN_US = 5000
 
 // The CS channels: 2 to 22 and 26 to 76, 72 of the 79 (channels 0, 1, 23, 24, 25, 77 and 78 are never used).
 const CHANNEL_COUNT = 72

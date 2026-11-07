@@ -11,6 +11,7 @@ use ctl_hci
 use ll_cs
 use ll_cs_pdu
 use ll_cs_proc
+use ll_cs_fit
 use ll_cs_hci
 use ll_cs_plan
 use ll_cs_radio
@@ -120,6 +121,16 @@ fn radio_ants(var r: CsCaps, n: Int)
 
 fn env_set(var en: Env, interval: Int, ev: Int)
     en.interval_us = interval
+    en.ev_count = ev
+
+// The environment takes the scheduling of the carrying link `iv` microseconds apart (the event `ev` at time 0, `factor` the subrate factor with `ev` on its grid) and `plan`
+// microseconds of planning between two subevents.
+fn env_fit_set(var en: Env, iv: Int, ev: Int, factor: Int, plan: Int)
+    var b = ll_cs_fit.busy_link(0, ev, iv, factor, ev % factor, 2000, ll_cs.FINISH_US)
+    ll_cs_fit.busy_set_plan(var b, plan)
+    let _a = ll_cs_fit.busy_add(var b, 0, iv * factor, ll_cs.CONN_FIT_US, 1000, true)
+    en.fit = b
+    en.interval_us = iv
     en.ev_count = ev
 
 // The octets 0 to 19 of the procedure parameters of a procedure of 100 * 0.625 ms, 10 to 20 connection events apart, 5 of them, subevents of 2.5 ms, ACI 0, LE 1M.
@@ -416,6 +427,64 @@ fn test_the_procedure_parameters_become_the_fields_of_ll_cs_req_with_the_schedul
     test.assert_eq(s.proc_interval, (100 * 625 + 3000 + 150) / 7500 + 1)
 
 @test
+fn test_the_controller_places_the_start_it_makes_among_the_events_of_the_link()
+    if not ctl_limits.cs_on()
+        return
+    var b = pp_ok()
+    var s = ll_cs_pdu.start_new()
+    // A link of 30 ms: the event 106, and the offsets from 4250, the first that clear the connection event, the lead and the reserve, to the 6000 the Controller names.
+    var en = ll_cs_proc.env_new()
+    env_fit_set(var en, 30000, 100, 1, 3500)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var en, var s), 0)
+    test.assert_eq(s.conn_event, 106)
+    test.assert_eq(s.offset_min, 4250)
+    test.assert_eq(s.offset_max, 6000)
+    test.assert_eq(s.event_interval, 1)
+    test.assert_eq(s.subevent_len, 2500)
+    // A link of 7.5 ms: the events are two apart so that the program can plan between them, and the subevent is shortened to end before the next connection event.
+    var fast = ll_cs_proc.env_new()
+    env_fit_set(var fast, 7500, 100, 1, 3500)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var fast, var s), 0)
+    test.assert_eq(s.event_interval, 2)
+    test.assert_eq(s.subevent_len, 1562)
+    test.assert_eq(s.offset_min, 4250)
+    test.assert_eq(s.offset_max, 4250)
+    // A subrated link (factor 3, event 100 on its grid): the first event (106, six ahead) is on the grid, the events are a multiple of 3 apart, and the interval of the procedures too.
+    var sub = ll_cs_proc.env_new()
+    env_fit_set(var sub, 30000, 100, 3, 3500)
+    test.assert_eq(ll_cs_hci.start_from_pp(var b, 0, var sub, var s), 0)
+    test.assert_eq(s.conn_event, 106)
+    test.assert_eq(s.event_interval, 3)
+    test.assert_eq(s.proc_interval, 12)
+    // The Host's greatest interval of procedures is under the multiple of 3 above the 10 the procedure needs: no Start is made.
+    var c = pp_ok()
+    ll_cs_hci.p16(var c, ll_cs_hci.PP_MAX_INT, 11)
+    test.assert_eq(ll_cs_hci.start_from_pp(var c, 0, var sub, var s), ll_cs_proc.E_LIMITED)
+
+@test
+fn test_the_controller_proposes_a_subevent_of_5_ms_at_the_most_inside_the_range_of_the_host()
+    if not ctl_limits.cs_on()
+        return
+    var en = ll_cs_proc.env_new()
+    var s = ll_cs_pdu.start_new()
+    var wide = pp_ok()
+    ll_cs_hci.p16(var wide, ll_cs_hci.PP_MAX_SUB, 14500)
+    test.assert_eq(ll_cs_hci.start_from_pp(var wide, 0, var en, var s), 0)
+    test.assert_eq(s.subevent_len, ll_cs.PROPOSE_LEN_US)
+    // The Host's least wins over the Controller's choice, and its greatest below it too, and the procedure's length cuts it.
+    ll_cs_hci.p16(var wide, ll_cs_hci.PP_MIN_SUB, 8000)
+    test.assert_eq(ll_cs_hci.start_from_pp(var wide, 0, var en, var s), 0)
+    test.assert_eq(s.subevent_len, 8000)
+    ll_cs_hci.p16(var wide, ll_cs_hci.PP_MAX_LEN, 10)
+    test.assert_eq(ll_cs_hci.start_from_pp(var wide, 0, var en, var s), 0)
+    test.assert_eq(s.subevent_len, 6250)
+    var narrow = pp_ok()
+    ll_cs_hci.p16(var narrow, ll_cs_hci.PP_MIN_SUB, 1300)
+    ll_cs_hci.p16(var narrow, ll_cs_hci.PP_MAX_SUB, 3000)
+    test.assert_eq(ll_cs_hci.start_from_pp(var narrow, 0, var en, var s), 0)
+    test.assert_eq(s.subevent_len, 3000)
+
+@test
 fn test_one_procedure_has_no_interval_and_an_interval_that_cannot_hold_the_procedure_is_refused()
     var b = pp_ok()
     var en = ll_cs_proc.env_new()
@@ -439,6 +508,9 @@ fn test_one_procedure_has_no_interval_and_an_interval_that_cannot_hold_the_proce
     ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_LEN, 2400)
     ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_SUB, 0x4240)
     ll_cs_hci.p8(var f, ll_cs_hci.PP_MAX_SUB + 2, 0x0F)
+    // The Host's range is 1 s to 1 s: the Controller proposes at most 5 ms (D6) but never below the Host's least.
+    ll_cs_hci.p16(var f, ll_cs_hci.PP_MIN_SUB, 0x4240)
+    ll_cs_hci.p8(var f, ll_cs_hci.PP_MIN_SUB + 2, 0x0F)
     test.assert_eq(ll_cs_hci.start_from_pp(var f, 0, var en, var s), 0)
     test.assert_eq(s.subevent_len, 1_000_000)
     ll_cs_hci.p16(var f, ll_cs_hci.PP_MAX_LEN, 1500)

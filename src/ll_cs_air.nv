@@ -16,23 +16,28 @@
 // The procedures.  The Start fixes the connection event the first CS event is offset from, the offset, the interval of the events, the subevents of an event and the interval of
 // the procedures (`ctl_cs_sched`).  The program takes one connection at a time and keeps where it is in the series: the instance of the procedure, the event in it and the
 // subevent in the event.  A subevent is made in two parts because the part that plans it draws every channel and access address from the cipher and takes milliseconds:
-//   plan   as soon as the radio is idle for as long as the planning takes (`PLAN_US`, then what the longest plan took), with the connection events of the link between;
+//   plan   as soon as the radio is idle for as long as the planning takes (`ll_cs.PLAN_FIT_US` and the margin, then what the longest plan took), with the connection events of the link between;
 //   run    when the subevent is `RUN_AHEAD_US` from its start, if the arbiter has no booking inside its span; a booking that comes before the start (the connection event the
 //          subevent is offset from has not run yet) is waited for, and a subevent that cannot be run on time is handed to the radio with a start in the past, which it refuses,
 //          so the Host reads it as a subevent aborted for a scheduling conflict and the generator stays in step with the peer.
 // The subevent starts `offset` after the anchor point of the connection event: the program is between two events then, since it is polled after `ll_poll` has run the event
 // that was due, and `ctl_cs_event_time` gives the anchor from the link's next due time.
 //
-// The priority.  A subevent is all or nothing on the radio, so it runs only when the arbiter has no booking inside the span it needs (`ctl_ll_room`): a connection event,
-// an advertising event or a scan window that is due comes first, and the subevent waits for the next poll.  This is one fixed priority, below every class of `ll_arb.nv`;
-// the classes of the arbiter for Channel Sounding are a later piece of work (planning/BLE-CHANNEL-SOUNDING.md, section 8).  A receiver that a scan window left on is stopped
-// before the run, and the radio is configured for the advertising channels again after it, as every other activity leaves it.
+// The priority.  A subevent is all or nothing on the radio, so it is booked in the arbiter as `[t0 - lead, t0 + length + finish]` (`ctl_hci.ctl_cs_book`) in the first of its two
+// classes, below the connection classes (`ll_arb.class_cs`), or in the second, above them, when it is a later subevent of an event that is under way (`class_cs_next`), and it runs
+// only when no class above its own, and no event of the link that carries the procedure, is booked inside that stretch (`ctl_hci.ctl_cs_fits`).  The test is made when the
+// subevent is `BOOK_AHEAD_US` from the start of its lead, so that advertising, scanning and the periodic trains, which are below both classes, leave the radio to it, and again
+// when the program hands the subevent to the radio.  One that does not fit is given up (`ctl_hci.ctl_cs_subevent_skip`): the Host reads it as a subevent aborted for a
+// scheduling conflict, and so does a subevent offset from a connection event that is not a subrated event.  A receiver that a scan window left on is stopped before the
+// run, and the radio is configured for the advertising channels again after it, as every other activity leaves it.
 //
 // The pause after the run.  The UARTE that carries the HCI stream sends bytes that arrive garbled within about 2 milliseconds of a radio operation (planning/BLE-CS-NRF54-BRINGUP.md,
-// section 3.5), and the result events of the subevent go out as soon as the loop moves them, so the program waits `UART_QUIET_US` after the run before it returns.
+// section 3.5).  The program does not wait for it, since connection events are served meanwhile: the booking sets `ll_cs.QUIET_US` during which the Controller moves no octet of the
+// stream to the UARTE (`ctl_hci.ctl_cs_room`, which the image's main loop applies to the room it gives `move_octets`).
 
 use ctl_hci
 use ll_air
+use ll_cs
 use ll_radio
 use ll_cs_radio
 use ll_cs_plan
@@ -48,27 +53,20 @@ const TEST_START_US = 20000
 const PREP_US = 8000
 const TEST_LEAST_US = 6000
 
-// A subevent of a procedure is waited for when its start is this near (the program does nothing else meanwhile, and the arbiter has nothing booked inside the span), and it
-// is handed to the radio `RUN_LEAD_US` before its start: the work between the wait and the radio's arming (the Controller reads the record of the connection and the
-// capabilities) takes some hundreds of microseconds, an initiator brings the tone processing to its ready state before its first packet (`CsTiming.arm_lead_us`), and the
-// backend waits for the instant itself.  A reflector's receiver is open from the hand-over on.
-const RUN_AHEAD_US = 4000
-const RUN_LEAD_US = 2000
-
-// The span a run needs beyond the subevent's own length: the radio's turn-round at the end and the pause after the run.
-const RUN_SLACK_US = 6000
+// A subevent of a procedure is booked and tested when its lead begins this far ahead (`BOOK_AHEAD_US`), and handed to the radio `ctl_hci.ctl_cs_lead_us` before its start: the work
+// between the wait and the radio's arming (the Controller reads the record of the connection and the capabilities) takes some hundreds of microseconds, an initiator brings the
+// tone processing to its ready state before its first packet (`CsTiming.arm_lead_us`), and the backend waits for the instant itself.  A reflector's receiver is open from the
+// hand-over on.  The program waits for the hand-over from `HAND_SLACK_US` before it, and does nothing else meanwhile.
+const BOOK_AHEAD_US = 8000
+const HAND_SLACK_US = 500
 
 // The least span a run of a test is booked for, whatever Subevent_Len says: a reflector's receiver stays open for the first packet of the initiator, and the radio takes
 // `CsTiming.max_run_us` at the most.
 const RUN_MIN_US = 5000
 
-// The time the planning of a subevent is expected to take before one has been timed, and the margin kept over a time that has: the room the arbiter leaves must cover it.
-const PLAN_US = 12000
-const PLAN_MARGIN_US = 2000
-
-// The time after the end of a run during which the program does not return, so that the bytes of the events that follow are not sent within 2 milliseconds of a radio
-// operation.
-const UART_QUIET_US = 2500
+// The room the planning of a subevent is given before one has been timed is what the placing keeps clear for it (`ll_cs.PLAN_FIT_US`, 3.2 ms for 31 steps on the DK); the margin
+// is kept over a time that has been timed: the room the arbiter leaves must cover it.
+const PLAN_MARGIN_US = 500
 
 // What the program has done, kept between polls.
 //
@@ -90,6 +88,10 @@ const UART_QUIET_US = 2500
 //   off_us      the offset of the subevents from the anchor of their connection event, once a series is open (for the status line)
 //   lead_us     the time from the hand-over of the last subevent of a procedure to the radio to its start (negative when the start had passed)
 //   t0          the start time of the subevent at (inst, ev_i, sub_i), on the radio's timebase, once it is planned
+//   booked      the subevent at (inst, ev_i, sub_i) is booked in the arbiter
+//   under_way   the first subevent of the event at (inst, ev_i) ran, so the later ones take the class above the connection classes
+//   skips       subevents of procedures given up for a scheduling conflict (`missed` counts those of them whose connection event had passed)
+//   grid_skips  subevents given up because the connection event they are offset from is not a subrated event
 pub @value
 struct CsAir
     inited: Bool
@@ -110,13 +112,17 @@ struct CsAir
     off_us: Int
     lead_us: Int
     t0: Int
+    booked: Bool
+    under_way: Bool
+    skips: Int
+    grid_skips: Int
 
 @when(noble_controller_config.CTL_CS > 0)
 pub @tier(embedded)
 @no_alloc
 fn cs_air_new() -> CsAir
     CsAir { inited: false, test_t0: 0, runs: 0, late: 0, waits: 0, last: ctl_hci.RUN_NONE, ls: -1, inst: 0, ev_i: 0, sub_i: 0, begun: false, prepared: false, plan_us: 0, missed: 0,
-            done: 0, off_us: 0, lead_us: 0, t0: 0 }
+            done: 0, off_us: 0, lead_us: 0, t0: 0, booked: false, under_way: false, skips: 0, grid_skips: 0 }
 
 // Hold the radio for a run: a receiver a scan window left on is stopped.
 @when(noble_controller_config.CTL_CS > 0)
@@ -126,13 +132,12 @@ fn take_radio<R: Radio[e]>(var air: R, var rf: ll_air.Rf) [e]
         ll_air.stop_rx(var air, var rf)
     air.hold()
 
-// Give the radio back after a run: the configuration of the advertising channels, the power state released, and the pause for the UART.
+// Give the radio back after a run: the configuration of the advertising channels and the power state released.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
-fn give_radio<R: Radio[e] + Timebase[t]>(var air: R) [e, t]
+fn give_radio<R: Radio[e]>(var air: R) [e]
     air.config(ll_radio.ADV_ACCESS_ADDRESS, ll_radio.ADV_CRC_INIT, ll_radio.ADV_MAXLEN)
     air.release()
-    air.wait_until(air.now_us() + UART_QUIET_US)
 
 // Run one subevent of the LE CS Test, starting at `t0`.  The answer is that of `ctl_cs_test_subevent`.
 @when(noble_controller_config.CTL_CS > 0)
@@ -142,6 +147,7 @@ fn run_test<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, va
     take_radio(var air, var rf)
     let r = ctl_hci.ctl_cs_test_subevent(var c, var air, var cc, var st, t0)
     give_radio(var air)
+    ctl_hci.ctl_cs_unbook(var c)
     r
 
 // The LE CS Test in progress, which has run `n` subevents: start the next when it is due and the radio is clear for it.
@@ -163,9 +169,11 @@ fn test_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, v
     var span = ctl_hci.ctl_cs_test_len_us(var c)
     if span < RUN_MIN_US
         span = RUN_MIN_US
-    if not clear_for(var c, now, t0 - now + span + RUN_SLACK_US)
+    // The program is held from the planning to the end of the run, so nothing may be booked in that time, and the stream is held back after it.
+    if not clear_for(var c, now, t0 - now + span + ll_cs.FINISH_US + ll_cs.QUIET_US)
         a.waits = a.waits + 1
         return
+    ctl_hci.ctl_cs_book(var c, true, false, now, t0, span)
     a.test_t0 = t0
     a.runs = a.runs + 1
     a.last = run_test(var air, var c, var rf, var cc, var st, t0)
@@ -205,12 +213,19 @@ fn subevent_time(var c: Controller, ls: Int, var sc: ctl_hci.CsSched, inst: Int,
         return -1
     anchor + sc.offset_us + sub_i * sc.subevent_interval_us
 
+// The event at the program's position is under way (its first subevent ran).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn under_way_set(var a: CsAir, on: Bool)
+    a.under_way = on
+
 // Move on to the next subevent: the next in the event, the first of the next event, or, when the procedure is complete (`done`), the first of the next instance.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn advance(var a: CsAir, var sc: ctl_hci.CsSched, done: Bool)
     a.prepared = false
     if done
+        a.under_way = false
         a.inst = a.inst + 1
         a.ev_i = 0
         a.sub_i = 0
@@ -220,6 +235,7 @@ fn advance(var a: CsAir, var sc: ctl_hci.CsSched, done: Bool)
     if a.sub_i >= sc.subevents
         a.sub_i = 0
         a.ev_i = a.ev_i + 1
+        a.under_way = false
 
 // Plan the subevent the program is at: begin the instance when it is the first of it, and plan.  False when the series is over (an instance that finds too few channels, or a
 // cipher that failed).
@@ -261,18 +277,23 @@ fn proc_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, v
         a.sub_i = 0
         a.begun = false
         a.prepared = false
+        a.booked = false
+        a.under_way = false
     var sc = ctl_hci.cs_sched_new()
     if not ctl_hci.ctl_cs_sched(var c, a.ls, var sc)
         // The series is over.
         a.ls = -1
         a.prepared = false
+        a.booked = false
+        a.under_way = false
+        ctl_hci.ctl_cs_unbook(var c)
         return
     a.off_us = sc.offset_us
     let now = air.now_us()
     let t0 = subevent_time(var c, a.ls, var sc, a.inst, a.ev_i, a.sub_i)
     if not a.prepared
         // While the radio is idle for as long as the planning takes.
-        var need = PLAN_US
+        var need = ll_cs.PLAN_FIT_US + PLAN_MARGIN_US
         if a.plan_us > 0
             need = a.plan_us + PLAN_MARGIN_US
         if not clear_for(var c, now, need)
@@ -280,32 +301,60 @@ fn proc_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, v
             return
         if not plan_one(var air, var c, var cc, var st, var a, var sc, t0)
             a.ls = -1
+            a.under_way = false
         return
-    if t0 >= 0 and t0 - now > RUN_AHEAD_US
-        return
-    // The span the run needs: the subevent's length (and the pause after it), from now.  A booking inside it that comes before the start (the connection event the
-    // subevent is offset from has not run yet) is waited for; one that is still there when the start is too near to arm, or that comes after the start, makes the subevent
-    // a conflict.
-    var late = t0 < 0
-    if not late and not clear_for(var c, now, t0 - now + sc.subevent_len_us + RUN_SLACK_US)
-        if t0 - now > RUN_LEAD_US
-            a.waits = a.waits + 1
+    // The subevent is booked, and tested, when its lead is `BOOK_AHEAD_US` away; the program hands it to the radio when the lead begins.
+    let lead = ctl_hci.ctl_cs_lead_us(var c)
+    let first = a.sub_i == 0
+    let ev = subevent_event(var sc, a.inst, a.ev_i)
+    var skip = t0 < 0
+    if not skip and not a.booked
+        if t0 - lead - now > BOOK_AHEAD_US
             return
-        late = true
-    var start = t0
-    if not late and t0 - now > RUN_LEAD_US
-        air.wait_until(t0 - RUN_LEAD_US)
-    if late
-        // The connection event is behind, or the radio is not clear: the radio is given a start it cannot meet, and the Host reads a subevent aborted for a scheduling conflict.
-        start = now
-        a.missed = a.missed + 1
+        if not ctl_hci.ctl_cs_event_on_grid(var c, a.ls, ev)
+            // Only a subrated connection event may offset a Channel Sounding event (Vol 6 Part B, Section 4.5.7.1): a Connection Subrate Update moved the grid.
+            a.grid_skips = a.grid_skips + 1
+            skip = true
+        else if not ctl_hci.ctl_cs_fits(var c, a.ls, first, a.under_way, now, t0, sc.subevent_len_us)
+            if t0 - lead - now > 0
+                // A booking in the stretch may pass (the connection event the subevent is offset from has not run yet).
+                a.waits = a.waits + 1
+                return
+            skip = true
+        else
+            ctl_hci.ctl_cs_book(var c, first, a.under_way, now, t0, sc.subevent_len_us)
+            a.booked = true
+    if not skip
+        if t0 - lead - now > HAND_SLACK_US
+            return
+        // The bookings are tested again at the hand-over: the connection events that were not booked when the subevent was (the one after the next of a short interval) are.
+        if not ctl_hci.ctl_cs_fits(var c, a.ls, first, a.under_way, now, t0, sc.subevent_len_us)
+            skip = true
+    if skip
+        // The subevent is given up whole: the radio is not handed anything, and the Host reads a subevent aborted for a scheduling conflict.
+        a.skips = a.skips + 1
+        if t0 < now
+            a.missed = a.missed + 1
+        ctl_hci.ctl_cs_unbook(var c)
+        a.booked = false
+        a.done = a.done + 1
+        let r = ctl_hci.ctl_cs_subevent_skip(var c, var air, var st, a.ls, ev)
+        a.last = r
+        advance(var a, var sc, r == ctl_hci.RUN_DONE)
+        return
+    if t0 - lead - air.now_us() > 0
+        air.wait_until(t0 - lead)
     a.runs = a.runs + 1
     take_radio(var air, var rf)
-    a.lead_us = start - air.now_us()
-    let r = ctl_hci.ctl_cs_subevent_run(var c, var air, var st, a.ls, subevent_event(var sc, a.inst, a.ev_i), start)
+    a.lead_us = t0 - air.now_us()
+    let r = ctl_hci.ctl_cs_subevent_run(var c, var air, var st, a.ls, ev, t0)
     give_radio(var air)
+    ctl_hci.ctl_cs_unbook(var c)
+    a.booked = false
     a.last = r
     a.done = a.done + 1
+    if first
+        a.under_way = true
     advance(var a, var sc, r == ctl_hci.RUN_DONE)
 
 // The slot of the radio program for Channel Sounding: called once for every turn of the main loop, after `ll_poll`.  It runs the subevents of the LE CS Test and of the
