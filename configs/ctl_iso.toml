@@ -13,14 +13,15 @@ ctl_ploss = true
 ctl_peersca = true
 ctl_connrate = true
 ctl_framespace = true
-# Channel Sounding (ll_cs.nv): one connection, one configuration, both roles, one antenna, the test commands.
-ctl_cs = 1
-ctl_cs_configs = 1
-ctl_cs_steps = 32
-ctl_cs_roles = 3
+# Channel Sounding (ll_cs.nv) is not part of the audio profile: a product that wants it sets `ctl_cs` and the keys that go
+# with it (configs/ctl_cs.toml is the profile with it on).  Off, the image links none of it (owner decision 2026-11-07).
+ctl_cs = 0
+ctl_cs_configs = 0
+ctl_cs_steps = 0
+ctl_cs_roles = 0
 ctl_cs_mode3 = false
 ctl_cs_rtt_seq = false
-ctl_cs_ant = 1
+ctl_cs_ant = 0
 ctl_cs_3c = false
 ctl_cs_ipt = false
-ctl_cs_test = true
+ctl_cs_test = false
