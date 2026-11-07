@@ -1,0 +1,3259 @@
+// tests/ctl_cs_air_tests.nv — Channel Sounding end to end, layers L4 and L5 of section 12.1 of planning/BLE-CHANNEL-SOUNDING.md: two Controllers, a Central and a Peripheral,
+// each with its own Host, joined by an encrypted ACL connection that carries the Link Layer control PDUs of both, and by one simulated radio medium (`CsMedium`, fidelity S1 of
+// `SimCs`) that carries the subevents.
+//
+// Everything the Host sees comes through the Controller as HCI: the Hosts set Channel Sounding (Host Support), read the capabilities of the peer (the Controller makes the
+// Feature Exchange it lacks), start Security Enable, read the table of frequency actuation errors of the reflector, create the configuration, set the procedure parameters and
+// enable the procedures, and then read the Subevent Result and Subevent Result Continue events.  The subevents run through `ctl_cs_instance` and `ctl_cs_subevent` of both
+// Controllers, each over its own `SimCs`.  The estimator at the end of the file works on what the Hosts read and nothing else (the octets of the events, the capabilities and
+// the configuration the Host knows), so that a fault of the assembly in the Controller (the delays, the scaling to 0.5 nanosecond, the packing, the extension slot, the
+// phase correction terms) shows as a distance that disagrees with the geometry.
+//
+// A helper beside a test file is not a module (`novo test` sees the `src/` of the package and its dependencies only), so the simulated radio is the one of
+// `tests/sim_cs_tests.nv`, written into this file as the other suites write what they share; it is the same source, taken whole, from the section "Constants" to the end of
+// `impl CsRadio[] for SimCs`, with the three pieces of the estimator that the Host-side estimator here uses (`Est`, `Products`, `est_pbr`).
+//
+// The two Controllers run in lock step.  `ctl_cs_subevent` plans, arms and runs a subevent in one call, and the medium resolves a subevent when both radios are armed, so a
+// subevent is run three times: first on a copy of the Controller that comes second, whose radio only takes the plan (`PairRadio` in the mode `PROBE`) and so arms the medium,
+// then by the Controller that comes first, whose run resolves the pair, then by the second one itself, which finds its own side resolved.  The copy plans what the Controller
+// plans, since the plan is a function of the state of the generator, and is thrown away.
+//
+//   novo test --config configs/ctl_cs.toml tests/ctl_cs_air_tests.nv
+
+use std.test
+use std.math
+use ctl_limits
+use noble_controller_config
+use ctl_hci
+use ctl_pool
+use ll_pdu
+use ll_data
+use ll_link
+use ll_ccm
+use ll_cipher
+use ll_cs
+use ll_cs_pdu
+use ll_cs_proc
+use ll_cs_hci
+use ll_cs_res
+use ll_cs_plan
+use ll_cs_radio
+
+// ── Constants ───────────────────────────────────────────────────────
+
+// The metres per second of light, and the picoseconds light takes for a millimetre (3.3356...), as a ratio of integers.
+const C_MPS = 299_792_458
+const PS_PER_MM_NUM = 3_335_641
+const PS_PER_MM_DEN = 1_000_000
+
+// The kinds of `SimFault`.  `side` is the device the fault happens to.
+//   F_BAD_AA      the access address `side` receives in step `step` differs from the expected one in the bits of `arg`
+//   F_MISS_SYNC   `side` does not detect the CS_SYNC of step `step`
+//   F_NO_TONE     the tone slot `arg` (-1 for all) that `side` should receive in step `step` is not transmitted
+//   F_SHIFT       the time of arrival `side` measures in step `step` is moved by `arg` picoseconds
+//   F_ABORT       `side` stops before step `step` with the abort reason `arg`
+//   F_LATE        `cs_arm` of `side` answers `CS_LATE`
+//   F_RESOURCES   `cs_arm` of `side` answers `CS_RESOURCES`
+// A `step` of -1 matches every step.
+const F_BAD_AA = 1
+const F_MISS_SYNC = 2
+const F_NO_TONE = 3
+const F_SHIFT = 4
+const F_ABORT = 5
+const F_LATE = 6
+const F_RESOURCES = 7
+
+// The abort reasons of a subevent ([Vol 6] Part B, Section 4.5.18.1).
+const ABORT_NO_SYNC = 2
+const ABORT_SCHEDULING = 3
+
+// ── Random numbers ──────────────────────────────────────────────────
+
+// xorshift64: the noise of the radio.  The generator of the plan (`ll_cs_drbg.nv`) is another thing.
+struct Rng
+    var s: Int
+
+fn rng_new(seed: Int) -> Rng
+    let x = seed ^ 0x2545F4914F6CDD1D
+    if x == 0
+        return Rng { s: 1 }
+    Rng { s: x }
+
+fn rng_next(var r: Rng) -> Int
+    var x = r.s
+    x = x ^ (x << 13)
+    x = x ^ (x >>> 7)
+    x = x ^ (x << 17)
+    r.s = x
+    x
+
+// A number in [0, 1).
+fn rng_unit(var r: Rng) -> Float
+    int.to_float(rng_next(var r) >>> 11) / 9007199254740992.0
+
+// A number with mean 0 and standard deviation 1: four uniform numbers, summed and scaled.
+fn rng_gauss(var r: Rng) -> Float
+    var s = 0.0
+    for _ in 0..4
+        s = s + rng_unit(var r)
+    (s - 2.0) * 1.7320508075688772
+
+// A number in [0, 1) that depends on the three arguments only (the finalizer of splitmix64 over their combination).
+fn hash_unit(seed: Int, a: Int, b: Int) -> Float
+    var z = int.wrapping_add(seed ^ (a << 40) ^ (b << 8), 0x1E3779B97F4A7C15)
+    z = int.wrapping_mul(z ^ (z >>> 30), 0x3F58476D1CE4E5B9)
+    z = int.wrapping_mul(z ^ (z >>> 27), 0x14D049BB133111EB)
+    z = z ^ (z >>> 31)
+    int.to_float(z >>> 11) / 9007199254740992.0
+
+// ── The world ───────────────────────────────────────────────────────
+
+// What one fault does; see `F_BAD_AA` and the others.
+struct SimFault
+    var kind: Int
+    var step: Int
+    var side: Int
+    var arg: Int
+
+// The physical figures of one device.
+//
+//   ppm            the fractional clock offset against true time
+//   ffo_err        the error of its frequency offset estimate (the initiator), in ppm
+//   fae, fae_tab   the actuation error of each CS channel 0 to 78, the real one and the table the radio reports with `cs_fae`, in 1/32 ppm
+//   fae_known      the initiator knows the reflector's table when it retunes; when it does not, the reflector's actuation error stays in
+//                  the mismatch
+//   tx_ps, rx_ps   the delay from the point a time stamp is taken to the antenna port, for each CS_SYNC PHY (index PHY - 1)
+//   cal            what `cs_cal` reports; `sim_cs_delays` sets it to the real delays
+//   gain_db        the gain of the receive antenna
+//   n0             the noise density of the receiver in dBm/Hz
+//   aa_floor, aa_clean   the signal to noise ratios in dB below which no access address is found and from which an exact one is found
+//                  without errors
+//   tick_ps        the clock tick the time stamps are rounded to, 0 for none
+//   sigma_ps       the standard deviation of the error of a time stamp when `noise_on`
+//   turn_err_ps    an error of the time the reflector takes to turn a packet around
+//   noise_on       whether the generator adds noise to time stamps, tones and the frequency estimate
+//   sounding       whether the sounding sequence is measured (`Packet_PCT1` and `Packet_PCT2`)
+//   seed           the seed of the local oscillator phase
+struct SimDev
+    var ppm: Float
+    var ffo_err: Float
+    var fae: [Int]
+    var fae_tab: [Int]
+    var fae_known: Bool
+    var tx_ps: [Int]
+    var rx_ps: [Int]
+    var cal: CsCal
+    var gain_db: Float
+    var n0: Float
+    var aa_floor: Float
+    var aa_clean: Float
+    var tick_ps: Int
+    var sigma_ps: Int
+    var turn_err_ps: Int
+    var noise_on: Bool
+    var sounding: Bool
+    var seed: Int
+
+@tier(app)
+fn zeros(n: Int) -> [Int]
+    var l: [Int] = []
+    for _ in 0..n
+        list.push(l, 0)
+    l
+
+fn dev_new(seed: Int) -> SimDev
+    SimDev { ppm: 0.0,
+        ffo_err: 0.0,
+        fae: zeros(79),
+        fae_tab: zeros(79),
+        fae_known: true,
+        tx_ps: zeros(3),
+        rx_ps: zeros(3),
+        cal: ll_cs_radio.cs_cal_none(),
+        gain_db: 0.0,
+        n0: -160.0,
+        aa_floor: 6.0,
+        aa_clean: 12.0,
+        tick_ps: 0,
+        sigma_ps: 0,
+        turn_err_ps: 0,
+        noise_on: false,
+        sounding: true,
+        seed: seed }
+
+// What the two devices share: the distance, the antenna paths, the plans registered by the arms, the results of the last resolution and
+// the faults.
+//
+//   dist_mm        the distance between the antenna ports
+//   devs           the two devices, indices 0 and 1
+//   ap_gain, ap_phase   the amplitude and the phase (rad) of each of the four antenna paths
+//   auto_peer      a run with no peer armed fills the peer in from the device's own plan with the role turned (S0)
+//   peer_head, peer_set, peer_steps, peer_steps_set   the peer's plan, when the test sets one
+//   armed, heads, t0, steps, loaded   the plan of each side as the arms and loads registered it
+//   ready, out_head, out_steps, out_len_us   the result of each side once the pair is resolved, and the length of its subevent
+struct CsMedium
+    var dist_mm: Int
+    var devs: [SimDev]
+    var ap_gain: [Float]
+    var ap_phase: [Float]
+    var auto_peer: Bool
+    var peer_head: CsPlan
+    var peer_set: Bool
+    var peer_steps: [CsStep]
+    var peer_steps_set: Bool
+    var armed: [Bool]
+    var heads: [CsPlan]
+    var t0: [Int]
+    var steps: [[CsStep]]
+    var loaded: [Int]
+    var ready: [Bool]
+    var out_head: [CsRaw]
+    var out_steps: [[CsStepRaw]]
+    var out_len_us: [Int]
+    var faults: [SimFault]
+    var rng: Rng
+
+fn medium_new() -> CsMedium
+    var ones: [Float] = []
+    var zero: [Float] = []
+    for _ in 0..4
+        list.push(ones, 1.0)
+        list.push(zero, 0.0)
+    CsMedium { dist_mm: 1000,
+        devs: [dev_new(0x51), dev_new(0xA3)],
+        ap_gain: ones,
+        ap_phase: zero,
+        auto_peer: true,
+        peer_head: ll_cs_radio.cs_plan_new(),
+        peer_set: false,
+        peer_steps: [],
+        peer_steps_set: false,
+        armed: [false, false],
+        heads: [ll_cs_radio.cs_plan_new(), ll_cs_radio.cs_plan_new()],
+        t0: [0, 0],
+        steps: [[], []],
+        loaded: [0, 0],
+        ready: [false, false],
+        out_head: [ll_cs_radio.cs_raw_new(), ll_cs_radio.cs_raw_new()],
+        out_steps: [[], []],
+        out_len_us: [0, 0],
+        faults: [],
+        rng: rng_new(1) }
+
+// The radio: one side of a medium, the capabilities and the timing it reports, and its own clock.
+struct SimCs
+    var med: CsMedium
+    var side: Int
+    var caps: CsCaps
+    var timing: CsTiming
+    var now_us: Int
+    var arms: Int
+    var runs: Int
+    var aborts: Int
+
+// What a radio that runs everything the model can does: both roles, mode 3, every RTT type, LE 1M and LE 2M and LE 2M 2BT, four antenna
+// paths, every optional timing.
+fn cs_caps_full() -> CsCaps
+    CsCaps { supported: true,
+        roles: 3,
+        modes: 1,
+        rtt_types: 0x7F,
+        phys: 7,
+        ant_elements: 4,
+        max_paths: 4,
+        t_ip1: 0x7F,
+        t_ip2: 0x7F,
+        t_fcs: 0x1FF,
+        t_pm: 3,
+        t_sw_us: 0,
+        t_sw_ipt_us: 0,
+        t_ip2_ipt: 0x7F,
+        snr_mask: 0,
+        no_fae: false,
+        ch3c: false,
+        sounding_pct: true,
+        ipt: true,
+        rtt_per_phy: false,
+        tq: true,
+        nadm_sound: 0,
+        nadm_rand: 0,
+        rtt_cap: 1,
+        n_aa: 255,
+        n_sound: 255,
+        n_rand: 255,
+        n_2m_aa: 255,
+        n_2m_sound: 255,
+        n_2m_rand: 255 }
+
+// What a smaller port reports: both roles, modes 0 to 2, access address only, LE 1M and LE 2M, one antenna path, the mandatory timings
+// alone.
+fn cs_caps_basic() -> CsCaps
+    CsCaps { supported: true,
+        roles: 3,
+        modes: 0,
+        rtt_types: 1,
+        phys: 3,
+        ant_elements: 1,
+        max_paths: 1,
+        t_ip1: 0,
+        t_ip2: 0,
+        t_fcs: 0,
+        t_pm: 0,
+        t_sw_us: 0,
+        t_sw_ipt_us: 0,
+        t_ip2_ipt: 0,
+        snr_mask: 0,
+        no_fae: false,
+        ch3c: false,
+        sounding_pct: false,
+        ipt: false,
+        rtt_per_phy: false,
+        tq: false,
+        nadm_sound: 0,
+        nadm_rand: 0,
+        rtt_cap: 1,
+        n_aa: 100,
+        n_sound: 0,
+        n_rand: 0,
+        n_2m_aa: 100,
+        n_2m_sound: 0,
+        n_2m_rand: 0 }
+
+// The timing of the model: a start 400 microseconds ahead, the receiver 20 microseconds early, 160 steps, a run of 20 ms.
+fn cs_timing_default() -> CsTiming
+    CsTiming { arm_lead_us: 400,
+        rx_window_us: 20,
+        turn_us: 200,
+        finish_us: 100,
+        max_steps: 160,
+        max_run_us: 20_000 }
+
+fn sim_cs_new() -> SimCs
+    SimCs { med: medium_new(),
+        side: 0,
+        caps: cs_caps_full(),
+        timing: cs_timing_default(),
+        now_us: 0,
+        arms: 0,
+        runs: 0,
+        aborts: 0 }
+
+// The second radio of the medium of `a` (S1): the pair resolves when both are armed, so the peer is no longer filled in.
+fn sim_cs_other(var a: SimCs) -> SimCs
+    a.med.auto_peer = false
+    SimCs { med: a.med,
+        side: 1 - a.side,
+        caps: cs_caps_full(),
+        timing: cs_timing_default(),
+        now_us: 0,
+        arms: 0,
+        runs: 0,
+        aborts: 0 }
+
+// The figures of the device the radio is, and of the one it talks to.
+fn sim_cs_dev(s: SimCs) -> SimDev
+    s.med.devs[s.side]
+
+fn sim_cs_far(s: SimCs) -> SimDev
+    s.med.devs[1 - s.side]
+
+fn sim_cs_dist(var s: SimCs, mm: Int)
+    s.med.dist_mm = mm
+
+// The capabilities and the timing a port reports, to drive the refusals of the Link Layer (the counterpart of `sim_ramps` in
+// `ctl_air_tests.nv`).
+fn sim_cs_caps(var s: SimCs, c: CsCaps)
+    s.caps = c
+
+fn sim_cs_timing(var s: SimCs, t: CsTiming)
+    s.timing = t
+
+fn sim_cs_fault(var s: SimCs, kind: Int, step: Int, side: Int, arg: Int)
+    list.push(s.med.faults, SimFault { kind: kind, step: step, side: side, arg: arg })
+
+// The delays of a device to its antenna port, for every PHY, and the calibration it reports for them.
+fn sim_cs_delays(var d: SimDev, tx_ps: Int, rx_ps: Int)
+    for i in 0..3
+        d.tx_ps[i] = tx_ps
+        d.rx_ps[i] = rx_ps
+    d.cal = CsCal { tx_1m_ps: tx_ps,
+        tx_2m_ps: tx_ps,
+        tx_2bt_ps: tx_ps,
+        rx_1m_ps: rx_ps,
+        rx_2m_ps: rx_ps,
+        rx_2bt_ps: rx_ps,
+        tone_ps: 0,
+        distance_offset_cm: 0 }
+
+// An actuation error of the channel `ch`, real and in the table, in 1/32 ppm.
+fn sim_cs_fae(var d: SimDev, ch: Int, v: Int)
+    d.fae[ch] = v
+    d.fae_tab[ch] = v
+
+// Every noise source on, with the seed of the generator.
+fn sim_cs_noise(var s: SimCs, seed: Int)
+    s.med.rng = rng_new(seed)
+    s.med.devs[0].noise_on = true
+    s.med.devs[1].noise_on = true
+
+// ── Geometry, signal and permutations ───────────────────────────────
+
+fn ps_of_mm(mm: Int) -> Int
+    (mm * PS_PER_MM_NUM + PS_PER_MM_DEN / 2) / PS_PER_MM_DEN
+
+// The free-space path loss in dB over `mm` millimetres at `f_mhz`, for a distance of at least 5 cm.
+@tier(app)
+fn fspl_db(mm: Int, f_mhz: Float) -> Float
+    let d = math.max(int.to_float(mm) / 1000.0, 0.05)
+    20.0 * math.log10(d) + 20.0 * math.log10(f_mhz) - 27.55
+
+// The antenna path positions of the permutation `perm` for `n_ap` paths, as the digits of Tables 4.13 to 4.15 of Part H.
+@tier(app)
+fn perm_code(n_ap: Int, perm: Int) -> Int
+    if n_ap == 2
+        let t = [12, 21]
+        return t[perm % 2]
+    if n_ap == 3
+        let t = [123, 213, 132, 312, 321, 231]
+        return t[perm % 6]
+    if n_ap == 4
+        let t = [1234, 2134, 1324, 3124, 3214, 2314, 1243, 2143, 1423, 4123, 4213, 2413, 1432, 4132, 1342, 3142, 3412, 4312, 4231, 2431,
+                 4321, 3421, 3241, 2341]
+        return t[perm % 24]
+    1
+
+// The antenna path (0 to 3) in slot `pos` of the permutation; the tone extension slot (`pos` = `n_ap`) takes the last path.
+@tier(app)
+fn perm_path(n_ap: Int, perm: Int, pos: Int) -> Int
+    var p = pos
+    if p > n_ap - 1
+        p = n_ap - 1
+    var div = 1
+    for _ in 0..n_ap - 1 - p
+        div = div * 10
+    (perm_code(n_ap, perm) / div) % 10 - 1
+
+fn popcount(v: Int) -> Int
+    var n = 0
+    var x = v & 0xFFFFFFFF
+    for _ in 0..32
+        n = n + (x & 1)
+        x = x >>> 1
+    n
+
+fn clamp_int(v: Int, lo: Int, hi: Int) -> Int
+    if v < lo
+        return lo
+    if v > hi
+        return hi
+    v
+
+@tier(app)
+fn round_int(f: Float) -> Int
+    float.to_int(math.round(f))
+
+// The nominal time between the arrival of CS_SYNC and the departure of the answer, measured between the two starts, in picoseconds: the
+// `T_SY_CENTER_DELTA` of Part H, Sections 4.3.2 (mode 1) and 4.3.4 (mode 3), the latter with the tone extension slot of the reflector
+// present or not.
+fn center_delta_ps(h: CsPlan, mode: Int, ext_r: Bool) -> Int
+    let sy = ll_cs_plan.sync_ns(h.phy as Int, ll_cs_plan.rtt_bits(h.rtt as Int)) * 1000
+    let rd = ll_cs.T_RD_US * 1_000_000
+    let gd = ll_cs.T_GD_US * 1_000_000
+    let pmsw = ((h.t_pm_us as Int) + (h.t_sw_us as Int)) * 1_000_000
+    if mode == 1
+        return sy + rd + (h.t_ip1_us as Int) * 1_000_000
+    var ext = 1
+    if ext_r
+        ext = 2
+    sy + rd + 2 * gd + 2 * pmsw * (h.n_ap as Int) + ext * pmsw + (h.t_ip2_us as Int) * 1_000_000
+
+// The nominal time between the centres of the initiator's and the reflector's tone on one path, in seconds
+// (`T_PM_CENTER_DELTA` of Part H, Section 4.3.4).
+fn tone_delta_s(h: CsPlan) -> Float
+    let pmsw = (h.t_pm_us as Int) + (h.t_sw_us as Int)
+    int.to_float(pmsw * ((h.n_ap as Int) + 1) + ll_cs.T_RD_US + (h.t_ip2_us as Int)) * 0.000001
+
+// The time stamp of a device: the picoseconds `dt_ps` of true time since its origin on its own clock, with the error and the tick.
+@tier(app)
+fn local_ps(dt_ps: Int, ppm: Float) -> Int
+    round_int(int.to_float(dt_ps) * (1.0 + ppm * 0.000001))
+
+@tier(app)
+fn stamp_ps(var r: Rng, d: SimDev, v: Int) -> Int
+    var x = v
+    if d.noise_on and d.sigma_ps > 0
+        x = x + round_int(rng_gauss(var r) * int.to_float(d.sigma_ps))
+    if d.tick_ps > 0
+        x = ((x + d.tick_ps / 2) / d.tick_ps) * d.tick_ps
+    x
+
+// The 15-bit signed frequency offset of the HCI in 0.01 ppm, as the field holds it.
+@tier(app)
+fn enc_ffo(ppm: Float) -> Int
+    clamp_int(round_int(ppm * 100.0), -10000, 10000) & 0x7FFF
+
+fn dec_ffo(v: Int) -> Float
+    var x = v & 0x7FFF
+    if x >= 0x4000
+        x = x - 0x8000
+    int.to_float(x) / 100.0
+
+fn pack_pct(i: Int, q: Int) -> Int
+    (i & 0xFFF) | ((q & 0xFFF) << 12)
+
+// ── Faults ──────────────────────────────────────────────────────────
+
+fn fault_idx(m: CsMedium, kind: Int, step: Int, side: Int) -> Int
+    for i in 0..list.len(m.faults)
+        let f = m.faults[i]
+        if f.kind == kind and f.side == side and (f.step == step or f.step < 0)
+            return i
+    -1
+
+fn fault_arg(m: CsMedium, kind: Int, step: Int, side: Int) -> Int
+    let i = fault_idx(m, kind, step, side)
+    if i < 0
+        return 0
+    m.faults[i].arg
+
+// Whether the tone slot `slot` that `side` receives in `step` is lost.
+fn tone_lost(m: CsMedium, step: Int, side: Int, slot: Int) -> Bool
+    for i in 0..list.len(m.faults)
+        let f = m.faults[i]
+        if f.kind == F_NO_TONE and f.side == side and (f.step == step or f.step < 0) and (f.arg < 0 or f.arg == slot)
+            return true
+    false
+
+// ── The receiver ────────────────────────────────────────────────────
+
+// What a receiver made of one CS_SYNC: the access address quality, the signal strength, the power, the bit errors of the sequence.
+struct SyncRx
+    var aa_q: Int
+    var rssi: Int
+    var p_dbm: Float
+    var errs: Int
+
+// The access address quality from the signal to noise ratio `snr` (dB) and the bits `nerr` that differ from the expected address: 0 found,
+// 1 found with errors, 2 not found.  Below 6 dB nothing is found; from 12 dB an exact address is found clean; the correlator takes up to 3
+// wrong bits.
+fn aa_quality(snr: Float, nerr: Int, floor: Float, clean: Float) -> Int
+    if snr < floor
+        return 2
+    if nerr == 0 and snr >= clean
+        return 0
+    if nerr <= 3
+        return 1
+    2
+
+@tier(app)
+fn ber(snr: Float) -> Float
+    0.5 * math.exp(-math.pow(10.0, snr / 10.0) / 2.0)
+
+// The tone quality of a tone with carrier to noise density `cn0` (dB-Hz): high from 84, low up to 66, medium between.
+fn tone_quality(cn0: Float) -> Int
+    if cn0 >= 84.0
+        return 0
+    if cn0 <= 66.0
+        return 2
+    1
+
+// The power in dBm that device `rx` receives from a transmitter at `tx_dbm` on a channel of `f_mhz`, over a path of linear gain `g`.
+@tier(app)
+fn rx_power(m: CsMedium, rx: Int, tx_dbm: Int, f_mhz: Float, g: Float) -> Float
+    int.to_float(tx_dbm) + 20.0 * math.log10(g) + m.devs[rx].gain_db - fspl_db(m.dist_mm, f_mhz)
+
+// The receiver of one CS_SYNC.  `heard` says the transmitter sent one that the receiver could hear.
+@tier(app)
+fn sync_rx(var m: CsMedium, rx: Int, heard: Bool, tx_aa: Int, exp_aa: Int, tx_dbm: Int, f_mhz: Float, phy: Int, step: Int,
+           nbits: Int, rand_seq: Bool) -> SyncRx
+    if not heard or fault_idx(m, F_MISS_SYNC, step, rx) >= 0
+        return SyncRx { aa_q: 2, rssi: 127, p_dbm: -200.0, errs: 0 }
+    let p = rx_power(m, rx, tx_dbm, f_mhz, 1.0)
+    var bw = 2.0e6
+    if phy == 1
+        bw = 1.0e6
+    let snr = p - (m.devs[rx].n0 + 10.0 * math.log10(bw))
+    var mask = 0
+    if fault_idx(m, F_BAD_AA, step, rx) >= 0
+        mask = fault_arg(m, F_BAD_AA, step, rx)
+    let q = aa_quality(snr, popcount((tx_aa ^ exp_aa) ^ mask), m.devs[rx].aa_floor, m.devs[rx].aa_clean)
+    var errs = 0
+    if q <= 1 and rand_seq
+        let pe = ber(snr)
+        if m.devs[rx].noise_on
+            for _ in 0..nbits
+                if rng_unit(var m.rng) < pe
+                    errs = errs + 1
+        else
+            errs = round_int(pe * int.to_float(nbits))
+    SyncRx { aa_q: q, rssi: clamp_int(round_int(p), -127, 20), p_dbm: p, errs: errs }
+
+// ── The tones ───────────────────────────────────────────────────────
+
+// The reference power level in dBm that device `rx` reports for the tones it receives from a transmitter at `tx_dbm`: one above the
+// strongest power a tone can have on any channel, so that the 12-bit values stay in range and the level is constant over the subevent.
+@tier(app)
+fn rpl_of(m: CsMedium, rx: Int, tx_dbm: Int) -> Int
+    var gmax = 0.0
+    for p in 0..4
+        gmax = math.max(gmax, m.ap_gain[p])
+    float.to_int(math.ceil(rx_power(m, rx, tx_dbm, 2404.0, gmax))) + 1
+
+// The measurement of one tone slot by device `rx`: the phase `theta` at the amplitude the path gives, rounded to 12 bits against `rpl`.
+// A slot with no tone in it is noise; `real_i` makes the value of the reflector with the initiator phase tone (real and not negative).
+@tier(app)
+fn tone_slot(var m: CsMedium, rx: Int, tx_dbm: Int, f_mhz: Float, g: Float, theta: Float, rpl: Int, present: Bool, real_i: Bool) -> CsTone
+    let n0 = m.devs[rx].n0
+    let noisy = m.devs[rx].noise_on
+    if not present
+        let pn = n0 + 10.0 * math.log10(25000.0)
+        let an = 2048.0 * math.pow(10.0, (pn - int.to_float(rpl)) / 20.0)
+        var ni = 0
+        var nq = 0
+        if noisy
+            ni = round_int(rng_gauss(var m.rng) * an * 0.7071)
+            nq = round_int(rng_gauss(var m.rng) * an * 0.7071)
+        return CsTone { i: clamp_int(ni, -2048, 2047) as i16, q: clamp_int(nq, -2048, 2047) as i16, tq: 2, present: false }
+    let p = rx_power(m, rx, tx_dbm, f_mhz, g)
+    let amp = 2048.0 * math.pow(10.0, (p - int.to_float(rpl)) / 20.0)
+    let sig = amp * math.pow(10.0, -((p - n0 - 10.0 * math.log10(25000.0)) / 20.0)) * 0.7071
+    var x = amp * math.cos(theta)
+    var y = amp * math.sin(theta)
+    if real_i
+        x = amp
+        y = 0.0
+    if noisy
+        x = x + rng_gauss(var m.rng) * sig
+        if not real_i
+            y = y + rng_gauss(var m.rng) * sig
+    var xi = clamp_int(round_int(x), -2048, 2047)
+    if real_i and xi < 0
+        xi = 0
+    CsTone { i: xi as i16, q: clamp_int(round_int(y), -2048, 2047) as i16, tq: tone_quality(p - n0) as u8, present: true }
+
+fn tone_empty() -> CsTone
+    CsTone { i: 0, q: 0, tq: ll_cs_radio.CS_TONE_QUALITY_UNAVAILABLE as u8, present: false }
+
+// The part of a step that one side hands to `cs_step_raw`, and the flags the reflector and the initiator share while it is made.
+struct SideStep
+    var rx: SyncRx
+    var tones: Vec[CsTone; 5]
+    var pct: Int
+    var toa_ps: Int
+    var tod_ps: Int
+    var toa_ok: Bool
+    var tod_ok: Bool
+
+@tier(app)
+fn side_step_new() -> SideStep
+    SideStep { rx: SyncRx { aa_q: 2, rssi: 127, p_dbm: -200.0, errs: 0 },
+        tones: Vec.new(),
+        pct: 0xFFFFFFFF,
+        toa_ps: 0,
+        tod_ps: 0,
+        toa_ok: false,
+        tod_ok: false }
+
+fn raw_of(done: Bool, md: Int, s: SideStep, ffo: Int) -> CsStepRaw
+    if not done
+        return ll_cs_radio.cs_step_raw_none()
+    var aa = s.rx.aa_q
+    var ant = 1
+    if md == 2
+        aa = 0
+        ant = 0
+    CsStepRaw { done: true,
+        aa_q: aa as u8,
+        bit_errors: clamp_int(s.rx.errs, 0, 15) as u8,
+        rssi_dbm: s.rx.rssi as i8,
+        ant: ant as u8,
+        toa_valid: s.toa_ok,
+        tod_valid: s.tod_ok,
+        ffo: ffo as u16,
+        pct1: s.pct as u32,
+        pct2: s.pct as u32,
+        toa_ps: s.toa_ps,
+        tod_ps: s.tod_ps,
+        tones: s.tones }
+
+// ── The resolution of a pair ────────────────────────────────────────
+
+// Resolve the subevent of the pair `ia` (initiator) and `ib` (reflector), either of which may be -1 for a device that is not there, into
+// the heads and the steps of `out_head` and `out_steps`.  The initiator's plan carries the timeline; the reflector answers what it hears.
+@tier(app)
+fn sim_pair(var m: CsMedium, ia: Int, ib: Int)
+    var hh = m.heads[0]
+    if ia >= 0
+        hh = m.heads[ia]
+    else
+        hh = m.heads[ib]
+    let phy = hh.phy as Int
+    let n_ap = hh.n_ap as Int
+    let rtt = hh.rtt as Int
+    let seq_bits = ll_cs_plan.rtt_bits(rtt)
+    let rand_seq = rtt >= 3
+    let snd = rtt == 1 or rtt == 2
+    var n_i = 0
+    if ia >= 0
+        n_i = list.len(m.steps[ia])
+    var n_r = 0
+    if ib >= 0
+        n_r = list.len(m.steps[ib])
+    var n = n_i
+    if ia < 0
+        n = n_r
+    var t0 = 0
+    if ia >= 0
+        t0 = m.t0[ia]
+    else
+        t0 = m.t0[ib]
+    let t0_ps = t0 * 1_000_000
+    var tx_i = 0
+    var tx_r = 0
+    var rpl_i = 0
+    var rpl_r = 0
+    var ppm_i = 0.0
+    var ppm_r = 0.0
+    var ipt = false
+    var late_ns = 0
+    var seed_i = 0x51
+    var seed_r = 0xA3
+    if ia >= 0
+        tx_i = m.heads[ia].tx_dbm as Int
+        ppm_i = m.devs[ia].ppm
+        seed_i = m.devs[ia].seed
+    if ib >= 0
+        tx_r = m.heads[ib].tx_dbm as Int
+        ppm_r = m.devs[ib].ppm
+        seed_r = m.devs[ib].seed
+        ipt = m.heads[ib].ipt
+        if ia >= 0
+            rpl_i = rpl_of(m, ia, tx_r)
+            rpl_r = rpl_of(m, ib, tx_i)
+            late_ns = (m.t0[ib] - m.t0[ia] - (m.heads[ib].window_us as Int)) * 1000
+    let dps = ps_of_mm(m.dist_mm)
+    let dm = int.to_float(m.dist_mm) / 1000.0
+
+    // The leading mode 0 steps of the timeline.
+    var n0run = 0
+    for k in 0..n
+        var md0 = 1
+        if ia >= 0
+            md0 = m.steps[ia][k].mode as Int
+        else
+            md0 = m.steps[ib][k].mode as Int
+        if md0 != 0
+            break
+        n0run = n0run + 1
+
+    var i_on = ia >= 0
+    var r_on = ib >= 0
+    var i_abort = 0
+    var r_abort = 0
+    var i_ok0 = 0
+    var r_ok0 = 0
+    var i_done = 0
+    var r_done = 0
+    var r_ref = false
+    var r_origin = t0_ps
+    var have_comp = false
+    var comp = 0.0
+    var oi: [CsStepRaw] = []
+    var orr: [CsStepRaw] = []
+    var end_ns = 0
+
+    for k in 0..n
+        if i_on and abort_at(m, k, ia) >= 0
+            i_on = false
+            i_abort = m.faults[abort_at(m, k, ia)].arg
+        if r_on and abort_at(m, k, ib) >= 0
+            r_on = false
+            r_abort = m.faults[abort_at(m, k, ib)].arg
+        if k == n0run and n0run > 0
+            if i_on and i_ok0 == 0
+                i_on = false
+                i_abort = ABORT_NO_SYNC
+            if r_on and r_ok0 == 0
+                r_on = false
+                r_abort = ABORT_NO_SYNC
+
+        var si = ll_cs_radio.cs_step_new()
+        var sr = ll_cs_radio.cs_step_new()
+        let i_has = ia >= 0 and k < n_i
+        let r_has = ib >= 0 and k < n_r
+        if i_has
+            si = m.steps[ia][k]
+        if r_has
+            sr = m.steps[ib][k]
+        var tl = si
+        if not i_has
+            tl = sr
+        let md = tl.mode as Int
+        let ch = tl.ch as Int
+        let f_mhz = 2402.0 + int.to_float(ch)
+        let t_tod_i = t0_ps + (tl.start_ns as Int) * 1000
+        end_ns = (tl.start_ns as Int) + (tl.len_ns as Int)
+        var sync_bits = seq_bits
+        if md == 0
+            sync_bits = 0
+        let i_tx = i_on and i_has
+        let deaf = r_has and (tl.start_ns as Int) < late_ns
+
+        var rs = side_step_new()
+        var is = side_step_new()
+
+        // The reflector hears the initiator's CS_SYNC.
+        if md != 2
+            rs.rx = sync_rx(var m, ib, i_tx and r_on and r_has and not deaf, si.aa_i, sr.aa_i, tx_i, f_mhz, phy, k, sync_bits,
+                            rand_seq and md != 0)
+        var r_tx = false
+        if r_on and r_has
+            if md == 0
+                r_tx = rs.rx.aa_q <= 1
+            else
+                r_tx = r_ref
+        if md == 0 and r_on and r_has and rs.rx.aa_q <= 1
+            r_ok0 = r_ok0 + 1
+            if not r_ref
+                r_ref = true
+                r_origin = t_tod_i + dps
+
+        // The initiator hears the reflector's CS_SYNC.
+        if md != 2
+            is.rx = sync_rx(var m, ia, r_tx and i_tx, sr.aa_r, si.aa_r, tx_r, f_mhz, phy, k, sync_bits, rand_seq and md != 0)
+        var ffo_raw = 0.0
+        var ffo_ok = false
+        if md == 0 and i_tx and is.rx.aa_q <= 1
+            let d_i = m.devs[ia]
+            let d_r = m.devs[ib]
+            ffo_raw = d_r.ppm - d_i.ppm + int.to_float(d_r.fae[ch]) / 32.0 + int.to_float(d_i.fae_tab[ch] - d_i.fae[ch]) / 32.0 + d_i.ffo_err
+            if d_i.noise_on
+                ffo_raw = ffo_raw + rng_gauss(var m.rng) * 0.02
+            ffo_ok = true
+            i_ok0 = i_ok0 + 1
+            if not have_comp
+                have_comp = true
+                comp = ffo_raw
+                if d_i.fae_known
+                    comp = comp - int.to_float(d_r.fae_tab[ch]) / 32.0
+
+        // Time stamps of the round trip.
+        if md == 1 or md == 3
+            let tcd = center_delta_ps(hh, md, tl.ext_r)
+            var turn_err = 0
+            if ib >= 0
+                turn_err = m.devs[ib].turn_err_ps
+            let tcd_true = round_int(int.to_float(tcd) / (1.0 + ppm_r * 0.000001)) + turn_err
+            let toa_r_true = t_tod_i + dps
+            let tod_r_true = toa_r_true + tcd_true
+            let toa_i_true = tod_r_true + dps
+            if i_tx
+                let d_i = m.devs[ia]
+                let shift_i = fault_arg(m, F_SHIFT, k, ia)
+                is.tod_ps = stamp_ps(var m.rng, d_i, local_ps(t_tod_i - t0_ps, ppm_i) - d_i.tx_ps[phy - 1])
+                is.tod_ok = true
+                is.toa_ps = stamp_ps(var m.rng, d_i, local_ps(toa_i_true - t0_ps, ppm_i) + d_i.rx_ps[phy - 1]) + shift_i
+                is.toa_ok = is.rx.aa_q <= 1
+            if r_on and r_has
+                let d_r = m.devs[ib]
+                let shift_r = fault_arg(m, F_SHIFT, k, ib)
+                rs.tod_ok = r_tx
+                if r_tx
+                    rs.tod_ps = stamp_ps(var m.rng, d_r, local_ps(tod_r_true - r_origin, ppm_r) - d_r.tx_ps[phy - 1])
+                rs.toa_ps = stamp_ps(var m.rng, d_r, local_ps(toa_r_true - r_origin, ppm_r) + d_r.rx_ps[phy - 1]) + shift_r
+                rs.toa_ok = rs.rx.aa_q <= 1
+
+        // Tones and the phase of a sounding sequence.
+        if md == 2 or md == 3
+            let phi_i = 2.0 * math.pi * hash_unit(seed_i, 0, k)
+            let phi_r = 2.0 * math.pi * hash_unit(seed_r, 1, k)
+            let ang = 2.0 * math.pi * f_mhz * 1.0e6 * dm / int.to_float(C_MPS)
+            let mism = comp - (ppm_r - ppm_i)
+            let resid = -2.0 * math.pi * f_mhz * 1.0e6 * mism * 0.000001 * tone_delta_s(hh)
+            let r_run = r_on and r_has
+            for s in 0..n_ap + 1
+                let ap = perm_path(n_ap, tl.perm as Int, s)
+                let g = m.ap_gain[ap]
+                let ph = m.ap_phase[ap]
+                let i_sends = i_tx and (s < n_ap or si.ext_i)
+                let r_sends = r_tx and r_run and (s < n_ap or sr.ext_r)
+                let th_refl = phi_i - phi_r - ang + ph
+                let hear_r = i_sends and r_run and not tone_lost(m, k, ib, s)
+                let hear_i = r_sends and i_tx and not tone_lost(m, k, ia, s)
+                var phi_r_tx = phi_r
+                if ipt and hear_r
+                    phi_r_tx = phi_r + th_refl
+                let th_init = phi_r_tx - phi_i - ang + ph + resid
+                if r_run
+                    let _a = rs.tones.push(tone_slot(var m, ib, tx_i, f_mhz, g, th_refl, rpl_r, hear_r, ipt and hear_r))
+                if i_tx
+                    var t = tone_empty()
+                    if not (md == 3 and s == n_ap and not r_sends)
+                        t = tone_slot(var m, ia, tx_r, f_mhz, g, th_init, rpl_i, hear_i, false)
+                    let _b = is.tones.push(t)
+        if md == 1 or md == 3
+            if snd
+                let phi_i1 = 2.0 * math.pi * hash_unit(seed_i, 0, k)
+                let phi_r1 = 2.0 * math.pi * hash_unit(seed_r, 1, k)
+                let ang1 = 2.0 * math.pi * f_mhz * 1.0e6 * dm / int.to_float(C_MPS)
+                let ph1 = m.ap_phase[0]
+                let g1 = m.ap_gain[0]
+                let mism1 = comp - (ppm_r - ppm_i)
+                let resid1 = -2.0 * math.pi * f_mhz * 1.0e6 * mism1 * 0.000001 * int.to_float(center_delta_ps(hh, md, tl.ext_r)) * 1.0e-12
+                if r_on and r_has and m.devs[ib].sounding and rs.rx.aa_q <= 1
+                    let t = tone_slot(var m, ib, tx_i, f_mhz, g1, phi_i1 - phi_r1 - ang1 + ph1, rpl_r, true, false)
+                    rs.pct = pack_pct(t.i as Int, t.q as Int)
+                if i_tx and m.devs[ia].sounding and is.rx.aa_q <= 1
+                    let t = tone_slot(var m, ia, tx_r, f_mhz, g1, phi_r1 - phi_i1 - ang1 + ph1 + resid1, rpl_i, true, false)
+                    is.pct = pack_pct(t.i as Int, t.q as Int)
+
+        var ffo_field = ll_cs_radio.CS_FREQ_UNAVAILABLE
+        if ffo_ok
+            ffo_field = enc_ffo(ffo_raw)
+        if ia >= 0
+            list.push(oi, raw_of(i_tx, md, is, ffo_field))
+            if i_tx
+                i_done = i_done + 1
+        if ib >= 0
+            list.push(orr, raw_of(r_on and r_has, md, rs, ll_cs_radio.CS_FREQ_UNAVAILABLE))
+            if r_on and r_has
+                r_done = r_done + 1
+
+    // A subevent with nothing but mode 0 steps ends in the check of the leading steps.
+    if n0run > 0 and n0run >= n
+        if i_on and i_ok0 == 0
+            i_abort = ABORT_NO_SYNC
+        if r_on and r_ok0 == 0
+            r_abort = ABORT_NO_SYNC
+    let len_us = (end_ns + 999) / 1000
+    if ia >= 0
+        var st = ll_cs_radio.CS_OK
+        if i_abort != 0
+            st = ll_cs_radio.CS_ABORTED
+        var ffo_h = ll_cs_radio.CS_FREQ_UNAVAILABLE
+        if have_comp
+            ffo_h = enc_ffo(comp)
+        m.out_head[ia] = CsRaw { status: st as u8, n_done: i_done as u8, abort: i_abort as u8, ffo: ffo_h as u16, rpl_dbm: rpl_i as i8,
+                                 t_ref_us: t0 }
+        m.out_steps[ia] = oi
+        m.out_len_us[ia] = len_us
+        m.ready[ia] = true
+    if ib >= 0
+        var st = ll_cs_radio.CS_OK
+        if r_abort != 0
+            st = ll_cs_radio.CS_ABORTED
+        m.out_head[ib] = CsRaw { status: st as u8, n_done: r_done as u8, abort: r_abort as u8, ffo: ll_cs_radio.CS_FREQ_UNAVAILABLE as u16,
+                                 rpl_dbm: rpl_r as i8, t_ref_us: m.t0[ib] + (r_origin - t0_ps) / 1_000_000 }
+        m.out_steps[ib] = orr
+        m.out_len_us[ib] = len_us
+        m.ready[ib] = true
+
+// ── The radio ───────────────────────────────────────────────────────
+
+fn abort_at(m: CsMedium, step: Int, side: Int) -> Int
+    for i in 0..list.len(m.faults)
+        let f = m.faults[i]
+        if f.kind == F_ABORT and f.side == side and f.step == step
+            return i
+    -1
+
+// The plan with the role turned: the other device of the procedure runs the same steps.
+fn plan_with_role(h: CsPlan, role: Int) -> CsPlan
+    CsPlan { role: role as u8,
+        phy: h.phy,
+        rtt: h.rtt,
+        n_steps: h.n_steps,
+        n_mode0: h.n_mode0,
+        t_ip1_us: h.t_ip1_us,
+        t_ip2_us: h.t_ip2_us,
+        t_fcs_us: h.t_fcs_us,
+        t_pm_us: h.t_pm_us,
+        t_sw_us: h.t_sw_us,
+        ipt: h.ipt,
+        n_ap: h.n_ap,
+        aci: h.aci,
+        tx_dbm: h.tx_dbm,
+        snr_i: h.snr_i,
+        snr_r: h.snr_r,
+        window_us: h.window_us,
+        test: h.test }
+
+// The peer's plan for a test of S0: its head and its steps, when the test does not want the device's own turned round.
+fn sim_cs_peer(var s: SimCs, h: CsPlan, steps: [CsStep])
+    s.med.peer_head = h
+    s.med.peer_set = true
+    s.med.peer_steps = list.clone(steps)
+    s.med.peer_steps_set = true
+
+fn bit_set(mask: Int, bit: Int) -> Bool
+    ((mask >>> bit) & 1) == 1
+
+// Whether the timing `us` is the mandatory one or a bit of `mask` that stands for it in the HCI order.
+fn timing_ok(us: Int, mandatory: Int, table: [Int], mask: Int) -> Bool
+    if us == mandatory
+        return true
+    for i in 0..list.len(table)
+        if table[i] == us
+            return bit_set(mask, i)
+    false
+
+// Whether a radio that reports `c` runs the plan with the head `p`.
+@tier(app)
+fn plan_in_caps(c: CsCaps, p: CsPlan) -> Bool
+    let phy = p.phy as Int
+    let rtt = p.rtt as Int
+    let n_ap = p.n_ap as Int
+    if (p.role as Int) > 1 or not bit_set(c.roles, p.role as Int)
+        return false
+    if phy < 1 or phy > 3 or not bit_set(c.phys, phy - 1)
+        return false
+    if rtt > 6 or not bit_set(c.rtt_types, rtt)
+        return false
+    if n_ap < 1 or n_ap > c.max_paths or (p.ipt and not c.ipt)
+        return false
+    timing_ok(p.t_ip1_us as Int, 145, [10, 20, 30, 40, 50, 60, 80], c.t_ip1) and timing_ok(p.t_ip2_us as Int, 145, [10, 20, 30, 40, 50, 60, 80], c.t_ip2)
+        and timing_ok(p.t_fcs_us as Int, 150, [15, 20, 30, 40, 50, 60, 80, 100, 120], c.t_fcs)
+        and timing_ok(p.t_pm_us as Int, 40, [10, 20], c.t_pm)
+
+fn ch_ok(ch: Int) -> Bool
+    (ch >= 2 and ch <= 22) or (ch >= 26 and ch <= 76)
+
+// Fill in the peer a run of S0 talks to, resolve what is armed, and take the peer out again.
+@tier(app)
+fn sim_run_pair(var m: CsMedium, me: Int)
+    let other = 1 - me
+    var filled = false
+    if m.auto_peer and not m.armed[other]
+        filled = true
+        m.armed[other] = true
+        m.t0[other] = m.t0[me]
+        if m.peer_set
+            m.heads[other] = m.peer_head
+        else
+            m.heads[other] = plan_with_role(m.heads[me], 1 - (m.heads[me].role as Int))
+        if m.peer_steps_set
+            m.steps[other] = m.peer_steps
+        else
+            m.steps[other] = m.steps[me]
+    if m.armed[0] and m.armed[1] and m.heads[0].role != m.heads[1].role
+        var ini = 1
+        if m.heads[0].role == 0
+            ini = 0
+        sim_pair(var m, ini, 1 - ini)
+    else
+        for s in 0..2
+            if m.armed[s]
+                if m.heads[s].role == 0
+                    sim_pair(var m, s, -1)
+                else
+                    sim_pair(var m, -1, s)
+    if filled
+        m.armed[other] = false
+        m.ready[other] = false
+
+impl CsRadio[] for SimCs
+    fn supports_cs(var self) -> Bool
+        self.caps.supported
+
+    fn cs_caps(var self) -> CsCaps
+        self.caps
+
+    fn cs_timing(var self) -> CsTiming
+        self.timing
+
+    fn cs_cal(var self) -> CsCal
+        self.med.devs[self.side].cal
+
+    fn cs_fae(var self, ch: Int) -> Int
+        if ch < 0 or ch > 78
+            return 0
+        self.med.devs[self.side].fae_tab[ch]
+
+    @tier(app)
+    fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
+        self.arms = self.arms + 1
+        var m = self.med
+        let me = self.side
+        m.armed[me] = false
+        m.ready[me] = false
+        if not self.caps.supported or not plan_in_caps(self.caps, plan)
+            return ll_cs_radio.CS_UNSUPPORTED
+        if (plan.n_steps as Int) > self.timing.max_steps or fault_idx(m, F_RESOURCES, -1, me) >= 0
+            return ll_cs_radio.CS_RESOURCES
+        if t0_us - self.now_us < self.timing.arm_lead_us or fault_idx(m, F_LATE, -1, me) >= 0
+            return ll_cs_radio.CS_LATE
+        m.armed[me] = true
+        m.heads[me] = plan
+        m.t0[me] = t0_us
+        m.steps[me] = []
+        m.loaded[me] = 0
+        ll_cs_radio.CS_OK
+
+    @tier(app)
+    fn cs_load(var self, i: Int, var step: CsStep) -> Int
+        var m = self.med
+        let me = self.side
+        if not m.armed[me] or i != m.loaded[me] or i >= (m.heads[me].n_steps as Int)
+            return ll_cs_radio.CS_UNSUPPORTED
+        let md = step.mode as Int
+        if md > 3 or (md == 3 and (self.caps.modes & 1) == 0) or not ch_ok(step.ch as Int)
+            return ll_cs_radio.CS_UNSUPPORTED
+        list.push(m.steps[me], step)
+        m.loaded[me] = i + 1
+        ll_cs_radio.CS_OK
+
+    @tier(app)
+    fn cs_run(var self, var raw: CsRaw) -> Int
+        var m = self.med
+        let me = self.side
+        if not m.armed[me] or m.loaded[me] != (m.heads[me].n_steps as Int)
+            return ll_cs_radio.CS_UNSUPPORTED
+        if not m.ready[me]
+            sim_run_pair(var m, me)
+        raw = m.out_head[me]
+        self.runs = self.runs + 1
+        let end = m.t0[me] + m.out_len_us[me] + self.timing.finish_us
+        if end > self.now_us
+            self.now_us = end
+        m.armed[me] = false
+        m.ready[me] = false
+        if (m.out_head[me].status as Int) == ll_cs_radio.CS_OK
+            return ll_cs_radio.CS_OK
+        ll_cs_radio.CS_ABORTED
+
+    fn cs_step_raw(var self, i: Int, var out: CsStepRaw) -> Bool
+        let l = self.med.out_steps[self.side]
+        if i < 0 or i >= list.len(l)
+            return false
+        out = l[i]
+        true
+
+    fn cs_abort(var self)
+        self.aborts = self.aborts + 1
+        var m = self.med
+        m.armed[self.side] = false
+        m.ready[self.side] = false
+
+// ── The pieces of the estimator that the Host-side estimator shares with the raw one ──
+
+// What the estimator found.
+struct Est
+    var d_pbr: Float
+    var n_pbr: Int
+    var peak: Float
+    var d_rtt: Float
+    var n_rtt: Int
+    var ffo: Float
+
+fn est_new() -> Est
+    Est { d_pbr: 0.0, n_pbr: 0, peak: 0.0, d_rtt: 0.0, n_rtt: 0, ffo: 0.0 }
+
+// The products `PCT_REFL x PCT_INIT` of the channels of a run: the frequency of each in Hz and the sum over the slots of the step.
+struct Products
+    var f: [Float]
+    var re: [Float]
+    var im: [Float]
+
+// The size of the sum of the products turned by the delay of a distance of `d` metres.
+fn mf_eval(p: Products, d: Float) -> Float
+    var sr = 0.0
+    var si = 0.0
+    for k in 0..list.len(p.f)
+        let ph = 4.0 * math.pi * (p.f[k] - 2402.0e6) * d / int.to_float(C_MPS)
+        let c = math.cos(ph)
+        let s = math.sin(ph)
+        sr = sr + p.re[k] * c - p.im[k] * s
+        si = si + p.re[k] * s + p.im[k] * c
+    math.hypot(sr, si)
+
+// The distance in metres from the peak of `mf_eval` over 0 to 60 m: a search at 2 cm, refined twice.
+fn est_pbr(p: Products) -> Est
+    var e = est_new()
+    e.n_pbr = list.len(p.f)
+    if e.n_pbr == 0
+        return e
+    var best = 0.0
+    var best_v = -1.0
+    for i in 0..3001
+        let d = int.to_float(i) * 0.02
+        let v = mf_eval(p, d)
+        if v > best_v
+            best_v = v
+            best = d
+    var lo = best - 0.02
+    var step = 0.001
+    for _ in 0..2
+        best_v = -1.0
+        for i in 0..41
+            let d = lo + int.to_float(i) * step
+            let v = mf_eval(p, d)
+            if v > best_v
+                best_v = v
+                best = d
+        lo = best - step
+        step = step / 20.0
+    e.d_pbr = best
+    e.peak = best_v
+    e
+
+
+// ── The Hosts' side ─────────────────────────────────────────────────
+
+fn send(var c: ctl_hci.Controller, opcode: Int, params: [Int])
+    ctl_hci.ctl_rx(var c, 0x01)
+    ctl_hci.ctl_rx(var c, opcode & 0xFF)
+    ctl_hci.ctl_rx(var c, (opcode >>> 8) & 0xFF)
+    ctl_hci.ctl_rx(var c, list.len(params))
+    for p in params
+        ctl_hci.ctl_rx(var c, p)
+
+fn host_read(var c: ctl_hci.Controller, var log: [Int])
+    let _ran = ctl_hci.ctl_step(var c)
+    while ctl_hci.ctl_tx_pending(var c)
+        list.push(log, ctl_hci.ctl_tx_next(var c))
+
+fn cmd(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> [Int]
+    var out: [Int] = []
+    send(var c, opcode, params)
+    host_read(var c, var out)
+    for b in out
+        list.push(log, b)
+    out
+
+// Split the octets into packets: an event (0x04) or an ACL packet (0x02).
+fn packets_of(bytes: [Int]) -> [[Int]]
+    var out: [[Int]] = []
+    var i = 0
+    while i < list.len(bytes)
+        var n = 3 + bytes[i + 2]
+        if bytes[i] == 0x02
+            n = 5 + bytes[i + 3]
+        list.push(out, bytes[i:i + n])
+        i = i + n
+    out
+
+fn events_coded(bytes: [Int], code: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in packets_of(bytes)
+        if e[0] == 0x04 and e[1] == code
+            list.push(out, e[:])
+    out
+
+// The LE Meta events with the subevent code `sub`.
+fn meta_events(bytes: [Int], sub: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for e in events_coded(bytes, 0x3E)
+        if e[3] == sub
+            list.push(out, e[:])
+    out
+
+// The status of the Command Status event of a command, and the command it answers.
+fn status_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> Int
+    let r = cmd(var c, var log, opcode, params)
+    let st = events_coded(r, 0x0F)
+    test.assert_eq(list.len(st), 1)
+    test.assert_eq(st[0][5] | (st[0][6] << 8), opcode)
+    st[0][3]
+
+// The status of the Command Complete event of a command.
+fn complete_of(var c: ctl_hci.Controller, var log: [Int], opcode: Int, params: [Int]) -> Int
+    let r = cmd(var c, var log, opcode, params)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4] | (done[0][5] << 8), opcode)
+    done[0][6]
+
+fn le16(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF]
+
+fn cat(a: [Int], b: [Int]) -> [Int]
+    var out: [Int] = []
+    for x in a
+        list.push(out, x)
+    for x in b
+        list.push(out, x)
+    out
+
+// The list `p` with the element `i` set to `v`.
+fn with(p: [Int], i: Int, v: Int) -> [Int]
+    var q: [Int] = []
+    for x in p
+        list.push(q, x)
+    q[i] = v
+    q
+
+// ── The sample data of [Vol 6] Part C, Section 1 (the key of the encryption) ──
+
+fn s_ltk() -> [Int]
+    [0xBF, 0x01, 0xFB, 0x9D, 0x4E, 0xF3, 0xBC, 0x36, 0xD8, 0x74, 0xF5, 0x39, 0x41, 0x38, 0x68, 0x4C]
+
+fn s_rand() -> [Int]
+    [0x90, 0x78, 0x56, 0x34, 0x12, 0xEF, 0xCD, 0xAB]
+
+// SKD_C and IV_C, then SKD_P and IV_P, as each end draws them.
+fn s_rnd_central() -> [Int]
+    [0x13, 0x02, 0xF1, 0xE0, 0xDF, 0xCE, 0xBD, 0xAC, 0x24, 0xAB, 0xDC, 0xBA]
+
+fn s_rnd_peripheral() -> [Int]
+    [0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xBE, 0xBA, 0xAF, 0xDE]
+
+// ── The two ends ────────────────────────────────────────────────────
+
+fn conn_req(aa: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 0, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0xA0 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0xB0 + i)
+    for k in 0..4
+        let _c = ll_pdu.pdu_put(var p, (aa >>> (8 * k)) & 0xFF)
+    for b in [0x11, 0x22, 0x33, 2]
+        let _d = ll_pdu.pdu_put(var p, b)
+    for v in [0, 24, 0, 400]
+        let _e = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _f = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _g = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A Controller whose Host enables every event and sets Channel Sounding (Host Support) before any connection, over the radio `air`.
+@when(noble_controller_config.CTL_CS > 0)
+fn host_ctl(first: Int, var air: SimCs) -> ctl_hci.Controller
+    var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
+    for i in 0..6
+        ctl_hci.ctl_set_public(var c, i, first + i)
+    var trace: [Int] = []
+    test.assert_eq(complete_of(var c, var trace, 0x0C01, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]), 0)
+    test.assert_eq(complete_of(var c, var trace, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 0)
+    ctl_hci.ctl_cs_radio_init(var c, var air)
+    test.assert_eq(complete_of(var c, var trace, 0x2074, [47, 1]), 0)
+    c
+
+// The two Controllers, their radios, the logs of what each Host read, and the planning of each.  `a` is the Central of the connection, `b` the Peripheral; `ra` and
+// `rb` are the two sides of one medium.  `ia` and `ib` are the first octet of the logs that no reader of results has looked at, `tw_a` and `tw_b` the tweak a radio applies to what it reads back
+// (`PairRadio`).
+@when(noble_controller_config.CTL_CS > 0)
+struct Air
+    var a: ctl_hci.Controller
+    var b: ctl_hci.Controller
+    var ca: ll_ccm.SoftCipher
+    var cb: ll_ccm.SoftCipher
+    var ma: Pdu
+    var na: Pdu
+    var mb: Pdu
+    var nb: Pdu
+    var ha: [Int]
+    var hb: [Int]
+    var air_a: [[Int]]
+    var air_b: [[Int]]
+    var rnd_a: [Int]
+    var rnd_b: [Int]
+    var ra: SimCs
+    var rb: SimCs
+    var sa: ll_cs_plan.CsState
+    var sb: ll_cs_plan.CsState
+    var ia: Int
+    var ib: Int
+    var tw_a: Int
+    var tw_b: Int
+
+@when(noble_controller_config.CTL_CS > 0)
+fn air_new() -> Air
+    var ra = sim_cs_new()
+    return air_from(var ra)
+
+// The two Controllers over the radio `ra` and the other side of its medium.  A Controller reads the table of frequency actuation errors of its radio when it starts, so the
+// figures of the devices are set before this.
+@when(noble_controller_config.CTL_CS > 0)
+fn air_from(var ra: SimCs) -> Air
+    var rb = sim_cs_other(var ra)
+    var a = host_ctl(0xA0, var ra)
+    var b = host_ctl(0xB0, var rb)
+    var req = conn_req(0x50655A12)
+    ll_link.link_open_central(var a.links[0], 1, var req, 1000)
+    ll_link.link_open(var b.links[0], 1, var req, 1000)
+    var w = Air { a: a, b: b, ca: ll_ccm.soft_cipher_new(), cb: ll_ccm.soft_cipher_new(), ma: ll_pdu.pdu_new(), na: ll_pdu.pdu_new(), mb: ll_pdu.pdu_new(),
+                  nb: ll_pdu.pdu_new(), ha: [], hb: [], air_a: [], air_b: [], rnd_a: s_rnd_central(), rnd_b: s_rnd_peripheral(), ra: ra, rb: rb,
+                  sa: ll_cs_plan.state_new(noble_controller_config.CTL_CS), sb: ll_cs_plan.state_new(noble_controller_config.CTL_CS), ia: 0, ib: 0, tw_a: 0, tw_b: 0 }
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+    w
+
+// What the radio program does when it mirrors a link's PDUs into radio memory.
+fn mirror(var c: ctl_hci.Controller, var cc: ll_ccm.SoftCipher, var cur: Pdu, var nxt: Pdu)
+    ctl_hci.ctl_conn_air(var c, 0, var cc, false, var cur)
+    ctl_hci.ctl_conn_air(var c, 0, var cc, true, var nxt)
+    ctl_hci.ctl_conn_mirrored(var c, 0)
+
+fn rnd_vec(v: [Int]) -> Vec[u8; 12]
+    var out: Vec[u8; 12] = Vec.new()
+    for i in 0..12
+        let _a = out.push(v[i] as u8)
+    out
+
+// The next twelve octets after `v`.
+fn rnd_next(var v: [Int])
+    for i in 0..12
+        v[i] = (v[i] + 17) & 0xFF
+
+// The program's turn between events: give a link that waits for random octets or for the cipher what it needs.
+@when(noble_controller_config.CTL_CS > 0)
+fn secure(var w: Air)
+    if ctl_hci.ctl_secure_wanted(var w.a)
+        var ra = rnd_vec(w.rnd_a)
+        if ctl_hci.ctl_secure_poll(var w.a, var w.ca, var ra, ctl_hci.ctl_wants_random(var w.a))
+            rnd_next(var w.rnd_a)
+    if ctl_hci.ctl_secure_wanted(var w.b)
+        var rb = rnd_vec(w.rnd_b)
+        if ctl_hci.ctl_secure_poll(var w.b, var w.cb, var rb, ctl_hci.ctl_wants_random(var w.b))
+            rnd_next(var w.rnd_b)
+
+fn bytes_of(var p: Pdu) -> [Int]
+    var out: [Int] = []
+    for i in 0..p.n
+        list.push(out, p.b[i] as Int)
+    out
+
+fn flight(var l: ll_link.Link, var m: Pdu, var n: Pdu, var out: Pdu)
+    if l.use_nxt
+        ll_link.pdu_copy(var out, var n)
+    else
+        ll_link.pdu_copy(var out, var m)
+
+// One connection event of the connection in the slot 0, run as the radio program runs it.  `mute`: the Peripheral hears nothing.  `lose`: the Central does not hear the
+// Peripheral's answers.
+@when(noble_controller_config.CTL_CS > 0)
+fn event(var w: Air, mute: Bool, lose: Bool)
+    if not ctl_hci.ctl_conn_active(var w.a, 0)
+        return
+    secure(var w)
+    let t0 = w.a.links[0].due
+    ctl_hci.ctl_set_time(var w.a, t0)
+    ctl_hci.ctl_set_time(var w.b, t0)
+    let b_on = ctl_hci.ctl_conn_active(var w.b, 0)
+    let _cha = ctl_hci.ctl_conn_begin(var w.a, 0)
+    if b_on
+        let _chb = ctl_hci.ctl_conn_begin(var w.b, 0)
+    mirror(var w.a, var w.ca, var w.ma, var w.na)
+    if b_on
+        mirror(var w.b, var w.cb, var w.mb, var w.nb)
+    var t = t0
+    var tx = ll_pdu.pdu_new()
+    ll_link.pdu_copy(var tx, var w.ma)
+    var hdr = ll_link.link_first_header(var w.a.links[0])
+    tx.b[0] = hdr as u8
+    var n = 0
+    var open = true
+    while open and n < 8
+        list.push(w.air_a, bytes_of(var tx))
+        var rxp = ll_pdu.pdu_new()
+        ll_link.pdu_copy(var rxp, var tx)
+        let start = t
+        t = t + ll_pdu.airtime_us(tx.n)
+        if mute or not b_on
+            open = false
+        else
+            ll_link.link_note_rx(var w.b.links[0], start, true)
+            let hb = ll_link.link_rx_fast(var w.b.links[0], hdr)
+            var reply = ll_pdu.pdu_new()
+            flight(var w.b.links[0], var w.mb, var w.nb, var reply)
+            reply.b[0] = hb as u8
+            ctl_hci.ctl_conn_rx_open(var w.b, 0, var w.cb, var rxp)
+            ctl_hci.ctl_conn_rx_slow(var w.b, 0, var rxp)
+            if w.b.links[0].dirty
+                mirror(var w.b, var w.cb, var w.mb, var w.nb)
+            list.push(w.air_b, bytes_of(var reply))
+            t = t + 150
+            let rstart = t
+            t = t + ll_pdu.airtime_us(reply.n)
+            if lose
+                open = false
+            else
+                var rxr = ll_pdu.pdu_new()
+                ll_link.pdu_copy(var rxr, var reply)
+                ll_link.link_note_rx(var w.a.links[0], rstart, true)
+                let nh = ll_link.link_rx_fast(var w.a.links[0], hb)
+                var next = ll_pdu.pdu_new()
+                flight(var w.a.links[0], var w.ma, var w.na, var next)
+                next.b[0] = nh as u8
+                ctl_hci.ctl_conn_rx_open(var w.a, 0, var w.ca, var rxr)
+                ctl_hci.ctl_conn_rx_slow(var w.a, 0, var rxr)
+                if w.a.links[0].dirty
+                    mirror(var w.a, var w.ca, var w.ma, var w.na)
+                n = n + 1
+                t = t + 150
+                let ends = ll_data.dpdu_llid(var reply) == ll_data.LLID_CONTROL and (ll_data.dpdu_opcode(var reply) == ll_data.OP_TERMINATE_IND or w.a.links[0].enc_rx)
+                open = w.a.links[0].cont and not w.a.links[0].closing and not w.b.links[0].closing or ends and not w.b.links[0].closing
+                tx = next
+                hdr = nh
+    ctl_hci.ctl_conn_done(var w.a, 0, t)
+    if b_on
+        ctl_hci.ctl_conn_done(var w.b, 0, t)
+    host_read(var w.a, var w.ha)
+    host_read(var w.b, var w.hb)
+
+@when(noble_controller_config.CTL_CS > 0)
+fn events(var w: Air, n: Int)
+    for _ in 0..n
+        event(var w, false, false)
+
+// The Hosts read what the Controllers owe them, a few times over, since a Controller sends the events of a result as the pool has slots.
+@when(noble_controller_config.CTL_CS > 0)
+fn settle(var w: Air)
+    for _ in 0..6
+        host_read(var w.a, var w.ha)
+        host_read(var w.b, var w.hb)
+
+// The Central's Host and the Peripheral's.
+@when(noble_controller_config.CTL_CS > 0)
+fn ca_cmd(var w: Air, op: Int, p: [Int]) -> [Int]
+    cmd(var w.a, var w.ha, op, p)
+
+@when(noble_controller_config.CTL_CS > 0)
+fn pe_cmd(var w: Air, op: Int, p: [Int]) -> [Int]
+    cmd(var w.b, var w.hb, op, p)
+
+fn start_params(rand: [Int], ediv: Int, ltk: [Int]) -> [Int]
+    var p: [Int] = [1, 0]
+    for r in rand
+        list.push(p, r)
+    list.push(p, ediv & 0xFF)
+    list.push(p, (ediv >>> 8) & 0xFF)
+    for k in ltk
+        list.push(p, k)
+    p
+
+// ── The Hosts' log and what is in it ────────────────────────────────
+
+// The command status of the command `op` in the octets `r`, and that no Command Complete came with it.
+fn cstatus(r: [Int], op: Int) -> Int
+    test.assert_eq(list.len(events_coded(r, 0x0E)), 0)
+    let st = events_coded(r, 0x0F)
+    test.assert_eq(list.len(st), 1)
+    test.assert_eq(st[0][5] | (st[0][6] << 8), op)
+    st[0][3]
+
+// The LE Meta events with the subevent code `sub` in the log `log` from the octet `from`.
+fn meta_from(log: [Int], from: Int, sub: Int) -> [[Int]]
+    var tail: [Int] = []
+    for k in from..list.len(log)
+        list.push(tail, log[k])
+    meta_events(tail, sub)
+
+const SUB_CAPS = 0x2C
+const SUB_CAPS_V2 = 0x38
+const SUB_FAE = 0x2D
+const SUB_SEC = 0x2E
+const SUB_CFG = 0x2F
+const SUB_PROC = 0x30
+const SUB_RESULT = 0x31
+const SUB_CONT = 0x32
+
+// The Host establishes the encrypted connection, long packets in both directions, the capabilities of the peer, CS security and the default settings.  `central_reads`
+// says the Central's Host asks for the capabilities too (the Peripheral's does in any case: its Controller has to ask for the features first).
+@when(noble_controller_config.CTL_CS > 0)
+fn connect(var w: Air)
+    events(var w, 2)
+    test.assert_eq(status_of(var w.a, var w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
+    events(var w, 4)
+    if list.len(meta_events(w.hb, 0x05)) != 1
+        test.fail("hb ${w.hb} ha ${w.ha} air_a ${w.air_a}")
+    test.assert_eq(list.len(meta_events(w.hb, 0x05)), 1)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x201A, cat([1, 0], s_ltk())), 0)
+    events(var w, 6)
+    test.assert(ll_link.link_encrypted(var w.a.links[0]))
+    test.assert(ll_link.link_encrypted(var w.b.links[0]))
+    // Long packets both ways: the LL_CS_FAE_RSP is 75 octets.
+    test.assert_eq(complete_of(var w.a, var w.ha, 0x2022, cat([1, 0], cat(le16(251), le16(2100)))), 0)
+    events(var w, 4)
+    test.assert_eq(w.a.links[0].dl_rem_rx_octets, 251)
+    test.assert_eq(w.b.links[0].dl_rem_rx_octets, 251)
+
+
+// ── The radio of one Controller in the lock step ────────────────────
+
+// What a `PairRadio` changes in what the radio reads back to the Controller, to test the assembly of the result with values the model never makes (`tw`):
+//   TW_NONE        nothing
+//   TW_PCT         the phase correction terms: PCT1 with a reserved bit set, PCT2 not available
+//   TW_NO_TONES    the radio measured no tone in any slot of any step (a radio whose receiver was off)
+const TW_NONE = 0
+const TW_PCT = 1
+const TW_NO_TONES = 2
+
+// A `SimCs` as the Controller holds its radio.  `probe` makes a copy of a Controller take part in the arming of the medium without running (see the header of the file).
+// A normal radio keeps the result of its side that the first run of the pair left, which the model clears when the radio arms.
+struct PairRadio
+    var s: SimCs
+    var probe: Bool
+    var tw: Int
+
+impl CsRadio[] for PairRadio
+    fn supports_cs(var self) -> Bool
+        self.s.supports_cs()
+
+    fn cs_caps(var self) -> CsCaps
+        self.s.cs_caps()
+
+    fn cs_timing(var self) -> CsTiming
+        self.s.cs_timing()
+
+    fn cs_cal(var self) -> CsCal
+        self.s.cs_cal()
+
+    fn cs_fae(var self, ch: Int) -> Int
+        self.s.cs_fae(ch)
+
+    @tier(app)
+    fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
+        var m = self.s.med
+        let me = self.s.side
+        let was = m.ready[me]
+        let r = self.s.cs_arm(var plan, t0_us)
+        if was and not self.probe and r == ll_cs_radio.CS_OK
+            m.ready[me] = true
+        r
+
+    fn cs_load(var self, i: Int, var step: CsStep) -> Int
+        self.s.cs_load(i, var step)
+
+    fn cs_run(var self, var raw: CsRaw) -> Int
+        if self.probe
+            raw = ll_cs_radio.cs_raw_new()
+            return ll_cs_radio.CS_ABORTED
+        self.s.cs_run(var raw)
+
+    @tier(app)
+    fn cs_step_raw(var self, i: Int, var out: CsStepRaw) -> Bool
+        let ok = self.s.cs_step_raw(i, var out)
+        if ok and self.tw == TW_PCT
+            out.pct1 = (out.pct1 | 0x7F000000) as u32
+            out.pct2 = 0xFFFFFFFF
+        if ok and self.tw == TW_NO_TONES
+            out.tones.clear()
+        ok
+
+    fn cs_abort(var self)
+        self.s.cs_abort()
+
+struct Two
+    var a: Int
+    var b: Int
+
+// One subevent of the pair, planned, armed, run and stored by the two Controllers at `t0` and `anchor_ns` after the start of their procedure, in the connection event `ev`.
+@when(noble_controller_config.CTL_CS > 0)
+fn lock_step(var w: Air, ev: Int, t0: Int, anchor_ns: Int) -> Two
+    // The copy of the Peripheral's Controller plans what it will plan and registers the plan with the medium.
+    var pc = w.b
+    var pst = w.sb
+    var pcc = w.cb
+    var probe = PairRadio { s: SimCs { med: w.rb.med, side: w.rb.side, caps: w.rb.caps, timing: w.rb.timing, now_us: w.rb.now_us, arms: 0, runs: 0, aborts: 0 },
+                            probe: true, tw: 0 }
+    let _p = ctl_hci.ctl_cs_subevent(var pc, var probe, var pcc, var pst, 0, ev, t0, anchor_ns)
+    var rad_a = PairRadio { s: w.ra, probe: false, tw: w.tw_a }
+    let xa = ctl_hci.ctl_cs_subevent(var w.a, var rad_a, var w.ca, var w.sa, 0, ev, t0, anchor_ns)
+    var rad_b = PairRadio { s: w.rb, probe: false, tw: w.tw_b }
+    let xb = ctl_hci.ctl_cs_subevent(var w.b, var rad_b, var w.cb, var w.sb, 0, ev, t0, anchor_ns)
+    Two { a: xa, b: xb }
+
+// ── The Hosts' side of Channel Sounding ─────────────────────────────
+
+// What a series needs: whether the Central is the initiator (it is the reflector otherwise), the Max_Procedure_Count of the Start (0 for no end), the main and sub mode of the
+// configuration, the range of main steps between two sub steps, the main steps a subevent repeats, the RTT type, the number of times the channels are used, the length of
+// the subevents the Host allows and the antenna configuration index.  `first_central` says the Central's Host asks for the capabilities before the Peripheral's does (the
+// Peripheral's asks first otherwise), `lazy` that neither does: the Controllers exchange the features and the capabilities when the configuration is made.
+struct Setup
+    var init_central: Bool
+    var count: Int
+    var main: Int
+    var sub: Int
+    var mn: Int
+    var mx: Int
+    var mrep: Int
+    var rtt: Int
+    var chrep: Int
+    var sub_len: Int
+    var aci: Int
+    var first_central: Bool
+    var lazy: Bool
+
+fn setup_new() -> Setup
+    Setup { init_central: true, count: 3, main: 2, sub: 1, mn: 2, mx: 3, mrep: 0, rtt: 0, chrep: 1, sub_len: 20000, aci: 0, first_central: false, lazy: false }
+
+// The channel map of all 72 channels, ten octets.
+fn chm_all() -> [Int]
+    [0xFC, 0xFF, 0x7F, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F]
+
+// LE CS Create Config for the handle 1, the configuration 0 made with the peer (context 1), the role `role` of the end that sends the command.
+fn create_cfg(s: Setup, role: Int) -> [Int]
+    cat(cat([1, 0, 0, 1, s.main, s.sub, s.mn, s.mx, s.mrep, 1, role, s.rtt, 1], chm_all()), [s.chrep, 0, 0, 0, 0])
+
+fn le24(v: Int) -> [Int]
+    [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF]
+
+// LE CS Set Procedure Parameters for the handle 1 and the configuration 0: 250 ms of procedure, 9 to 16 events between the procedures, `count` procedures, subevents of
+// `sub_len` microseconds, the antenna configuration, LE 1M, no power change.
+fn proc_params(s: Setup) -> [Int]
+    cat(cat(cat([1, 0, 0], le16(400)), cat(le16(9), le16(16))), cat(cat(le16(s.count), cat(le24(s.sub_len), le24(s.sub_len))), [s.aci, 1, 0x80, 1, 0xFF, 0xFF]))
+
+@when(noble_controller_config.CTL_CS > 0)
+fn ini_cmd(var w: Air, s: Setup, op: Int, p: [Int]) -> [Int]
+    if s.init_central
+        return ca_cmd(var w, op, p)
+    pe_cmd(var w, op, p)
+
+@when(noble_controller_config.CTL_CS > 0)
+fn rfl_cmd(var w: Air, s: Setup, op: Int, p: [Int]) -> [Int]
+    if s.init_central
+        return pe_cmd(var w, op, p)
+    ca_cmd(var w, op, p)
+
+// The subevent code of the Read Remote Supported Capabilities Complete event the Host gets: [v2] when the build has Enhancement #1.
+fn caps_sub() -> Int
+    if ctl_limits.cs_ipt_on()
+        return SUB_CAPS_V2
+    SUB_CAPS
+
+// The Hosts walk the whole way to a series that is on: the capabilities of the peer (the Peripheral's Host asks first, with the features of the Central unknown to its
+// Controller), CS security, the default settings, the table of the reflector, the configuration and the procedure parameters, and the Start.
+@when(noble_controller_config.CTL_CS > 0)
+fn open_series(var w: Air, s: Setup)
+    connect(var w)
+    if not s.lazy
+        if s.first_central
+            test.assert_eq(cstatus(ca_cmd(var w, 0x208A, [1, 0]), 0x208A), 0)
+        else
+            test.assert_eq(cstatus(pe_cmd(var w, 0x208A, [1, 0]), 0x208A), 0)
+        events(var w, 8)
+        test.assert_eq(cstatus(ca_cmd(var w, 0x208C, [1, 0]), 0x208C), 0)
+        events(var w, 8)
+    test.assert_eq(complete_of(var w.a, var w.ha, 0x208D, [1, 0, 3, 1, 0]), 0)
+    test.assert_eq(complete_of(var w.b, var w.hb, 0x208D, [1, 0, 3, 1, 0]), 0)
+    if s.lazy
+        // The configuration first: the Controller of the initiator exchanges the features and the capabilities for it.
+        test.assert_eq(cstatus(ini_cmd(var w, s, 0x2090, create_cfg(s, 0)), 0x2090), 0)
+        events(var w, 12)
+        test.assert_eq(cstatus(ca_cmd(var w, 0x208C, [1, 0]), 0x208C), 0)
+        events(var w, 8)
+        test.assert_eq(cstatus(ini_cmd(var w, s, 0x208E, [1, 0]), 0x208E), 0)
+        events(var w, 8)
+    else
+        test.assert_eq(cstatus(ini_cmd(var w, s, 0x208E, [1, 0]), 0x208E), 0)
+        events(var w, 8)
+        test.assert_eq(cstatus(ini_cmd(var w, s, 0x2090, create_cfg(s, 0)), 0x2090), 0)
+        events(var w, 8)
+    test.assert_eq(complete_of_cmd(var w, s, 0x2093, proc_params(s)), 0)
+    test.assert_eq(cstatus(ini_cmd(var w, s, 0x2094, [1, 0, 0, 1]), 0x2094), 0)
+    events(var w, 10)
+
+@when(noble_controller_config.CTL_CS > 0)
+fn complete_of_cmd(var w: Air, s: Setup, op: Int, p: [Int]) -> Int
+    let r = ini_cmd(var w, s, op, p)
+    let done = events_coded(r, 0x0E)
+    test.assert_eq(list.len(done), 1)
+    done[0][6]
+
+// ── What the Hosts read: the events of a subevent ───────────────────
+
+// One step of a Subevent Result or Continue event: the mode, the channel and the data as the event carries them.
+struct HStep
+    var mode: Int
+    var ch: Int
+    var data: [Int]
+
+// One subevent as a Host reads it: the fields of the Subevent Result event, the done statuses and abort reasons of its last event, the number of events it took and its
+// steps.
+struct HSub
+    var handle: Int
+    var cfg: Int
+    var start_ev: Int
+    var proc: Int
+    var freq: Int
+    var rpl: Int
+    var pdone: Int
+    var sdone: Int
+    var abort: Int
+    var nap: Int
+    var events: Int
+    var steps: [HStep]
+
+fn h_steps_of(e: [Int], at0: Int, n: Int, var steps: [HStep])
+    var at = at0
+    for _ in 0..n
+        let len = e[at + 2]
+        var d: [Int] = []
+        for k in 0..len
+            list.push(d, e[at + 3 + k])
+        list.push(steps, HStep { mode: e[at], ch: e[at + 1], data: d })
+        at = at + 3 + len
+
+// The subevents in the Subevent Result and Continue events of the log `log` from its octet `from`.
+fn h_subs(log: [Int], from: Int) -> [HSub]
+    var tail: [Int] = []
+    for k in from..list.len(log)
+        list.push(tail, log[k])
+    var out: [HSub] = []
+    for e in events_coded(tail, 0x3E)
+        if e[3] == SUB_RESULT
+            var s = HSub { handle: e[4] | (e[5] << 8), cfg: e[6], start_ev: e[7] | (e[8] << 8), proc: e[9] | (e[10] << 8), freq: e[11] | (e[12] << 8), rpl: e[13],
+                           pdone: e[14], sdone: e[15], abort: e[16], nap: e[17], events: 1, steps: [] }
+            h_steps_of(e, 19, e[18], var s.steps)
+            list.push(out, s)
+        else if e[3] == SUB_CONT and list.len(out) > 0
+            var s = out[list.len(out) - 1]
+            s.pdone = e[7]
+            s.sdone = e[8]
+            s.abort = e[9]
+            s.events = s.events + 1
+            h_steps_of(e, 12, e[11], var s.steps)
+    out
+
+// The signed value of 16 bits and of 12.
+fn s16(lo: Int, hi: Int) -> Int
+    let v = lo | (hi << 8)
+    if v >= 0x8000
+        return v - 0x10000
+    v
+
+fn s12(v: Int) -> Int
+    let x = v & 0xFFF
+    if x >= 0x800
+        return x - 0x1000
+    x
+
+// The octet of the data of a step where the tone slots begin (the antenna path permutation index): after the round-trip fields of a step of mode 3, with the two phase
+// correction terms when the build reports them.
+fn h_tone_at(mode: Int, pct: Bool) -> Int
+    if mode == 2
+        return 0
+    if pct
+        return 14
+    6
+
+// The tone slot `k` of a step: the I and Q values, and the tone quality indicator with the extension slot bits.
+fn h_tone_i(st: HStep, pct: Bool, k: Int) -> Int
+    let at = h_tone_at(st.mode, pct) + 1 + 4 * k
+    s12(st.data[at] | (st.data[at + 1] << 8))
+
+fn h_tone_q(st: HStep, pct: Bool, k: Int) -> Int
+    let at = h_tone_at(st.mode, pct) + 1 + 4 * k
+    s12((st.data[at + 1] >>> 4) | (st.data[at + 2] << 4))
+
+fn h_tone_tq(st: HStep, pct: Bool, k: Int) -> Int
+    st.data[h_tone_at(st.mode, pct) + 1 + 4 * k + 3]
+
+// Packet_Quality: the access address found in the low four bits.
+fn h_aa(st: HStep) -> Int
+    st.data[0] & 0xF
+
+// ToA_ToD or ToD_ToA of a round-trip step, in units of 0.5 nanosecond; 0x8000 when not available.
+fn h_tdiff(st: HStep) -> Int
+    st.data[3] | (st.data[4] << 8)
+
+// ── The Host-side estimator ─────────────────────────────────────────
+//
+// It reads what the Controllers sent and what a Host knows: the capabilities (whether the phase correction terms of a sounding sequence are reported), the configuration
+// (the CS_SYNC PHY, the RTT type, the timings, the antenna paths) and the table of the reflector.  The extension slot of a step is the slot after the antenna paths; it is
+// left out of the phase estimate, and its bits say whether the other end sent a tone in it.
+
+// What the Host knows of the configuration.
+struct HCfg
+    var head: CsPlan
+    var n_ap: Int
+    var pct: Bool
+
+// The configuration the Host made with the setup `s` (LE 1M, the mandatory timings): the head the nominal offsets of Part H follow from.
+fn hcfg_of(s: Setup, n_ap: Int, pct: Bool) -> HCfg
+    var h = ll_cs_radio.cs_plan_new()
+    set_head(var h, s.rtt, n_ap)
+    HCfg { head: h, n_ap: n_ap, pct: pct and (s.rtt == 1 or s.rtt == 2) }
+
+fn set_head(var h: CsPlan, rtt: Int, n_ap: Int)
+    h.rtt = rtt as u8
+    h.n_ap = n_ap as u8
+
+// The products of the tones of the two ends: the sum over the antenna paths (and not the extension slot) of `PCT_REFL x PCT_INIT` of each channel, for the slots both ends
+// measured with a tone quality of high or medium.
+fn h_products(ini: HSub, rfl: HSub, hc: HCfg) -> Products
+    var p = Products { f: [], re: [], im: [] }
+    let n = math_min_int(list.len(ini.steps), list.len(rfl.steps))
+    for k in 0..n
+        let mi = ini.steps[k]
+        let mr = rfl.steps[k]
+        let tone = mi.mode == 2 or mi.mode == 3
+        if tone and mr.mode == mi.mode and mr.ch == mi.ch and list.len(mi.data) > 0 and list.len(mr.data) > 0
+            var re = 0.0
+            var im = 0.0
+            var used = 0
+            for s in 0..hc.n_ap
+                if (h_tone_tq(mi, hc.pct, s) & 0xF) <= 1 and (h_tone_tq(mr, hc.pct, s) & 0xF) <= 1
+                    let a = int.to_float(h_tone_i(mr, hc.pct, s))
+                    let b = int.to_float(h_tone_q(mr, hc.pct, s))
+                    let c = int.to_float(h_tone_i(mi, hc.pct, s))
+                    let d = int.to_float(h_tone_q(mi, hc.pct, s))
+                    re = re + a * c - b * d
+                    im = im + a * d + b * c
+                    used = used + 1
+            if used > 0
+                list.push(p.f, (2402.0 + int.to_float(mi.ch)) * 1.0e6)
+                list.push(p.re, re)
+                list.push(p.im, im)
+    p
+
+fn math_min_int(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+// The index of the channel `ch` in a table of 72 values.
+fn fae_index(ch: Int) -> Int
+    if ch <= 22
+        return ch - 2
+    ch - 5
+
+// The sum of the frequency offsets of the reflector in ppm that the initiator measured in the mode 0 steps of a subevent (Measured_Freq_Offset less the reflector's value
+// of the channel, the table being read from the reflector: signed octets in units of 1/32 ppm), and how many steps gave one.
+fn h_ffo_sum(ini: HSub, table: [Int]) -> Float
+    var sum = 0.0
+    for st in ini.steps
+        if h_ffo_has(st)
+            sum = sum + dec_ffo(st.data[3] | (st.data[4] << 8)) - int.to_float(table[fae_index(st.ch)]) / 32.0
+    sum
+
+fn h_ffo_n(ini: HSub) -> Int
+    var n = 0
+    for st in ini.steps
+        if h_ffo_has(st)
+            n = n + 1
+    n
+
+// Whether a mode 0 step of the initiator holds a frequency offset: the CS_SYNC was found and the radio measured one.
+fn h_ffo_has(st: HStep) -> Bool
+    st.mode == 0 and list.len(st.data) >= 5 and h_aa(st) <= 1 and (st.data[3] | (st.data[4] << 8)) != ll_cs_radio.CS_FREQ_UNAVAILABLE
+
+// The nominal offset between the two CS_SYNC of a step in picoseconds (T_SY_CENTER_DELTA of Part H), from what the Host made the configuration with.  The extension slot
+// of the reflector in a step of mode 3 is read from the initiator's data.
+fn h_nominal_ps(hc: HCfg, st: HStep) -> Int
+    var ext = false
+    if st.mode == 3
+        ext = (h_tone_tq(st, hc.pct, hc.n_ap) & 0xF0) == 0x20
+    center_delta_ps(hc.head, st.mode, ext)
+
+// The distance in metres from the round trip: the initiator's difference of arrival and departure, scaled by the frequency offset it measured, less the reflector's
+// difference of departure and arrival.  The events carry both without the nominal offset, so the Host adds it back to scale it.
+fn h_rtt(ini: HSub, rfl: HSub, hc: HCfg, ffo: Float) -> Est
+    var e = est_new()
+    e.ffo = ffo
+    var sum = 0.0
+    var n = 0
+    let m = math_min_int(list.len(ini.steps), list.len(rfl.steps))
+    for k in 0..m
+        let a = ini.steps[k]
+        let b = rfl.steps[k]
+        let rtt = a.mode == 1 or a.mode == 3
+        if rtt and b.mode == a.mode and list.len(a.data) > 0 and list.len(b.data) > 0 and h_aa(a) == 0 and h_aa(b) == 0 and h_tdiff(a) != 0x8000 and h_tdiff(b) != 0x8000
+            let tcd = int.to_float(h_nominal_ps(hc, a))
+            let di = int.to_float(s16(a.data[3], a.data[4]) * 500)
+            let dr = int.to_float(s16(b.data[3], b.data[4]) * 500)
+            sum = sum + (di + tcd) * (1.0 + ffo * 0.000001) - tcd - dr
+            n = n + 1
+    e.n_rtt = n
+    if n > 0
+        e.d_rtt = sum / int.to_float(n) * 1.0e-12 * int.to_float(C_MPS) / 2.0
+    e
+
+// The estimates from a procedure's subevents: the phase over all the channels of all the subevents, the round trip over all the steps.
+fn h_estimate(ini: [HSub], rfl: [HSub], hc: HCfg, table: [Int]) -> Est
+    var all = Products { f: [], re: [], im: [] }
+    var sum = 0.0
+    var n = 0
+    var ffo_sum = 0.0
+    var ffo_n = 0
+    for j in 0..math_min_int(list.len(ini), list.len(rfl))
+        let p = h_products(ini[j], rfl[j], hc)
+        for k in 0..list.len(p.f)
+            list.push(all.f, p.f[k])
+            list.push(all.re, p.re[k])
+            list.push(all.im, p.im[k])
+        ffo_sum = ffo_sum + h_ffo_sum(ini[j], table)
+        ffo_n = ffo_n + h_ffo_n(ini[j])
+    var ffo = 0.0
+    if ffo_n > 0
+        ffo = ffo_sum / int.to_float(ffo_n)
+    var e = est_pbr(all)
+    for j in 0..math_min_int(list.len(ini), list.len(rfl))
+        let r = h_rtt(ini[j], rfl[j], hc, ffo)
+        sum = sum + r.d_rtt * int.to_float(r.n_rtt)
+        n = n + r.n_rtt
+    e.n_rtt = n
+    if n > 0
+        e.d_rtt = sum / int.to_float(n)
+    e.ffo = ffo
+    e
+
+fn err_m(est: Float, mm: Int) -> Float
+    math.abs(est - int.to_float(mm) / 1000.0)
+
+// ── A procedure instance, run by the two Controllers ────────────────
+
+// What the Hosts read of one procedure instance.
+struct Round
+    var a: [HSub]
+    var b: [HSub]
+    var xa: [Int]
+    var xb: [Int]
+
+// The spacing of the subevents of a procedure, in nanoseconds.
+const SUB_SPACING_NS = 30_000_000
+
+// Both Controllers begin a procedure instance in the connection event `ev`; the answer is the octets of the Hosts' logs that the instance starts at.
+@when(noble_controller_config.CTL_CS > 0)
+fn round_begin(var w: Air, ev: Int) -> Two
+    let mark = Two { a: list.len(w.ha), b: list.len(w.hb) }
+    test.assert_eq(ctl_hci.ctl_cs_instance(var w.a, var w.ca, var w.sa, 0, ev), ctl_hci.RUN_OK)
+    test.assert_eq(ctl_hci.ctl_cs_instance(var w.b, var w.cb, var w.sb, 0, ev), ctl_hci.RUN_OK)
+    mark
+
+// The next subevent, number `k` of the instance, of both Controllers, in lock step; the radios start it a millisecond after the later one ended.
+@when(noble_controller_config.CTL_CS > 0)
+fn sub_step(var w: Air, ev: Int, k: Int) -> Two
+    var t0 = w.ra.now_us
+    if w.rb.now_us > t0
+        t0 = w.rb.now_us
+    lock_step(var w, ev, t0 + 1000, k * SUB_SPACING_NS)
+
+// One procedure instance in the connection event `ev`: both Controllers begin it and run its subevents in lock step, each followed by the Hosts reading what is owed.
+@when(noble_controller_config.CTL_CS > 0)
+fn run_round(var w: Air, ev: Int, subs_max: Int) -> Round
+    let mark = round_begin(var w, ev)
+    var xa: [Int] = []
+    var xb: [Int] = []
+    for k in 0..subs_max
+        let r = sub_step(var w, ev, k)
+        list.push(xa, r.a)
+        list.push(xb, r.b)
+        settle(var w)
+        if r.a != ctl_hci.RUN_OK and r.b != ctl_hci.RUN_OK
+            break
+    Round { a: h_subs(w.ha, mark.a), b: h_subs(w.hb, mark.b), xa: xa, xb: xb }
+
+// The subevents of the initiator's Host and of the reflector's, of a round.
+fn ini_subs(r: Round, s: Setup) -> [HSub]
+    if s.init_central
+        return r.a[:]
+    r.b[:]
+
+fn rfl_subs(r: Round, s: Setup) -> [HSub]
+    if s.init_central
+        return r.b[:]
+    r.a[:]
+
+// ── Helpers of the tests ────────────────────────────────────────────
+
+// The log of the initiator's Host and of the reflector's.
+@when(noble_controller_config.CTL_CS > 0)
+fn ini_log(w: Air, s: Setup) -> [Int]
+    if s.init_central
+        return w.ha[:]
+    w.hb[:]
+
+@when(noble_controller_config.CTL_CS > 0)
+fn rfl_log(w: Air, s: Setup) -> [Int]
+    if s.init_central
+        return w.hb[:]
+    w.ha[:]
+
+// The signed table of a Read Remote FAE Table Complete event in the log, after the status and the handle check.
+fn fae_event(log: [Int]) -> [Int]
+    let evs = meta_from(log, 0, SUB_FAE)
+    test.assert_eq(list.len(evs), 1)
+    test.assert_eq(evs[0][4], 0)
+    test.assert_eq(evs[0][5] | (evs[0][6] << 8), 1)
+    var t: [Int] = []
+    for k in 0..72
+        var v = evs[0][7 + k]
+        if v >= 128
+            v = v - 256
+        list.push(t, v)
+    t
+
+// The geometry and the figures of the two devices of the model (the device 0 is the radio of the Central): the distance, a clock offset for each, the delays between the
+// time stamps and the antenna ports, a table of frequency actuation errors for each (the reported one is the real one), and a phase of the first antenna path.
+@when(noble_controller_config.CTL_CS > 0)
+fn world_figures(var ra: SimCs, mm: Int, ppm0: Float, ppm1: Float)
+    sim_cs_dist(var ra, mm)
+    var d0 = sim_cs_dev(ra)
+    var d1 = sim_cs_far(ra)
+    d0.ppm = ppm0
+    d1.ppm = ppm1
+    sim_cs_delays(var d0, 1200, 2100)
+    sim_cs_delays(var d1, 800, 1900)
+    for ch in 0..79
+        sim_cs_fae(var d1, ch, (ch % 9) - 4)
+        sim_cs_fae(var d0, ch, 3 - (ch % 7))
+    ra.med.ap_phase[0] = 0.3
+
+// The two Controllers over a medium with those figures.
+@when(noble_controller_config.CTL_CS > 0)
+fn air_with(mm: Int, ppm0: Float, ppm1: Float) -> Air
+    var ra = sim_cs_new()
+    world_figures(var ra, mm, ppm0, ppm1)
+    air_from(var ra)
+
+// The table the radio of the reflector reports for the 72 allowed channels.
+@when(noble_controller_config.CTL_CS > 0)
+fn table_of(w: Air, s: Setup) -> [Int]
+    var d = sim_cs_dev(w.ra)
+    if s.init_central
+        d = sim_cs_far(w.ra)
+    var t: [Int] = []
+    for k in 0..72
+        list.push(t, d.fae_tab[ll_cs.fae_channel(k)])
+    t
+
+// The bound on the phase estimate (the CS4a bound of the raw results) and on the round-trip estimate, in metres.  The round trip reaches the Host in units of 0.5 nanosecond,
+// each of the two time differences rounded to the nearest, so the mean over the steps can be off by half a nanosecond of flight: 7.5 cm.
+const PBR_TOL_M = 0.005
+const RTT_TOL_M = 0.08
+
+// ── What the Hosts are told on the way ──────────────────────────────
+
+// The setup as the Hosts saw it: the feature exchange the Peripheral's Controller made for its Host, the capabilities each Host was told, Security Enable Complete, the
+// Config Complete event with the role of each end, the Procedure Enable Complete event of the initiator.
+@when(noble_controller_config.CTL_CS > 0)
+fn check_setup(w: Air, s: Setup)
+    // The Controller of the Host that asked for the capabilities (the Host that made the configuration, when it was the Controllers that exchanged them) had no features of
+    // the other end: the Host hears LE Read Remote Features Complete, once, from the exchange the Controller made.
+    var asker = w.hb[:]
+    var other = w.ha[:]
+    if s.first_central or s.lazy and s.init_central
+        asker = w.ha[:]
+        other = w.hb[:]
+    let feat = meta_events(asker, 0x04)
+    test.assert_eq(list.len(feat), 1)
+    test.assert_eq(feat[0][4], 0)
+    test.assert_eq(list.len(meta_events(other, 0x04)), 0)
+    // Both Hosts heard the capabilities of the other end, once; the one that did not ask without having asked.
+    for log in [w.ha, w.hb]
+        let caps = meta_events(log, caps_sub())
+        test.assert_eq(list.len(caps), 1)
+        test.assert_eq(caps[0][4], 0)
+        test.assert_eq(caps[0][5] | (caps[0][6] << 8), 1)
+    // CS security, on both Hosts.
+    for log in [w.ha, w.hb]
+        let sec = meta_events(log, SUB_SEC)
+        test.assert_eq(list.len(sec), 1)
+        test.assert_eq(sec[0][4], 0)
+    // The configuration: made by the initiator's Host in the role of the initiator, accepted by the peer in the other.
+    let ci = meta_events(ini_log(w, s), SUB_CFG)
+    let cr = meta_events(rfl_log(w, s), SUB_CFG)
+    test.assert_eq(list.len(ci), 1)
+    test.assert_eq(list.len(cr), 1)
+    for c in [ci[0], cr[0]]
+        test.assert_eq(c[4], 0)
+        test.assert_eq(c[7], 0)
+        test.assert_eq(c[8], 1)
+        test.assert_eq(c[9], s.main)
+        test.assert_eq(c[10], s.sub)
+        test.assert_eq(c[16], s.rtt)
+    test.assert_eq(ci[0][15], 0)
+    test.assert_eq(cr[0][15], 1)
+    // The Start: the initiator's Host is told the procedures are on.
+    let pe = meta_events(ini_log(w, s), SUB_PROC)
+    test.assert_eq(list.len(pe), 1)
+    test.assert_eq(pe[0][4], 0)
+    test.assert_eq(pe[0][7], 0)
+    test.assert_eq(pe[0][8], 1)
+
+// A round as the Hosts read it: the two read the same subevents, each with the steps in the same modes and channels, the header the specification gives, the data of the
+// length the mode and the role give, and the done statuses of a procedure that runs to its end.
+// Whether the Hosts read the phase correction terms of a sounding sequence: the build has the sequences (the radios of the model measure them).
+fn pct_on() -> Bool
+    ctl_limits.cs_rtt_seq_on()
+
+// The octets of the data of a step of mode `mode` that the end in `role` (0 initiator) reads in a configuration with `rtt` and `n_ap` paths.
+fn data_octets(mode: Int, role: Int, rtt: Int, n_ap: Int) -> Int
+    var pcts = 0
+    if pct_on() and (rtt == 1 or rtt == 2)
+        pcts = 8
+    if mode == 0
+        if role == 0
+            return 5
+        return 3
+    if mode == 1
+        return 6 + pcts
+    if mode == 2
+        return 1 + 4 * (n_ap + 1)
+    6 + pcts + 1 + 4 * (n_ap + 1)
+
+@when(noble_controller_config.CTL_CS > 0)
+fn check_round(r: Round, s: Setup, ev: Int, proc: Int, n_ap: Int)
+    let ini = ini_subs(r, s)
+    let rfl = rfl_subs(r, s)
+    test.assert(list.len(ini) >= 2)
+    test.assert_eq(list.len(ini), list.len(rfl))
+    for j in 0..list.len(ini)
+        let a = ini[j]
+        let b = rfl[j]
+        test.assert_eq(a.cfg, 0)
+        test.assert_eq(b.cfg, 0)
+        test.assert_eq(a.start_ev, ev)
+        test.assert_eq(b.start_ev, ev)
+        test.assert_eq(a.proc, proc)
+        test.assert_eq(b.proc, proc)
+        test.assert_eq(a.handle, 1)
+        test.assert_eq(a.sdone, 0)
+        test.assert_eq(b.sdone, 0)
+        test.assert_eq(a.abort, 0)
+        test.assert_eq(b.abort, 0)
+        var last = 1
+        if j == list.len(ini) - 1
+            last = 0
+        test.assert_eq(a.pdone, last)
+        test.assert_eq(b.pdone, last)
+        // The frequency compensation is the initiator's alone.
+        test.assert(a.freq != ll_cs_radio.CS_FREQ_UNAVAILABLE)
+        test.assert_eq(b.freq, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+        test.assert_eq(a.nap, n_ap)
+        test.assert_eq(b.nap, n_ap)
+        test.assert_eq(list.len(a.steps), list.len(b.steps))
+        // A subevent of 32 steps does not go in one event.
+        if list.len(a.steps) > 25
+            test.assert(a.events >= 2)
+        for k in 0..list.len(a.steps)
+            let x = a.steps[k]
+            let y = b.steps[k]
+            test.assert_eq(x.mode, y.mode)
+            test.assert_eq(x.ch, y.ch)
+            test.assert(ll_cs.channel_ok(x.ch))
+            test.assert_eq(list.len(x.data), data_octets(x.mode, 0, s.rtt, n_ap))
+            test.assert_eq(list.len(y.data), data_octets(y.mode, 1, s.rtt, n_ap))
+            // Every step ran, and the access address of a step that has one was found clean (a step of mode 2 holds the permutation first).
+            test.assert(list.len(x.data) > 0)
+            if x.mode != 2
+                test.assert_eq(h_aa(x), 0)
+                test.assert_eq(h_aa(y), 0)
+
+// ── The whole path, with the Host's eyes ────────────────────────────
+
+// The Hosts walk the whole path with the initiator at `init_central`, the devices `mm` millimetres apart with the clock offsets `ppm0` (the Central's) and `ppm1`, and read
+// one procedure.  What they were told on the way and what they read in the results is checked here; the estimate is the answer.
+@when(noble_controller_config.CTL_CS > 0)
+fn walk(init_central: Bool, mm: Int, ppm0: Float, ppm1: Float) -> Est
+    var w = air_with(mm, ppm0, ppm1)
+    var s = setup_new()
+    s.init_central = init_central
+    open_series(var w, s)
+    check_setup(w, s)
+    let table = fae_event(ini_log(w, s))
+    test.assert_eq(table, table_of(w, s))
+    let r = run_round(var w, 100, 8)
+    check_round(r, s, 100, 0, 1)
+    h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_hosts_walk_the_whole_path_and_the_estimate_gives_the_distance_with_the_central_as_the_initiator()
+    let e = walk(true, 3200, 11.0, -14.0)
+    test.assert(err_m(e.d_pbr, 3200) < PBR_TOL_M)
+    test.assert(err_m(e.d_rtt, 3200) < RTT_TOL_M)
+    // The frequency offset of the reflector the Host measured: -14 less 11 ppm.
+    test.assert(math.abs(e.ffo - (-25.0)) < 0.01)
+    test.assert_eq(e.n_pbr, 72)
+    test.assert(e.n_rtt >= 20)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_hosts_walk_the_whole_path_and_the_estimate_gives_the_distance_with_the_peripheral_as_the_initiator()
+    let e = walk(false, 3200, 11.0, -14.0)
+    test.assert(err_m(e.d_pbr, 3200) < PBR_TOL_M)
+    test.assert(err_m(e.d_rtt, 3200) < RTT_TOL_M)
+    // The initiator is the Peripheral's radio now: the reflector is 11 ppm from -14 ppm.
+    test.assert(math.abs(e.ffo - 25.0) < 0.01)
+    test.assert_eq(e.n_pbr, 72)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_estimate_follows_the_distance_from_half_a_metre_to_twenty_with_either_end_the_initiator()
+    let ds = [500, 2000, 7300, 15000, 20000]
+    for i in 0..list.len(ds)
+        let e = walk(i % 2 == 0, ds[i], 8.0, -17.0)
+        test.assert(err_m(e.d_pbr, ds[i]) < PBR_TOL_M)
+        test.assert(err_m(e.d_rtt, ds[i]) < RTT_TOL_M)
+
+// ── The assembly of the result, against the radios' own measurements ──
+
+// The expected time difference of a round-trip step in units of 0.5 nanosecond, computed here from the radio's time stamps, its calibration and the nominal offset: the
+// initiator's arrival less departure, the reflector's departure less arrival, each at the antenna port.
+fn expect_tdiff(raw: CsStepRaw, cal: CsCal, initiator: Bool, nominal_ps: Int) -> Int
+    let arrival = raw.toa_ps - cal.rx_1m_ps
+    let departure = raw.tod_ps + cal.tx_1m_ps
+    var dt = arrival - departure
+    if not initiator
+        dt = departure - arrival
+    round_int(int.to_float(dt - nominal_ps) / 500.0)
+
+// What one Host read of a step against what the radio under it measured: the access address check, the signal strength, the antenna, the frequency offset of the
+// initiator, the time difference (delays off, the nominal offset `nominal_ps` of the step off, half nanoseconds) and the tones.  `initiator` says the end is the initiator of
+// the configuration.
+@when(noble_controller_config.CTL_CS > 0)
+fn check_step(x: HStep, raw: CsStepRaw, cal: CsCal, initiator: Bool, hc: HCfg, nominal_ps: Int)
+    test.assert(raw.done)
+    var rtt = 0
+    if x.mode != 2
+        rtt = hc.head.rtt as Int
+    // Packet_Quality: the check in the low nibble; the bit errors of a sequence above it, in the steps that carry one.
+    var q = raw.aa_q as Int
+    if x.mode != 0 and rtt != 0
+        q = q | ((raw.bit_errors as Int) << 4)
+    if x.mode == 0
+        test.assert_eq(x.data[0], q)
+        test.assert_eq(x.data[1], (raw.rssi_dbm as Int) & 0xFF)
+        test.assert_eq(x.data[2], raw.ant as Int)
+        if initiator
+            test.assert_eq(x.data[3] | (x.data[4] << 8), raw.ffo as Int)
+    if x.mode == 1 or x.mode == 3
+        test.assert_eq(x.data[0], q)
+        test.assert_eq(x.data[1], 0xFF)
+        test.assert_eq(x.data[2], (raw.rssi_dbm as Int) & 0xFF)
+        test.assert_eq(x.data[5], raw.ant as Int)
+        let want = expect_tdiff(raw, cal, initiator, nominal_ps)
+        test.assert_eq(s16(x.data[3], x.data[4]), want)
+    if x.mode == 2 or x.mode == 3
+        let at = h_tone_at(x.mode, hc.pct)
+        test.assert_eq(x.data[at], 0)
+        for k in 0..hc.n_ap + 1
+            var want_i = 0
+            var want_q = 0
+            var want_tq = ll_cs_radio.CS_TONE_QUALITY_UNAVAILABLE
+            if raw.tones[k].present
+                want_i = raw.tones[k].i as Int
+                want_q = raw.tones[k].q as Int
+                want_tq = (raw.tones[k].tq as Int) & 0xF
+            test.assert_eq(h_tone_i(x, hc.pct, k), want_i)
+            test.assert_eq(h_tone_q(x, hc.pct, k), want_q)
+            test.assert_eq(h_tone_tq(x, hc.pct, k) & 0xF, want_tq)
+            // The extension slot says whether the other end was to send a tone in it; the slots of the paths say nothing.
+            let hi = h_tone_tq(x, hc.pct, k) >>> 4
+            if k < hc.n_ap
+                test.assert_eq(hi, 0)
+            else
+                test.assert(hi == 1 or hi == 2)
+                test.assert_eq(hi == 2, raw.tones[k].present)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_events_carry_what_the_radios_measured_with_the_delays_off_and_in_half_nanoseconds_whichever_end_is_the_initiator()
+    for who in 0..2
+        var w = air_with(4100, 11.0, -14.0)
+        var s = setup_new()
+        s.init_central = who == 0
+        open_series(var w, s)
+        let mark = round_begin(var w, 100)
+        var checked = 0
+        var tone_steps = 0
+        var rtt_steps = 0
+        var ext_present = 0
+        var ext_absent = 0
+        for k in 0..6
+            let r = sub_step(var w, 100, k)
+            settle(var w)
+            let sa = h_subs(w.ha, mark.a)
+            let sb = h_subs(w.hb, mark.b)
+            let hc = hcfg_of(s, 1, false)
+            // The radios' results of this subevent: the device 0 is the Central's.
+            let raw0 = w.ra.med.out_steps[0]
+            let raw1 = w.ra.med.out_steps[1]
+            test.assert_eq(list.len(sa[k].steps), list.len(raw0))
+            test.assert_eq(list.len(sb[k].steps), list.len(raw1))
+            for j in 0..list.len(raw0)
+                // The nominal offset is the one of the step the initiator reads: the extension slot of the reflector in a step of mode 3 is told by its data.
+                var nominal = 0
+                if s.init_central
+                    nominal = h_nominal_ps(hc, sa[k].steps[j])
+                else
+                    nominal = h_nominal_ps(hc, sb[k].steps[j])
+                check_step(sa[k].steps[j], raw0[j], w.ra.med.devs[0].cal, s.init_central, hc, nominal)
+                check_step(sb[k].steps[j], raw1[j], w.ra.med.devs[1].cal, not s.init_central, hc, nominal)
+                checked = checked + 2
+                if sa[k].steps[j].mode == 2
+                    tone_steps = tone_steps + 1
+                    if (h_tone_tq(sa[k].steps[j], false, 1) >>> 4) == 2
+                        ext_present = ext_present + 1
+                    else
+                        ext_absent = ext_absent + 1
+                if sa[k].steps[j].mode == 1
+                    rtt_steps = rtt_steps + 1
+            if r.a != ctl_hci.RUN_OK and r.b != ctl_hci.RUN_OK
+                break
+        test.assert(checked >= 200)
+        test.assert(rtt_steps >= 20)
+        // Both kinds of extension slot occur, so that the check above saw a slot with a tone and one without.
+        test.assert(ext_present > 0)
+        test.assert(ext_absent > 0)
+        test.assert(tone_steps >= 70)
+
+// ── The delays, the scaling, the clocks ─────────────────────────────
+
+// A series with the radios of the Central and the Peripheral both reporting no calibration, or one of them; the estimates of one procedure.
+@when(noble_controller_config.CTL_CS > 0)
+fn est_with_cal(init_central: Bool, none0: Bool, none1: Bool) -> Est
+    var w = air_with(5300, 6.0, -9.0)
+    var s = setup_new()
+    s.init_central = init_central
+    open_series(var w, s)
+    let table = table_of(w, s)
+    var d0 = sim_cs_dev(w.ra)
+    var d1 = sim_cs_far(w.ra)
+    if none0
+        d0.cal = ll_cs_radio.cs_cal_none()
+    if none1
+        d1.cal = ll_cs_radio.cs_cal_none()
+    let r = run_round(var w, 100, 8)
+    h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_delays_of_the_radios_are_taken_off_the_round_trip_by_the_calibration_each_reports()
+    // The delays of the model: the Central's radio 1200 and 2100 picoseconds (departure, arrival), the Peripheral's 800 and 1900.  A radio that reports no calibration
+    // leaves its two delays in the time difference it reports: the estimate of the distance grows by half the sum of the delays, as light covers it.
+    let per_ps_m = 0.5 * 1.0e-12 * int.to_float(C_MPS)
+    for who in 0..2
+        let central_ini = who == 0
+        let right = est_with_cal(central_ini, false, false)
+        test.assert(err_m(right.d_rtt, 5300) < RTT_TOL_M)
+        let no0 = est_with_cal(central_ini, true, false)
+        test.assert(math.abs((no0.d_rtt - right.d_rtt) - 3300.0 * per_ps_m) < RTT_TOL_M)
+        let no1 = est_with_cal(central_ini, false, true)
+        test.assert(math.abs((no1.d_rtt - right.d_rtt) - 2700.0 * per_ps_m) < RTT_TOL_M)
+        let both = est_with_cal(central_ini, true, true)
+        test.assert(math.abs((both.d_rtt - right.d_rtt) - 6000.0 * per_ps_m) < RTT_TOL_M)
+        // The delays do not move the phase.
+        test.assert(err_m(both.d_pbr, 5300) < PBR_TOL_M)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_clock_offset_of_85_ppm_is_scaled_out_of_the_round_trip_with_the_offset_the_initiator_reported()
+    for who in 0..2
+        var w = air_with(8200, 40.0, -45.0)
+        var s = setup_new()
+        s.init_central = who == 0
+        open_series(var w, s)
+        let table = table_of(w, s)
+        let r = run_round(var w, 100, 8)
+        let ini = ini_subs(r, s)
+        let rfl = rfl_subs(r, s)
+        let hc = hcfg_of(s, 1, false)
+        let e = h_estimate(ini, rfl, hc, table)
+        test.assert(err_m(e.d_pbr, 8200) < PBR_TOL_M)
+        test.assert(err_m(e.d_rtt, 8200) < RTT_TOL_M)
+        // The offset the Host measured is the one between the devices, the reflector's less the initiator's.
+        var want = -85.0
+        if who == 1
+            want = 85.0
+        test.assert(math.abs(e.ffo - want) < 0.05)
+        // Without the scaling the 200 microseconds of the nominal turnaround drift by 17 nanoseconds: two and a half metres of error.
+        let r0 = h_rtt(ini[0], rfl[0], hc, 0.0)
+        test.assert(err_m(r0.d_rtt, 8200) > 1.0)
+
+// ── The exchanges the Controllers make for the Hosts, seen from the Hosts ──
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_controllers_make_the_feature_exchange_and_the_capabilities_exchange_a_host_leaves_out_and_the_distance_is_there()
+    for who in 0..2
+        var w = air_with(6100, 5.0, -3.0)
+        var s = setup_new()
+        s.init_central = who == 0
+        s.lazy = true
+        open_series(var w, s)
+        check_setup(w, s)
+        let table = fae_event(ini_log(w, s))
+        test.assert_eq(table, table_of(w, s))
+        let r = run_round(var w, 100, 8)
+        check_round(r, s, 100, 0, 1)
+        let e = h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
+        test.assert(err_m(e.d_pbr, 6100) < PBR_TOL_M)
+        test.assert(err_m(e.d_rtt, 6100) < RTT_TOL_M)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_central_that_asks_for_the_capabilities_first_gets_the_feature_exchange_of_its_own_controller()
+    var w = air_with(2400, 5.0, -3.0)
+    var s = setup_new()
+    s.first_central = true
+    open_series(var w, s)
+    check_setup(w, s)
+    let r = run_round(var w, 100, 8)
+    check_round(r, s, 100, 0, 1)
+
+// ── The table of the reflector ──────────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_table_the_host_reads_is_the_table_of_the_reflectors_radio_and_a_radio_with_a_different_table_gives_a_different_one()
+    for who in 0..2
+        var ra = sim_cs_new()
+        world_figures(var ra, 3000, 4.0, -6.0)
+        // The extremes of the octet: -128 and 127 in the first and the last channel of the reflector, and values beyond them cut to the octet.
+        var dr = sim_cs_far(ra)
+        if who == 1
+            dr = sim_cs_dev(ra)
+        sim_cs_fae(var dr, 2, -128)
+        sim_cs_fae(var dr, 76, 127)
+        sim_cs_fae(var dr, 3, 200)
+        sim_cs_fae(var dr, 75, -200)
+        var w = air_from(var ra)
+        var s = setup_new()
+        s.init_central = who == 0
+        open_series(var w, s)
+        let t = fae_event(ini_log(w, s))
+        test.assert_eq(list.len(t), 72)
+        test.assert_eq(t[0], -128)
+        test.assert_eq(t[71], 127)
+        test.assert_eq(t[1], 127)
+        test.assert_eq(t[70], -128)
+        // The other channels are the values of the radio.
+        for k in 2..70
+            test.assert_eq(t[k], dr.fae_tab[ll_cs.fae_channel(k)])
+        // The initiator's Controller has not got the table of its own radio on the air; the reflector's Host did not ask for one.
+        test.assert_eq(list.len(meta_events(rfl_log(w, s), SUB_FAE)), 0)
+
+// ── Three procedures, a subevent lost on one side ───────────────────
+
+// The channels of the steps of a subevent as one list.
+fn channels_of(h: HSub) -> [Int]
+    var l: [Int] = []
+    for st in h.steps
+        list.push(l, st.ch)
+    l
+
+fn same_steps(a: HSub, b: HSub) -> Bool
+    if list.len(a.steps) != list.len(b.steps)
+        return false
+    for k in 0..list.len(a.steps)
+        if a.steps[k].mode != b.steps[k].mode or a.steps[k].ch != b.steps[k].ch
+            return false
+    true
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_generators_of_the_two_controllers_stay_in_step_over_three_procedures_with_a_mode_0_lost_on_either_side()
+    // 0: the initiator misses the answers of the reflector in a subevent of the second procedure; 1: the reflector misses the initiator's CS_SYNC.
+    for lost in 0..2
+        var w = air_with(4100, 11.0, -14.0)
+        var s = setup_new()
+        s.init_central = lost == 0
+        open_series(var w, s)
+        let table = fae_event(ini_log(w, s))
+        let rfl_dev = 1 - dev_index_of_initiator(s)
+        var first_hops: [Int] = []
+        for p in 0..3
+            let ev = 100 + 30 * p
+            let mark = round_begin(var w, ev)
+            for k in 0..8
+                if p == 1 and k == 1
+                    var rx = dev_index_of_initiator(s)
+                    if lost == 1
+                        rx = rfl_dev
+                    sim_cs_fault(var w.ra, F_MISS_SYNC, -1, rx, 0)
+                let r = sub_step(var w, ev, k)
+                if p == 1 and k == 1
+                    w.ra.med.faults = []
+                settle(var w)
+                if r.a != ctl_hci.RUN_OK and r.b != ctl_hci.RUN_OK
+                    // The last subevent of the third procedure ends the series.
+                    if p == 2
+                        test.assert_eq(r.a, ctl_hci.RUN_DONE)
+                        test.assert_eq(r.b, ctl_hci.RUN_DONE)
+                    break
+            let ini = h_subs(ini_log(w, s), mark_of(mark, s, true))
+            let rfl = h_subs(rfl_log(w, s), mark_of(mark, s, false))
+            test.assert_eq(list.len(ini), list.len(rfl))
+            test.assert(list.len(ini) >= 3)
+            // The two Hosts read the same steps in every subevent, lost or not, and the counter of the procedure is the instance.
+            for j in 0..list.len(ini)
+                test.assert(same_steps(ini[j], rfl[j]))
+                test.assert_eq(ini[j].proc, p)
+                test.assert_eq(rfl[j].proc, p)
+            if p == 1
+                // The subevent that lost its mode 0: aborted for the missing CS_SYNC at the end that lost it (and at the other end when the reflector lost it, since it
+                // answers nothing).  The steps it ran carry data, the others do not.
+                test.assert_eq(ini[1].sdone, 0xF)
+                test.assert_eq(ini[1].abort, 0x20)
+                test.assert_eq(ini[1].pdone, 1)
+                if lost == 1
+                    test.assert_eq(rfl[1].sdone, 0xF)
+                    test.assert_eq(rfl[1].abort, 0x20)
+                else
+                    test.assert_eq(rfl[1].sdone, 0)
+                    test.assert_eq(rfl[1].abort, 0)
+                var data_steps = 0
+                for st in ini[1].steps
+                    if list.len(st.data) > 0
+                        data_steps = data_steps + 1
+                test.assert_eq(data_steps, 1)
+                test.assert_eq(list.len(ini[1].steps), list.len(ini[0].steps))
+                // The other subevents of the procedure are whole.
+                for j in 0..list.len(ini)
+                    if j != 1
+                        test.assert_eq(ini[j].sdone, 0)
+                        test.assert_eq(rfl[j].sdone, 0)
+            else
+                for j in 0..list.len(ini)
+                    test.assert_eq(ini[j].sdone, 0)
+                    test.assert_eq(rfl[j].sdone, 0)
+                    test.assert_eq(ini[j].abort, 0)
+            // The estimate of the procedure is there with the subevent left out.
+            let e = h_estimate(ini, rfl, hcfg_of(s, 1, false), table)
+            if err_m(e.d_pbr, 4100) > PBR_TOL_M or err_m(e.d_rtt, 4100) > RTT_TOL_M
+                test.fail("lost ${lost} p ${p} pbr ${e.d_pbr} rtt ${e.d_rtt} n ${e.n_pbr} ${e.n_rtt} ffo ${e.ffo}")
+            if p == 1
+                test.assert(e.n_pbr < 72)
+                test.assert(e.n_pbr >= 15)
+            else
+                test.assert_eq(e.n_pbr, 72)
+            // The hops are those of the procedure: the Hosts of the next procedure read other ones than the first's.
+            var hops: [Int] = []
+            for h in ini
+                for c in channels_of(h)
+                    list.push(hops, c)
+            if p == 0
+                first_hops = hops
+            else
+                test.assert(hops != first_hops)
+        // The series is over on both: nothing runs.
+        test.assert_eq(ctl_hci.ctl_cs_instance(var w.a, var w.ca, var w.sa, 0, 400), ctl_hci.RUN_NONE)
+        test.assert_eq(ctl_hci.ctl_cs_instance(var w.b, var w.cb, var w.sb, 0, 400), ctl_hci.RUN_NONE)
+
+// The index in the model of the device of the initiator, 0 for the radio of the Central.
+fn dev_index_of_initiator(s: Setup) -> Int
+    if s.init_central
+        return 0
+    1
+
+// The octet of the log of the initiator's Host (or the reflector's) where a round began.
+fn mark_of(m: Two, s: Setup, initiator: Bool) -> Int
+    if s.init_central == initiator
+        return m.a
+    m.b
+
+// ── A subevent that cannot run ──────────────────────────────────────
+
+// The radio of the device `dev` answers `CS_RESOURCES` (a subevent beyond its steps) in the first subevent of the round, then runs.  What the Hosts read: the end that could
+// not run it says so, the other finds nobody to answer it, and the next subevent is whole and in step.
+@when(noble_controller_config.CTL_CS > 0)
+fn refused_case(init_central: Bool, dev: Int, kind: Int) -> Int
+    var w = air_with(2600, 3.0, -3.0)
+    var s = setup_new()
+    s.init_central = init_central
+    open_series(var w, s)
+    let table = fae_event(ini_log(w, s))
+    let mark = round_begin(var w, 100)
+    var radio = w.ra
+    if dev == 1
+        radio = w.rb
+    let saved_caps = radio.caps
+    let saved_timing = radio.timing
+    if kind == 0
+        // The steps the radio takes: fewer than a subevent holds.
+        radio.timing = CsTiming { arm_lead_us: 400, rx_window_us: 20, turn_us: 200, finish_us: 100, max_steps: 20, max_run_us: 20000 }
+    else if kind == 1
+        // The start is nearer than the radio can arm for.
+        radio.timing = CsTiming { arm_lead_us: 50000, rx_window_us: 20, turn_us: 200, finish_us: 100, max_steps: 160, max_run_us: 20000 }
+    else
+        // A plan the radio does not run: no PHY of its own.
+        let c = radio.caps
+        radio.caps = CsCaps { supported: c.supported, roles: c.roles, modes: c.modes, rtt_types: c.rtt_types, phys: 0, ant_elements: c.ant_elements, max_paths: c.max_paths,
+                              t_ip1: c.t_ip1, t_ip2: c.t_ip2, t_fcs: c.t_fcs, t_pm: c.t_pm, t_sw_us: c.t_sw_us, t_sw_ipt_us: c.t_sw_ipt_us, t_ip2_ipt: c.t_ip2_ipt,
+                              snr_mask: c.snr_mask, no_fae: c.no_fae, ch3c: c.ch3c, sounding_pct: c.sounding_pct, ipt: c.ipt, rtt_per_phy: c.rtt_per_phy, tq: c.tq,
+                              nadm_sound: c.nadm_sound, nadm_rand: c.nadm_rand, rtt_cap: c.rtt_cap, n_aa: c.n_aa, n_sound: c.n_sound, n_rand: c.n_rand,
+                              n_2m_aa: c.n_2m_aa, n_2m_sound: c.n_2m_sound, n_2m_rand: c.n_2m_rand }
+    let first = sub_step(var w, 100, 0)
+    settle(var w)
+    radio.timing = saved_timing
+    radio.caps = saved_caps
+    test.assert_eq(first.a, ctl_hci.RUN_OK)
+    test.assert_eq(first.b, ctl_hci.RUN_OK)
+    // The next subevents run.
+    for k in 1..8
+        let r = sub_step(var w, 100, k)
+        settle(var w)
+        if r.a != ctl_hci.RUN_OK and r.b != ctl_hci.RUN_OK
+            break
+    let ini = h_subs(ini_log(w, s), mark_of(mark, s, true))
+    let rfl = h_subs(rfl_log(w, s), mark_of(mark, s, false))
+    test.assert_eq(list.len(ini), list.len(rfl))
+    test.assert(list.len(ini) >= 3)
+    // The end whose radio refused: every step without data, aborted for what the radio answered, procedure going on.
+    var bad = ini[0]
+    var good = rfl[0]
+    if dev != dev_index_of_initiator(s)
+        bad = rfl[0]
+        good = ini[0]
+    test.assert_eq(bad.sdone, 0xF)
+    var abort = 0x30
+    if kind == 2
+        abort = 0xF0
+    test.assert_eq(bad.abort, abort)
+    test.assert_eq(bad.pdone, 1)
+    test.assert_eq(list.len(bad.steps), list.len(good.steps))
+    for st in bad.steps
+        test.assert_eq(list.len(st.data), 0)
+    // The other end ran its mode 0 steps and found no answer: aborted for no CS_SYNC.
+    test.assert_eq(good.sdone, 0xF)
+    test.assert_eq(good.abort, 0x20)
+    // The generators are in step: the next subevents are whole and agree with the geometry.
+    for j in 1..list.len(ini)
+        test.assert_eq(ini[j].sdone, 0)
+        test.assert_eq(rfl[j].sdone, 0)
+        test.assert(same_steps(ini[j], rfl[j]))
+    var rest_i: [HSub] = []
+    var rest_r: [HSub] = []
+    for j in 1..list.len(ini)
+        list.push(rest_i, ini[j])
+        list.push(rest_r, rfl[j])
+    let e = h_estimate(rest_i, rest_r, hcfg_of(s, 1, false), table)
+    test.assert(err_m(e.d_pbr, 2600) < PBR_TOL_M)
+    test.assert(err_m(e.d_rtt, 2600) < RTT_TOL_M)
+    e.n_pbr
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_subevent_that_does_not_fit_the_radio_is_reported_aborted_for_lack_of_resources_and_the_next_one_runs_in_step()
+    for init_central in [true, false]
+        for dev in 0..2
+            // The radio takes fewer steps than the subevent has.
+            let n = refused_case(init_central, dev, 0)
+            test.assert(n >= 15)
+    // The radio is asked to start sooner than it can arm.
+    let m = refused_case(true, 0, 1)
+    test.assert(m >= 15)
+    let m2 = refused_case(false, 0, 1)
+    test.assert(m2 >= 15)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_plan_the_radio_does_not_run_is_reported_aborted_for_another_reason()
+    let n = refused_case(true, 1, 2)
+    test.assert(n >= 15)
+    let n2 = refused_case(false, 0, 2)
+    test.assert(n2 >= 15)
+
+// ── A result the Host does not read ─────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_result_the_host_has_not_read_when_the_next_comes_is_reported_aborted_and_the_third_is_dropped()
+    var w = air_with(3700, 3.0, -3.0)
+    var s = setup_new()
+    // Subevents of 8 ms, so that a procedure has more than three of them in any build.
+    s.sub_len = 8000
+    open_series(var w, s)
+    let table = fae_event(ini_log(w, s))
+    let mark = round_begin(var w, 100)
+    for k in 0..3
+        let r = sub_step(var w, 100, k)
+        test.assert_eq(r.a, ctl_hci.RUN_OK)
+        test.assert_eq(r.b, ctl_hci.RUN_OK)
+        // The Peripheral's Host reads; the Central's does not.
+        for _ in 0..6
+            host_read(var w.b, var w.hb)
+    test.assert_eq(w.a.dropped_events, 1)
+    test.assert_eq(w.b.dropped_events, 0)
+    settle(var w)
+    let sa = h_subs(w.ha, mark.a)
+    let sb = h_subs(w.hb, mark.b)
+    test.assert_eq(list.len(sb), 3)
+    // The Central's Host reads the first as it was, the second by its header, aborted for lack of resources, and nothing of the third.
+    test.assert_eq(list.len(sa), 2)
+    test.assert_eq(sa[0].sdone, 0)
+    test.assert(list.len(sa[0].steps) >= 10)
+    test.assert_eq(sa[1].sdone, 0xF)
+    test.assert_eq(sa[1].abort, 0x30)
+    test.assert_eq(list.len(sa[1].steps), 0)
+    test.assert_eq(sa[1].proc, 0)
+    test.assert_eq(sa[1].start_ev, 100)
+    test.assert_eq(sa[1].pdone, 1)
+    // The first subevent is the whole subevent, the one the Peripheral read too.
+    test.assert(same_steps(sa[0], sb[0]))
+    for j in 0..3
+        test.assert_eq(sb[j].sdone, 0)
+    // The Host reads again: the next result is not held up.
+    let r2 = sub_step(var w, 100, 3)
+    settle(var w)
+    let sa2 = h_subs(w.ha, mark.a)
+    test.assert_eq(list.len(sa2), 3)
+    test.assert_eq(sa2[2].sdone, 0)
+    test.assert(r2.a == ctl_hci.RUN_DONE or r2.a == ctl_hci.RUN_OK)
+    // What was read of the whole is in step with the peer.
+    test.assert(same_steps(sa2[2], h_subs(w.hb, mark.b)[3]))
+    test.assert(err_m(h_estimate([sa[0]], [sb[0]], hcfg_of(s, 1, false), table).d_pbr, 3700) < PBR_TOL_M)
+
+// ── Terminate, channel map update, disconnect ───────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_series_without_an_end_runs_until_the_initiators_host_stops_it_and_both_controllers_stop()
+    for who in 0..2
+        var w = air_with(2200, 7.0, -2.0)
+        var s = setup_new()
+        s.init_central = who == 0
+        s.count = 0
+        open_series(var w, s)
+        let table = fae_event(ini_log(w, s))
+        // Procedures one after the other, with no limit the Controllers know of.
+        for p in 0..2
+            let r = run_round(var w, 100 + 30 * p, 8)
+            check_round(r, s, 100 + 30 * p, p, 1)
+            test.assert_eq(r.xa[list.len(r.xa) - 1], ctl_hci.RUN_DONE)
+            let e = h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
+            test.assert(err_m(e.d_pbr, 2200) < PBR_TOL_M)
+        // The Host stops the series; the Controller tells the other end and the Host hears the end.
+        let mark = list.len(ini_log(w, s))
+        let before = meta_events(ini_log(w, s), SUB_PROC)
+        test.assert_eq(list.len(before), 1)
+        test.assert_eq(cstatus(ini_cmd(var w, s, 0x2094, [1, 0, 0, 0]), 0x2094), 0)
+        events(var w, 8)
+        let after = meta_events(ini_log(w, s), SUB_PROC)
+        test.assert_eq(list.len(after), 2)
+        test.assert_eq(after[1][4], 0)
+        test.assert_eq(after[1][8], 0)
+        // Neither end begins another procedure; a subevent has nothing to run.
+        test.assert_eq(ctl_hci.ctl_cs_instance(var w.a, var w.ca, var w.sa, 0, 400), ctl_hci.RUN_NONE)
+        test.assert_eq(ctl_hci.ctl_cs_instance(var w.b, var w.cb, var w.sb, 0, 400), ctl_hci.RUN_NONE)
+        let r2 = lock_step(var w, 400, 900000, 0)
+        test.assert_eq(r2.a, ctl_hci.RUN_NONE)
+        test.assert_eq(r2.b, ctl_hci.RUN_NONE)
+        test.assert(mark > 0)
+
+// The map of the channels 22 and 26 to 76 (the channels 2 to 21 of the 72 are left out): ten octets.
+fn chm_without_low() -> [Int]
+    [0x00, 0x00, 0x40, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F]
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_channel_map_the_host_sets_in_the_middle_of_a_series_applies_at_the_next_procedure_on_both_ends()
+    for who in 0..2
+        var w = air_with(5100, 7.0, -2.0)
+        var s = setup_new()
+        s.init_central = who == 0
+        open_series(var w, s)
+        let table = fae_event(ini_log(w, s))
+        // The first procedure uses every channel.
+        let r0 = run_round(var w, 100, 8)
+        let all0 = hcfg_of(s, 1, false)
+        let e0 = h_estimate(ini_subs(r0, s), rfl_subs(r0, s), all0, table)
+        test.assert_eq(e0.n_pbr, 72)
+        // The initiator's Host classifies the channels: the low ones are bad.  The peer is told at an instant six events ahead.
+        test.assert_eq(complete_of_cmd(var w, s, 0x2092, chm_without_low()), 0)
+        events(var w, 10)
+        let ev1 = w.a.links[0].ev_count
+        // The second procedure begins after the instant; both ends use the map.
+        let r1 = run_round(var w, ev1, 8)
+        let ini = ini_subs(r1, s)
+        let rfl = rfl_subs(r1, s)
+        test.assert(list.len(ini) >= 2)
+        test.assert_eq(list.len(ini), list.len(rfl))
+        var steps = 0
+        for j in 0..list.len(ini)
+            test.assert(same_steps(ini[j], rfl[j]))
+            test.assert_eq(ini[j].sdone, 0)
+            for st in ini[j].steps
+                steps = steps + 1
+                test.assert(st.ch == 22 or st.ch >= 26)
+        test.assert(steps > 50)
+        let e1 = h_estimate(ini, rfl, all0, table)
+        test.assert_eq(e1.n_pbr, 52)
+        test.assert(err_m(e1.d_pbr, 5100) < PBR_TOL_M)
+        test.assert(err_m(e1.d_rtt, 5100) < RTT_TOL_M)
+        // The third procedure keeps the map.
+        let r2 = run_round(var w, ev1 + 30, 8)
+        let e2 = h_estimate(ini_subs(r2, s), rfl_subs(r2, s), all0, table)
+        test.assert_eq(e2.n_pbr, 52)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_connection_that_ends_in_the_middle_of_a_procedure_ends_the_series_and_frees_the_records()
+    var w = air_with(3300, 7.0, -2.0)
+    var s = setup_new()
+    open_series(var w, s)
+    let mark = round_begin(var w, 100)
+    let r = sub_step(var w, 100, 0)
+    settle(var w)
+    test.assert_eq(r.a, ctl_hci.RUN_OK)
+    test.assert_eq(r.b, ctl_hci.RUN_OK)
+    test.assert(ctl_hci.cs_find(var w.a, 0) >= 0)
+    test.assert(ctl_hci.cs_find(var w.b, 0) >= 0)
+    // The Central's Host ends the connection (remote user terminated); both Hosts hear Disconnection Complete.
+    test.assert_eq(cstatus(ca_cmd(var w, 0x0406, [1, 0, 0x13]), 0x0406), 0)
+    events(var w, 6)
+    test.assert_eq(list.len(events_coded(w.ha, 0x05)), 1)
+    test.assert_eq(list.len(events_coded(w.hb, 0x05)), 1)
+    test.assert(not ctl_hci.ctl_conn_active(var w.a, 0))
+    test.assert(not ctl_hci.ctl_conn_active(var w.b, 0))
+    // The procedure's records are given back, and nothing is left to run.
+    test.assert_eq(ctl_hci.cs_find(var w.a, 0), -1)
+    test.assert_eq(ctl_hci.cs_find(var w.b, 0), -1)
+    let r2 = sub_step(var w, 100, 1)
+    test.assert_eq(r2.a, ctl_hci.RUN_NONE)
+    test.assert_eq(r2.b, ctl_hci.RUN_NONE)
+    test.assert_eq(ctl_hci.ctl_cs_instance(var w.a, var w.ca, var w.sa, 0, 130), ctl_hci.RUN_NONE)
+    // What the Hosts read before the end is whole; nothing new comes after it.
+    let sa = h_subs(w.ha, mark.a)
+    test.assert_eq(list.len(sa), 1)
+    test.assert_eq(sa[0].sdone, 0)
+
+// ── The noise of the radio, the clock of the time stamps ────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_noise_in_the_tones_and_the_time_stamps_moves_the_estimates_within_the_noise_over_three_procedures()
+    for who in 0..2
+        var ra = sim_cs_new()
+        world_figures(var ra, 4400, 9.0, -11.0)
+        var d0 = sim_cs_dev(ra)
+        var d1 = sim_cs_far(ra)
+        // A clock of 250 ps ticks (4 GHz) and an error of 0.6 ns in each time stamp, a noise floor of -160 dBm/Hz.
+        d0.tick_ps = 250
+        d1.tick_ps = 250
+        d0.sigma_ps = 600
+        d1.sigma_ps = 600
+        sim_cs_noise(var ra, 77)
+        var w = air_from(var ra)
+        var s = setup_new()
+        s.init_central = who == 0
+        open_series(var w, s)
+        let table = fae_event(ini_log(w, s))
+        var sum_rtt = 0.0
+        var n_rtt = 0
+        for p in 0..3
+            let r = run_round(var w, 100 + 30 * p, 8)
+            check_round(r, s, 100 + 30 * p, p, 1)
+            let e = h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
+            // 12-bit tones and stamps of 0.6 ns: a few millimetres of phase, a decimetre of round trip at the most.
+            test.assert(err_m(e.d_pbr, 4400) < 0.02)
+            test.assert(err_m(e.d_rtt, 4400) < 0.12)
+            sum_rtt = sum_rtt + e.d_rtt * int.to_float(e.n_rtt)
+            n_rtt = n_rtt + e.n_rtt
+        // The mean over the 80 round-trip steps of the three procedures is closer than the 0.6 ns of one: the stamps' noise is not the quantization's.
+        test.assert(n_rtt > 60)
+        test.assert(err_m(sum_rtt / int.to_float(n_rtt), 4400) < 0.05)
+
+// ── The assembly with what a model never makes ──────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_radio_that_measured_no_tone_is_reported_with_zeros_and_not_available_and_the_estimate_finds_none()
+    for who in 0..2
+        var w = air_with(2500, 7.0, -2.0)
+        w.tw_a = TW_NO_TONES
+        w.tw_b = TW_NO_TONES
+        var s = setup_new()
+        s.init_central = who == 0
+        open_series(var w, s)
+        let table = fae_event(ini_log(w, s))
+        let r = run_round(var w, 100, 8)
+        let ini = ini_subs(r, s)
+        let rfl = rfl_subs(r, s)
+        var tone_steps = 0
+        for j in 0..list.len(ini)
+            for k in 0..list.len(ini[j].steps)
+                for st in [ini[j].steps[k], rfl[j].steps[k]]
+                    if st.mode == 2
+                        tone_steps = tone_steps + 1
+                        test.assert_eq(list.len(st.data), 9)
+                        // Both slots: I and Q zero, tone quality not available; the extension slot keeps its bits.
+                        for slot in 0..2
+                            test.assert_eq(h_tone_i(st, false, slot), 0)
+                            test.assert_eq(h_tone_q(st, false, slot), 0)
+                            test.assert_eq(h_tone_tq(st, false, slot) & 0xF, 3)
+                        test.assert_eq(h_tone_tq(st, false, 0) >>> 4, 0)
+                        test.assert(h_tone_tq(st, false, 1) >>> 4 == 1 or h_tone_tq(st, false, 1) >>> 4 == 2)
+        test.assert(tone_steps >= 100)
+        // No product, so no distance from the phase; the round trip is where it was.
+        let e = h_estimate(ini, rfl, hcfg_of(s, 1, false), table)
+        test.assert_eq(e.n_pbr, 0)
+        test.assert(err_m(e.d_rtt, 2500) < RTT_TOL_M)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_phase_correction_terms_of_a_sounding_sequence_are_24_bits_each_or_not_available_and_in_their_own_fields()
+    if not ctl_limits.cs_rtt_seq_on()
+        return
+    for variant in 0..2
+        var w = air_with(3300, 7.0, -2.0)
+        if variant == 1
+            w.tw_a = TW_PCT
+            w.tw_b = TW_PCT
+        var s = setup_new()
+        s.rtt = 1
+        open_series(var w, s)
+        let mark = round_begin(var w, 100)
+        let first = sub_step(var w, 100, 0)
+        settle(var w)
+        let sa = h_subs(w.ha, mark.a)
+        let sb = h_subs(w.hb, mark.b)
+        let raw0 = w.ra.med.out_steps[0]
+        let raw1 = w.ra.med.out_steps[1]
+        var sounding_steps = 0
+        for j in 0..list.len(sa[0].steps)
+            for side in 0..2
+                var st = sa[0].steps[j]
+                var raw = raw0[j]
+                if side == 1
+                    st = sb[0].steps[j]
+                    raw = raw1[j]
+                if st.mode == 1
+                    sounding_steps = sounding_steps + 1
+                    // Packet_PCT1 and Packet_PCT2 follow the quality, the NADM, the signal strength, the time and the antenna, four octets each.
+                    test.assert_eq(list.len(st.data), 14)
+                    let p1 = st.data[6] | (st.data[7] << 8) | (st.data[8] << 16) | (st.data[9] << 24)
+                    let p2 = st.data[10] | (st.data[11] << 8) | (st.data[12] << 16) | (st.data[13] << 24)
+                    if variant == 0
+                        // The model measures one term for the whole sequence: the two are alike, and are the radio's 24 bits.
+                        test.assert_eq(p1, (raw.pct1 as Int) & 0xFFFFFF)
+                        test.assert_eq(p2, p1)
+                    else
+                        // A radio that sets a reserved bit in PCT1 and has no PCT2: the reserved bits are clear in the first and the second is not available.
+                        test.assert_eq(p1, (raw.pct1 as Int) & 0xFFFFFF)
+                        test.assert_eq(p2, 0xFFFFFFFF)
+                        test.assert_eq(st.data[9], 0)
+        test.assert(sounding_steps >= 10)
+        test.assert_eq(first.a, ctl_hci.RUN_OK)
+
+// ── The options of the build: mode 3, the sequences, more than one antenna path ──
+
+// A series in the build's option, the result of one procedure read by the Hosts, and the estimate; `n_ap` paths.
+@when(noble_controller_config.CTL_CS > 0)
+fn option_case(init_central: Bool, main: Int, sub: Int, rtt: Int, aci: Int, n_ap: Int, mm: Int) -> Est
+    var ra = sim_cs_new()
+    world_figures(var ra, mm, 6.0, -8.0)
+    // The same phase on the four antenna paths: the paths differ only in the antenna permutation the plan names.
+    for p in 0..4
+        ra.med.ap_phase[p] = 0.3
+    var w = air_from(var ra)
+    var s = setup_new()
+    s.init_central = init_central
+    s.main = main
+    s.sub = sub
+    s.rtt = rtt
+    s.aci = aci
+    open_series(var w, s)
+    let table = fae_event(ini_log(w, s))
+    let r = run_round(var w, 100, 12)
+    check_round(r, s, 100, 0, n_ap)
+    let hc = hcfg_of(s, n_ap, pct_on())
+    let e = h_estimate(ini_subs(r, s), rfl_subs(r, s), hc, table)
+    test.assert(err_m(e.d_pbr, mm) < PBR_TOL_M)
+    test.assert(err_m(e.d_rtt, mm) < RTT_TOL_M)
+    e
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_mode_3_gives_the_phase_and_the_round_trip_in_every_step_and_the_hosts_read_both()
+    if not ctl_limits.cs_mode3_on()
+        return
+    for who in 0..2
+        let e = option_case(who == 0, 3, 0xFF, 0, 0, 1, 4700)
+        test.assert_eq(e.n_pbr, 72)
+        // Every step is a round trip too.
+        test.assert_eq(e.n_rtt, 72)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_events_of_mode_3_steps_carry_what_the_radios_measured()
+    if not ctl_limits.cs_mode3_on()
+        return
+    for who in 0..2
+        var ra = sim_cs_new()
+        world_figures(var ra, 4700, 6.0, -8.0)
+        var w = air_from(var ra)
+        var s = setup_new()
+        s.init_central = who == 0
+        s.main = 3
+        s.sub = 0xFF
+        open_series(var w, s)
+        let mark = round_begin(var w, 100)
+        let r = sub_step(var w, 100, 0)
+        settle(var w)
+        let sa = h_subs(w.ha, mark.a)
+        let sb = h_subs(w.hb, mark.b)
+        let hc = hcfg_of(s, 1, false)
+        let raw0 = w.ra.med.out_steps[0]
+        let raw1 = w.ra.med.out_steps[1]
+        var mode3 = 0
+        for j in 0..list.len(raw0)
+            var nominal = 0
+            if s.init_central
+                nominal = h_nominal_ps(hc, sa[0].steps[j])
+            else
+                nominal = h_nominal_ps(hc, sb[0].steps[j])
+            check_step(sa[0].steps[j], raw0[j], w.ra.med.devs[0].cal, s.init_central, hc, nominal)
+            check_step(sb[0].steps[j], raw1[j], w.ra.med.devs[1].cal, not s.init_central, hc, nominal)
+            if sa[0].steps[j].mode == 3
+                mode3 = mode3 + 1
+                test.assert_eq(list.len(sa[0].steps[j].data), data_octets(3, 0, 0, 1))
+        test.assert(mode3 >= 20)
+        test.assert_eq(r.a, ctl_hci.RUN_OK)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_every_round_trip_type_gives_the_distance_and_the_sequences_change_the_nominal_offsets()
+    if not ctl_limits.cs_rtt_seq_on()
+        return
+    // The sounding sequences (1, 2) and the random ones (3 to 6): the CS_SYNC is longer, and so is the turnaround the Host removes.
+    for rtt in 1..7
+        let e = option_case(rtt % 2 == 0, 2, 1, rtt, 0, 1, 2900)
+        test.assert(e.n_rtt >= 20)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_two_antenna_paths_give_three_tone_slots_and_the_extension_slot_repeats_the_last_path()
+    if noble_controller_config.CTL_CS_ANT < 2
+        return
+    for who in 0..2
+        var ra = sim_cs_new()
+        world_figures(var ra, 3900, 6.0, -8.0)
+        for p in 0..4
+            ra.med.ap_phase[p] = 0.3
+        var w = air_from(var ra)
+        var s = setup_new()
+        s.init_central = who == 0
+        s.aci = 1
+        open_series(var w, s)
+        let table = fae_event(ini_log(w, s))
+        let r = run_round(var w, 100, 12)
+        check_round(r, s, 100, 0, 2)
+        let ini = ini_subs(r, s)
+        let rfl = rfl_subs(r, s)
+        var dup = 0
+        for j in 0..list.len(ini)
+            for k in 0..list.len(ini[j].steps)
+                for st in [ini[j].steps[k], rfl[j].steps[k]]
+                    if st.mode == 2 and (h_tone_tq(st, false, 2) >>> 4) == 2
+                        // The tone of the extension slot is the tone of the last path again.
+                        test.assert_eq(h_tone_i(st, false, 2), h_tone_i(st, false, 1))
+                        test.assert_eq(h_tone_q(st, false, 2), h_tone_q(st, false, 1))
+                        dup = dup + 1
+        test.assert(dup > 0)
+        // The estimate over the two paths of each step alone, and over the two paths and the extension slot as a third path: the second counts the last path twice, which
+        // the same phase on every path hides, so what the estimator must not do is not shown by the distance; it is shown by the number of products.
+        let hc = hcfg_of(s, 2, false)
+        let e = h_estimate(ini, rfl, hc, table)
+        test.assert(err_m(e.d_pbr, 3900) < PBR_TOL_M)
+        test.assert_eq(e.n_pbr, 72)
+        let hc3 = hcfg_of(s, 3, false)
+        let p3 = h_products(ini[0], rfl[0], hc3)
+        let p2 = h_products(ini[0], rfl[0], hc)
+        test.assert_eq(list.len(p3.f), list.len(p2.f))
+        var bigger = 0
+        for k in 0..list.len(p2.f)
+            if p3.re[k] != p2.re[k] or p3.im[k] != p2.im[k]
+                bigger = bigger + 1
+        test.assert(bigger > 0)
+
+// ── The probe copy and the lock step, without a Controller ──────────
+
+// The head of a plan of one step, for the role `role`, and the step: mode 0 on channel 20.
+fn one_step_head(var h: CsPlan, role: Int)
+    h.n_steps = 1
+    h.n_mode0 = 1
+    h.role = role as u8
+
+fn one_step(var st: CsStep)
+    st.ch = 20
+    st.aa_i = 0x12345678
+    st.aa_r = 0x6B8A3D91
+    st.start_ns = 150_000
+    st.len_ns = 600_000
+
+@test
+fn test_a_probe_radio_arms_the_medium_without_running_and_the_radio_that_comes_second_finds_its_side_resolved_by_the_first()
+    // One mode 0 step on channel 20: the initiator sends CS_SYNC, the reflector answers with its own and a tone.
+    var pa = ll_cs_radio.cs_plan_new()
+    one_step_head(var pa, 0)
+    var pb = ll_cs_radio.cs_plan_new()
+    one_step_head(var pb, 1)
+    var st = ll_cs_radio.cs_step_new()
+    one_step(var st)
+    var a = sim_cs_new()
+    var b = sim_cs_other(var a)
+    sim_cs_dist(var a, 2000)
+    // The copy of the second radio: a new object over the same medium.
+    var probe = PairRadio { s: SimCs { med: b.med, side: b.side, caps: b.caps, timing: b.timing, now_us: b.now_us, arms: 0, runs: 0, aborts: 0 }, probe: true, tw: 0 }
+    test.assert_eq(probe.cs_arm(var pb, 1000), ll_cs_radio.CS_OK)
+    test.assert_eq(probe.cs_load(0, var st), ll_cs_radio.CS_OK)
+    var raw_p = ll_cs_radio.cs_raw_new()
+    test.assert_eq(probe.cs_run(var raw_p), ll_cs_radio.CS_ABORTED)
+    test.assert_eq(raw_p.n_done as Int, 0)
+    // The medium holds the plan of the second radio, armed, and the probe's own clock and counters are its own.
+    test.assert(b.med.armed[1])
+    test.assert(not b.med.ready[1])
+    test.assert_eq(b.runs, 0)
+    test.assert_eq(b.arms, 0)
+    test.assert_eq(probe.s.arms, 1)
+    // The first radio runs: it finds the second armed and resolves the pair.
+    var ra = PairRadio { s: a, probe: false, tw: 0 }
+    test.assert_eq(ra.cs_arm(var pa, 1000), ll_cs_radio.CS_OK)
+    test.assert_eq(ra.cs_load(0, var st), ll_cs_radio.CS_OK)
+    var raw_a = ll_cs_radio.cs_raw_new()
+    test.assert_eq(ra.cs_run(var raw_a), ll_cs_radio.CS_OK)
+    test.assert_eq(raw_a.n_done as Int, 1)
+    test.assert(b.med.ready[1])
+    // The second arms again, as its Controller does: its own side is kept, and it is run and read without a new resolution.
+    var rb = PairRadio { s: b, probe: false, tw: 0 }
+    test.assert_eq(rb.cs_arm(var pb, 1000), ll_cs_radio.CS_OK)
+    test.assert(b.med.ready[1])
+    test.assert_eq(rb.cs_load(0, var st), ll_cs_radio.CS_OK)
+    var raw_b = ll_cs_radio.cs_raw_new()
+    test.assert_eq(rb.cs_run(var raw_b), ll_cs_radio.CS_OK)
+    test.assert_eq(raw_b.n_done as Int, 1)
+    var s_b = ll_cs_radio.cs_step_raw_none()
+    test.assert(rb.cs_step_raw(0, var s_b))
+    test.assert_eq(s_b.aa_q as Int, 0)
+    // A radio that arms and finds nothing resolved runs alone: it hears nobody.
+    var c = sim_cs_new()
+    var d = sim_cs_other(var c)
+    var rd = PairRadio { s: d, probe: false, tw: 0 }
+    test.assert_eq(rd.cs_arm(var pb, 1000), ll_cs_radio.CS_OK)
+    test.assert_eq(rd.cs_load(0, var st), ll_cs_radio.CS_OK)
+    var raw_d = ll_cs_radio.cs_raw_new()
+    test.assert_eq(rd.cs_run(var raw_d), ll_cs_radio.CS_ABORTED)
+    test.assert_eq(raw_d.abort as Int, ABORT_NO_SYNC)
+    // The tweaks: a radio that is told to hide its tones, and the rest of the radio's surface through the wrapper.
+    var re = PairRadio { s: sim_cs_new(), probe: false, tw: TW_NO_TONES }
+    test.assert(re.supports_cs())
+    test.assert_eq(re.cs_caps().roles, 3)
+    test.assert_eq(re.cs_timing().max_steps, 160)
+    test.assert_eq(re.cs_cal().tx_1m_ps, 0)
+    test.assert_eq(re.cs_fae(20), 0)
+    re.cs_abort()
+    test.assert_eq(re.s.aborts, 1)
+    var nope = ll_cs_radio.cs_step_raw_none()
+    test.assert(not re.cs_step_raw(0, var nope))
+

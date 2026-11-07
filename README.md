@@ -78,5 +78,6 @@ novo test
 `novo test` runs the suites under `tests/`: one for each module that holds logic (`tests/<module>_tests.nv`, for
 example `novo test tests/ll_scan_tests.nv`), and the suites that drive the Controller through HCI against a scripted
 radio (`tests/ctl_*_tests.nv`, for example `novo test tests/ctl_air_tests.nv`).  `tests/sim_cs_tests.nv` holds the simulated
-Channel Sounding radio `SimCs` (two fidelities), the reference estimator of the tests and the tests of both.  A suite that needs
+Channel Sounding radio `SimCs` (two fidelities), the reference estimator of the tests and the tests of both; `tests/ctl_cs_air_tests.nv`
+runs two Controllers with a Host each over an encrypted connection and one `SimCs` medium, and estimates the distance from what the Hosts read.  A suite that needs
 a profile takes it with `--config configs/ctl_iso.toml`.  The tests are not part of the published package.

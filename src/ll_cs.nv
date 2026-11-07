@@ -257,6 +257,14 @@ const CHANNEL_COUNT = 72
 fn channel_ok(ch: Int) -> Bool
     ch >= 2 and ch <= 22 or ch >= 26 and ch <= 76
 
+// The CS channel that value `i` (0 to 71) of an FAE table belongs to: the tables hold one value for each allowed channel in the order of the channel index, so
+// the values 0 to 20 are the channels 2 to 22 and the values 21 to 71 the channels 26 to 76.
+@tier(embedded)
+fn fae_channel(i: Int) -> Int
+    if i < 21
+        return i + 2
+    i + 5
+
 // ── The step timings ────────────────────────────────────────────────
 // Tables 4.3, 4.5, 4.8 and 4.9 of [Vol 6] Part H: the value in microseconds of each index the control PDUs carry, -1 for an index
 // beyond the table, and the index of each value, -1 for a value the table lacks.  T_IP1 and T_IP2 share one table.

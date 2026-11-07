@@ -298,6 +298,13 @@ fn configure(var cen: Cs, var per: Cs, id: Int, role: Int)
     test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
     test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
 
+// A table of the radio of the answering end: value `i` is `3 i - 100` in units of 1/32 ppm.
+fn fae_tbl() -> Vec[u8; 72]
+    var t: Vec[u8; 72] = Vec.new()
+    for i in 0..72
+        let _p = t.push(((i * 3 - 100) & 0xFF) as u8)
+    t
+
 // Run the FAE Table Request: the end `asker` asks the other.
 fn fae_table(var asker: Cs, var other: Cs, asker_central: Bool)
     var caps = caps_full()
@@ -306,7 +313,9 @@ fn fae_table(var asker: Cs, var other: Cs, asker_central: Bool)
     var a = ll_pdu.pdu_new()
     var b = ll_pdu.pdu_new()
     test.assert_eq(ll_cs_proc.begin_fae(var asker, var ea, var a), 0)
-    test.assert_eq(ll_cs_proc.receive(var other, var eo, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var other, var eo, var caps, var a, var b), ll_cs_proc.R_FAE)
+    var table = fae_tbl()
+    test.assert_eq(ll_cs_proc.fae_rsp(var eo, var table, var b), ll_cs_proc.R_SEND)
     test.assert_eq(ll_cs_proc.receive(var asker, var ea, var caps, var b, var a), ll_cs_proc.R_NONE)
 
 // Two ends that have done everything a Start needs: secured, capabilities exchanged, the configuration 0 created by the Central in `role` (0 the initiator), and
@@ -1795,12 +1804,15 @@ fn test_the_fae_table_of_the_reflector_reaches_the_initiator()
     test.assert_eq(op_of(var a), ll_cs.OP_CS_FAE_REQ)
     test.assert_eq(ll_data.dpdu_len(var a), 1)
     test.assert_eq(cen.wait, ll_cs_proc.W_FAE)
-    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_FAE)
+    var table = fae_tbl()
+    test.assert_eq(ll_cs_proc.fae_rsp(var ep, var table, var b), ll_cs_proc.R_SEND)
     test.assert_eq(op_of(var b), ll_cs.OP_CS_FAE_RSP)
     test.assert_eq(ll_data.dpdu_len(var b), 73)
     test.assert_eq(b.n, 75)
+    // The values of the table of the answering end, signed, in the order of the allowed channels.
     for i in 0..72
-        test.assert_eq(ll_cs_pdu.fae_value(var b, i), ll_cs_proc.local_fae(i))
+        test.assert_eq(ll_cs_pdu.fae_value(var b, i), i * 3 - 100)
     test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_NONE)
     test.assert(cen.fae_known)
     test.assert(cen.fae_air)
@@ -1920,7 +1932,9 @@ fn test_a_fae_table_request_is_refused_without_the_feature_set_the_encryption_or
     test.assert(rejects(var out, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
     var per2 = fresh()
     var small = envf(false, E_SMALL, 10)
-    test.assert_eq(ll_cs_proc.receive(var per2, var small, var caps, var req, var out), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var per2, var small, var caps, var req, var out), ll_cs_proc.R_FAE)
+    var table = fae_tbl()
+    test.assert_eq(ll_cs_proc.fae_rsp(var small, var table, var out), ll_cs_proc.R_SEND)
     test.assert(rejects(var out, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_LIMITED))
 
 @test
@@ -3962,8 +3976,8 @@ fn tables() -> Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_control
     var w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1] = Vec.new()
     w
 
-fn store_tables() -> Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1]
-    var b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1] = Vec.new()
+fn store_tables() -> Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1]
+    var b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1] = Vec.new()
     b
 
 @test
@@ -4116,3 +4130,152 @@ fn test_a_claimed_record_is_new_and_a_freed_one_belongs_to_nobody()
     test.assert_eq(cs.owner, -1)
     test.assert_eq(ll_cs_proc.b2i(true), 1)
     test.assert_eq(ll_cs_proc.b2i(false), 0)
+
+// ── The exchanges the Controller starts for itself ──────────────────
+
+fn set_wait(var cs: Cs, w: Int)
+    cs.wait = w
+
+@test
+fn test_the_controller_starts_the_feature_exchange_for_a_host_that_asked_before_the_features_were_known()
+    if skip()
+        return
+    var cs = fresh()
+    var e = env(false, 77)
+    test.assert_eq(ll_cs_proc.begin_features(var cs, var e), 0)
+    test.assert_eq(cs.wait, ll_cs_proc.W_FEAT)
+    test.assert_eq(cs.t0, 77)
+    // One procedure at a time.
+    test.assert_eq(ll_cs_proc.begin_features(var cs, var e), ll_cs_proc.E_DISALLOWED)
+    // The link would not take the request: the record stops waiting.
+    ll_cs_proc.end_features(var cs)
+    test.assert_eq(cs.wait, ll_cs_proc.W_NONE)
+    // The Host Support bit clear, and a link that is not encrypted.
+    var none = fresh_no_host()
+    test.assert_eq(ll_cs_proc.begin_features(var none, var e), ll_cs_proc.E_DISALLOWED)
+    var plain = envf(false, E_PLAIN, 77)
+    test.assert_eq(ll_cs_proc.begin_features(var cs, var plain), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(cs.wait, ll_cs_proc.W_NONE)
+    // The peer's feature set is not part of the guard: the Controller does not know it yet.
+    var nopeer = envf(false, E_NOPEER, 77)
+    test.assert_eq(ll_cs_proc.begin_features(var cs, var nopeer), 0)
+
+@test
+fn test_a_feature_exchange_or_a_capabilities_exchange_that_fails_tells_the_host_through_the_event_of_the_command_that_waited()
+    if skip()
+        return
+    // The Host asked for the capabilities: the Read Remote Supported Capabilities Complete event carries the code, for the features and for the capabilities.
+    var a = fresh()
+    var e = env(false, 10)
+    test.assert_eq(ll_cs_proc.begin_features(var a, var e), 0)
+    ll_cs_proc.fail_wait(var a, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(a.wait, ll_cs_proc.W_NONE)
+    test.assert_eq(a.st_caps, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert(ll_cs_proc.take_owed(var a, ll_cs_proc.OWED_CAPS))
+    var b = fresh()
+    set_wait(var b, ll_cs_proc.W_CAP)
+    ll_cs_proc.fail_wait(var b, ll_cs_proc.E_INVALID_LL)
+    test.assert_eq(b.st_caps, ll_cs_proc.E_INVALID_LL)
+    test.assert(ll_cs_proc.take_owed(var b, ll_cs_proc.OWED_CAPS))
+    // The Host asked for a configuration: the Config Complete event carries it, with the configuration and the action, and the Host is not told of capabilities it did
+    // not ask for.
+    var caps = caps_full()
+    var out = ll_pdu.pdu_new()
+    var c = fresh()
+    var cfg = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.stage_config(var c, var e, var caps, var cfg, var out), 0)
+    test.assert(ll_cs_proc.staged(var c))
+    var en = env(false, 20)
+    set_wait(var c, ll_cs_proc.W_FEAT)
+    ll_cs_proc.fail_wait(var c, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert(not ll_cs_proc.staged(var c))
+    test.assert_eq(c.st_cfg, ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(c.ev_cfg, 0)
+    test.assert_eq(c.ev_act, 1)
+    test.assert(ll_cs_proc.take_owed(var c, ll_cs_proc.OWED_CFG))
+    test.assert(not ll_cs_proc.take_owed(var c, ll_cs_proc.OWED_CAPS))
+    // The wait for the features times out after 40 seconds like the others.
+    var d = fresh()
+    test.assert_eq(ll_cs_proc.begin_features(var d, var e), 0)
+    test.assert_eq(ll_cs_proc.poll(var d, var en), 0)
+    var late = env(false, 10 + ll_cs_proc.WAIT_US + 1)
+    test.assert_eq(ll_cs_proc.poll(var d, var late), ll_cs_proc.E_RESPONSE_TIMEOUT)
+    test.assert_eq(d.st_caps, ll_cs_proc.E_RESPONSE_TIMEOUT)
+
+@test
+fn test_a_configuration_is_staged_after_the_checks_that_need_no_peer_and_refused_by_the_others()
+    if skip()
+        return
+    var caps = caps_full()
+    var e = env(false, 10)
+    var out = ll_pdu.pdu_new()
+    // The checks of the command that need no capabilities of the peer.
+    var none = fresh_no_host()
+    var c1 = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.stage_config(var none, var e, var caps, var c1, var out), ll_cs_proc.E_DISALLOWED)
+    var plain = envf(false, E_PLAIN, 10)
+    var a = fresh()
+    test.assert_eq(ll_cs_proc.stage_config(var a, var plain, var caps, var c1, var out), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    set_wait(var a, ll_cs_proc.W_CAP)
+    test.assert_eq(ll_cs_proc.stage_config(var a, var e, var caps, var c1, var out), ll_cs_proc.E_DISALLOWED)
+    set_wait(var a, ll_cs_proc.W_NONE)
+    var remove = cfg_set(C_ACTION, 0)
+    test.assert_eq(ll_cs_proc.stage_config(var a, var e, var caps, var remove, var out), ll_cs_proc.E_DISALLOWED)
+    var bad = cfg_set(C_RTT, 7)
+    test.assert_eq(ll_cs_proc.stage_config(var a, var e, var caps, var bad, var out), ll_cs_proc.E_INVALID_PARAMS)
+    var lacking = cfg_set(C_PHY, 4)
+    test.assert_eq(ll_cs_proc.stage_config(var a, var e, var caps, var lacking, var out), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    test.assert(not ll_cs_proc.staged(var a))
+    // A configuration the specification allows waits, with the Config_ID the event will name, and the store holds its PDU.
+    var ok = cfg_ok(3, 1)
+    if ll_cs_proc.cfg_slots() > 3
+        test.assert_eq(ll_cs_proc.stage_config(var a, var e, var caps, var ok, var out), 0)
+        test.assert(ll_cs_proc.staged(var a))
+        test.assert_eq(a.wait_cfg, 3)
+        ll_cs_proc.unstage(var a)
+        test.assert(not ll_cs_proc.staged(var a))
+
+@test
+fn test_a_staged_configuration_goes_to_the_peer_when_its_capabilities_are_known_and_fails_when_they_rule_it_out()
+    if skip()
+        return
+    var caps = caps_full()
+    var e = env(false, 10)
+    var out = ll_pdu.pdu_new()
+    var cen = fresh()
+    var per = fresh()
+    var ec = env(true, 10)
+    var c = cfg_ok(0, 1)
+    test.assert_eq(ll_cs_proc.stage_config(var cen, var ec, var caps, var c, var out), 0)
+    // The Capabilities Exchange: the Central asks, the Peripheral answers, and the Central goes on with the configuration it kept.
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen, var ec, var caps, var out), 0)
+    var b = ll_pdu.pdu_new()
+    var ep = env(false, 10)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var out, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var out), ll_cs_proc.R_NONE)
+    test.assert(ll_cs_proc.staged(var cen))
+    test.assert_eq(ll_cs_proc.config_resume(var cen, var ec, var caps, var out), ll_cs_proc.R_SEND)
+    test.assert(not ll_cs_proc.staged(var cen))
+    test.assert_eq(op_of(var out), ll_cs.OP_CS_CONFIG_REQ)
+    test.assert_eq(cen.wait, ll_cs_proc.W_CFG)
+    // The Peripheral accepts it as it would a request of the Host.
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var out, var b), ll_cs_proc.R_SEND)
+    test.assert_eq(op_of(var b), ll_cs.OP_CS_CONFIG_RSP)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var out), ll_cs_proc.R_NONE)
+    test.assert(ll_cs_proc.cfg_used(var cen, 0))
+    // A peer whose capabilities the configuration is beyond: the Host is told with the Config Complete event, and nothing goes out.
+    var cen2 = fresh()
+    var c2 = cfg_ok(0, 0)
+    test.assert_eq(ll_cs_proc.stage_config(var cen2, var ec, var caps, var c2, var out), 0)
+    test.assert_eq(ll_cs_proc.begin_capabilities(var cen2, var ec, var caps, var out), 0)
+    var peer_caps = caps_set(10, 1)
+    var rsp = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var rsp, ll_cs.OP_CS_CAPABILITIES_RSP, var peer_caps)
+    test.assert_eq(ll_cs_proc.receive(var cen2, var ec, var caps, var rsp, var out), ll_cs_proc.R_NONE)
+    test.assert_eq(ll_cs_proc.config_resume(var cen2, var ec, var caps, var out), ll_cs_proc.R_NONE)
+    test.assert(not ll_cs_proc.staged(var cen2))
+    test.assert_eq(cen2.st_cfg, ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    test.assert_eq(cen2.ev_cfg, 0)
+    test.assert_eq(cen2.ev_act, 1)
+    test.assert(ll_cs_proc.take_owed(var cen2, ll_cs_proc.OWED_CFG))
+    test.assert(not ll_cs_proc.cfg_used(var cen2, 0))

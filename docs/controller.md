@@ -95,6 +95,16 @@ simulated radio for `CsRadio`: it takes the plan of `plan_arm`, computes the ton
 time stamps and the frequency offset of a subevent from a model of the two devices and
 the distance between them, and returns them a step at a time; the same file holds the
 estimator the tests use to recover the distance from the results of both devices.
+`tests/ctl_cs_air_tests.nv` runs two Controllers, each with its Host, over an encrypted
+connection and one medium of two `SimCs`: the Hosts set Channel Sounding up through HCI,
+the subevents run through `ctl_cs_instance` and `ctl_cs_subevent` of both, and an
+estimator that reads the events alone (the Subevent Result and Continue events, the
+configuration and the table of the reflector the Host read) gives the distance.  A Host
+that asks for the capabilities of a peer whose features are not known, or for a
+configuration with a peer whose capabilities are not known, is not refused: the Controller
+makes the Feature Exchange and the Capabilities Exchange itself and the configuration waits
+for them.  The table of frequency actuation errors that the Controller sends a peer is the
+one `CsRadio.cs_fae` reports for each allowed channel, read when `ctl_cs_radio_init` runs.
 
 `configs/<profile>.toml` are the profiles the package's tests run under.
 The same names exist in `orbit/ble/configs/`, whose `[noble-controller]`

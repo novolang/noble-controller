@@ -46,6 +46,10 @@ fn raw_of(var r: CsStepRaw, aa_q: Int, errors: Int, rssi: Int, ant: Int, tod: In
     r.pct1 = 0x00ABCDEF
     r.pct2 = 0x00123456
 
+fn set_pcts(var r: CsStepRaw, a: Int, b: Int)
+    r.pct1 = a as u32
+    r.pct2 = b as u32
+
 fn invalid_times(var r: CsStepRaw, toa: Bool, tod: Bool)
     r.toa_valid = toa
     r.tod_valid = tod
@@ -354,3 +358,25 @@ fn test_the_data_of_a_mode_3_step_is_the_round_trip_fields_then_the_tones()
     var d2 = ll_cs_res.data_new()
     test.assert_eq(ll_cs_res.step_data(var d2, var h, var s, var r, var k, true), 23)
     test.assert_eq(d2[14] as Int, 4)
+
+@test
+fn test_the_phase_correction_terms_of_a_sounding_sequence_are_24_bits_or_not_available()
+    test.assert_eq(ll_cs_res.pct_field(0x00ABCDEF), 0x00ABCDEF)
+    // A radio that sets one of the eight reserved bits is not repeated in the event.
+    test.assert_eq(ll_cs_res.pct_field(0x5A123456), 0x00123456)
+    test.assert_eq(ll_cs_res.pct_field(0xFF000001), 0x000001)
+    // 0xFFFFFFFF says the term is not available and goes on as it is.
+    test.assert_eq(ll_cs_res.pct_field(0xFFFFFFFF), 0xFFFFFFFF)
+    var h = ll_cs_radio.cs_plan_new()
+    head_of(var h, 0, 1, 1, 1, 145, 145, 40, 0)
+    var s = ll_cs_radio.cs_step_new()
+    step_of(var s, 1, 5, 0, false, false)
+    var r = ll_cs_radio.cs_step_raw_none()
+    var k = ll_cs_radio.cs_cal_none()
+    raw_of(var r, 0, 0, -45, 1, 1_000_000, 200_000_000, 0)
+    // PCT1 with a reserved bit set, PCT2 not available: the two fields stay apart and in their order.
+    set_pcts(var r, 0x7F654321, 0xFFFFFFFF)
+    var d = ll_cs_res.data_new()
+    test.assert_eq(ll_cs_res.step_data(var d, var h, var s, var r, var k, true), 14)
+    test.assert_eq(u24at(d, 6) | ((d[9] as Int) << 24), 0x00654321)
+    test.assert_eq(u24at(d, 10) | ((d[13] as Int) << 24), 0xFFFFFFFF)

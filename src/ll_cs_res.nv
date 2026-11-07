@@ -34,6 +34,9 @@ const NADM_UNKNOWN = 0xFF
 // Packet_RSSI that is not available.
 const RSSI_NA = 0x7F
 
+// Packet_PCT1 and Packet_PCT2 that are not available.
+const PCT_NA = 0xFFFFFFFF
+
 // Whether an RTT type carries a sounding sequence (1 and 2) and a random sequence (3 to 6).
 @tier(embedded)
 @no_alloc
@@ -185,6 +188,15 @@ fn time_diff(var head: CsPlan, var s: CsStep, var r: CsStepRaw, var cal: CsCal) 
 fn tone_pct(i: Int, q: Int) -> Int
     (i & 0xFFF) | ((q & 0xFFF) << 12)
 
+// The Packet_PCT1 or Packet_PCT2 of a step: the 24 bits of the phase correction term the radio measured, with the eight reserved bits clear, or 0xFFFFFFFF when the radio
+// has none ([Vol 4] Part E, Section 7.7.65.44).  A radio that sets a reserved bit of a value is not repeated in the event.
+@tier(embedded)
+@no_alloc
+fn pct_field(v: Int) -> Int
+    if v == PCT_NA
+        return PCT_NA
+    v & 0xFFFFFF
+
 // Write the mode 2 fields of a step at `at`: the permutation index, and for each of the `N_AP + 1` tone slots the PCT and the quality indicator.  A slot
 // the radio has no measurement for, or in which no tone was received, reads I and Q zero with the quality `not available`.  The extension slot is the
 // last one; whether its tone is expected is what the other device was told to send.  Returns the octet after the last written.
@@ -238,8 +250,8 @@ fn step_data(var d: Vec[u8; 40], var head: CsPlan, var s: CsStep, var r: CsStepR
     put(var d, 5, r.ant as Int)
     var o = 6
     if pct and rtt_sounding(rtt)
-        put32(var d, o, r.pct1 as Int)
-        put32(var d, o + 4, r.pct2 as Int)
+        put32(var d, o, pct_field(r.pct1 as Int))
+        put32(var d, o + 4, pct_field(r.pct2 as Int))
         o = o + 8
     if mode == 3
         let _end = put_tones(var d, o, var head, var s, var r)

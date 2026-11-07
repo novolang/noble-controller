@@ -265,8 +265,15 @@ fn peer_caps() -> CapPdu
     peer_caps_fae(1)
 
 fn peer_caps_fae(no_fae: Int) -> CapPdu
+    peer_caps_role_fae(3, no_fae)
+
+// The same with the roles `role` (bit 0 the initiator, bit 1 the reflector).
+fn peer_caps_role(role: Int) -> CapPdu
+    peer_caps_role_fae(role, 1)
+
+fn peer_caps_role_fae(role: Int, no_fae: Int) -> CapPdu
     ll_cs_pdu.CapPdu { v2: false, mode_types: 0, rtt_cap: 0, n_aa: 255, n_sound: 0, n_rand: 0, nadm_sound: 0, nadm_rand: 0, sync_phy: 0, num_ant: 1, max_path: 1,
-                       role: 3, ipt: 0, no_fae: no_fae, ch3c: 0, sounding_pct: 0, num_configs: 1, max_procs: 0, t_sw: 0, t_ip1: 0, t_ip2: 0, t_fcs: 0, t_pm: 0, rtt_phy: 0,
+                       role: role, ipt: 0, no_fae: no_fae, ch3c: 0, sounding_pct: 0, num_configs: 1, max_procs: 0, t_sw: 0, t_ip1: 0, t_ip2: 0, t_fcs: 0, t_pm: 0, rtt_phy: 0,
                        tx_snr: 0, t_ip2_ipt: 0, t_sw_ipt: 0, n2_aa: 0, n2_sound: 0, n2_rand: 0 }
 
 fn caps_pdu(op: Int) -> Pdu
@@ -537,8 +544,9 @@ fn test_read_remote_capabilities_reports_a_peer_that_refused_and_a_peer_without_
     test.assert_eq(cmd_status(run(var d, 0x208A, [1, 0]), 0x208A), 0x0C)
     feat_set(var d.links[0], 5, 0)
     test.assert_eq(cmd_status(run(var d, 0x208A, [1, 0]), 0x208A), 0x1A)
+    // One whose features are not known is asked for them (test_read_remote_capabilities_completes_the_feature_exchange_first follows the exchange): the command is accepted.
     d.links[0].have_feat = false
-    test.assert_eq(cmd_status(run(var d, 0x208A, [1, 0]), 0x208A), 0x0C)
+    test.assert_eq(cmd_status(run(var d, 0x208A, [1, 0]), 0x208A), 0)
     var e = connected()
     peer_has_cs(var e, true)
     test.assert_eq(cmd_status(run(var e, 0x208A, [1, 0]), 0x208A), 0x0C)
@@ -894,7 +902,9 @@ fn test_create_config_refuses_what_the_specification_forbids_and_what_the_build_
     // The peer's capabilities unknown: a configuration with the peer cannot be made.
     var d = ready()
     test.assert_eq(status_of(run(var d, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
-    cfg_status(var d, "case 22", create_params(0, 1, 0), 0x0C)
+    // The Controller asks for the capabilities first (test_create_config_asks_for_the_capabilities_first follows the exchange): the command is accepted and the request goes out.
+    cfg_status(var d, "case 22", create_params(0, 1, 0), 0)
+    test.assert_eq(queued_op(var d), ll_cs.OP_CS_CAPABILITIES_REQ)
     // The Host Support bit of the peer or the Controller clear.
     var e = ready()
     peer_has_cs(var e, false)
@@ -1438,10 +1448,11 @@ struct Fake
     var tq: Bool
     var roles: Int
     var supported: Bool
+    var no_fae: Bool
 
 fn fake_new() -> Fake
     Fake { armed: false, head: ll_cs_radio.cs_plan_new(), modes: Vec.new(), n: 0, loaded: 0, arm_status: 0, run_status: 0, n_done: 1000, abort: 0, runs: 0, tq: false, roles: 3,
-           supported: true }
+           supported: true, no_fae: true }
 
 fn caps_of(var f: Fake, var c: CsCaps)
     c.supported = f.supported
@@ -1452,7 +1463,7 @@ fn caps_of(var f: Fake, var c: CsCaps)
     c.ant_elements = 4
     c.max_paths = 4
     c.t_sw_us = 0
-    c.no_fae = true
+    c.no_fae = f.no_fae
     c.tq = f.tq
     c.rtt_cap = 0
     c.n_aa = 200
@@ -1498,6 +1509,10 @@ impl CsRadio[] for Fake
         var c = ll_cs_radio.cs_caps_none()
         caps_of(var self, var c)
         c
+
+    // The table of frequency actuation errors, 9 ch - 150 in units of 1/32 ppm: the channels at the ends of the range (2 and 76) lie beyond the octet of the PDU.
+    fn cs_fae(var self, ch: Int) -> Int
+        ch * 9 - 150
 
     fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
         if self.arm_status != 0
@@ -2081,6 +2096,396 @@ fn test_a_radio_that_takes_no_part_leaves_the_controller_no_role_and_no_tone_qua
     test.assert_eq(r[7 + 5], 0)
     let f = complete_of(run(var c, 0x2003, []), 0x2003)
     test.assert_eq(f[7 + 6] & ll_cs.FEAT6_CS_TQ, 0)
+
+// ── The exchanges the Controller makes for itself ───────────────────
+
+// The answer of the peer to LL_PERIPHERAL_FEATURE_REQ: Channel Sounding (46) and, with `host`, its Host Support (47); `cs` false gives a peer without either.
+fn features_rsp(cs: Bool, host: Bool) -> Pdu
+    var f: Vec[u8; 8] = Vec.new()
+    for _ in 0..8
+        let _z = f.push(0)
+    f[0] = 0x04
+    if cs
+        f[5] = 0x40
+    if cs and host
+        f[5] = 0xC0
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_features(var p, ll_data.OP_FEATURE_RSP, var f)
+    p
+
+fn control_pdu_of(op: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.ctrl_bare(var p, op)
+    p
+
+// A Controller as `ready` makes it, but the features of the peer are not known.
+@when(noble_controller_config.CTL_CS > 0)
+fn unknown_features() -> ctl_hci.Controller
+    var c = ready()
+    c.links[0].have_feat = false
+    for i in 0..8
+        feat_set(var c.links[0], i, 0)
+    c
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_read_remote_capabilities_completes_the_feature_exchange_first()
+    if not ctl_limits.cs_on()
+        return
+    var c = unknown_features()
+    test.assert_eq(cmd_status(run(var c, 0x208A, [1, 0]), 0x208A), 0)
+    test.assert_eq(snap(var c).wait, ll_cs_proc.W_FEAT)
+    // The feature exchange goes out; the capabilities do not, and a second command finds the record busy.
+    test.assert_eq(queued_op(var c), ll_data.OP_PERIPHERAL_FEATURE_REQ)
+    pop_queued(var c)
+    test.assert_eq(cmd_status(run(var c, 0x208A, [1, 0]), 0x208A), 0x0C)
+    test.assert_eq(queued_op(var c), -1)
+    // The peer answers: the Host hears LE Read Remote Features Complete, as it does when the Controller makes the exchange for a stream, and the capabilities are asked.
+    var rsp = features_rsp(true, true)
+    peer_sends(var c, var rsp)
+    let out = flush(var c)
+    test.assert_eq(list.len(meta(out, 0x04)), 1)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_REQ)
+    test.assert_eq(snap(var c).wait, ll_cs_proc.W_CAP)
+    pop_queued(var c)
+    var caps = caps_pdu(ll_cs.OP_CS_CAPABILITIES_RSP)
+    peer_sends(var c, var caps)
+    let ev = meta(flush(var c), caps_sub())
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], 0)
+    let rec = peer_caps_record()
+    for k in 0..28
+        test.assert_eq(ev[0][7 + k], rec[k])
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_read_remote_capabilities_reports_a_peer_whose_features_rule_it_out_and_one_that_never_answers()
+    if not ctl_limits.cs_on()
+        return
+    // A peer without Channel Sounding, and one without its Host Support bit.
+    var a = unknown_features()
+    let _r1 = run(var a, 0x208A, [1, 0])
+    pop_queued(var a)
+    var none = features_rsp(false, false)
+    peer_sends(var a, var none)
+    var ev = meta(flush(var a), caps_sub())
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(queued_op(var a), -1)
+    var b = unknown_features()
+    let _r2 = run(var b, 0x208A, [1, 0])
+    pop_queued(var b)
+    var nohost = features_rsp(true, false)
+    peer_sends(var b, var nohost)
+    ev = meta(flush(var b), caps_sub())
+    test.assert_eq(ev[0][4], ll_cs_proc.E_DISALLOWED)
+    // A peer that does not know the feature request: the status of the exchange is the code.
+    var c = unknown_features()
+    let _r3 = run(var c, 0x208A, [1, 0])
+    pop_queued(var c)
+    var unk = ll_pdu.pdu_new()
+    ll_data.ctrl_unknown_rsp(var unk, ll_data.OP_PERIPHERAL_FEATURE_REQ)
+    peer_sends(var c, var unk)
+    ev = meta(flush(var c), caps_sub())
+    test.assert_eq(ev[0][4], ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    // A peer that stays silent for 40 seconds: the procedure times out, the Host is told with the response timeout, and the connection ends.
+    var d = unknown_features()
+    let _r4 = run(var d, 0x208A, [1, 0])
+    pop_queued(var d)
+    ctl_hci.ctl_set_time(var d, 1000 + ll_cs_proc.WAIT_US + 10)
+    ev = meta(flush(var d), caps_sub())
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], ll_cs_proc.E_RESPONSE_TIMEOUT)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_feature_exchange_is_not_started_for_a_link_that_cannot_take_it()
+    if not ctl_limits.cs_on()
+        return
+    // Not encrypted: Insufficient Security, and the record does not wait.
+    var a = unknown_features()
+    a.links[0].enc_tx = false
+    a.links[0].enc_rx = false
+    test.assert_eq(cmd_status(run(var a, 0x208A, [1, 0]), 0x208A), ll_cs_proc.E_INSUFFICIENT_SECURITY)
+    test.assert_eq(snap(var a).wait, ll_cs_proc.W_NONE)
+    // Another procedure of the link is out: Command Disallowed, and the record does not wait either.
+    var b = unknown_features()
+    b.links[0].proc = ll_link.PROC_VERSION
+    test.assert_eq(cmd_status(run(var b, 0x208A, [1, 0]), 0x208A), 0x0C)
+    test.assert_eq(snap(var b).wait, ll_cs_proc.W_NONE)
+    // The control queue is full.
+    var c = unknown_features()
+    fill_queue(var c)
+    test.assert_eq(cmd_status(run(var c, 0x208A, [1, 0]), 0x208A), 0x0C)
+    // Every record belongs to another connection.
+    var d = unknown_features()
+    exhaust_records(var d)
+    test.assert_eq(cmd_status(run(var d, 0x208A, [1, 0]), 0x208A), 0x0D)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_capabilities_the_host_wrote_are_the_answer_when_the_features_arrive()
+    if not ctl_limits.cs_on()
+        return
+    var c = unknown_features()
+    let cached = cat([1, 0], peer_caps_record())
+    // The Host's write needs no features of the peer.
+    test.assert_eq(status_of(run(var c, 0x208B, cached), 0x208B), 0)
+    test.assert_eq(cmd_status(run(var c, 0x208A, [1, 0]), 0x208A), 0)
+    pop_queued(var c)
+    var rsp = features_rsp(true, true)
+    peer_sends(var c, var rsp)
+    let ev = meta(flush(var c), caps_sub())
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], 0)
+    // No exchange of capabilities went out.
+    test.assert_eq(queued_op(var c), -1)
+
+// A Controller in which the Host enabled both roles and the capabilities of the peer are not known.
+@when(noble_controller_config.CTL_CS > 0)
+fn for_config(known_features: Bool) -> ctl_hci.Controller
+    var c = ready()
+    if not known_features
+        c.links[0].have_feat = false
+        for i in 0..8
+            feat_set(var c.links[0], i, 0)
+    test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
+    c
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_create_config_asks_for_the_capabilities_first()
+    if not ctl_limits.cs_on()
+        return
+    var c = for_config(true)
+    test.assert_eq(cmd_status(run(var c, 0x2090, create_params(0, 1, 0)), 0x2090), 0)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_REQ)
+    test.assert(ctl_hci.cs_staged(var c, ctl_hci.cs_find(var c, 0)))
+    pop_queued(var c)
+    // A second command of the kind finds the record busy; the configuration waits.
+    test.assert_eq(cmd_status(run(var c, 0x2090, create_params(0, 1, 0)), 0x2090), 0x0C)
+    var caps = caps_pdu(ll_cs.OP_CS_CAPABILITIES_RSP)
+    peer_sends(var c, var caps)
+    // The Host hears the capabilities, and the request to create the configuration goes to the peer.
+    let ev = meta(flush(var c), caps_sub())
+    test.assert_eq(list.len(ev), 1)
+    test.assert_eq(ev[0][4], 0)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CONFIG_REQ)
+    test.assert(not ctl_hci.cs_staged(var c, ctl_hci.cs_find(var c, 0)))
+    test.assert_eq(snap(var c).wait, ll_cs_proc.W_CFG)
+    // The octets of the PDU are those of the command: Config_ID 0 with Action 1.
+    test.assert_eq(queued_byte(var c, 1) & 0x3F, 0)
+    test.assert_eq(queued_byte(var c, 1) >>> 6, 1)
+    pop_queued(var c)
+    var rsp = config_rsp_pdu(0)
+    peer_sends(var c, var rsp)
+    let done = meta(flush(var c), 0x2F)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4], 0)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_create_config_completes_the_feature_exchange_and_the_capabilities_exchange_first()
+    if not ctl_limits.cs_on()
+        return
+    var c = for_config(false)
+    test.assert_eq(cmd_status(run(var c, 0x2090, create_params(0, 1, 0)), 0x2090), 0)
+    test.assert_eq(queued_op(var c), ll_data.OP_PERIPHERAL_FEATURE_REQ)
+    test.assert_eq(snap(var c).wait, ll_cs_proc.W_FEAT)
+    test.assert(ctl_hci.cs_staged(var c, ctl_hci.cs_find(var c, 0)))
+    pop_queued(var c)
+    // The features: nothing more goes out while the exchange runs.
+    let _a = flush(var c)
+    test.assert_eq(queued_op(var c), -1)
+    var feat = features_rsp(true, true)
+    peer_sends(var c, var feat)
+    let _b = flush(var c)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CAPABILITIES_REQ)
+    pop_queued(var c)
+    var caps = caps_pdu(ll_cs.OP_CS_CAPABILITIES_RSP)
+    peer_sends(var c, var caps)
+    let _c = flush(var c)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_CONFIG_REQ)
+    pop_queued(var c)
+    var rsp = config_rsp_pdu(0)
+    peer_sends(var c, var rsp)
+    let done = meta(flush(var c), 0x2F)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4], 0)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_configuration_that_waits_is_reported_failed_with_the_reason_the_exchange_failed()
+    if not ctl_limits.cs_on()
+        return
+    // The peer refuses the capabilities: the configuration fails with the code, and no capabilities event comes.
+    var a = for_config(true)
+    let _s1 = run(var a, 0x2090, create_params(0, 1, 0))
+    pop_queued(var a)
+    var rej = ll_pdu.pdu_new()
+    ll_data.ctrl_reject_ext(var rej, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    peer_sends(var a, var rej)
+    var out = flush(var a)
+    test.assert_eq(list.len(meta(out, caps_sub())), 0)
+    var done = meta(out, 0x2F)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4], ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    // The Config_ID and the action (create) of the command.
+    test.assert_eq(done[0][7], 0)
+    test.assert_eq(done[0][8], 1)
+    test.assert(not ctl_hci.cs_staged(var a, ctl_hci.cs_find(var a, 0)))
+    // The features show a peer without Channel Sounding.
+    var b = for_config(false)
+    let _s2 = run(var b, 0x2090, create_params(0, 1, 0))
+    pop_queued(var b)
+    var none = features_rsp(false, false)
+    peer_sends(var b, var none)
+    out = flush(var b)
+    done = meta(out, 0x2F)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4], ll_cs_proc.E_UNSUPPORTED_REMOTE)
+    test.assert_eq(list.len(meta(out, caps_sub())), 0)
+    // The capabilities of the peer rule the configuration out (a peer that is a reflector alone, for a Host that wants the initiator in this end and the reflector in the peer).
+    var c = for_config(true)
+    let _s3 = run(var c, 0x2090, create_params(0, 1, 0))
+    pop_queued(var c)
+    var one_role = peer_caps_role(1)
+    var rolep = ll_pdu.pdu_new()
+    ll_cs_pdu.put_caps(var rolep, ll_cs.OP_CS_CAPABILITIES_RSP, var one_role)
+    peer_sends(var c, var rolep)
+    out = flush(var c)
+    test.assert_eq(list.len(meta(out, caps_sub())), 1)
+    done = meta(out, 0x2F)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4], ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    test.assert_eq(queued_op(var c), -1)
+    // A silent peer: the capabilities request unanswered for 40 seconds.
+    var d = for_config(true)
+    let _s4 = run(var d, 0x2090, create_params(0, 1, 0))
+    pop_queued(var d)
+    ctl_hci.ctl_set_time(var d, 1000 + ll_cs_proc.WAIT_US + 10)
+    done = meta(flush(var d), 0x2F)
+    test.assert_eq(list.len(done), 1)
+    test.assert_eq(done[0][4], ll_cs_proc.E_RESPONSE_TIMEOUT)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_create_config_that_the_specification_forbids_is_refused_before_the_exchange_starts()
+    if not ctl_limits.cs_on()
+        return
+    var c = for_config(true)
+    let ok = create_params(0, 1, 0)
+    // A field outside its range, and a value this build lacks, are refused with the capabilities of the peer unknown.
+    test.assert_eq(cmd_status(run(var c, 0x2090, with(ok, CC_RTT, 7)), 0x2090), 0x12)
+    test.assert_eq(queued_op(var c), -1)
+    if not ctl_limits.cs_mode3_on()
+        test.assert_eq(cmd_status(run(var c, 0x2090, with(ok, CC_MAIN, 3)), 0x2090), 0x11)
+    test.assert(not ctl_hci.cs_staged(var c, ctl_hci.cs_find(var c, 0)))
+    // The control queue is full: the capabilities cannot be asked, and the configuration is not kept.
+    fill_queue(var c)
+    test.assert_eq(cmd_status(run(var c, 0x2090, ok), 0x2090), 0x0C)
+    // Another procedure of the link keeps the feature exchange from starting, and the configuration is not kept.
+    var d = for_config(false)
+    d.links[0].proc = ll_link.PROC_VERSION
+    test.assert_eq(cmd_status(run(var d, 0x2090, ok), 0x2090), 0x0C)
+    test.assert_eq(snap(var d).wait, ll_cs_proc.W_NONE)
+    test.assert(not ctl_hci.cs_staged(var d, ctl_hci.cs_find(var d, 0)))
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_request_for_a_configuration_that_waits_is_sent_when_the_queue_has_room()
+    if not ctl_limits.cs_on()
+        return
+    var c = for_config(true)
+    let _s = run(var c, 0x2090, create_params(0, 1, 0))
+    pop_queued(var c)
+    var caps = caps_pdu(ll_cs.OP_CS_CAPABILITIES_RSP)
+    peer_sends(var c, var caps)
+    // The queue holds all it can: the configuration waits, and goes out when a PDU has left.
+    fill_queue(var c)
+    let _a = flush(var c)
+    test.assert(ctl_hci.cs_staged(var c, ctl_hci.cs_find(var c, 0)))
+    c.links[0].cq_count = 0
+    let _b = flush(var c)
+    test.assert(not ctl_hci.cs_staged(var c, ctl_hci.cs_find(var c, 0)))
+    test.assert_eq(snap(var c).wait, ll_cs_proc.W_CFG)
+
+// ── The table of the radio ──────────────────────────────────────────
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_peers_request_for_the_fae_table_is_answered_with_the_table_of_the_radio_in_the_order_of_the_allowed_channels()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready()
+    var air = fake_new()
+    air.no_fae = false
+    ctl_hci.ctl_cs_radio_init(var c, var air)
+    var req = control_pdu_of(ll_cs.OP_CS_FAE_REQ)
+    peer_sends(var c, var req)
+    test.assert_eq(queued_op(var c), ll_cs.OP_CS_FAE_RSP)
+    test.assert_eq(c.links[0].nxt.n, 75)
+    // The values of the radio, 9 ch - 150, cut to the octet.
+    for k in 0..72
+        var want = ll_cs.fae_channel(k) * 9 - 150
+        if want < -128
+            want = -128
+        if want > 127
+            want = 127
+        test.assert_eq(ll_cs_pdu.fae_value(var c.links[0].nxt, k), want)
+    // The channels 2 to 22 are the first 21 values, 26 to 76 the rest.
+    test.assert_eq(ll_cs.fae_channel(0), 2)
+    test.assert_eq(ll_cs.fae_channel(20), 22)
+    test.assert_eq(ll_cs.fae_channel(21), 26)
+    test.assert_eq(ll_cs.fae_channel(71), 76)
+    // The table stays over a reset of the Controller, as the capabilities do.
+    pop_queued(var c)
+    let _z = run(var c, 0x0C03, [])
+    test.assert_eq(ctl_hci.cs_go(var c, ll_cs_proc.GO_LFAE), 0x80)
+    test.assert_eq(ctl_hci.cs_go(var c, ll_cs_proc.GO_LFAE + 71), 127)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_radio_that_needs_no_table_or_takes_no_part_leaves_a_table_of_zeros_and_the_request_is_refused()
+    if not ctl_limits.cs_on()
+        return
+    var c = ready()
+    var air = fake_new()
+    ctl_hci.ctl_cs_radio_init(var c, var air)
+    for k in 0..72
+        test.assert_eq(ctl_hci.cs_go(var c, ll_cs_proc.GO_LFAE + k), 0)
+    var req = control_pdu_of(ll_cs.OP_CS_FAE_REQ)
+    peer_sends(var c, var req)
+    test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var c, 2), ll_cs_proc.E_UNSUPPORTED_FEATURE)
+    var d = ready()
+    var air2 = fake_new()
+    air2.no_fae = false
+    air2.supported = false
+    ctl_hci.ctl_cs_radio_init(var d, var air2)
+    for k in 0..72
+        test.assert_eq(ctl_hci.cs_go(var d, ll_cs_proc.GO_LFAE + k), 0)
+    // A link that has not negotiated long packets cannot carry the table.
+    var e = ready()
+    var air3 = fake_new()
+    air3.no_fae = false
+    ctl_hci.ctl_cs_radio_init(var e, var air3)
+    e.links[0].dl_rem_rx_octets = 27
+    var req2 = control_pdu_of(ll_cs.OP_CS_FAE_REQ)
+    peer_sends(var e, var req2)
+    test.assert_eq(queued_op(var e), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var e, 2), ll_cs_proc.E_LIMITED)
 
 // ── LE CS Test ──────────────────────────────────────────────────────
 

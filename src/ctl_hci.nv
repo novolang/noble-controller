@@ -573,7 +573,7 @@ struct Controller
     pwa: Vec[PwAdv; if noble_controller_config.CTL_PAWR_ADV then max1(noble_controller_config.CTL_PER_ADV) else 1]
     pws: Vec[PwSync; if noble_controller_config.CTL_PAWR_SYNC then max1(noble_controller_config.CTL_PER_SYNC) else 1]
     cs_w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1]
-    cs_b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1]
+    cs_b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1]
 
 // A Controller in its power-on state, for hardware with the capabilities
 // `caps`.  The public address is zero until `ctl_set_public` gives it.
@@ -8846,8 +8846,9 @@ fn cs_local(var c: Controller, var out: ll_cs_pdu.CapPdu)
             b[k] = cs_go(var c, ll_cs_proc.GO_CAPS + k) as u8
         ll_cs_hci.caps_get(var b, out.v2, var out)
 
-// Read the capabilities of the radio `air` once, when the Controller starts, and keep what this end reports: the capabilities of the build cut down to the radio's, and
-// whether it reports the tone quality (LE feature 48).  A Controller that never calls this reports the capabilities of its build.
+// Read the capabilities of the radio `air` once, when the Controller starts, and keep what this end reports: the capabilities of the build cut down to the radio's, whether
+// it reports the tone quality (LE feature 48), and its table of frequency actuation errors, which the peer asks for (a value beyond the octet of the PDU is cut to it).  A
+// Controller that never calls this reports the capabilities of its build and a table of zeros.
 @when(noble_controller_config.CTL_CS > 0)
 pub @tier(embedded)
 fn ctl_cs_radio_init<S: CsRadio[s]>(var c: Controller, var air: S) [s]
@@ -8861,9 +8862,21 @@ fn ctl_cs_radio_init<S: CsRadio[s]>(var c: Controller, var air: S) [s]
         cs_go_put(var c, ll_cs_proc.GO_CAPS + k, b[k] as Int)
     cs_gw_put(var c, ll_cs_proc.GW_RADIO, 1)
     cs_gw_put(var c, ll_cs_proc.GW_TQ, ll_cs_proc.b2i(rc.supported and rc.tq))
+    // The table of frequency actuation errors the peer asks for with LL_CS_FAE_REQ: the radio's, for each allowed channel in index order.  A radio that needs none has no table
+    // to report, and the Controller says so with No_FAE.
+    for k in 0..ll_cs.CHANNEL_COUNT
+        var v = 0
+        if rc.supported and not rc.no_fae
+            v = air.cs_fae(ll_cs.fae_channel(k))
+        if v < -128
+            v = -128
+        if v > 127
+            v = 127
+        cs_go_put(var c, ll_cs_proc.GO_LFAE + k, v)
 
 // Whether the peer of the link in slot `ls` may be asked: its feature set is known, has Channel Sounding (46) and has its Host Support (47).  The status the command gets
-// otherwise: Command Disallowed when the features are not known or Host Support is clear, Unsupported Remote Feature when the peer has no Channel Sounding.
+// otherwise: Command Disallowed when the features are not known or Host Support is clear, Unsupported Remote Feature when the peer has no Channel Sounding.  The commands
+// that make the Feature Exchange for the Host (Read Remote Supported Capabilities, Create Config with the peer) ask this only once the features are known.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn cs_peer_gate(var c: Controller, ls: Int) -> Int
@@ -8951,12 +8964,27 @@ fn cmd_cs_read_local(var c: Controller, v2: Bool)
     complete_send(var c, slot)
 
 // LE CS Read Remote Supported Capabilities: Command Status, and the Read Remote Supported Capabilities Complete event when the exchange with the peer is done.  The
-// capabilities the Host wrote (LE CS Write Cached Remote Supported Capabilities) or an earlier exchange left are the answer without one.
+// capabilities the Host wrote (LE CS Write Cached Remote Supported Capabilities) or an earlier exchange left are the answer without one.  A peer whose features are not
+// known is asked for them first, as [Vol 4] Part E, Section 7.8.131 asks: the Feature Exchange runs, `ctl_cs_poll` goes on with the Capabilities Exchange when it has
+// ended, and a failure of either is the status of the event (the Host also hears LE Read Remote Features Complete, as it does for the exchange a stream needs).
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn cmd_cs_read_remote(var c: Controller)
     let ls = handle_slot(var c, param_handle(var c))
-    var status = cs_gate(var c, ls, true)
+    var status = cs_gate(var c, ls, false)
+    if status == STATUS_SUCCESS
+        if c.links[ls].have_feat
+            status = cs_caps_step(var c, ls)
+        else
+            status = ctl_cs_features(var c, ls)
+    answer_command_status(var c, ll_cs.OP_CS_READ_REMOTE_SUPPORTED_CAPABILITIES, status)
+
+// The step of LE CS Read Remote Supported Capabilities once the features of the peer on the link in slot `ls` are known: the peer is asked (it has Channel Sounding and
+// its Host Support bit set), and the capabilities the Host wrote or an earlier exchange left are the answer without an exchange.  The status of the command.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_caps_step(var c: Controller, ls: Int) -> Int
+    var status = cs_peer_gate(var c, ls)
     if status == STATUS_SUCCESS
         var cached = false
         let i = cs_find(var c, ls)
@@ -8968,7 +8996,7 @@ fn cmd_cs_read_remote(var c: Controller)
             cs_owe(var c, cs_find(var c, ls), ll_cs_proc.OWED_CAPS, 0)
         else
             status = ctl_cs_capabilities(var c, ls)
-    answer_command_status(var c, ll_cs.OP_CS_READ_REMOTE_SUPPORTED_CAPABILITIES, status)
+    status
 
 // LE CS Write Cached Remote Supported Capabilities, [v1] and [v2]: the record of a peer the Host knows from an earlier connection.  The 2M counts of a [v1] record are those of
 // the 1M ones, which the event of the [v2] form says when it is read back.  Command Disallowed once the peer has sent its capabilities or a configuration exists.
@@ -9137,8 +9165,9 @@ fn cs_link_running(var c: Controller, ls: Int) -> Bool
     cs.run_open
 
 // LE CS Create Config: Command Status, and the Config Complete event when the peer has answered, or at once when `Create_Context` is 0 (the configuration is kept here
-// alone).  Invalid HCI Command Parameters for a role the Host did not enable with LE CS Set Default Settings or a configuration outside the specification, Unsupported Feature or
-// Parameter Value for one this end or the peer lacks, Command Disallowed for a configuration that is enabled.
+// alone).  A peer whose capabilities, or whose features, are not known is asked for them first (`ctl_cs_config`).  Invalid HCI Command Parameters for a role the Host did
+// not enable with LE CS Set Default Settings or a configuration outside the specification, Unsupported Feature or Parameter Value for one this end or the peer lacks,
+// Command Disallowed for a configuration that is enabled.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn cmd_cs_create_config(var c: Controller)
@@ -9146,7 +9175,10 @@ fn cmd_cs_create_config(var c: Controller)
     let context = h4_rx.h4_param(var c.rx, 3)
     var cfg = ll_cs_pdu.cfg_new()
     ll_cs_hci.config_from_rx(var c.rx, var cfg)
-    var status = cs_gate(var c, ls, context == 1)
+    // A peer whose features are not known is not refused: the Controller asks for them (`ctl_cs_config`).
+    var status = cs_gate(var c, ls, false)
+    if status == STATUS_SUCCESS and context == 1 and c.links[ls].have_feat
+        status = cs_peer_gate(var c, ls)
     if status == STATUS_SUCCESS and context > 1
         status = STATUS_INVALID_PARAMETERS
     if status == STATUS_SUCCESS
@@ -10204,18 +10236,76 @@ fn cs_rx(var c: Controller, ls: Int, op: Int, var rx: Pdu)
     cs_put(var c, i, var cs)
     if r == ll_cs_proc.R_SEND
         let _s = iso_send(c, ls)
+    else if r == ll_cs_proc.R_FAE
+        var table: Vec[u8; 72] = Vec.new()
+        for k in 0..ll_cs.CHANNEL_COUNT
+            let _t = table.push(cs_go(var c, ll_cs_proc.GO_LFAE + k) as u8)
+        let _a = ll_cs_proc.fae_rsp(var en, var table, var c.links[ls].tmp)
+        let _s = iso_send(c, ls)
     else if r == ll_cs_proc.R_UNKNOWN
         ll_link.answer_unknown(var c.links[ls], op)
         ll_link.link_prepare(var c.links[ls])
 
-// The work of the procedures that is not in a radio event: a procedure that the peer leaves unanswered for 40 seconds ends the connection (Section 5.2).
-// True when a connection was ended.
+// Whether a configuration waits in the record `i` for the Capabilities Exchange (`ll_cs_proc.stage_config`): the octet of the store, read without copying the record.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_staged(var c: Controller, i: Int) -> Bool
+    c.cs_b[i * ll_cs_proc.bulk_octets() + ll_cs_proc.OFF_PCFG] == 4
+
+// The Feature Exchange the Controller started for the record `i` of the link in slot `ls` has ended: when the features are known, the Capabilities Exchange the Host asked
+// for (or the configuration needs) goes on; when the exchange failed, the Host is told by the event of the command that waited, with the status of the exchange.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_features_ended(var c: Controller, i: Int, ls: Int)
+    var st = STATUS_SUCCESS
+    if c.links[ls].have_feat
+        // The record stops waiting for the features before the exchange of the capabilities asks to wait for those.
+        var cs = ll_cs_proc.cs_new()
+        cs_get(var c, i, var cs)
+        ll_cs_proc.end_features(var cs)
+        cs_put(var c, i, var cs)
+        st = cs_caps_step(var c, ls)
+    else if c.links[ls].proc == ll_link.PROC_FEATURES
+        return
+    else
+        st = c.links[ls].feat_status
+    if st != STATUS_SUCCESS
+        var cs = ll_cs_proc.cs_new()
+        cs_get(var c, i, var cs)
+        ll_cs_proc.fail_auto(var cs, st)
+        cs_put(var c, i, var cs)
+
+// The Capabilities Exchange the Controller made for a configuration has ended: the request to create the configuration goes to the peer, or the Host is told why it will not.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_config_resume(var c: Controller, i: Int, ls: Int)
+    if c.links[ls].cq_count >= ll_link.CTRL_SLOTS - 1
+        return
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var local = ll_cs_pdu.cap_new()
+    cs_local(var c, var local)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    let r = ll_cs_proc.config_resume(var cs, var en, var local, var c.links[ls].tmp)
+    cs_put(var c, i, var cs)
+    if r == ll_cs_proc.R_SEND
+        let _s = iso_send(c, ls)
+
+// The work of the procedures that is not in a radio event: a procedure that the peer leaves unanswered for 40 seconds ends the connection (Section 5.2), and the
+// exchanges the Controller makes for a command of the Host go on from one to the next.  True when a connection was ended.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
 fn ctl_cs_poll(var c: Controller) -> Bool
     var did = false
     for i in 0..ctl_limits.cs_slots()
         let ls = cs_owner(var c, i)
+        let w = cs_wait(var c, i)
+        if ls >= 0 and (w == ll_cs_proc.W_FEAT or w == ll_cs_proc.W_NONE and cs_staged(var c, i)) and ctl_conn_active(var c, ls)
+            if w == ll_cs_proc.W_FEAT
+                cs_features_ended(var c, i, ls)
+            else
+                cs_config_resume(var c, i, ls)
         if ls >= 0 and cs_wait(var c, i) != ll_cs_proc.W_NONE and ctl_conn_active(var c, ls)
             var cs = ll_cs_proc.cs_new()
             cs_get(var c, i, var cs)
@@ -10302,6 +10392,26 @@ fn ctl_cs_security(var c: Controller, ls: Int) -> Int
     cs_put(var c, i, var cs)
     st
 
+// The Controller asks for the features of the peer on the link in slot `ls` because the Host asked for its capabilities (LE CS Read Remote Supported Capabilities) before
+// they were known: the Feature Exchange runs, and `ctl_cs_poll` goes on with the Capabilities Exchange when it has ended.  The status of the command.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn ctl_cs_features(var c: Controller, ls: Int) -> Int
+    let i = cs_request(var c, ls)
+    if i < 0
+        return cs_request_status(i)
+    var en = ll_cs_proc.env_new()
+    cs_env(var c, ls, var en)
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    var st = ll_cs_proc.begin_features(var cs, var en)
+    if st == 0
+        st = ll_link.link_read_features(var c.links[ls])
+        if st != 0
+            ll_cs_proc.end_features(var cs)
+    cs_put(var c, i, var cs)
+    st
+
 // LE CS Read Remote Supported Capabilities for the link in slot `ls`.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
@@ -10333,6 +10443,27 @@ fn ctl_cs_config(var c: Controller, ls: Int, var cfg: CfgPdu, local_only: Bool) 
     cs_local(var c, var local)
     var cs = ll_cs_proc.cs_new()
     cs_get(var c, i, var cs)
+    if not local_only and not ll_cs_proc.caps_known(var cs)
+        // The capabilities of the peer are not known: the configuration waits, and the Controller asks for the features (when it lacks them) and then the capabilities.
+        var st = ll_cs_proc.stage_config(var cs, var en, var local, var cfg, var c.links[ls].tmp)
+        var sent = false
+        if st == 0
+            if c.links[ls].have_feat
+                st = ll_cs_proc.begin_capabilities(var cs, var en, var local, var c.links[ls].tmp)
+                sent = st == 0
+            else
+                st = ll_cs_proc.begin_features(var cs, var en)
+                if st == 0
+                    st = ll_link.link_read_features(var c.links[ls])
+                    if st != 0
+                        ll_cs_proc.end_features(var cs)
+            // The exchange did not start after all: the configuration is not kept.
+            if st != 0
+                ll_cs_proc.unstage(var cs)
+        cs_put(var c, i, var cs)
+        if sent
+            return cs_sent(var c, ls, st)
+        return st
     let st = ll_cs_proc.begin_config(var cs, var en, var local, var cfg, local_only, var c.links[ls].tmp)
     cs_put(var c, i, var cs)
     if local_only

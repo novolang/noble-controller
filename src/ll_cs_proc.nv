@@ -50,6 +50,8 @@ use noble_controller_config
 const R_NONE = 0
 const R_SEND = 1
 const R_UNKNOWN = 2
+// A request for this end's FAE table that this end answers: the Controller fills LL_CS_FAE_RSP from the table of its radio (`fae_rsp`).
+const R_FAE = 3
 
 // What the procedure of this end waits for (`Cs.wait`).
 const W_NONE = 0
@@ -61,6 +63,8 @@ const W_TERM = 5
 const W_FAE = 6
 const W_RND_C = 7
 const W_RND_P = 8
+// The Controller waits for the Feature Exchange it started because the Host asked for a Capabilities Exchange (or a configuration) before the features of the peer were known.
+const W_FEAT = 9
 
 // The events the Host is owed (`Cs.owed`): the Read Remote Supported Capabilities Complete, Read Remote FAE Table Complete, Security Enable
 // Complete and Config Complete events, the answer of a Start (Procedure Enable Complete), and the end of a Procedure Repeat Termination.
@@ -174,12 +178,14 @@ const GW_DROPPED = 35
 const GLOBAL_WORDS = 40
 
 // The octets: the local capability record in the order of the HCI ([v2], 34 octets), the parameters of the LE CS Test in progress (30 and the override data), the FAE table
-// the Host wrote for LE CS Test (72), and the octets of the result of a subevent, `RES_STEP_OCT` for each step the build plans.
+// the Host wrote for LE CS Test (72), the FAE table of this end's radio (72, the values of `CsRadio.cs_fae` in 1/32 ppm, signed octets, in the order of LL_CS_FAE_RSP), and the
+// octets of the result of a subevent, `RES_STEP_OCT` for each step the build plans.
 const GO_CAPS = 0
 const GO_TEST = 40
 const GO_FAE = 88
-const GO_RESULT = 160
-const GLOBAL_OCTETS = 160
+const GO_LFAE = 160
+const GO_RESULT = 232
+const GLOBAL_OCTETS = 232
 const RES_STEP_OCT = 40
 
 // The configurations a connection holds: `ctl_cs_configs`, and 1 in a build without the feature.
@@ -360,7 +366,7 @@ fn b2i(v: Bool) -> Int
 // Copy the record of `slot` into `cs`.
 @tier(embedded)
 fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
-        var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
+        var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
         slot: Int, var cs: Cs)
     let w = slot * CS_WORDS
     cs.owner = words[w + WD_OWNER]
@@ -408,7 +414,7 @@ fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_con
 // Copy `cs` into the record of `slot`.
 @tier(embedded)
 fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
-         var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
+         var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
          slot: Int, var cs: Cs)
     let w = slot * CS_WORDS
     words[w + WD_OWNER] = cs.owner
@@ -456,7 +462,7 @@ fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_co
 // The tables of a Controller with `slots` records, each a new record that no connection owns.  `Vec.new()` has no elements; this fills them.
 @tier(embedded)
 fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
-               var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 160 + noble_controller_config.CTL_CS_STEPS * 40 else 1])
+               var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1])
     var cs = cs_new()
     for slot in 0..noble_controller_config.CTL_CS
         for _ in 0..CS_WORDS
@@ -569,12 +575,6 @@ fn stage(var cs: Cs, off: Int, op: Int, n: Int, var p: Pdu)
 fn copy_within(var cs: Cs, from: Int, to: Int, n: Int)
     for i in 0..n
         bs(var cs, to + i, bg(var cs, from + i))
-
-// The Link Layer's own FAE table, in units of 1/32 ppm, for the allowed channel `i` (0 to 71, in index order): the table of a build with no radio
-// that has one.
-@tier(embedded)
-fn local_fae(i: Int) -> Int
-    0
 
 // ── The capabilities ────────────────────────────────────────────────
 
@@ -1065,7 +1065,32 @@ fn begin_guard(var cs: Cs, var en: Env) -> Int
         return E_INSUFFICIENT_SECURITY
     0
 
+// The status a Host command gets for the checks every procedure of the Host meets before the features of the peer are known: `begin_guard` without the test of the peer's
+// feature set.
+@tier(embedded)
+fn begin_guard_open(var cs: Cs, var en: Env) -> Int
+    if not cs.host
+        return E_DISALLOWED
+    if not en.encrypted
+        return E_INSUFFICIENT_SECURITY
+    0
+
 // ── Waiting ─────────────────────────────────────────────────────────
+
+// The Capabilities Exchange, or the Feature Exchange before it, ended with `code` and did not succeed.  When it ran for a configuration the Host asked to create
+// (`staged`), the configuration is what fails and the Host is told by its Config Complete event; otherwise the Host asked for the capabilities and the Read Remote
+// Supported Capabilities Complete event carries the code.
+@tier(embedded)
+fn fail_auto(var cs: Cs, code: Int)
+    if staged(var cs)
+        unstage(var cs)
+        cs.ev_cfg = cs.wait_cfg
+        cs.ev_act = 1
+        cs.st_cfg = code
+        cs.owed = cs.owed | OWED_CFG
+        return
+    cs.st_caps = code
+    cs.owed = cs.owed | OWED_CAPS
 
 // The procedure of this end ended with `code`: the event it owes the Host carries it.  A Start the Host did not ask for tells the Host nothing.
 @tier(embedded)
@@ -1075,9 +1100,8 @@ fn fail_wait(var cs: Cs, code: Int)
     if w == W_SEC
         cs.st_sec = code
         cs.owed = cs.owed | OWED_SEC
-    else if w == W_CAP
-        cs.st_caps = code
-        cs.owed = cs.owed | OWED_CAPS
+    else if w == W_CAP or w == W_FEAT
+        fail_auto(var cs, code)
     else if w == W_CFG
         cs.st_cfg = code
         cs.ev_cfg = cs.wait_cfg
@@ -1362,6 +1386,79 @@ fn begin_config(var cs: Cs, var en: Env, var local: CapPdu, var c: CfgPdu, local
     cs.t0 = en.now
     0
 
+// ── The exchanges the Controller starts for itself ──────────────────
+// A command of the Host that needs the capabilities of the peer, or its features, finds neither when the Host has not asked for them first.  The Controller then
+// makes the exchange the command needs: LE CS Read Remote Supported Capabilities completes the Feature Exchange before the Capabilities Exchange ([Vol 4] Part E,
+// Section 7.8.131), and LE CS Create Config with the peer completes both before the Configuration procedure (Part B, Section 5.1.25 asks for the capabilities to be
+// known).  A configuration waits in `OFF_PCFG` with the flag 4 (`stage_config`) while the exchanges run.
+
+// The Controller starts the Feature Exchange for the Host's request: the record waits (`W_FEAT`).  Command Disallowed when the Host has not set Channel Sounding (Host
+// Support) or another procedure of this end is out, Insufficient Security on a link that is not encrypted.  The caller queues the request of the Feature Exchange.
+@tier(embedded)
+fn begin_features(var cs: Cs, var en: Env) -> Int
+    let g = begin_guard_open(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE
+        return E_DISALLOWED
+    cs.wait = W_FEAT
+    cs.t0 = en.now
+    0
+
+// The Feature Exchange could not be started after all (the link would not take the request): the record does not wait for it.
+@tier(embedded)
+fn end_features(var cs: Cs)
+    cs.wait = W_NONE
+
+// Whether a configuration waits in the store for the Capabilities Exchange (`stage_config`).
+@tier(embedded)
+fn staged(var cs: Cs) -> Bool
+    bg(var cs, OFF_PCFG) == 4
+
+// The configuration that waited is given up.
+@tier(embedded)
+fn unstage(var cs: Cs)
+    bs(var cs, OFF_PCFG, 0)
+
+// The Host asks for a configuration `c` made with a peer whose capabilities are not known.  What the specification forbids and what this end lacks are refused now, with
+// the statuses of `begin_config` (a removal is not staged: without the peer's capabilities it is made here alone); the request itself waits in the store until the
+// Capabilities Exchange has ended (`config_resume`).  `out` is overwritten.
+@tier(embedded)
+fn stage_config(var cs: Cs, var en: Env, var local: CapPdu, var c: CfgPdu, var out: Pdu) -> Int
+    let g = begin_guard_open(var cs, var en)
+    if g != 0
+        return g
+    if cs.wait != W_NONE or c.action == 0 or c.config_id <= 3 and cs.run_open and cs.series_cfg == c.config_id
+        return E_DISALLOWED
+    var peer = ll_cs_pdu.cap_new()
+    let k = config_check(var c, var local, var peer, false, true)
+    if k == 1
+        return E_INVALID_PARAMS
+    if k == 2
+        return E_UNSUPPORTED_FEATURE
+    ll_cs_pdu.put_config_req(var out, var c)
+    bs(var cs, OFF_PCFG, 4)
+    keep(var cs, OFF_PCFG + 1, var out, 27)
+    cs.wait_cfg = c.config_id
+    0
+
+// The Capabilities Exchange for a staged configuration has ended: the request goes to the peer, in `out`, with the capabilities known; otherwise (the exchange failed, or
+// the peer's capabilities rule the configuration out) the Host is told with the Config Complete event.  `R_SEND` or `R_NONE`.
+@tier(embedded)
+fn config_resume(var cs: Cs, var en: Env, var local: CapPdu, var out: Pdu) -> Int
+    var c = ll_cs_pdu.cfg_new()
+    stage(var cs, OFF_PCFG + 1, ll_cs.OP_CS_CONFIG_REQ, 27, var out)
+    let _read = ll_cs_pdu.get_config_req(var out, var c)
+    unstage(var cs)
+    let st = begin_config(var cs, var en, var local, var c, false, var out)
+    if st != 0
+        cs.ev_cfg = c.config_id
+        cs.ev_act = c.action
+        cs.st_cfg = st
+        cs.owed = cs.owed | OWED_CFG
+        return R_NONE
+    R_SEND
+
 // LL_CS_CONFIG_REQ: the configuration is created or removed and LL_CS_CONFIG_RSP answers.  Rejected with the error codes of Section 5.1.25:
 // Unsupported LL Parameter Value for parameters this end does not take, Command Disallowed for a configuration a Start is using, and LL Procedure
 // Collision for a request that crosses one of this end's.  A request for a configuration that does not exist, to remove it, is also refused with
@@ -1403,7 +1500,8 @@ fn rx_config_rsp(var cs: Cs, var rx: Pdu) -> Int
     if cs.ev_act == 0
         remove_config(var cs, cs.wait_cfg)
     else
-        copy_within(var cs, OFF_PCFG, cfg_base(cs.wait_cfg), CFG_OCT)
+        copy_within(var cs, OFF_PCFG, cfg_base(cs.wait_cfg), OFF_PP_FLAG)
+        bs(var cs, cfg_base(cs.wait_cfg) + OFF_PP_FLAG, 0)
     cs.wait = W_NONE
     cs.st_cfg = 0
     cs.ev_cfg = cs.wait_cfg
@@ -1429,7 +1527,8 @@ fn begin_fae(var cs: Cs, var en: Env, var out: Pdu) -> Int
     cs.t0 = en.now
     0
 
-// LL_CS_FAE_REQ: the answer is LL_CS_FAE_RSP with this end's table, or LL_REJECT_EXT_IND Unsupported Feature or Parameter Value when `local` has No_FAE.
+// LL_CS_FAE_REQ: the answer is LL_CS_FAE_RSP with this end's table (`R_FAE`: the caller fills it from the radio's table with `fae_rsp`), or LL_REJECT_EXT_IND Unsupported
+// Feature or Parameter Value when `local` has No_FAE.
 @tier(embedded)
 fn rx_fae_req(var cs: Cs, var en: Env, var local: CapPdu, var out: Pdu) -> Int
     let g = guard(var cs, var en, ll_cs.OP_CS_FAE_REQ, true, var out)
@@ -1437,9 +1536,15 @@ fn rx_fae_req(var cs: Cs, var en: Env, var local: CapPdu, var out: Pdu) -> Int
         return g
     if local.no_fae == 1
         return reject(var out, ll_cs.OP_CS_FAE_REQ, E_UNSUPPORTED_FEATURE)
+    R_FAE
+
+// The answer to LL_CS_FAE_REQ: LL_CS_FAE_RSP in `out` with the 72 values of `table`, the signed octets of this end's radio in units of 1/32 ppm, one for each allowed
+// channel in index order.  The table does not fit a link that has not negotiated long packets: the request is rejected with Rejected Due To Limited Resources.
+@tier(embedded)
+fn fae_rsp(var en: Env, var table: Vec[u8; 72], var out: Pdu) -> Int
     ll_cs_pdu.put_fae_begin(var out)
     for i in 0..ll_cs.CHANNEL_COUNT
-        ll_cs_pdu.put_fae_value(var out, local_fae(i))
+        ll_cs_pdu.put_fae_value(var out, table[i] as Int)
     ll_cs_pdu.put_fae_end(var out)
     if not fits(var en, var out)
         return no_room(var out, ll_cs.OP_CS_FAE_REQ)

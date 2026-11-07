@@ -37,7 +37,7 @@ const CTL_CS_WORDS = 304
 const CTL_CS_STORE = 224
 const CTL_CS_CONFIG = 56
 const CTL_CS_GLOBAL_WORDS = 320
-const CTL_CS_GLOBAL_OCTETS = 160
+const CTL_CS_GLOBAL_OCTETS = 232
 const CTL_CS_RESULT_STEP = 40
 
 // The larger of `n` and 1: a table of an absent feature keeps one record.  A `const fn` of another module cannot take part in
