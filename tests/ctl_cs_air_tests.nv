@@ -976,7 +976,9 @@ fn plan_with_role(h: CsPlan, role: Int) -> CsPlan
         snr_i: h.snr_i,
         snr_r: h.snr_r,
         window_us: h.window_us,
-        test: h.test }
+        test: h.test,
+        ant_sync: h.ant_sync,
+        fae_peer: h.fae_peer }
 
 // The peer's plan for a test of S0: its head and its steps, when the test does not want the device's own turned round.
 fn sim_cs_peer(var s: SimCs, h: CsPlan, steps: [CsStep])

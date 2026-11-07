@@ -9818,6 +9818,10 @@ const RUN_DONE = 1
 const RUN_NONE = 2
 const RUN_FAULT = 3
 
+// How long a reflector's receiver stays open past the start of a subevent of a procedure for the first packet of the initiator, in microseconds: the clocks of the two ends
+// agree to the accuracy of the connection's anchor points, which is tens of microseconds, and the two radios' turn-on times differ by about as much.
+const CS_LISTEN_US = 2000
+
 // The transmit power the plan names for an octet that `ll_cs_hci.dbm_ok` allowed, in dBm: a signed value from -127 to +20.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
@@ -9898,24 +9902,36 @@ fn cs_store<S: CsRadio[s]>(var c: Controller, var air: S, var plan: ll_cs_plan.C
     cs_gw_put(var c, ll_cs_proc.GW_RES_STEPS, plan.n)
     cs_gw_put(var c, ll_cs_proc.GW_RES_OCT, pos)
 
-// Plan the subevent for the configuration `cfg` and the role `role` into `st.plan`, hand it to the radio, run it and keep the result for the Host: the part `ctl_cs_subevent`
-// and `ctl_cs_test_subevent` share.  `gen` is the index of the generator, `ls` the link (-1 for a test) and `proc_last` says the procedure ends with this subevent whatever the
-// plan says.  The answer is `RUN_FAULT`, `RUN_DONE` or `RUN_OK`.
+// The first half of a subevent: plan it for the configuration `cfg` and the role `role` into `st.plan` and complete the head with what is not the configuration's: the initiator
+// phase tone flag `ipt`, the transmit power `tx` in dBm, the antenna selection `ant` of CS_SYNC and the peer's frequency actuation error table `fae` (empty when the Controller
+// has none).  `gen` is the index of the generator.  The answer is the code of `ll_cs_plan.plan_subevent`, which `cs_run_part` takes.  The planning draws the channels and the
+// access addresses of every step from the cipher, which takes milliseconds on a radio's chip: the radio program plans a subevent while the radio is idle and runs it at its time.
 @when(noble_controller_config.CTL_CS > 0)
 @tier(embedded)
-fn cs_run<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
-                                       var st: ll_cs_plan.CsState, gen: Int,
-                                       var cfg: ll_cs_plan.CsCfg, role: Int, ipt: Bool, tx: Int,
-                                       test: Bool, proc_last: Bool, pct: Bool, handle: Int,
-                                       cfg_id: Int, start_ev: Int, proc: Int, t0_us: Int,
-                                       anchor_ns: Int) -> Int [s, e]
+fn cs_plan_part<C: Cipher[e]>(var c: Controller, var cc: C, var st: ll_cs_plan.CsState, gen: Int,
+                              var cfg: ll_cs_plan.CsCfg, role: Int, ipt: Bool, tx: Int, ant: Int,
+                              var fae: Vec[i8; ll_cs_radio.CS_FAE_COUNT], anchor_ns: Int) -> Int [e]
     let code = ll_cs_plan.plan_subevent(var cc, var st.gens[gen], var cfg, var st.plan, role, anchor_ns)
+    st.plan.code = code
     if code == ll_cs_plan.PLAN_FAULT
-        return RUN_FAULT
+        return code
     st.plan.head.ipt = ipt
     st.plan.head.tx_dbm = tx as i8
+    st.plan.head.ant_sync = ant as u8
+    st.plan.head.fae_peer = fae
+    code
+
+// The second half: hand the plan in `st.plan` (planned with the code `code`) to the radio to run from `t0_us`, run it and keep the result for the Host.  `ls` is the link
+// (-1 for a test) and `proc_last` says the procedure ends with this subevent whatever the plan says.  `window_us` is how long a reflector's receiver stays open past `t0_us` for the
+// first packet of the initiator (0 for a test, whose peer starts when its Host says so).  The answer is `RUN_DONE` or `RUN_OK`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_run_part<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_cs_plan.CsState, gen: Int, code: Int,
+                              test: Bool, proc_last: Bool, pct: Bool, handle: Int, cfg_id: Int,
+                              start_ev: Int, proc: Int, t0_us: Int, window_us: Int) -> Int [s]
     if test
         st.plan.head.test = 1
+    st.plan.head.window_us = window_us as u32
     var raw = ll_cs_radio.cs_raw_new()
     let armed = ll_cs_plan.plan_arm(var air, var st.plan, t0_us)
     var status = armed
@@ -9961,6 +9977,24 @@ fn cs_run<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
         return RUN_DONE
     RUN_OK
 
+// Plan the subevent for the configuration `cfg` and the role `role` into `st.plan`, hand it to the radio, run it and keep the result for the Host: the part `ctl_cs_subevent`
+// and `ctl_cs_test_subevent` share.  `gen` is the index of the generator, `ls` the link (-1 for a test) and `proc_last` says the procedure ends with this subevent whatever the
+// plan says.  The answer is `RUN_FAULT`, `RUN_DONE` or `RUN_OK`.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_run<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
+                                       var st: ll_cs_plan.CsState, gen: Int,
+                                       var cfg: ll_cs_plan.CsCfg, role: Int, ipt: Bool, tx: Int,
+                                       test: Bool, proc_last: Bool, pct: Bool, handle: Int,
+                                       cfg_id: Int, start_ev: Int, proc: Int, t0_us: Int,
+                                       anchor_ns: Int, ant: Int,
+                                       var fae: Vec[i8; ll_cs_radio.CS_FAE_COUNT]) -> Int [s, e]
+    let code = cs_plan_part(var c, var cc, var st, gen, var cfg, role, ipt, tx, ant, var fae, anchor_ns)
+    if code == ll_cs_plan.PLAN_FAULT
+        return RUN_FAULT
+    // Only a test runs the planning and the subevent in one call, and its peer starts when its Host says so: the receiver waits for it.
+    cs_run_part(var c, var air, var st, gen, code, test, proc_last, pct, handle, cfg_id, start_ev, proc, t0_us, 0)
+
 // A procedure instance of the series of the connection in slot `ls` begins in the connection event `ev`: the channel map of a Channel Map Update whose instant has come takes
 // effect, CSProcCount is incremented (except for the first instance after Security Start), and the generator of the connection is keyed from the values of the Security Start
 // procedure (the first instance) and ratcheted (the later ones).  An instance that finds fewer than 15 channels after the filtering ends the series and is reported to the Host.
@@ -9999,6 +10033,155 @@ fn ctl_cs_instance<C: Cipher[e]>(var c: Controller, var cc: C, var st: ll_cs_pla
         return RUN_OK
     RUN_FAULT
 
+// The configuration of the planning for the series that runs in the record `i` of the link in slot `ls`, read into `cs`, `local` (the capabilities of this end) and `cfg`:
+// the answer is the configuration's IPT flag (0 or 1), -1 when no subevent can be planned (the record has no series open, or its generator has finished the procedure).
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_series_cfg(var c: Controller, var st: ll_cs_plan.CsState, ls: Int, i: Int, var cs: ll_cs_proc.Cs,
+                 var local: ll_cs_pdu.CapPdu, var cfg: ll_cs_plan.CsCfg) -> Int
+    cs_get(var c, i, var cs)
+    if not cs.run_open or st.gens[i].done
+        return -1
+    cs_local(var c, var local)
+    ll_cs_hci.plan_cfg(var cs, var local, var c.links[ls].tmp, var cfg)
+
+// The peer's frequency actuation error table of the record `cs`, when the Controller has it (LL_CS_FAE_RSP or LE CS Write Cached Remote FAE Table), as the plan carries it;
+// empty when it has none.
+@when(noble_controller_config.CTL_CS > 0)
+@tier(embedded)
+fn cs_peer_table(var cs: ll_cs_proc.Cs) -> Vec[i8; ll_cs_radio.CS_FAE_COUNT]
+    var fae: Vec[i8; ll_cs_radio.CS_FAE_COUNT] = Vec.new()
+    if cs.fae_known
+        for k in 0..ll_cs_radio.CS_FAE_COUNT
+            let _f = fae.push(ll_cs_proc.peer_fae(var cs, k) as i8)
+    fae
+
+// Whether the series of procedures of the connection in slot `ls` is open: a Start completed and its procedures are not all done.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_series_open(var c: Controller, ls: Int) -> Bool
+    let i = cs_find(var c, ls)
+    if i < 0
+        return false
+    c.cs_w[i * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_RUN_OPEN] != 0
+
+// The schedule of the procedures of one connection, from the Start that completed:
+//
+//   conn_event            the connection event the first CS event is offset from (connEventCount of the Start)
+//   offset_us             the time from that event's anchor point to the first subevent
+//   event_interval        connection events between the starts of two CS events
+//   subevents             subevents in a CS event
+//   subevent_interval_us  the time between the starts of two subevents of an event
+//   subevent_len_us       the longest a subevent lasts
+//   proc_interval         connection events between the starts of two procedures, 0 when the series is one procedure
+//   proc_count            procedures in the series, 0 for no end
+//   proc_us               the extent of a procedure at the longest
+//   interval_us           the connection interval
+@when(noble_controller_config.CTL_CS > 0)
+@value
+struct CsSched
+    conn_event: Int
+    offset_us: Int
+    event_interval: Int
+    subevents: Int
+    subevent_interval_us: Int
+    subevent_len_us: Int
+    proc_interval: Int
+    proc_count: Int
+    proc_us: Int
+    interval_us: Int
+
+// A schedule of nothing: zero everywhere.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+@no_alloc
+fn cs_sched_new() -> CsSched
+    CsSched { conn_event: 0, offset_us: 0, event_interval: 0, subevents: 0, subevent_interval_us: 0, subevent_len_us: 0, proc_interval: 0, proc_count: 0, proc_us: 0, interval_us: 0 }
+
+// Read the schedule of the series of the connection in slot `ls` into `out`; false when no series is open.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_sched(var c: Controller, ls: Int, var out: CsSched) -> Bool
+    let i = cs_find(var c, ls)
+    if i < 0
+        return false
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    var s = ll_cs_pdu.start_new()
+    if not ll_cs_proc.load_run(var cs, var s, var c.links[ls].tmp)
+        return false
+    out.conn_event = s.conn_event
+    out.offset_us = s.offset_min
+    out.event_interval = s.event_interval
+    out.subevents = s.subevents
+    out.subevent_interval_us = s.subevent_interval * ll_cs_proc.UNIT_US
+    out.subevent_len_us = s.subevent_len
+    out.proc_interval = s.proc_interval
+    out.proc_count = s.proc_count
+    out.proc_us = s.max_proc_len * ll_cs_proc.UNIT_US
+    out.interval_us = ll_link.interval_us(var c.links[ls])
+    true
+
+// The time of the anchor point of the connection event with the counter `ev` of the connection in slot `ls`, on the radio's timebase, as the schedule of the link stands between
+// two events: the event the link is to run next is due at `Link.due`, and the others are whole intervals before or after it.  -2 when a Connection Update has its instant between
+// the event and the next one, which moves the anchors in a way the caller cannot know.  (`ll_link.link_event_time` answers for the event under way, which the radio program
+// that polls between events is never in.)
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_event_time(var c: Controller, ls: Int, ev: Int) -> Int
+    var d = (ev - c.links[ls].ev_count) & 0xFFFF
+    if d >= 0x8000
+        d = d - 0x10000
+    if d > 0 and c.links[ls].upd_pending and ((c.links[ls].upd_instant - c.links[ls].ev_count) & 0xFFFF) <= d
+        return -2
+    c.links[ls].due + d * ll_link.interval_us(var c.links[ls])
+
+// Plan the next subevent of the procedure instance of the connection in slot `ls` into `st.plan`, for a subevent that begins `anchor_ns` after the start of the procedure; the
+// radio runs it later (`ctl_cs_subevent_run`).  `next_ns` is where the subevent after it would begin, or -1 when the caller does not know: a subevent after which the next would
+// begin at or past the longest the procedure may last (Max_Procedure_Len) is the last of the procedure, which its result says.  The answer is `RUN_OK` (planned), `RUN_NONE` (no
+// series is open, or the procedure is complete) or `RUN_FAULT` (the cipher failed).
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_subevent_plan<C: Cipher[e]>(var c: Controller, var cc: C, var st: ll_cs_plan.CsState, ls: Int, anchor_ns: Int, next_ns: Int) -> Int [e]
+    let i = cs_find(var c, ls)
+    if i < 0
+        return RUN_NONE
+    var local = ll_cs_pdu.cap_new()
+    var cfg = ll_cs_plan.cfg_new()
+    var cs = ll_cs_proc.cs_new()
+    let ipt = cs_series_cfg(var c, var st, ls, i, var cs, var local, var cfg)
+    if ipt < 0
+        return RUN_NONE
+    var fae = cs_peer_table(var cs)
+    let code = cs_plan_part(var c, var cc, var st, i, var cfg, ll_cs_proc.cfg_role(var cs, cs.series_cfg), ipt == 1, cs_tx_dbm(cs.def_txp), cs.def_ant, var fae, anchor_ns)
+    if code == ll_cs_plan.PLAN_FAULT
+        return RUN_FAULT
+    if next_ns >= 0 and next_ns >= cfg.proc_len_us * 1000
+        ll_cs_plan.gen_finish(var st.gens[i])
+    RUN_OK
+
+// Run the subevent that `ctl_cs_subevent_plan` planned, from `t0_us` on the radio's timebase, anchored to the connection event `ev` (Start_ACL_Conn_Event_Counter of the
+// result), and keep its result for the Host.  A start that is too near for the radio to arm is reported as a subevent aborted for a scheduling conflict.  The series ends with the
+// last procedure the Start named.  The answer is `RUN_OK` (more subevents follow), `RUN_DONE` (the procedure is complete) or `RUN_NONE`.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_subevent_run<S: CsRadio[s]>(var c: Controller, var air: S, var st: ll_cs_plan.CsState, ls: Int, ev: Int, t0_us: Int) -> Int [s]
+    let i = cs_find(var c, ls)
+    if i < 0
+        return RUN_NONE
+    var cs = ll_cs_proc.cs_new()
+    cs_get(var c, i, var cs)
+    if not cs.run_open
+        return RUN_NONE
+    var local = ll_cs_pdu.cap_new()
+    cs_local(var c, var local)
+    let last = cs.series_n != 0 and ((cs.proc_count - cs.series_start + 1) & 0xFFFF) >= cs.series_n
+    let r = cs_run_part(var c, var air, var st, i, st.plan.code, false, false, local.sounding_pct == 1, c.links[ls].handle, cs.series_cfg, ev, cs.proc_count, t0_us, CS_LISTEN_US)
+    if r == RUN_DONE and last
+        ll_cs_proc.series_done(var cs)
+        cs_put(var c, i, var cs)
+    r
+
 // The next subevent of the procedure instance of the connection in slot `ls` runs: it starts at `t0_us` on the radio's timebase, lies `anchor_ns` after the start of the
 // procedure, and is anchored to the connection event `ev` (Start_ACL_Conn_Event_Counter of the result).  The series ends with the last procedure the Start named.  The answer is
 // `RUN_OK` (more subevents follow), `RUN_DONE` (the procedure is complete), `RUN_NONE` or `RUN_FAULT`.
@@ -10007,29 +10190,10 @@ pub @tier(embedded)
 fn ctl_cs_subevent<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air: S, var cc: C,
                                                 var st: ll_cs_plan.CsState, ls: Int, ev: Int,
                                                 t0_us: Int, anchor_ns: Int) -> Int [s, e]
-    let i = cs_find(var c, ls)
-    if i < 0
-        return RUN_NONE
-    var cs = ll_cs_proc.cs_new()
-    cs_get(var c, i, var cs)
-    if not cs.run_open or st.gens[i].done
-        return RUN_NONE
-    var local = ll_cs_pdu.cap_new()
-    cs_local(var c, var local)
-    var cfg = ll_cs_plan.cfg_new()
-    let ipt = ll_cs_hci.plan_cfg(var cs, var local, var c.links[ls].tmp, var cfg)
-    // cov: skip — a series that is open has its configuration and its Start
-    if ipt < 0
-        return RUN_NONE
-    let id = cs.series_cfg
-    let role = ll_cs_proc.cfg_role(var cs, id)
-    let last = cs.series_n != 0 and ((cs.proc_count - cs.series_start + 1) & 0xFFFF) >= cs.series_n
-    let r = cs_run(var c, var air, var cc, var st, i, var cfg, role, ipt == 1, cs_tx_dbm(cs.def_txp), false, false, local.sounding_pct == 1, c.links[ls].handle, id, ev,
-        cs.proc_count, t0_us, anchor_ns)
-    if r == RUN_DONE and last
-        ll_cs_proc.series_done(var cs)
-        cs_put(var c, i, var cs)
-    r
+    let planned = ctl_cs_subevent_plan(var c, var cc, var st, ls, anchor_ns, -1)
+    if planned != RUN_OK
+        return planned
+    ctl_cs_subevent_run(var c, var air, var st, ls, ev, t0_us)
 
 // The next subevent of the LE CS Test the Host started runs, starting at `t0_us`.  The first call keys the generator with the key of zeros and the test's nonce.  The test ends
 // when its procedure is complete or Max_Num_Subevents subevents have run (one when Subevent_Interval is zero), and its result events carry the handle 0xFFF.  The answer is as
@@ -10066,11 +10230,40 @@ fn ctl_cs_test_subevent<S: CsRadio[s], C: Cipher[e]>(var c: Controller, var air:
         tx = -127
     else if ll_cs_hci.g8(var t, ll_cs_hci.TEST_POWER) == 0x7F
         tx = 20
+    // A test has no peer to ask for a table: the radio assumes zero.
+    var fae: Vec[i8; ll_cs_radio.CS_FAE_COUNT] = Vec.new()
     let r = cs_run(var c, var air, var cc, var st, 0, var cfg, ll_cs_hci.g8(var t, ll_cs_hci.TEST_ROLE), ll_cs_hci.g8(var t, ll_cs_hci.TEST_ENH) == 1, tx, true, stop,
-        local.sounding_pct == 1, ll_cs_proc.HANDLE_TEST, 0, 0, 0, t0_us, 0)
+        local.sounding_pct == 1, ll_cs_proc.HANDLE_TEST, 0, 0, 0, t0_us, 0, ll_cs_hci.g8(var t, ll_cs_hci.TEST_ANT), var fae)
     if r == RUN_DONE
         cs_gw_put(var c, ll_cs_proc.GW_TEST_ON, 0)
     r
+
+// The subevents of the LE CS Test the Host started that have run: 0 for a test that has not begun, -1 when no test is on.  The radio program schedules the subevents from it
+// (`ll_cs_air.nv`).
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_test_count(var c: Controller) -> Int
+    if cs_gw(var c, ll_cs_proc.GW_TEST_ON) == 0
+        return -1
+    cs_gw(var c, ll_cs_proc.GW_TEST_N)
+
+// The time between the starts of two subevents of the LE CS Test in progress, in microseconds (Subevent_Interval, units of 625 microseconds); 0 for a test of one subevent.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_test_interval_us(var c: Controller) -> Int
+    (cs_go(var c, ll_cs_proc.GO_TEST + ll_cs_hci.TEST_SUB_INT) | (cs_go(var c, ll_cs_proc.GO_TEST + ll_cs_hci.TEST_SUB_INT + 1) << 8)) * 625
+
+// The length of a subevent of the LE CS Test in progress, in microseconds (Subevent_Len).
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_test_len_us(var c: Controller) -> Int
+    cs_go(var c, ll_cs_proc.GO_TEST + ll_cs_hci.TEST_SUB_LEN) | (cs_go(var c, ll_cs_proc.GO_TEST + ll_cs_hci.TEST_SUB_LEN + 1) << 8) | (cs_go(var c, ll_cs_proc.GO_TEST + ll_cs_hci.TEST_SUB_LEN + 2) << 16)
+
+// Whether the result of a subevent still waits to go to the Host: a subevent that ran before it has gone keeps its result apart from the next.
+@when(noble_controller_config.CTL_CS > 0)
+pub @tier(embedded)
+fn ctl_cs_result_waiting(var c: Controller) -> Bool
+    cs_gw(var c, ll_cs_proc.GW_RES_STATE) != 0
 
 // ── Channel Sounding: the procedures of the Link Layer ──────────────
 // The procedures are in ll_cs_proc.nv, over one record `Cs` for each connection that runs them.  The Controller keeps the records as numbers and octets

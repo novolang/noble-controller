@@ -62,8 +62,8 @@ it.  `ctl_cs` needs `ctl_pcl`, and `ctl_cs_ipt` needs `ctl_featpages`.  Three ke
 feature, the generator of the planning (`CsGen` of `ll_cs_plan`, 712 bytes) and one record of the procedures (`ll_cs_proc`) kept in two tables of the Controller,
 38 words and a store of 224 B, and once for the Controller 40 words and 160 B of store after the records (the Host Support bit, the capabilities, the parameters of an
 LE CS Test, the FAE table of the test, the header of the result that waits); `ctl_cs_configs`: 56 B more of store for each configuration a connection holds (the 27
-octets of its PDU and the 20 of the procedure parameters the Host set); `ctl_cs_steps`: the plan of one subevent (`CsSubevent`, 40 bytes and 56 for each step) and 40 B
-for each step of the result that waits to go to the Host.  `CsState` holds the generators and the plan, and the caller of the functions that run a subevent owns it.  A build without the feature keeps the two tables of the
+octets of its PDU and the 20 of the procedure parameters the Host set); `ctl_cs_steps`: the plan of one subevent (`CsSubevent`, 136 bytes, which hold the antenna selection of CS_SYNC, the peer's table of 72 frequency actuation errors, the count of steps and the code the planning ended with, and 56 for each step) and 40 B
+for each step of the result that waits to go to the Host.  `CsState` holds the generators and the plan, and the caller of the functions that run a subevent owns it (an image holds the one it passes to `ll_cs_air.cs_poll`, with the record of the slot, as module variables behind `@when`).  A build without the feature keeps the two tables of the
 procedures at one element each and makes nothing else; the modules of the feature are not part of it.  The control queue of a link holds 76 octets a slot
 in a build with the feature, 40 in one without it, for the 75 octets of LL_CS_FAE_RSP.  With `ctl_cs` at 0 the 18 commands are answered with Unknown HCI
 Command, the 14 Link Layer opcodes (0x2D to 0x3A) with LL_UNKNOWN_RSP, and LE features 46, 47, 48 and 75 stay clear; with it on, `ll_cs` lists the commands in
@@ -77,10 +77,11 @@ and 55): the capabilities event is the [v2] one when the build has Enhancement #
 Controller as the records of its steps and goes out as a Subevent Result event and as many Continue events as it needs, each at most 255 octets of parameters, as soon as
 the pool has a slot; one result waits at a time, a second is reported by its header, aborted for lack of resources, and a third is dropped and counted.
 
-The radio's side of the feature is `CsRadio` in `noble-radio`, which the radio program does not call yet.  The caller that will (the arbiter's class of CS7, the tests) runs
-a subevent with three functions of `ctl_hci`: `ctl_cs_instance` at the start of each procedure instance (the channel map of an update takes effect, CSProcCount is
-incremented, the generator is keyed from the values of Security Start and ratcheted), `ctl_cs_subevent` for each subevent of it and `ctl_cs_test_subevent` for each subevent
-of an LE CS Test; they plan the subevent into the `CsState` the caller holds, hand it to the radio, run it and keep the result for the Host.  `ctl_cs_radio_init` reads the
+The radio's side of the feature is `CsRadio` in `noble-radio`.  `ll_poll` does not take it; an image whose Controller has the feature calls `ll_cs_air.cs_poll` after `ll_poll` in its main loop, and the slot runs the subevents on any radio that
+implements `Radio`, `Timebase` and `CsRadio`: an LE CS Test from the command on, and the procedures of a connection at the times the Start fixed, planning each subevent while the radio is idle (the planning takes some milliseconds) and running it when the arbiter has nothing booked in its span.  The slot is below every class of the arbiter; the classes for Channel Sounding are CS7.
+It runs a subevent with the functions of `ctl_hci`: `ctl_cs_instance` at the start of each procedure instance (the channel map of an update takes effect, CSProcCount is
+incremented, the generator is keyed from the values of Security Start and ratcheted), `ctl_cs_subevent_plan` and `ctl_cs_subevent_run` for each subevent of it (`ctl_cs_subevent` does both) and `ctl_cs_test_subevent` for each subevent
+of an LE CS Test; they plan the subevent into the `CsState` the caller holds, hand it to the radio, run it and keep the result for the Host.  `ctl_cs_sched`, `ctl_cs_series_open` and `ctl_cs_event_time` give the slot the Start's schedule and the anchor of a connection event.  The Central that answers a Start picks the offset of the first subevent 3 ms after the anchor point when the window allows (`ll_cs_proc.pick_offset`), and the Peripheral answers the request with the part of its window from there on.  `ctl_cs_radio_init` reads the
 capabilities of the radio once, so that the Controller reports the intersection with its build and reports the tone quality (LE feature 48) when the radio does.
 
 The plan of a subevent is a function of the generator's key, the configuration

@@ -2056,7 +2056,8 @@ fn test_a_start_the_central_begins_runs_request_response_indication_and_both_end
     var rsp = ll_cs_pdu.start_new()
     test.assert(ll_cs_pdu.get_rsp(var b, var rsp))
     test.assert_eq(rsp.config_id, 0)
-    test.assert_eq(rsp.offset_min, 1000)
+    // The request's window is 1000 to 2000: the Peripheral answers with the end of it nearest to 3 ms.
+    test.assert_eq(rsp.offset_min, 2000)
     test.assert_eq(rsp.offset_max, 2000)
     test.assert_eq(rsp.subevent_len, 2500)
     test.assert_eq(rsp.pwr_delta, 0)
@@ -2066,7 +2067,8 @@ fn test_a_start_the_central_begins_runs_request_response_indication_and_both_end
     var ind = ll_cs_pdu.start_new()
     test.assert(ll_cs_pdu.get_ind(var a, var ind))
     test.assert_eq(ind.conn_event, 110)
-    test.assert_eq(ind.offset_min, 1000)
+    // The window of the request is 1000 to 2000 microseconds: the Central picks the end of it nearest to 3 milliseconds.
+    test.assert_eq(ind.offset_min, 2000)
     test.assert_eq(ind.pwr_delta, -5)
     test.assert_eq(ind.phy, 1)
     test.assert(cen.run_open)
@@ -2082,8 +2084,8 @@ fn test_a_start_the_central_begins_runs_request_response_indication_and_both_end
                  [rc.proc_interval, rp.proc_interval], [rc.proc_count, rp.proc_count], [rc.aci, rp.aci], [rc.pref_ant, rp.pref_ant], [rc.phy, rp.phy],
                  [rc.pwr_delta, rp.pwr_delta]]
         test.assert_eq(pair[0], pair[1])
-    test.assert_eq(rc.offset_min, 1000)
-    test.assert_eq(rc.offset_max, 1000)
+    test.assert_eq(rc.offset_min, 2000)
+    test.assert_eq(rc.offset_max, 2000)
     test.assert_eq(rc.proc_count, 7)
     test.assert_eq(rc.proc_interval, 3)
     test.assert_eq(rc.pwr_delta, -5)
@@ -2097,6 +2099,17 @@ fn test_a_start_the_central_begins_runs_request_response_indication_and_both_end
     test.assert(ll_cs_proc.take_owed(var per, ll_cs_proc.OWED_PROC))
     test.assert_eq(cen.st_proc, 0)
     test.assert_eq(per.st_proc, 0)
+
+@test
+fn test_the_central_picks_the_offset_of_the_indication_3_milliseconds_after_the_anchor_when_the_window_allows()
+    // A window that holds 3 milliseconds: 3 milliseconds.  One wholly under it: its end.  One wholly over it: its start.
+    test.assert_eq(ll_cs_proc.pick_offset(1000, 5000), 3000)
+    test.assert_eq(ll_cs_proc.pick_offset(3000, 3000), 3000)
+    test.assert_eq(ll_cs_proc.pick_offset(500, 3000), 3000)
+    test.assert_eq(ll_cs_proc.pick_offset(1000, 2999), 2999)
+    test.assert_eq(ll_cs_proc.pick_offset(500, 500), 500)
+    test.assert_eq(ll_cs_proc.pick_offset(3001, 9000), 3001)
+    test.assert_eq(ll_cs_proc.pick_offset(8000, 8000), 8000)
 
 @test
 fn test_a_start_the_peripheral_begins_is_answered_by_the_central_with_the_indication_alone()
@@ -2116,7 +2129,7 @@ fn test_a_start_the_peripheral_begins_is_answered_by_the_central_with_the_indica
     test.assert_eq(op_of(var b), ll_cs.OP_CS_IND)
     var ind = ll_cs_pdu.start_new()
     test.assert(ll_cs_pdu.get_ind(var b, var ind))
-    test.assert_eq(ind.offset_min, 1000)
+    test.assert_eq(ind.offset_min, 2000)
     test.assert_eq(ind.phy, 1)
     test.assert_eq(ind.pwr_delta, 0)
     test.assert(cen.run_open)
@@ -4279,3 +4292,29 @@ fn test_a_staged_configuration_goes_to_the_peer_when_its_capabilities_are_known_
     test.assert_eq(cen2.ev_act, 1)
     test.assert(ll_cs_proc.take_owed(var cen2, ll_cs_proc.OWED_CFG))
     test.assert(not ll_cs_proc.cfg_used(var cen2, 0))
+
+@test
+fn test_the_peripheral_answers_a_wide_window_with_the_part_from_3_milliseconds_on_and_the_central_picks_its_start()
+    if skip()
+        return
+    var cen = fresh()
+    var per = fresh()
+    ready(var cen, var per, 0)
+    var s = start_set2(S_OMIN, 1000, S_OMAX, 5000)
+    var caps = caps_full()
+    var ec = env(true, 20)
+    var ep = env(false, 20)
+    var a = ll_pdu.pdu_new()
+    var b = ll_pdu.pdu_new()
+    test.assert_eq(ll_cs_proc.begin_start(var cen, var ec, var caps, var s, var a), 0)
+    test.assert_eq(ll_cs_proc.receive(var per, var ep, var caps, var a, var b), ll_cs_proc.R_SEND)
+    var rsp = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_rsp(var b, var rsp))
+    test.assert_eq(rsp.offset_min, 3000)
+    test.assert_eq(rsp.offset_max, 5000)
+    test.assert_eq(ll_cs_proc.receive(var cen, var ec, var caps, var b, var a), ll_cs_proc.R_SEND)
+    var ind = ll_cs_pdu.start_new()
+    test.assert(ll_cs_pdu.get_ind(var a, var ind))
+    test.assert_eq(ind.offset_min, 3000)
+    // The answer is inside the request's window, as the Central checks.
+    test.assert(cen.run_open)

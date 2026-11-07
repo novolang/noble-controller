@@ -10,6 +10,8 @@ consumer deciding whether to upgrade can read.
 program that drives a radio without the Controller (the Channel Sounding bench rig of `orbit/ble`) can plan the subevent of an
 `LE CS Test` and hand it to a `CsRadio`.  No behaviour changes.
 
+`ll_cs_air` is the Channel Sounding slot of the radio program: `cs_poll`, which an image's main loop calls after `ll_poll` with the planning storage (`ll_cs_plan.CsState`) and the record (`ll_cs_air.CsAir`) the image holds, reads the radio's capabilities once, runs the subevents of an `LE CS Test` and plans and runs the subevents of the procedures of a connection at the times the Start fixed, on any radio that implements `Radio`, `Timebase` and `CsRadio`.  It is removed with `ctl_cs` 0, which links none of it.  `ctl_cs_subevent` is split into `ctl_cs_subevent_plan` (the planning, which takes milliseconds) and `ctl_cs_subevent_run`; `ctl_cs_series_open`, `ctl_cs_sched`, `ctl_cs_event_time`, `ctl_cs_test_count`, `ctl_cs_test_interval_us`, `ctl_cs_test_len_us` and `ctl_cs_result_waiting` read the state the slot schedules from.  A Central that answers a Channel Sounding Start picks the offset of the first subevent 3 ms after the anchor point when the window allows (it took the window's start), and a Peripheral answers the request with the part of its window from there on (it repeated the window).  The plan carries the peer's FAE table and the CS_SYNC antenna selection, and the storage the keys state grows by 96 octets (`ctl_cs_steps`: 136 + 96 per step).  `ll_air.stop_rx` is public.  With `ctl_cs` 0 nothing changes.
+
 ## 0.1.0
 
 First release.  The portable Link Layer and HCI command handler of the noble

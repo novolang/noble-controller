@@ -29,9 +29,10 @@ const CTL_PCL_RECORD = 192
 const CTL_PAWR_ADV_RECORD = 144
 const CTL_PAWR_SYNC_RECORD = 64
 const CTL_PAWR_BUF_RECORD = 56
-// Channel Sounding (ll_cs_plan.nv): the generator of one connection, the plan's head and count, and one step.
+// Channel Sounding (ll_cs_plan.nv): the generator of one connection, the plan's head (112 octets: the 24 of the fields of the timings and the 88 of the antenna selection and the
+// peer's table of 72 frequency actuation errors), the count of steps and the code the planning ended with (8 octets each), and one step.
 const CTL_CS_GEN_RECORD = 712
-const CTL_CS_PLAN_FIXED = 32
+const CTL_CS_PLAN_FIXED = 128
 const CTL_CS_STEP_RECORD = 56
 const CTL_CS_WORDS = 304
 const CTL_CS_STORE = 224

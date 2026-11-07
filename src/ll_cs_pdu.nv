@@ -257,6 +257,17 @@ fn start_new() -> StartPdu
     StartPdu { config_id: 0, conn_event: 0, offset_min: 0, offset_max: 0, max_proc_len: 0, event_interval: 0, subevents: 0, subevent_interval: 0,
                subevent_len: 0, proc_interval: 0, proc_count: 0, aci: 0, pref_ant: 0, phy: 0, pwr_delta: 0, snr_i: 0xF, snr_r: 0xF }
 
+// Narrow the window of offsets of the answer in `s` (LL_CS_RSP) to `lo` to `hi`.
+@tier(embedded)
+fn start_window(var s: StartPdu, lo: Int, hi: Int)
+    s.offset_min = lo
+    s.offset_max = hi
+
+// Set the offset of the answer in `s` (LL_CS_IND names one Offset, which the record keeps in `offset_min`).
+@tier(embedded)
+fn start_offset(var s: StartPdu, offset: Int)
+    s.offset_min = offset
+
 // Set the connEventCount, the PHY and the power delta of the answer in `s`, the fields a Start answer chooses itself.
 @tier(embedded)
 fn start_answer(var s: StartPdu, conn_event: Int, phy: Int, pwr_delta: Int)

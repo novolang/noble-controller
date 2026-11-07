@@ -999,7 +999,9 @@ fn plan_with_role(h: CsPlan, role: Int) -> CsPlan
         snr_i: h.snr_i,
         snr_r: h.snr_r,
         window_us: h.window_us,
-        test: h.test }
+        test: h.test,
+        ant_sync: h.ant_sync,
+        fae_peer: h.fae_peer }
 
 // The peer's plan for a test of S0: its head and its steps, when the test does not want the device's own turned round.
 fn sim_cs_peer(var s: SimCs, h: CsPlan, steps: [CsStep])
@@ -1548,7 +1550,9 @@ fn h_edit(h: CsPlan, phy: Int, rtt: Int, n_ap: Int, ip1: Int, ipt: Bool) -> CsPl
         snr_i: h.snr_i,
         snr_r: h.snr_r,
         window_us: h.window_us,
-        test: h.test }
+        test: h.test,
+        ant_sync: h.ant_sync,
+        fae_peer: h.fae_peer }
 
 fn h_window(h: CsPlan, window_us: Int) -> CsPlan
     CsPlan { role: h.role,
@@ -1568,7 +1572,9 @@ fn h_window(h: CsPlan, window_us: Int) -> CsPlan
         snr_i: h.snr_i,
         snr_r: h.snr_r,
         window_us: window_us as u32,
-        test: h.test }
+        test: h.test,
+        ant_sync: h.ant_sync,
+        fae_peer: h.fae_peer }
 
 fn p_head(p: PlanBuf, h: CsPlan) -> PlanBuf
     PlanBuf { head: h, steps: list.clone(p.steps), n: p.n, code: p.code }

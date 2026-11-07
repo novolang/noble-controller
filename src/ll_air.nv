@@ -1282,8 +1282,8 @@ fn start_rx<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf
     rf.rx_ch = ch
     rf.rx_phy = phy
 
-// Stop the receiver and let go of the radio.
-fn stop_rx<R: Radio[e]>(var air: R, var rf: Rf) [e]
+// Stop the receiver and let go of the radio.  Public for the Channel Sounding slot of the radio program (`ll_cs_air.nv`).
+pub fn stop_rx<R: Radio[e]>(var air: R, var rf: Rf) [e]
     if rf.rx_on
         air.halt()
         rf.rx_on = false

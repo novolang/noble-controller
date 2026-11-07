@@ -240,7 +240,7 @@ doc     = "buffers of subevent data the advertiser keeps, and of responses each 
 # (`CsState` of ll_cs_plan.nv, 712 B) and one record of the procedures (ll_cs_proc.nv) in two tables of the Controller, 38 words of 8 B and a store of 224 B, and,
 # once for the Controller, 40 words and 232 B of store after the records (the Host Support bit, the test, the capabilities, the table of frequency actuation errors of the radio, the header of the result of a subevent);
 # a build without the feature keeps those two tables at one element each, which is the floor.  `ctl_cs_configs`: 56 B more of store for each configuration a
-# connection holds (the 27 octets of the PDU and the 20 of the procedure parameters of the Host).  `ctl_cs_steps`: the plan of one subevent, 40 B and 56 B a step,
+# connection holds (the 27 octets of the PDU and the 20 of the procedure parameters of the Host).  `ctl_cs_steps`: the plan of one subevent, 136 B (the head of 112 B, which holds the antenna selection of CS_SYNC and the peer's table of 72 frequency actuation errors, the count of steps and the code the planning ended with) and 56 B a step,
 # and 40 B a step for the result of a subevent that waits to go to the Host.
 [config.ctl_cs]
 type     = "int"
@@ -270,7 +270,7 @@ max      = 160
 unit     = "steps"
 zero_iff = "ctl_cs"
 min_when = [{ when = "ctl_cs", min = 8 }]
-bytes_expr = "ctl_cs_steps * 96 + 40"
+bytes_expr = "ctl_cs_steps * 96 + 136"
 doc      = "steps one Channel Sounding subevent holds in its plan, 8 to 160; 0 exactly when CTL_CS is 0; the Controller's storage (ll_cs_plan.nv)"
 
 [config.ctl_cs_roles]

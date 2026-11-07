@@ -440,6 +440,12 @@ fn gen_begin_procedure<C: Cipher[e]>(var cc: C, var g: CsGen) -> Bool [e]
     g.last_ch = 2
     true
 
+// The procedure is over: no subevent follows the one just planned.
+@tier(embedded)
+@no_alloc
+fn gen_finish(var g: CsGen)
+    g.done = true
+
 // Begin the next subevent of the procedure, which starts `anchor_ns` after the procedure and may hold `steps_max` steps.  The main steps of
 // the subevent that ended become those the repetition repeats.  A procedure that has run its 32 subevents is complete.
 @tier(embedded)
@@ -669,18 +675,20 @@ fn plan_next<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, var out: CsSte
 //
 //   head            the plan's head, with `n_steps` and `n_mode0` filled by `plan_subevent`
 //   n               the steps held
+//   code            the code `plan_subevent` ended the subevent with, which the run of the subevent reads (a plan made now is run later)
 //   steps           the steps; the build's `ctl_cs_steps` is their capacity
 @value
 struct CsSubevent
     head: CsPlan
     n: Int
+    code: Int
     steps: Vec[CsStep; max1(noble_controller_config.CTL_CS_STEPS)]
 
 // A plan with no step.  Public for the bench rig of `orbit/ble`.
 pub @tier(embedded)
 @no_alloc
 fn plan_new() -> CsSubevent
-    CsSubevent { head: ll_cs_radio.cs_plan_new(), n: 0, steps: Vec.new() }
+    CsSubevent { head: ll_cs_radio.cs_plan_new(), n: 0, code: 0, steps: Vec.new() }
 
 // The storage of the planning that a build with Channel Sounding holds: a generator for each of the connections that run it (`ctl_cs`) and the
 // plan of one subevent, which the connections share (`ctl_cs_steps` steps).  A build without the feature never makes one, so a program that
@@ -720,7 +728,9 @@ fn plan_head(c: CsCfg, role: Int, n: Int, n0: Int) -> CsPlan
         snr_i: 0,
         snr_r: 0,
         window_us: 0,
-        test: 0 }
+        test: 0,
+        ant_sync: 1,
+        fae_peer: Vec.new() }
 
 // Plan the next subevent of the procedure into `p`: its steps, as many as `p` holds (`ctl_cs_steps`, at most 160), and its head.  `anchor_ns` is where
 // the subevent begins in the procedure.  The answer is the code that ended the subevent: `PLAN_SUBEVENT_END`, `PLAN_PROCEDURE_END` (the

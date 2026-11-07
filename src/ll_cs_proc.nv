@@ -111,6 +111,10 @@ const EVENT_HALF = 32768
 // The limits of LL_CS_REQ ([Vol 6] Part B, Section 2.4.2.47): the least Offset_Min and Subevent_Len and the 4 seconds that bound the offsets and the
 // length, in microseconds, and the unit of the lengths in 625 microseconds.
 const OFFSET_MIN_US = 500
+
+// The offset the Central picks for the first subevent in the window a Start names, when the window allows: 3 milliseconds after the anchor point, so that the
+// connection event the subevent is offset from has ended (a short exchange takes about a millisecond) and the radio has its lead before the subevent.
+const OFFSET_PICK_US = 3000
 const SUBEVENT_LEN_MIN_US = 1250
 const FOUR_SECONDS_US = 4000000
 const UNIT_US = 625
@@ -1650,6 +1654,16 @@ fn begin_start(var cs: Cs, var en: Env, var local: CapPdu, var s: StartPdu, var 
     cs.t0 = en.now
     0
 
+// The offset the Central picks in the window from `lo` to `hi`: `OFFSET_PICK_US` when the window holds it, otherwise the end of the window nearest to it.  The Peripheral
+// answers the request with the window from that offset to the request's end, so the Central's pick is the one the Peripheral wants too.
+@tier(embedded)
+fn pick_offset(lo: Int, hi: Int) -> Int
+    if lo >= OFFSET_PICK_US
+        return lo
+    if hi < OFFSET_PICK_US
+        return hi
+    OFFSET_PICK_US
+
 // LL_CS_REQ: the Central answers with LL_CS_IND and the procedures start; the Peripheral answers LL_CS_RSP and waits for the Central's LL_CS_IND.  Rejected
 // with Unsupported Remote Feature (the Host has not set the feature), Insufficient Security, Command Disallowed (a Security Start under way), Invalid LL
 // Parameters (the configuration was not created), Rejected due to Security Reasons (the Host's requirements are not met), Unsupported LL Parameter Value
@@ -1687,6 +1701,7 @@ fn rx_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu)
     if en.central
         var ind = s
         ll_cs_pdu.start_answer(var ind, pick_event(s.conn_event, en.ev_count), en.phy, 0)
+        ll_cs_pdu.start_offset(var ind, pick_offset(s.offset_min, s.offset_max))
         ll_cs_pdu.put_ind(var out, var ind)
         if not fits(var en, var out)
             return no_room(var out, ll_cs.OP_CS_REQ)
@@ -1694,6 +1709,8 @@ fn rx_req(var cs: Cs, var en: Env, var local: CapPdu, var rx: Pdu, var out: Pdu)
         return R_SEND
     var r = s
     ll_cs_pdu.start_answer(var r, s.conn_event, en.phy, 0)
+    // The window of the answer is the part of the request's the Peripheral prefers: the Central picks the offset in it.
+    ll_cs_pdu.start_window(var r, pick_offset(s.offset_min, s.offset_max), s.offset_max)
     ll_cs_pdu.put_rsp(var out, var r)
     if not fits(var en, var out)
         return no_room(var out, ll_cs.OP_CS_REQ)
@@ -1717,6 +1734,7 @@ fn rx_rsp(var cs: Cs, var en: Env, var rx: Pdu, var out: Pdu) -> Int
         return reject(var out, ll_cs.OP_CS_RSP, E_UNSUPPORTED_LL)
     var ind = a
     ll_cs_pdu.start_answer(var ind, pick_event(a.conn_event, en.ev_count), req.phy, req.pwr_delta)
+    ll_cs_pdu.start_offset(var ind, pick_offset(a.offset_min, a.offset_max))
     ll_cs_pdu.put_ind(var out, var ind)
     if not fits(var en, var out)
         fail_wait(var cs, E_LIMITED)

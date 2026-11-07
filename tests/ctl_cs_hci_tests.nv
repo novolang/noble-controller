@@ -24,6 +24,10 @@ use ll_cs_plan
 use ll_cs_radio
 use ll_ccm
 use ll_cipher
+use ll_air
+use ll_arb
+use ll_radio
+use ll_cs_air
 use ctl_pool
 
 // ── The Host's side ─────────────────────────────────────────────────
@@ -3028,6 +3032,61 @@ fn test_the_transmit_power_of_the_hosts_default_settings_and_of_a_test_goes_into
 @when(noble_controller_config.CTL_PERIPHERAL > 0)
 @when(noble_controller_config.CTL_CS > 0)
 @test
+fn test_the_antenna_of_the_default_settings_and_the_peers_fae_table_go_into_the_plan()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var air = fake_new()
+    var c = ready()
+    var req = caps_pdu_fae(ll_cs.OP_CS_CAPABILITIES_REQ)
+    peer_sends(var c, var req)
+    pop_queued(var c)
+    // The Host writes the table of the peer it kept from an earlier connection: the first value 3, the sixth -1 (0xFF), the one of channel 26 (the 22nd) -2 and the last 0x80.
+    var t = cat([1, 0], zeros(72))
+    t[2] = 3
+    t[2 + 5] = 0xFF
+    t[2 + 21] = 0xFE
+    t[2 + 71] = 0x80
+    test.assert_eq(status_of(run(var c, 0x208F, t), 0x208F), 0)
+    secure(var c)
+    // CS_SYNC_Antenna_Selection 0xFE: the Host leaves the alternation to the Controller.
+    test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 3, 0xFE, 0]), 0x208D), 0)
+    test.assert_eq(cmd_status(run(var c, 0x2090, create_params(0, 1, 0)), 0x2090), 0)
+    pop_queued(var c)
+    var rsp = config_rsp_pdu(0)
+    peer_sends(var c, var rsp)
+    let _e = flush(var c)
+    pp(var c, "set", pp_params(0, 1), 0)
+    test.assert_eq(cmd_status(run(var c, 0x2094, [1, 0, 0, 1]), 0x2094), 0)
+    peer_starts(var c)
+    let _f = flush(var c)
+    var st = state()
+    test.assert_eq(ctl_hci.ctl_cs_instance(var c, var cc, var st, 0, 5), ctl_hci.RUN_OK)
+    test.assert_eq(ctl_hci.ctl_cs_subevent(var c, var air, var cc, var st, 0, 5, 100000, 0), ctl_hci.RUN_OK)
+    test.assert_eq(st.plan.head.ant_sync as Int, 0xFE)
+    test.assert_eq(st.plan.head.fae_peer.len(), ll_cs_radio.CS_FAE_COUNT)
+    test.assert_eq(air.head.ant_sync as Int, 0xFE)
+    test.assert_eq(air.head.fae_peer.len(), 72)
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var air.head, 2), 3)
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var air.head, 7), -1)
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var air.head, 26), -2)
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var air.head, 76), -128)
+    // The channels a procedure does not use have no value.
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var air.head, 23), 0)
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var air.head, 77), 0)
+    test.assert_eq(ll_cs_radio.cs_fae_index(1), -1)
+    // A test has no peer to ask: no table, and the antenna of its parameters.
+    var d = fresh()
+    var st2 = state()
+    ts(var d, "ant", with(test_params(), T_ANT, 1), 0)
+    test.assert_eq(ctl_hci.ctl_cs_test_subevent(var d, var air, var cc, var st2, 100000), ctl_hci.RUN_DONE)
+    test.assert_eq(st2.plan.head.ant_sync as Int, 1)
+    test.assert_eq(st2.plan.head.fae_peer.len(), 0)
+    test.assert_eq(ll_cs_radio.cs_peer_fae(var st2.plan.head, 40), 0)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
 fn test_a_configuration_with_a_sub_mode_plans_sub_mode_steps()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
         return
@@ -3079,3 +3138,643 @@ fn test_the_peer_antennas_the_host_prefers_must_be_as_many_as_the_configuration_
     configure(var c, 0, 0)
     // No preferred element of the peer, which has one and uses it.
     pp(var c, "no preferred antenna", with(pp_params(0, 1), PP_PREF, 0), 0x12)
+
+// ── The slot of the radio program for Channel Sounding (ll_cs_air.nv) ─
+// The radio of these tests is `AirSim`: a clock that moves when the program waits or a subevent runs (3 milliseconds), a `Radio` that counts what it was asked, and the
+// scripted `Fake` behind `CsRadio`, whose arming refuses a start nearer than 150 microseconds as the backend of the nRF54 does.
+
+struct AirSim
+    var f: Fake
+    var now: Int
+    var holds: Int
+    var releases: Int
+    var configs: Int
+    var halts: Int
+    var arms: Int
+    var last_t0: Int
+    var ran: Int
+    var tick: Int
+
+fn air_sim(now: Int) -> AirSim
+    AirSim { f: fake_new(), now: now, holds: 0, releases: 0, configs: 0, halts: 0, arms: 0, last_t0: 0, ran: 0, tick: 0 }
+
+impl Timebase[] for AirSim
+    fn now_us(var self) -> Int
+        let t = self.now
+        self.now = self.now + self.tick
+        t
+
+    fn stamp(var self) -> Int
+        self.now
+
+    fn stamps_per_us(var self) -> Int
+        1
+
+    fn cycles(var self) -> Int
+        0
+
+    fn wait_until(var self, t: Int)
+        if self.now < t
+            self.now = t
+
+impl Radio[] for AirSim
+    fn tx_lead_us(var self) -> Int
+        145
+
+    fn rx_lead_us(var self) -> Int
+        170
+
+    fn has_fast_ramp(var self) -> Bool
+        false
+
+    fn ramp_us(var self, phy: Int, fast: Bool) -> Int
+        145
+
+    fn octet_work_ns(var self) -> Int
+        700
+
+    fn supports_phy(var self, phy: Int) -> Bool
+        true
+
+    fn config(var self, aa: Int, crc_init: Int, maxlen: Int)
+        self.configs = self.configs + 1
+
+    fn phy(var self, phy: Int, s8: Bool)
+        pass
+
+    fn ramp(var self, fast: Bool)
+        pass
+
+    fn channel(var self, ch: Int)
+        pass
+
+    fn whitening(var self, on: Bool)
+        pass
+
+    fn power(var self, dbm: Int) -> Int
+        dbm
+
+    fn hold(var self)
+        self.holds = self.holds + 1
+
+    fn release(var self)
+        self.releases = self.releases + 1
+
+    fn packet(var self, buf: Int)
+        pass
+
+    fn arm(var self, next: Int, rssi: Bool)
+        pass
+
+    fn disarm(var self)
+        pass
+
+    fn start_tx(var self)
+        pass
+
+    fn start_rx(var self)
+        pass
+
+    fn halt(var self)
+        self.halts = self.halts + 1
+
+    fn wait_disabled(var self) -> Bool
+        true
+
+    fn clear_all(var self)
+        pass
+
+    fn clear_address(var self)
+        pass
+
+    fn clear_packet(var self)
+        pass
+
+    fn clear_done(var self)
+        pass
+
+    fn address_seen(var self) -> Bool
+        false
+
+    fn wait_address(var self, limit: Int) -> Bool
+        false
+
+    fn wait_phyend(var self) -> Bool
+        false
+
+    fn wait_rx(var self) -> Int
+        0
+
+    fn rssi_dbm(var self) -> Int
+        -40
+
+    fn address_mark(var self) -> Int
+        0
+
+    fn mark_us(var self, mark: Int) -> Int
+        0
+
+    fn rx_stamp_us(var self) -> Int
+        0
+
+    fn turnaround_ns(var self) -> Int
+        0
+
+    fn put(var self, buf: Int, var p: Pdu)
+        pass
+
+    fn read(var self, buf: Int, var p: Pdu, from: Int, to: Int)
+        pass
+
+    fn read_pdu(var self, buf: Int, var p: Pdu, n: Int)
+        pass
+
+    fn octet(var self, buf: Int, at: Int) -> Int
+        0
+
+    fn set_octet(var self, buf: Int, at: Int, v: Int)
+        pass
+
+impl CsRadio[] for AirSim
+    fn supports_cs(var self) -> Bool
+        self.f.supports_cs()
+
+    fn cs_caps(var self) -> CsCaps
+        self.f.cs_caps()
+
+    fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
+        self.arms = self.arms + 1
+        self.last_t0 = t0_us
+        if t0_us - self.now < 150
+            return ll_cs_radio.CS_LATE
+        self.f.cs_arm(var plan, t0_us)
+
+    fn cs_load(var self, i: Int, var step: CsStep) -> Int
+        self.f.cs_load(i, var step)
+
+    fn cs_run(var self, var raw: CsRaw) -> Int
+        self.now = self.now + 3000
+        self.ran = self.ran + 1
+        self.f.cs_run(var raw)
+
+    fn cs_step_raw(var self, i: Int, var out: CsStepRaw) -> Bool
+        self.f.cs_step_raw(i, var out)
+
+// The Controller says the link in slot 0 has run the connection event `ev_ran` and will run the next at `due`.
+@when(noble_controller_config.CTL_CS > 0)
+fn link_at(var c: ctl_hci.Controller, ev_next: Int, due: Int)
+    c.links[0].ev_count = ev_next & 0xFFFF
+    c.links[0].due = due
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_runs_an_le_cs_test_when_the_radio_is_clear_and_gives_the_radio_back_configured()
+    if not ctl_limits.cs_test_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = fresh()
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    var air = air_sim(1_000_000)
+    // Nothing is on: the slot reads the radio's capabilities once and does nothing more.
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.inited)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(air.holds, 0)
+    // One subevent: it starts 20 milliseconds on, the radio is held and let go with the advertising channels' configuration, and the clock has moved by the run and the pause.
+    ts(var c, "start", test_params(), 0)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    test.assert_eq(a.last, ctl_hci.RUN_DONE)
+    test.assert_eq(air.holds, 1)
+    test.assert_eq(air.releases, 1)
+    test.assert_eq(air.configs, 1)
+    test.assert_eq(air.last_t0, 1_000_000 + 20000)
+    test.assert_eq(air.now, 1_000_000 + 3000 + 2500)
+    test.assert_eq(ctl_hci.ctl_cs_test_count(var c), -1)
+    // The result waits for the Host; the slot does nothing while it does, and the events go out.
+    test.assert(ctl_hci.ctl_cs_result_waiting(var c))
+    let evs = results(flush(var c))
+    test.assert(list.len(evs) >= 1)
+    test.assert(not ctl_hci.ctl_cs_result_waiting(var c))
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_starts_the_later_subevents_of_a_test_an_interval_after_the_one_before_and_waits_for_the_result_to_go()
+    if not ctl_limits.cs_test_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = fresh()
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    var air = air_sim(2_000_000)
+    // Three subevents, 40 * 625 microseconds apart.
+    ts(var c, "three", with(with(test_params(), T_INTERVAL, 40), T_MAX_SUB, 3), 0)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    test.assert_eq(a.test_t0, 2_000_000 + 20000)
+    test.assert_eq(ctl_hci.ctl_cs_test_count(var c), 1)
+    test.assert_eq(ctl_hci.ctl_cs_test_interval_us(var c), 25000)
+    test.assert_eq(ctl_hci.ctl_cs_test_len_us(var c), 2500)
+    // The result of the first has not gone to the Host: nothing runs.
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    let _a = flush(var c)
+    // The next is not due yet (it is 25 ms after the first, the clock is 5.5 ms on, 8 ms are needed): the slot waits.
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    // Within 8 ms of its start it runs, at the interval after the first.
+    air.now = a.test_t0 + 25000 - 7000
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 2)
+    test.assert_eq(a.test_t0, 2_000_000 + 20000 + 25000)
+    test.assert_eq(a.late, 0)
+    let _b = flush(var c)
+    // The Host was slow: the third is due in the past, and starts as soon as the radio can (6 ms on).
+    air.now = a.test_t0 + 60000
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 3)
+    test.assert_eq(a.late, 1)
+    test.assert_eq(air.last_t0, air.now - 3000 - 2500 + 6000)
+    test.assert_eq(a.last, ctl_hci.RUN_DONE)
+
+// A scan window's receiver is on.
+fn scan_on(var rf: ll_air.Rf)
+    rf.rx_on = true
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_leaves_a_test_alone_while_the_arbiter_has_a_booking_in_its_span_and_stops_a_receiver_first()
+    if not ctl_limits.cs_test_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = connected_with(true)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    var air = air_sim(3_000_000)
+    ts(var c, "start", test_params(), 0)
+    // The connection's next event is 10 ms from now, inside the span the test needs.
+    link_at(var c, 9, 3_010_000)
+    ctl_hci.ctl_set_time(var c, 3_000_000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(a.waits, 1)
+    test.assert_eq(air.holds, 0)
+    // Past it, with a scan window's receiver on: the receiver is stopped before the run.
+    air.now = 3_100_000
+    link_at(var c, 10, 3_200_000 + 60000)
+    scan_on(var rf)
+    ctl_hci.ctl_set_time(var c, 3_100_000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    test.assert(not rf.rx_on)
+    test.assert(air.halts >= 1)
+    test.assert_eq(air.holds, 1)
+
+// The program's record with the instance begun, for a cipher that fails in the planning.
+fn begun_set(var a: ll_cs_air.CsAir)
+    a.begun = true
+
+// The schedule of the series of the Controller `c`, whose link is a Peripheral with the interval of 30 milliseconds.
+@when(noble_controller_config.CTL_CS > 0)
+fn sched_of(var c: ctl_hci.Controller) -> ctl_hci.CsSched
+    var sc = ctl_hci.cs_sched_new()
+    test.assert(ctl_hci.ctl_cs_sched(var c, 0, var sc))
+    sc
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_schedule_of_a_series_and_the_anchor_of_its_events_are_read_from_the_start_and_the_link()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var none = ready()
+    var s0 = ctl_hci.cs_sched_new()
+    test.assert(not ctl_hci.ctl_cs_series_open(var none, 0))
+    test.assert(not ctl_hci.ctl_cs_sched(var none, 0, var s0))
+    test.assert(not ctl_hci.ctl_cs_sched(var none, 1, var s0))
+    var c = series_of(2, 2, 0)
+    test.assert(ctl_hci.ctl_cs_series_open(var c, 0))
+    test.assert(not ctl_hci.ctl_cs_series_open(var c, 1))
+    let sc = sched_of(var c)
+    test.assert_eq(sc.conn_event, (c.links[0].ev_count + 6) & 0xFFFF)
+    test.assert_eq(sc.offset_us, 1000)
+    test.assert_eq(sc.event_interval, 1)
+    test.assert_eq(sc.subevents, 1)
+    test.assert_eq(sc.subevent_interval_us, 0)
+    test.assert_eq(sc.subevent_len_us, 2500)
+    test.assert_eq(sc.proc_interval, 3)
+    test.assert_eq(sc.proc_count, 2)
+    test.assert_eq(sc.proc_us, 62500)
+    test.assert_eq(sc.interval_us, 30000)
+    // The next event is due at 1_000_000: the events after it are whole intervals on, and the one just run an interval before.
+    link_at(var c, 40, 1_000_000)
+    test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 40), 1_000_000)
+    test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 43), 1_090_000)
+    test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 39), 970_000)
+    // The counter wraps at 65536.
+    link_at(var c, 65535, 5_000_000)
+    test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 1), 5_060_000)
+    // A Connection Update with its instant between the two moves the anchors in a way the caller cannot know.
+    c.links[0].upd_pending = true
+    c.links[0].upd_instant = (65535 + 2) & 0xFFFF
+    test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 3), -2)
+    test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 65535), 5_000_000)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_plans_a_procedure_ahead_and_runs_each_subevent_after_the_event_it_is_offset_from()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    let e0 = sched_of(var c).conn_event
+    // Three events before the first: the link is to run the event e0 - 3 at 1_000_000, and the first anchor is 90 ms on.
+    link_at(var c, e0 - 3, 1_000_000)
+    var air = air_sim(1_000_000 - 50000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.ls, 0)
+    test.assert(a.begun)
+    test.assert(a.prepared)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(a.off_us, 1000)
+    // It is not time yet: the slot does nothing more.
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 0)
+    // The events are run one after the other; after each the slot runs the subevent offset from it, and plans the next.
+    var done = 0
+    for k in 0..6
+        let ta = 1_000_000 + (3 + k) * 30000
+        link_at(var c, e0 + k, ta + 30000)
+        air.now = ta + 500
+        for _ in 0..3
+            ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+        let r = results(flush(var c))
+        if a.done > done
+            done = a.done
+            test.assert_eq(air.last_t0, ta + 1000)
+            test.assert(list.len(r) >= 1)
+        if a.ls < 0
+            break
+    // The procedure has three subevents (its extent is 62.5 ms and the events are 30 ms apart), and the series of one procedure ends with it.
+    test.assert_eq(a.done, 3)
+    test.assert_eq(a.missed, 0)
+    test.assert_eq(a.last, ctl_hci.RUN_DONE)
+    test.assert_eq(a.ls, -1)
+    test.assert(not ctl_hci.ctl_cs_series_open(var c, 0))
+    test.assert_eq(air.holds, 3)
+    test.assert_eq(air.releases, 3)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_waits_for_the_event_the_subevent_is_offset_from_and_hands_a_subevent_it_cannot_place_to_the_radio_late()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    let e0 = sched_of(var c).conn_event
+    link_at(var c, e0 - 3, 2_000_000)
+    var air = air_sim(2_000_000 - 50000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.prepared)
+    // The event e0 has not run: it is booked at 2_090_000, before the subevent (1 ms after it), 4 ms from now.  The slot waits for the event to pass.
+    link_at(var c, e0, 2_090_000)
+    air.now = 2_090_000 - 3000
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 0)
+    test.assert_eq(a.waits, 1)
+    // Within the lead of the radio the booking is still there: the subevent is a conflict, handed to the radio with a start in the past and reported as aborted (abort 0x30).
+    air.now = 2_090_000 - 500
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    test.assert_eq(a.missed, 1)
+    let r = results(flush(var c))
+    test.assert_eq(list.len(r), 1)
+    test.assert_eq(r[0][3 + 12], 0xF)
+    test.assert_eq(r[0][3 + 13], 0x30)
+    test.assert_eq(a.last, ctl_hci.RUN_OK)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_reports_a_subevent_whose_connection_event_cannot_be_placed_as_a_conflict_and_ends_the_series_when_the_cipher_fails()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    let e0 = sched_of(var c).conn_event
+    // A Connection Update with its instant before the first event: the anchor is unknown, the subevent is planned and then handed over late.
+    link_at(var c, e0 - 3, 3_000_000)
+    c.links[0].upd_pending = true
+    c.links[0].upd_instant = (e0 - 2) & 0xFFFF
+    var air = air_sim(3_000_000 - 50000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.prepared)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    test.assert_eq(a.missed, 1)
+    let r = results(flush(var c))
+    test.assert_eq(r[0][3 + 12], 0xF)
+    test.assert_eq(r[0][3 + 13], 0x30)
+    // A cipher that cannot make the key of the instance ends the series for the program.
+    var d = series_of(1, 2, 0)
+    var st2 = state()
+    var a2 = ll_cs_air.cs_air_new()
+    link_at(var d, sched_of(var d).conn_event - 3, 5_000_000)
+    var air2 = air_sim(5_000_000 - 50000)
+    var bad = flaky_new(0)
+    ll_cs_air.cs_poll(var air2, var d, var rf, var bad, var st2, var a2)
+    test.assert_eq(a2.ls, -1)
+    test.assert(not a2.prepared)
+    // A cipher that fails in the planning of a subevent whose instance had begun does the same.
+    var e = series_of(1, 2, 0)
+    var st3 = state()
+    var a3 = ll_cs_air.cs_air_new()
+    link_at(var e, sched_of(var e).conn_event - 3, 5_000_000)
+    var air3 = air_sim(5_000_000 - 50000)
+    var good = flaky_new(1000)
+    test.assert_eq(ctl_hci.ctl_cs_instance(var e, var good, var st3, 0, sched_of(var e).conn_event), ctl_hci.RUN_OK)
+    begun_set(var a3)
+    var worn = flaky_new(0)
+    ll_cs_air.cs_poll(var air3, var e, var rf, var worn, var st3, var a3)
+    test.assert_eq(a3.ls, -1)
+    test.assert(not a3.prepared)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_plans_only_when_the_radio_is_idle_for_as_long_as_the_planning_takes()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    let e0 = sched_of(var c).conn_event
+    // The next connection event is 5 ms away: the planning (12 ms before it is timed) waits.
+    link_at(var c, e0 - 3, 4_000_000)
+    var air = air_sim(4_000_000 - 5000)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(not a.prepared)
+    test.assert_eq(a.waits, 1)
+    test.assert_eq(a.ls, 0)
+    // 30 ms away: it is made, and what it took is noted (the clock of the test does not move in it).
+    air.now = 4_000_000 - 30000
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.prepared)
+    test.assert_eq(a.plan_us, 0)
+    test.assert_eq(a.inst, 0)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_position_in_a_series_moves_to_the_next_subevent_the_next_event_or_the_next_instance_and_the_start_follows_it()
+    if not ctl_limits.cs_on()
+        return
+    var a = ll_cs_air.cs_air_new()
+    // Two subevents in an event, 5 milliseconds apart, events two intervals apart, procedures four intervals apart.
+    var s = ctl_hci.CsSched { conn_event: 100, offset_us: 3000, event_interval: 2, subevents: 2, subevent_interval_us: 5000, subevent_len_us: 2500, proc_interval: 4, proc_count: 3,
+                              proc_us: 200000, interval_us: 30000 }
+    test.assert_eq(ll_cs_air.subevent_event(var s, 0, 0), 100)
+    test.assert_eq(ll_cs_air.subevent_event(var s, 0, 1), 102)
+    test.assert_eq(ll_cs_air.subevent_event(var s, 2, 1), 110)
+    var w = ctl_hci.CsSched { conn_event: 65534, offset_us: 3000, event_interval: 2, subevents: 1, subevent_interval_us: 0, subevent_len_us: 2500, proc_interval: 0, proc_count: 1,
+                              proc_us: 62500, interval_us: 30000 }
+    test.assert_eq(ll_cs_air.subevent_event(var w, 0, 1), 0)
+    // The next subevent of the event, the first of the next event, and the first of the next instance.
+    ll_cs_air.advance(var a, var s, false)
+    test.assert_eq(a.sub_i, 1)
+    test.assert_eq(a.ev_i, 0)
+    ll_cs_air.advance(var a, var s, false)
+    test.assert_eq(a.sub_i, 0)
+    test.assert_eq(a.ev_i, 1)
+    ll_cs_air.advance(var a, var s, true)
+    test.assert_eq(a.inst, 1)
+    test.assert_eq(a.ev_i, 0)
+    test.assert_eq(a.sub_i, 0)
+    test.assert(not a.begun)
+    test.assert(not a.prepared)
+
+// The program is at the first subevent of the series of the link in slot 0.
+fn begin_at(var a: ll_cs_air.CsAir)
+    a.ls = 0
+
+// The clock of `AirSim` moves by `tick` microseconds at every reading, so the planning of a subevent takes a time.
+fn tick_set(var air: AirSim, tick: Int)
+    air.tick = tick
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_slot_times_the_planning_and_waits_for_a_run_that_is_between_the_lead_and_the_poll_threshold()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(2, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var rf = ll_air.rf_new()
+    let sc = sched_of(var c)
+    let e0 = sc.conn_event
+    link_at(var c, e0 - 3, 6_000_000)
+    var air = air_sim(6_000_000 - 50000)
+    tick_set(var air, 7)
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.prepared)
+    // The planning read the clock twice, 7 microseconds apart.
+    test.assert_eq(a.plan_us, 7)
+    // The run is 3 ms away (between the 2 ms of the lead and the 4 ms of the poll): the program waits for 2 ms before it, then hands the subevent over.
+    let ta = 6_000_000 + 3 * 30000
+    link_at(var c, e0 + 1, ta + 30000)
+    air.now = ta + 1000 - 3000
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert_eq(a.runs, 1)
+    test.assert_eq(a.missed, 0)
+    test.assert(a.lead_us >= 1900)
+    test.assert(a.lead_us <= 2000)
+    let _r = flush(var c)
+    // The next subevent is planned with the time the longest took in view (the room the arbiter must leave is that and 2 ms more, and there are 30 ms).
+    ll_cs_air.cs_poll(var air, var c, var rf, var cc, var st, var a)
+    test.assert(a.prepared)
+    test.assert_eq(a.plan_us, 7)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_subevent_in_an_event_of_two_is_planned_with_the_start_of_the_next_inside_the_event_and_the_end_of_the_series_is_told()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var c = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    var air = air_sim(7_000_000)
+    // Two subevents of 5 milliseconds in an event: the first is planned with the second 5 ms on in the procedure, well inside its 62.5 ms.
+    var s = ctl_hci.CsSched { conn_event: sched_of(var c).conn_event, offset_us: 1000, event_interval: 1, subevents: 2, subevent_interval_us: 5000, subevent_len_us: 2500,
+                              proc_interval: 0, proc_count: 1, proc_us: 62500, interval_us: 30000 }
+    begin_at(var a)
+    test.assert(ll_cs_air.plan_one(var air, var c, var cc, var st, var a, var s, 123))
+    test.assert(a.prepared)
+    test.assert_eq(a.t0, 123)
+    test.assert(not st.gens[0].done)
+    // The last subevent of the procedure's extent: the next would begin at 90 ms, past the 62.5 ms, and the planning ends the procedure.
+    var late = ctl_hci.CsSched { conn_event: s.conn_event, offset_us: 1000, event_interval: 1, subevents: 1, subevent_interval_us: 0, subevent_len_us: 2500, proc_interval: 0,
+                                 proc_count: 1, proc_us: 62500, interval_us: 90000 }
+    var a2 = ll_cs_air.cs_air_new()
+    begin_at(var a2)
+    var d = series_of(1, 2, 0)
+    var st2 = state()
+    test.assert(ll_cs_air.plan_one(var air, var d, var cc, var st2, var a2, var late, 0))
+    test.assert(st2.gens[0].done)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_the_program_gives_up_a_series_whose_instance_or_planning_fails_and_a_run_for_a_series_that_is_over_has_nothing_to_run()
+    if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
+        return
+    var cc = ll_ccm.soft_cipher_new()
+    var air = air_sim(8_000_000)
+    var rf = ll_air.rf_new()
+    var d = series_of(1, 2, 0)
+    var st = state()
+    var a = ll_cs_air.cs_air_new()
+    begin_at(var a)
+    var s = sched_of(var d)
+    // The key of the instance cannot be made.
+    var bad = flaky_new(0)
+    test.assert(not ll_cs_air.plan_one(var air, var d, var bad, var st, var a, var s, 0))
+    test.assert(not a.begun)
+    // The instance begins and the subevent is planned.
+    var e = series_of(1, 2, 0)
+    var st2 = state()
+    var a2 = ll_cs_air.cs_air_new()
+    begin_at(var a2)
+    var good = flaky_new(1000)
+    test.assert(ll_cs_air.plan_one(var air, var e, var good, var st2, var a2, var s, 0))
+    var f = series_of(1, 2, 0)
+    var st3 = state()
+    var a3 = ll_cs_air.cs_air_new()
+    var good2 = flaky_new(1000)
+    test.assert_eq(ctl_hci.ctl_cs_instance(var f, var good2, var st3, 0, s.conn_event), ctl_hci.RUN_OK)
+    begin_at(var a3)
+    begun_set(var a3)
+    var worn = flaky_new(0)
+    test.assert(not ll_cs_air.plan_one(var air, var f, var worn, var st3, var a3, var s, 0))
+    test.assert(not a3.prepared)
+    // A run for a link with no record, and for a series that is not open, has nothing to run.
+    var g = ready()
+    var air2 = air_sim(0)
+    var stg = state()
+    test.assert_eq(ctl_hci.ctl_cs_subevent_run(var g, var air2, var stg, 0, 5, 100000), ctl_hci.RUN_NONE)
+    test.assert_eq(ctl_hci.ctl_cs_subevent_plan(var g, var cc, var stg, 0, 0, -1), ctl_hci.RUN_NONE)
+    var h = ready()
+    exchange_caps(var h)
+    test.assert_eq(ctl_hci.ctl_cs_subevent_run(var h, var air2, var stg, 0, 5, 100000), ctl_hci.RUN_NONE)
+    test.assert_eq(ctl_hci.ctl_cs_subevent_plan(var h, var cc, var stg, 0, 0, -1), ctl_hci.RUN_NONE)
