@@ -355,8 +355,9 @@ struct CsGen
     prev_n: Int
     last_ch: Int
 
-// A generator with no key and no procedure.
-@tier(embedded)
+// A generator with no key and no procedure.  Public so that a program that drives a radio without the Controller, such as the bench
+// rig of `orbit/ble`, can plan a subevent.
+pub @tier(embedded)
 @no_alloc
 fn gen_new() -> CsGen
     var g = CsGen { d: ll_cs_drbg.drbg_new(),
@@ -403,8 +404,9 @@ fn gen_instantiate<C: Cipher[e]>(var cc: C, var g: CsGen, var iv: Vec[u8; 16], v
     g.in_sub = false
     ll_cs_drbg.drbg_instantiate(var cc, var g.d, var iv, var nc, var pv)
 
-// Key the generator as LE CS Test does, with the key of zeros and the 16 bits `nonce` in octets 14 and 15 of the nonce.
-@tier(embedded)
+// Key the generator as LE CS Test does, with the key of zeros and the 16 bits `nonce` in octets 14 and 15 of the nonce.  Public for the
+// bench rig of `orbit/ble`, which keys the generator as the peer of an `LE CS Test`.
+pub @tier(embedded)
 @no_alloc
 fn gen_instantiate_test(var g: CsGen, nonce: Int)
     g.started = false
@@ -413,8 +415,8 @@ fn gen_instantiate_test(var g: CsGen, nonce: Int)
     ll_cs_drbg.drbg_load_test(var g.d, nonce)
 
 // Begin a procedure: the first after `gen_instantiate` uses the key as it is, each later one ratchets it first.  The step counter, the
-// channel lists and the subevent state start again.  False when the cipher failed.
-@tier(embedded)
+// channel lists and the subevent state start again.  False when the cipher failed.  Public for the bench rig of `orbit/ble`.
+pub @tier(embedded)
 fn gen_begin_procedure<C: Cipher[e]>(var cc: C, var g: CsGen) -> Bool [e]
     if g.started
         if not ll_cs_drbg.drbg_backtrack(var cc, var g.d)
@@ -674,8 +676,8 @@ struct CsSubevent
     n: Int
     steps: Vec[CsStep; max1(noble_controller_config.CTL_CS_STEPS)]
 
-// A plan with no step.
-@tier(embedded)
+// A plan with no step.  Public for the bench rig of `orbit/ble`.
+pub @tier(embedded)
 @no_alloc
 fn plan_new() -> CsSubevent
     CsSubevent { head: ll_cs_radio.cs_plan_new(), n: 0, steps: Vec.new() }
@@ -722,8 +724,9 @@ fn plan_head(c: CsCfg, role: Int, n: Int, n0: Int) -> CsPlan
 
 // Plan the next subevent of the procedure into `p`: its steps, as many as `p` holds (`ctl_cs_steps`, at most 160), and its head.  `anchor_ns` is where
 // the subevent begins in the procedure.  The answer is the code that ended the subevent: `PLAN_SUBEVENT_END`, `PLAN_PROCEDURE_END` (the
-// procedure is complete, with or without a step in this subevent: `g.done` says which), `PLAN_NO_FIT` or `PLAN_FAULT`.
-@tier(embedded)
+// procedure is complete, with or without a step in this subevent: `g.done` says which), `PLAN_NO_FIT` or `PLAN_FAULT`.  Public for the bench
+// rig of `orbit/ble`.
+pub @tier(embedded)
 fn plan_subevent<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, var p: CsSubevent, role: Int,
                                anchor_ns: Int) -> Int [e]
     p.steps.clear()
@@ -745,8 +748,8 @@ fn plan_subevent<C: Cipher[e]>(var cc: C, var g: CsGen, var c: CsCfg, var p: CsS
     code
 
 // Hand the plan to a radio: the head with the start time `t0_us` on the radio's timebase, then each step.  The first answer that is not
-// `CS_OK`, or `CS_OK`.
-@tier(embedded)
+// `CS_OK`, or `CS_OK`.  Public for the bench rig of `orbit/ble`, which arms a backend with the plan of an `LE CS Test`.
+pub @tier(embedded)
 fn plan_arm<S: CsRadio[s]>(var air: S, var p: CsSubevent, t0_us: Int) -> Int [s]
     let a = air.cs_arm(var p.head, t0_us)
     if a != ll_cs_radio.CS_OK

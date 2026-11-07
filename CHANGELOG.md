@@ -4,6 +4,12 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## Unreleased
+
+`ll_cs_plan.gen_new`, `gen_instantiate_test`, `gen_begin_procedure`, `plan_new`, `plan_subevent` and `plan_arm` are public, so that a
+program that drives a radio without the Controller (the Channel Sounding bench rig of `orbit/ble`) can plan the subevent of an
+`LE CS Test` and hand it to a `CsRadio`.  No behaviour changes.
+
 ## 0.1.0
 
 First release.  The portable Link Layer and HCI command handler of the noble
