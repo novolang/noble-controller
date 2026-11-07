@@ -385,6 +385,24 @@ fn sim_cs_delays(var d: SimDev, tx_ps: Int, rx_ps: Int)
         tone_ps: 0,
         distance_offset_cm: 0 }
 
+// The delays of a device to its antenna port, each PHY with its own (LE 1M, LE 2M, LE 2M 2BT), and the calibration it reports for them.  A Controller that took the
+// calibration of another PHY for a step would show it in the round trip.
+fn sim_cs_delays_phy(var d: SimDev, tx_1m: Int, rx_1m: Int, tx_2m: Int, rx_2m: Int, tx_2bt: Int, rx_2bt: Int)
+    d.tx_ps[0] = tx_1m
+    d.rx_ps[0] = rx_1m
+    d.tx_ps[1] = tx_2m
+    d.rx_ps[1] = rx_2m
+    d.tx_ps[2] = tx_2bt
+    d.rx_ps[2] = rx_2bt
+    d.cal = CsCal { tx_1m_ps: tx_1m,
+        tx_2m_ps: tx_2m,
+        tx_2bt_ps: tx_2bt,
+        rx_1m_ps: rx_1m,
+        rx_2m_ps: rx_2m,
+        rx_2bt_ps: rx_2bt,
+        tone_ps: 0,
+        distance_offset_cm: 0 }
+
 // An actuation error of the channel `ch`, real and in the table, in 1/32 ppm.
 fn sim_cs_fae(var d: SimDev, ch: Int, v: Int)
     d.fae[ch] = v
@@ -456,7 +474,21 @@ fn round_int(f: Float) -> Int
 // `T_SY_CENTER_DELTA` of Part H, Sections 4.3.2 (mode 1) and 4.3.4 (mode 3), the latter with the tone extension slot of the reflector
 // present or not.
 fn center_delta_ps(h: CsPlan, mode: Int, ext_r: Bool) -> Int
-    let sy = ll_cs_plan.sync_ns(h.phy as Int, ll_cs_plan.rtt_bits(h.rtt as Int)) * 1000
+    // T_SY from the text of Part H, Section 2 and not from the plan: the preamble (8 bits on LE 1M, 16 on LE 2M and LE 2M 2BT), the address, the trailer and the sequence,
+    // 1,000,000 picoseconds a bit on LE 1M and 500,000 on the others.
+    var seq = 0
+    let rtt = h.rtt as Int
+    if rtt == 1 or rtt == 3
+        seq = 32
+    if rtt == 4
+        seq = 64
+    if rtt == 2 or rtt == 5
+        seq = 96
+    if rtt == 6
+        seq = 128
+    var sy = (16 + 32 + 4 + seq) * 500_000
+    if (h.phy as Int) == 1
+        sy = (8 + 32 + 4 + seq) * 1_000_000
     let rd = ll_cs.T_RD_US * 1_000_000
     let gd = ll_cs.T_GD_US * 1_000_000
     let pmsw = ((h.t_pm_us as Int) + (h.t_sw_us as Int)) * 1_000_000
@@ -1679,9 +1711,10 @@ struct Setup
     var aci: Int
     var first_central: Bool
     var lazy: Bool
+    var phy: Int
 
 fn setup_new() -> Setup
-    Setup { init_central: true, count: 3, main: 2, sub: 1, mn: 2, mx: 3, mrep: 0, rtt: 0, chrep: 1, sub_len: 20000, aci: 0, first_central: false, lazy: false }
+    Setup { init_central: true, count: 3, main: 2, sub: 1, mn: 2, mx: 3, mrep: 0, rtt: 0, chrep: 1, sub_len: 20000, aci: 0, first_central: false, lazy: false, phy: 1 }
 
 // The channel map of all 72 channels, ten octets.
 fn chm_all() -> [Int]
@@ -1689,7 +1722,7 @@ fn chm_all() -> [Int]
 
 // LE CS Create Config for the handle 1, the configuration 0 made with the peer (context 1), the role `role` of the end that sends the command.
 fn create_cfg(s: Setup, role: Int) -> [Int]
-    cat(cat([1, 0, 0, 1, s.main, s.sub, s.mn, s.mx, s.mrep, 1, role, s.rtt, 1], chm_all()), [s.chrep, 0, 0, 0, 0])
+    cat(cat([1, 0, 0, 1, s.main, s.sub, s.mn, s.mx, s.mrep, 1, role, s.rtt, s.phy], chm_all()), [s.chrep, 0, 0, 0, 0])
 
 fn le24(v: Int) -> [Int]
     [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF]
@@ -1868,11 +1901,12 @@ struct HCfg
 // The configuration the Host made with the setup `s` (LE 1M, the mandatory timings): the head the nominal offsets of Part H follow from.
 fn hcfg_of(s: Setup, n_ap: Int, pct: Bool) -> HCfg
     var h = ll_cs_radio.cs_plan_new()
-    set_head(var h, s.rtt, n_ap)
+    set_head(var h, s.rtt, s.phy, n_ap)
     HCfg { head: h, n_ap: n_ap, pct: pct and (s.rtt == 1 or s.rtt == 2) }
 
-fn set_head(var h: CsPlan, rtt: Int, n_ap: Int)
+fn set_head(var h: CsPlan, rtt: Int, phy: Int, n_ap: Int)
     h.rtt = rtt as u8
+    h.phy = phy as u8
     h.n_ap = n_ap as u8
 
 // The products of the tones of the two ends: the sum over the antenna paths (and not the extension slot) of `PCT_REFL x PCT_INIT` of each channel, for the slots both ends
@@ -2291,9 +2325,17 @@ fn test_the_estimate_follows_the_distance_from_half_a_metre_to_twenty_with_eithe
 
 // The expected time difference of a round-trip step in units of 0.5 nanosecond, computed here from the radio's time stamps, its calibration and the nominal offset: the
 // initiator's arrival less departure, the reflector's departure less arrival, each at the antenna port.
-fn expect_tdiff(raw: CsStepRaw, cal: CsCal, initiator: Bool, nominal_ps: Int) -> Int
-    let arrival = raw.toa_ps - cal.rx_1m_ps
-    let departure = raw.tod_ps + cal.tx_1m_ps
+fn expect_tdiff(raw: CsStepRaw, cal: CsCal, phy: Int, initiator: Bool, nominal_ps: Int) -> Int
+    var rx = cal.rx_1m_ps
+    var tx = cal.tx_1m_ps
+    if phy == 2
+        rx = cal.rx_2m_ps
+        tx = cal.tx_2m_ps
+    if phy == 3
+        rx = cal.rx_2bt_ps
+        tx = cal.tx_2bt_ps
+    let arrival = raw.toa_ps - rx
+    let departure = raw.tod_ps + tx
     var dt = arrival - departure
     if not initiator
         dt = departure - arrival
@@ -2323,7 +2365,7 @@ fn check_step(x: HStep, raw: CsStepRaw, cal: CsCal, initiator: Bool, hc: HCfg, n
         test.assert_eq(x.data[1], 0xFF)
         test.assert_eq(x.data[2], (raw.rssi_dbm as Int) & 0xFF)
         test.assert_eq(x.data[5], raw.ant as Int)
-        let want = expect_tdiff(raw, cal, initiator, nominal_ps)
+        let want = expect_tdiff(raw, cal, hc.head.phy as Int, initiator, nominal_ps)
         test.assert_eq(s16(x.data[3], x.data[4]), want)
     if x.mode == 2 or x.mode == 3
         let at = h_tone_at(x.mode, hc.pct)
@@ -3049,8 +3091,18 @@ fn test_the_phase_correction_terms_of_a_sounding_sequence_are_24_bits_each_or_no
 // A series in the build's option, the result of one procedure read by the Hosts, and the estimate; `n_ap` paths.
 @when(noble_controller_config.CTL_CS > 0)
 fn option_case(init_central: Bool, main: Int, sub: Int, rtt: Int, aci: Int, n_ap: Int, mm: Int) -> Est
+    option_case_phy(init_central, main, sub, rtt, 1, aci, n_ap, mm)
+
+// The same on the CS_SYNC PHY `phy` (1 LE 1M, 2 LE 2M, 3 LE 2M 2BT).  The delays of each PHY differ, so the calibration of the PHY of the step is the one that
+// brings the round trip to the distance.
+@when(noble_controller_config.CTL_CS > 0)
+fn option_case_phy(init_central: Bool, main: Int, sub: Int, rtt: Int, phy: Int, aci: Int, n_ap: Int, mm: Int) -> Est
     var ra = sim_cs_new()
     world_figures(var ra, mm, 6.0, -8.0)
+    var d0 = sim_cs_dev(ra)
+    var d1 = sim_cs_far(ra)
+    sim_cs_delays_phy(var d0, 1200, 2100, 700, 1500, 900, 1700)
+    sim_cs_delays_phy(var d1, 800, 1900, 450, 1300, 600, 1450)
     // The same phase on the four antenna paths: the paths differ only in the antenna permutation the plan names.
     for p in 0..4
         ra.med.ap_phase[p] = 0.3
@@ -3060,6 +3112,7 @@ fn option_case(init_central: Bool, main: Int, sub: Int, rtt: Int, aci: Int, n_ap
     s.main = main
     s.sub = sub
     s.rtt = rtt
+    s.phy = phy
     s.aci = aci
     open_series(var w, s)
     let table = fae_event(ini_log(w, s))
@@ -3124,6 +3177,57 @@ fn test_the_events_of_mode_3_steps_carry_what_the_radios_measured()
 @when(noble_controller_config.CTL_PERIPHERAL > 0)
 @when(noble_controller_config.CTL_CS > 0)
 @test
+fn test_the_events_of_steps_on_le_2m_and_le_2m_2bt_carry_the_time_differences_of_the_calibration_and_the_packet_of_that_phy()
+    if not ctl_limits.cs_mode3_on()
+        return
+    // The time difference of each step is recomputed in the test from the radio's time stamps, the calibration of the PHY of the step and the nominal offset written out from
+    // the text of Part H, the sequence (a random one of 64 bits, where the build has it) included.  Delays that differ with the PHY make a Controller that took the calibration
+    // of another PHY, or the length of another packet, fail the comparison.
+    var rtt = 0
+    if ctl_limits.cs_rtt_seq_on()
+        rtt = 4
+    for phy in [2, 3]
+        for who in 0..2
+            var ra = sim_cs_new()
+            world_figures(var ra, 4700, 6.0, -8.0)
+            var d0 = sim_cs_dev(ra)
+            var d1 = sim_cs_far(ra)
+            sim_cs_delays_phy(var d0, 1200, 2100, 700, 1500, 900, 1700)
+            sim_cs_delays_phy(var d1, 800, 1900, 450, 1300, 600, 1450)
+            var w = air_from(var ra)
+            var s = setup_new()
+            s.init_central = who == 0
+            s.main = 3
+            s.sub = 0xFF
+            s.rtt = rtt
+            s.phy = phy
+            open_series(var w, s)
+            let mark = round_begin(var w, 100)
+            let r = sub_step(var w, 100, 0)
+            settle(var w)
+            let sa = h_subs(w.ha, mark.a)
+            let sb = h_subs(w.hb, mark.b)
+            let hc = hcfg_of(s, 1, false)
+            let raw0 = w.ra.med.out_steps[0]
+            let raw1 = w.ra.med.out_steps[1]
+            test.assert_eq(r.a, ctl_hci.RUN_OK)
+            test.assert_eq(list.len(sa[0].steps), list.len(raw0))
+            var mode3 = 0
+            for j in 0..list.len(raw0)
+                var nominal = 0
+                if s.init_central
+                    nominal = h_nominal_ps(hc, sa[0].steps[j])
+                else
+                    nominal = h_nominal_ps(hc, sb[0].steps[j])
+                check_step(sa[0].steps[j], raw0[j], w.ra.med.devs[0].cal, s.init_central, hc, nominal)
+                check_step(sb[0].steps[j], raw1[j], w.ra.med.devs[1].cal, not s.init_central, hc, nominal)
+                if sa[0].steps[j].mode == 3
+                    mode3 = mode3 + 1
+            test.assert(mode3 >= 15)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
 fn test_every_round_trip_type_gives_the_distance_and_the_sequences_change_the_nominal_offsets()
     if not ctl_limits.cs_rtt_seq_on()
         return
@@ -3131,6 +3235,56 @@ fn test_every_round_trip_type_gives_the_distance_and_the_sequences_change_the_no
     for rtt in 1..7
         let e = option_case(rtt % 2 == 0, 2, 1, rtt, 0, 1, 2900)
         test.assert(e.n_rtt >= 20)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_le_2m_and_le_2m_2bt_give_the_distance_with_the_delays_and_the_packet_lengths_of_their_own()
+    // The radios of the model take part on all three CS_SYNC PHYs, each with delays of its own to the antenna port: the Controller removes the calibration of the PHY of the
+    // step and the nominal offset of the packet of that PHY (26 microseconds for an access address alone against 44 on LE 1M), or the round trip would be off by tens of
+    // centimetres.
+    for phy in [2, 3]
+        for who in 0..2
+            let e = option_case_phy(who == 0, 2, 1, 0, phy, 0, 1, 3100)
+            test.assert(e.n_rtt >= 20)
+            test.assert(e.n_pbr >= 20)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_mode_3_with_every_random_sequence_on_every_cs_sync_phy_gives_the_phase_and_the_round_trip()
+    if not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
+        return
+    // The random sequences of 32, 64, 96 and 128 bits (RTT types 3 to 6) in the steps of mode 3 alone, on the three PHYs, with the roles either way round.  Every step is a round
+    // trip with a tone, so the Hosts read both estimates from every step.
+    for phy in [1, 2, 3]
+        for rtt in 3..7
+            let e = option_case_phy(rtt % 2 == 0, 3, 0xFF, rtt, phy, 0, 1, 2200 + 700 * rtt)
+            test.assert_eq(e.n_pbr, 72)
+            test.assert_eq(e.n_rtt, 72)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_mode_3_with_a_sounding_sequence_on_le_2m_gives_the_phase_the_round_trip_and_the_two_phase_correction_terms()
+    if not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
+        return
+    for rtt in 1..3
+        for who in 0..2
+            let e = option_case_phy(who == 0, 3, 0xFF, rtt, 2, 0, 1, 3300)
+            test.assert_eq(e.n_pbr, 72)
+            test.assert_eq(e.n_rtt, 72)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_mode_3_as_the_sub_mode_of_mode_2_with_a_random_sequence_gives_both_estimates()
+    if not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
+        return
+    for phy in [1, 2]
+        let e = option_case_phy(phy == 1, 2, 3, 6, phy, 0, 1, 5100)
+        test.assert(e.n_rtt >= 10)
+        test.assert(e.n_pbr >= 40)
 
 @when(noble_controller_config.CTL_PERIPHERAL > 0)
 @when(noble_controller_config.CTL_CS > 0)

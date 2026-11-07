@@ -6,6 +6,8 @@ consumer deciding whether to upgrade can read.
 
 ## Unreleased
 
+`ll_cs_plan.sync_ns` takes the length of a CS_SYNC packet from `ll_cs_radio.cs_sync_bits` and `cs_sync_bit_ns`.  The figures do not change (44 microseconds on LE 1M and 26 on LE 2M and LE 2M 2BT for an access address alone).  The profile `ctl_cs` turns `ctl_cs_mode3` and `ctl_cs_rtt_seq` on, so the Controller's tests of mode 3, of the sounding and random sequences and of LE 2M run under it; a radio that does not report them still cuts them out of the capabilities.
+
 `ll_cs_plan.gen_new`, `gen_instantiate_test`, `gen_begin_procedure`, `plan_new`, `plan_subevent` and `plan_arm` are public, so that a
 program that drives a radio without the Controller (the Channel Sounding bench rig of `orbit/ble`) can plan the subevent of an
 `LE CS Test` and hand it to a `CsRadio`.  No behaviour changes.

@@ -232,6 +232,68 @@ fn test_a_sequence_and_a_switch_time_lengthen_the_steps_that_carry_them()
     // 150 + 2 * 172 + 10 + 145 on LE 1M with a 128-bit random sequence.
     test.assert_eq(ll_cs_plan.step_ns(c, 1), 649_000)
 
+@test
+fn test_every_rtt_type_on_every_cs_sync_phy_gives_the_step_durations_of_part_h_4_3()
+    // The packet of Section 2: a preamble of 8 bits (LE 1M) or 16 (LE 2M, LE 2M 2BT), the address, the trailer of 4 bits and the sequence; a bit takes 1000
+    // nanoseconds on LE 1M and 500 on the others.  Mode 1 is T_FCS + 2 T_SY + 2 T_RD + T_IP1, mode 3 is T_FCS + 2 (T_SY + T_GD) + 2 (T_PM + T_SW) (N_AP + 1) + 2 T_RD + T_IP2,
+    // each written out here with the figures of the mandatory timings and one antenna path.
+    for phy in [1, 2, 3]
+        for rtt in 0..7
+            var seq = 0
+            if rtt == 1 or rtt == 3
+                seq = 32
+            if rtt == 4
+                seq = 64
+            if rtt == 2 or rtt == 5
+                seq = 96
+            if rtt == 6
+                seq = 128
+            var pre = 16
+            var bit = 500
+            if phy == 1
+                pre = 8
+                bit = 1000
+            let t_sy = (pre + 32 + 4 + seq) * bit
+            var c = ll_cs_plan.cfg_new()
+            t_rtt(var c, phy, rtt)
+            test.assert_eq(ll_cs_plan.sync_ns(phy, seq), t_sy)
+            test.assert_eq(ll_cs_plan.step_ns(c, 1), 150_000 + 2 * t_sy + 2 * 5_000 + 145_000)
+            test.assert_eq(ll_cs_plan.step_ns(c, 3), 150_000 + 2 * (t_sy + 10_000) + 2 * 40_000 * 2 + 2 * 5_000 + 145_000)
+            // Mode 0 and mode 2 carry no sequence, so the RTT type does not change them.
+            test.assert_eq(ll_cs_plan.step_ns(c, 0), 150_000 + 2 * (pre + 32 + 4) * bit + 2 * 5_000 + 10_000 + 80_000 + 145_000)
+            test.assert_eq(ll_cs_plan.step_ns(c, 2), 465_000)
+
+@test
+fn test_a_subevent_of_mode_3_steps_on_le_2m_with_a_random_sequence_closes_where_the_step_times_say()
+    // 2.5 ms of mandatory-timing mode 3 steps on LE 2M with a 64-bit random sequence: each step is 150 + 2 (26 + 32 + 10) + 160 + 10 + 145 = 601 microseconds, so a
+    // subevent that opens with one mode 0 step of 447 holds that step and three more (447 + 3 x 601 = 2250; a fourth would end at 2851).
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_begin(var cc, var g)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, 3, 0, 1, 1, 0)
+    t_rtt(var c, 2, 4)
+    t_time(var c, 2500, 40_000_000)
+    var p = ll_cs_plan.plan_new()
+    if p.steps.capacity() < 4
+        return
+    let code = ll_cs_plan.plan_subevent(var cc, var g, var c, var p, 0, 0)
+    test.assert_eq(code, ll_cs_plan.PLAN_SUBEVENT_END)
+    test.assert_eq(p.n, 4)
+    test.assert_eq(p.head.n_mode0 as Int, 1)
+    test.assert_eq(p.head.phy as Int, 2)
+    test.assert_eq(p.head.rtt as Int, 4)
+    test.assert_eq(p.steps[0].len_ns as Int, 447_000)
+    for i in 1..4
+        test.assert_eq(p.steps[i].mode as Int, 3)
+        test.assert_eq(p.steps[i].len_ns as Int, 601_000)
+        test.assert_eq(p.steps[i].start_ns as Int, 447_000 + (i - 1) * 601_000 + 150_000)
+        test.assert_eq(p.steps[i].seq_bits as Int, 64)
+        // The two directions of a step carry sequences of their own, and 64 bits leave the words above them clear.
+        test.assert_eq(p.steps[i].seq_i1, 0)
+        test.assert_eq(p.steps[i].seq_r1, 0)
+        test.assert(p.steps[i].seq_i0 != p.steps[i].seq_r0)
+
 // ── The access address and the sequences ───────────────────────────
 
 @test

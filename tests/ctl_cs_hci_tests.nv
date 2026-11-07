@@ -1453,17 +1453,20 @@ struct Fake
     var roles: Int
     var supported: Bool
     var no_fae: Bool
+    var mode_bits: Int
+    var phys: Int
+    var rtt_types: Int
 
 fn fake_new() -> Fake
     Fake { armed: false, head: ll_cs_radio.cs_plan_new(), modes: Vec.new(), n: 0, loaded: 0, arm_status: 0, run_status: 0, n_done: 1000, abort: 0, runs: 0, tq: false, roles: 3,
-           supported: true, no_fae: true }
+           supported: true, no_fae: true, mode_bits: 1, phys: 7, rtt_types: 0x7F }
 
 fn caps_of(var f: Fake, var c: CsCaps)
     c.supported = f.supported
     c.roles = f.roles
-    c.modes = 1
-    c.rtt_types = 0x7F
-    c.phys = 7
+    c.modes = f.mode_bits
+    c.rtt_types = f.rtt_types
+    c.phys = f.phys
     c.ant_elements = 4
     c.max_paths = 4
     c.t_sw_us = 0
@@ -2100,6 +2103,149 @@ fn test_a_radio_that_takes_no_part_leaves_the_controller_no_role_and_no_tone_qua
     test.assert_eq(r[7 + 5], 0)
     let f = complete_of(run(var c, 0x2003, []), 0x2003)
     test.assert_eq(f[7 + 6] & ll_cs.FEAT6_CS_TQ, 0)
+
+// The configuration of the test above: main mode 3 alone with the RTT type `rtt` on the CS_SYNC PHY `phy`.
+fn set_mode3_cfg(var cfg: ll_cs_plan.CsCfg, rtt: Int, phy: Int)
+    cfg.phy = phy
+    cfg.sub_len_us = 2500
+    cfg.ch_rep = 1
+    cfg.main_min = 6
+    cfg.main_max = 10
+    cfg.main_mode = 3
+    cfg.rtt = rtt
+
+// A Controller with a link ready for Channel Sounding over the radio `air` (its capabilities read), the Host having enabled both roles.
+@when(noble_controller_config.CTL_CS > 0)
+fn for_radio(var air: Fake) -> ctl_hci.Controller
+    var d = connected_with(true)
+    ctl_hci.ctl_cs_radio_init(var d, var air)
+    encrypt(var d)
+    peer_has_cs(var d, true)
+    long_packets(var d)
+    test.assert_eq(status_of(run(var d, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
+    d
+
+// The Host's LE CS Test with `p` on a Controller over the radio `air`: its status, and a Test End so that the next call starts clean.
+@when(noble_controller_config.CTL_CS > 0)
+fn test_status_on(var air: Fake, p: [Int]) -> Int
+    var c = fresh()
+    ctl_hci.ctl_cs_radio_init(var c, var air)
+    status_of(run(var c, 0x2095, p), 0x2095)
+
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_a_radio_that_lacks_mode_3_le_2m_or_a_kind_of_sequence_refuses_them_in_le_cs_test_and_in_create_config_with_unsupported_feature()
+    if not ctl_limits.cs_test_on() or not ctl_limits.cs_initiator_on()
+        return
+    let ok = test_params()
+    // No mode 3 in the radio: Mode_Types of the capabilities is 0 and a main or a sub mode of 3 is refused.
+    var a = fake_new()
+    a.mode_bits = 0
+    test.assert_eq(test_status_on(var a, with(ok, T_MAIN, 3)), 0x11)
+    test.assert_eq(test_status_on(var a, with(with(ok, T_MAIN, 2), T_SUB, 3)), 0x11)
+    test.assert_eq(test_status_on(var a, with(ok, T_MAIN, 2)), 0)
+    var a1 = fake_new()
+    a1.mode_bits = 0
+    var d1 = for_radio(var a1)
+    cfg_status(var d1, "mode 3 on a radio without it", with(create_params(0, 1, 0), CC_MAIN, 3), 0x11)
+    // No LE 2M in the radio: LE 2M and LE 2M 2BT are refused, LE 1M is not.
+    var b = fake_new()
+    b.phys = 1
+    test.assert_eq(test_status_on(var b, with(ok, T_PHY, 2)), 0x11)
+    test.assert_eq(test_status_on(var b, with(ok, T_PHY, 3)), 0x11)
+    test.assert_eq(test_status_on(var b, with(ok, T_PHY, 1)), 0)
+    var b1 = fake_new()
+    b1.phys = 1
+    var d2 = for_radio(var b1)
+    cfg_status(var d2, "LE 2M on a radio without it", with(create_params(0, 1, 0), CC_PHY, 2), 0x11)
+    cfg_status(var d2, "LE 2M 2BT on a radio without it", with(create_params(0, 1, 0), CC_PHY, 3), 0x11)
+    // LE 2M without LE 2M 2BT.
+    var b2 = fake_new()
+    b2.phys = 3
+    test.assert_eq(test_status_on(var b2, with(ok, T_PHY, 3)), 0x11)
+    test.assert_eq(test_status_on(var b2, with(ok, T_PHY, 2)), 0)
+    // A radio with no sounding sequence refuses the RTT types 1 and 2 and takes the random ones; one with no random sequence the other way round.
+    // (A build without the sequences refuses all six types whatever the radio has.)
+    var taken = 0x11
+    if ctl_limits.cs_rtt_seq_on()
+        taken = 0
+    var c = fake_new()
+    c.rtt_types = 0x79
+    for rtt in 1..3
+        test.assert_eq(test_status_on(var c, with(ok, T_RTT, rtt)), 0x11)
+    for rtt in 3..7
+        test.assert_eq(test_status_on(var c, with(ok, T_RTT, rtt)), taken)
+    var e = fake_new()
+    e.rtt_types = 0x07
+    for rtt in 1..3
+        test.assert_eq(test_status_on(var e, with(ok, T_RTT, rtt)), taken)
+    for rtt in 3..7
+        test.assert_eq(test_status_on(var e, with(ok, T_RTT, rtt)), 0x11)
+    var c1 = fake_new()
+    c1.rtt_types = 0x79
+    var d3 = for_radio(var c1)
+    cfg_status(var d3, "sounding sequence on a radio without it", with(create_params(0, 1, 0), CC_RTT, 2), 0x11)
+    var e1 = fake_new()
+    e1.rtt_types = 0x07
+    var d4 = for_radio(var e1)
+    cfg_status(var d4, "random sequence on a radio without it", with(create_params(0, 1, 0), CC_RTT, 5), 0x11)
+    // The capabilities the Host reads say the same: the kinds of sequence and the PHYs the radio has.
+    var f = fake_new()
+    f.mode_bits = 0
+    f.phys = 1
+    f.rtt_types = 0x01
+    var g = fresh()
+    ctl_hci.ctl_cs_radio_init(var g, var f)
+    let _h = run(var g, 0x2074, [47, 1])
+    let r = complete_of(run(var g, 0x2089, []), 0x2089)
+    test.assert_eq(r[7 + 6], 0)
+    test.assert_eq(r[7 + 9], 0)
+    test.assert_eq(r[7 + 10], 0)
+    test.assert_eq(r[7 + 15], 0)
+
+@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller_config.CTL_CS > 0)
+@test
+fn test_le_cs_test_runs_mode_3_with_each_kind_of_sequence_on_le_2m_and_le_2m_2bt_and_arms_the_radio_with_the_plan_it_names()
+    if not ctl_limits.cs_test_on() or not ctl_limits.cs_initiator_on() or not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
+        return
+    // Each RTT type in turn, on LE 2M and on LE 2M 2BT alternately, with main mode 3 alone.  The radio is armed with the PHY and the RTT type, every step after the mode 0
+    // step is a step of mode 3, the Host reads steps of the same modes and channels as the same procedure planned here from the key of zeros, and the data of a mode 3
+    // step is the round trip with the two phase correction terms for a sounding sequence, then one antenna path and the extension slot.
+    for rtt in 1..7
+        let phy = 2 + rtt % 2
+        var c = fresh()
+        var st = state()
+        var cc = ll_ccm.soft_cipher_new()
+        var air = fake_new()
+        ctl_hci.ctl_cs_radio_init(var c, var air)
+        ts(var c, "mode 3", with(with(with(test_params(), T_MAIN, 3), T_RTT, rtt), T_PHY, phy), 0)
+        test.assert_eq(ctl_hci.ctl_cs_test_subevent(var c, var air, var cc, var st, 100000), ctl_hci.RUN_DONE)
+        test.assert_eq(air.head.phy as Int, phy)
+        test.assert_eq(air.head.rtt as Int, rtt)
+        let recs = step_records(results(flush_all(var c)))
+        var g = ll_cs_plan.gen_new()
+        ll_cs_plan.gen_instantiate_test(var g, 0)
+        test.assert(ll_cs_plan.gen_begin_procedure(var cc, var g))
+        var cfg = ll_cs_plan.cfg_new()
+        set_mode3_cfg(var cfg, rtt, phy)
+        var plan = ll_cs_plan.plan_new()
+        let _code = ll_cs_plan.plan_subevent(var cc, var g, var cfg, var plan, 0, 0)
+        test.assert_eq(list.len(recs), plan.n)
+        test.assert_eq(air.n, plan.n)
+        var mode3 = 0
+        for j in 0..plan.n
+            test.assert_eq(recs[j][0], plan.steps[j].mode as Int)
+            test.assert_eq(recs[j][1], plan.steps[j].ch as Int)
+            test.assert_eq(air.modes[j] as Int, plan.steps[j].mode as Int)
+            if recs[j][0] == 3
+                test.assert_eq(plan.steps[j].seq_bits as Int, ll_cs_plan.rtt_bits(rtt))
+                mode3 = mode3 + 1
+                var want = 6 + 1 + 4 * 2
+                if rtt <= 2
+                    want = want + 8
+                test.assert_eq(list.len(recs[j]) - 3, want)
+        test.assert(mode3 >= 3)
 
 // ── The exchanges the Controller makes for itself ───────────────────
 

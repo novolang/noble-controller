@@ -162,10 +162,7 @@ fn rtt_bits(rtt: Int) -> Int
 @tier(embedded)
 @no_alloc
 fn sync_ns(phy: Int, bits: Int) -> Int
-    if phy == 1
-        (8 + 32 + 4 + bits) * 1000
-    else
-        (16 + 32 + 4 + bits) * 500
+    ll_cs_radio.cs_sync_bits(phy, bits) * ll_cs_radio.cs_sync_bit_ns(phy)
 
 // The nanoseconds of a step of `mode`, from the start of its T_FCS to the start of the next step's ([Vol 6] Part H, Sections 4.3.1 to
 // 4.3.4).  The packets of a mode 0 step carry no sequence.  The `n_ap` antenna paths and the tone extension slot each take a T_PM and a
