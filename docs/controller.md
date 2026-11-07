@@ -76,7 +76,11 @@ plan (`ll_cs_drbg` and `ll_cs_plan`).  `plan_next` makes one step and
 addresses, sequences, tone extension slots, antenna path permutations and times,
 in the `CsSubevent` the Controller holds.  The tests hold the generator and the
 channel selection, the access addresses and the sequences to the sample data of
-Core 6.3 Vol 6 Part C, Sections 7 and 8.1.
+Core 6.3 Vol 6 Part C, Sections 7 and 8.1.  `SimCs` in `tests/sim_cs_tests.nv` is a
+simulated radio for `CsRadio`: it takes the plan of `plan_arm`, computes the tones, the
+time stamps and the frequency offset of a subevent from a model of the two devices and
+the distance between them, and returns them a step at a time; the same file holds the
+estimator the tests use to recover the distance from the results of both devices.
 
 `configs/<profile>.toml` are the profiles the package's tests run under.
 The same names exist in `orbit/ble/configs/`, whose `[noble-controller]`

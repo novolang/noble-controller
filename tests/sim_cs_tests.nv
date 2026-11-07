@@ -1,0 +1,3203 @@
+// tests/sim_cs_tests.nv — `SimCs`, the simulated Channel Sounding radio, the reference estimator of the tests, and the tests of both.
+//
+// `SimCs` is the second implementation of `CsRadio` (`orbit/noble-radio/src/ll_cs_radio.nv`), beside the empty impl of a port without the
+// feature and the `FakeCs` of `ll_cs_radio_tests.nv`.  It has no registers.  A plan goes in through `cs_arm` and `cs_load`, `cs_run` computes
+// the measurements of the whole subevent from a model of the two devices and the channel between them, and `cs_step_raw` returns them a step
+// at a time.  Time passes only through `now_us`, which a run moves to the end of the subevent.  The tests drive it through the trait alone;
+// the knobs that set up the world are plain fields of the structures below, written by the test before a run.
+//
+// What the model holds, with the equations it follows ([Vol 1] Part A, Section 9.2; [Vol 6] Part A, Section 3.5 and Part H, Sections 3.1,
+// 4.3 and 4.6):
+//
+//   geometry   the distance `d` in millimetres; the delay `d / c` in picoseconds is `ps_of_mm(d)`.
+//   clocks     each device has a fractional clock offset in ppm.  A time stamp is the true time since the device's own origin, scaled by
+//              `1 + ppm`; a device that turns a packet around (the reflector) waits `T / (1 + ppm)` of true time for a nominal `T`.  The
+//              initiator measures the frequency offset of the reflector in the mode-0 step (`ppm_r - ppm_i`, plus the reflector's actuation
+//              error on that channel, plus a configurable error of the estimate), retunes by it, and reports it as the Frequency_Compensation.
+//   tones      on the channel of frequency `f`, with `phi` the local oscillator phase of each device in the step (a deterministic function of
+//              the seed and the step, constant over the tones of the step):
+//                  theta_refl = phi_i - phi_r - 2 pi f d / c          what the reflector measures of the initiator's tone
+//                  theta_init = phi_r - phi_i - 2 pi f d / c          what the initiator measures of the reflector's tone
+//              so the product `PCT_REFL x PCT_INIT` has the phase `-4 pi f d / c`.  With the initiator phase tone the reflector adds the phase
+//              it measured to its own and reports a real, non-negative value (Q = 0); the initiator's value then holds the whole round trip.
+//              Amplitudes follow the free-space path loss, the I and Q values are rounded to 12 bits against a reference power level that is
+//              constant over the subevent.  A carrier mismatch left after the initiator's retune (the error of its estimate, an actuation
+//              error table that differs from the real one, the reflector's actuation error when the initiator does not know it) turns the
+//              initiator's value by `-2 pi f x mismatch x T_PM_CENTER_DELTA`.
+//   antennas   a gain and a phase for each antenna path; the permutation of Table 4.13 to 4.15 of Part H maps a slot to its path; the tone
+//              extension slot repeats the last path.  A slot without a tone is an empty measurement (I = Q = 0, quality 3) where Part H
+//              Section 4.6 says so (mode 3, reflector to initiator) and a measurement of noise with quality low everywhere else.
+//   sounding   a sounding sequence (RTT types 1 and 2) gives each side a phase correction term, measured as a tone on antenna path 0 at the
+//              centre of the sequence; `Packet_PCT1` and `Packet_PCT2` hold the same value, since the model has no change of phase over the
+//              sequence.  The other RTT types, and a device with `sounding` off, report 0xFFFFFFFF (not available).
+//   RTT        ToA and ToD are taken at the start of CS_SYNC.  The reflector's ToD is its ToA plus the nominal `T_SY_CENTER_DELTA` of Part H
+//              Section 4.3.2 (mode 1) or 4.3.4 (mode 3), so the difference the portable layer subtracts is checked.  A time stamp is
+//              the true time of the antenna port moved by the delay to the measurement point (`tx_ps`, `rx_ps` of the device), then rounded
+//              to a clock tick, with a deterministic error of a configurable size.
+//   receiver   the signal strength is the transmit power less the path loss; the access address quality follows the signal to noise ratio of
+//              the bandwidth of the PHY and the bits that differ from the expected address; the bit errors of a random sequence follow the
+//              same ratio; the tone quality is high at 84 dB-Hz of carrier to noise density and low at 66 dB-Hz (the points of Part H, Section
+//              4.6: -67 dBm over -151 and -133 dBm/Hz).
+//   noise      one xorshift64 generator, seeded by the test, independent of the generator of the plan.  It is read only when `noise_on` is
+//              set, so a run with the noise off does not depend on it.
+//   faults     a wrong access address, a missing CS_SYNC, a missing tone, a shifted time stamp, a device that stops after some steps, an
+//              arm that answers `CS_LATE` or `CS_RESOURCES`: `SimFault`.
+//
+// Two fidelities share one routine.  S0: a `SimCs` owns its `CsMedium`; the peer's plan is the device's own with the role turned (or
+// `peer_head` and `peer_steps` when the test sets them), the peer's physical figures are the second `SimDev`, and a run computes both
+// sides and keeps its own.  S1: two `SimCs` share a `CsMedium`; each arm registers a plan, the first `cs_run` resolves the pair when both
+// are armed, and each `cs_run` returns its own side.  A pair runs in lock step: both arm, then both run, in either order.
+//
+// What it does not model: multipath, interference, the shape of the ramps, the levels of an RF chain.  It does not run the antenna switch
+// itself; the portable layer names the permutation and the model applies the path.
+//
+//   novo test tests/sim_cs_tests.nv
+//   novo test --config configs/ctl_cs.toml tests/sim_cs_tests.nv
+
+use std.test
+use std.math
+use ll_ccm
+use ll_cs
+use ll_cs_plan
+use ll_cs_radio
+use noble_controller_config
+
+// ── Constants ───────────────────────────────────────────────────────
+
+// The metres per second of light, and the picoseconds light takes for a millimetre (3.3356...), as a ratio of integers.
+const C_MPS = 299_792_458
+const PS_PER_MM_NUM = 3_335_641
+const PS_PER_MM_DEN = 1_000_000
+
+// The kinds of `SimFault`.  `side` is the device the fault happens to.
+//   F_BAD_AA      the access address `side` receives in step `step` differs from the expected one in the bits of `arg`
+//   F_MISS_SYNC   `side` does not detect the CS_SYNC of step `step`
+//   F_NO_TONE     the tone slot `arg` (-1 for all) that `side` should receive in step `step` is not transmitted
+//   F_SHIFT       the time of arrival `side` measures in step `step` is moved by `arg` picoseconds
+//   F_ABORT       `side` stops before step `step` with the abort reason `arg`
+//   F_LATE        `cs_arm` of `side` answers `CS_LATE`
+//   F_RESOURCES   `cs_arm` of `side` answers `CS_RESOURCES`
+// A `step` of -1 matches every step.
+const F_BAD_AA = 1
+const F_MISS_SYNC = 2
+const F_NO_TONE = 3
+const F_SHIFT = 4
+const F_ABORT = 5
+const F_LATE = 6
+const F_RESOURCES = 7
+
+// The abort reasons of a subevent ([Vol 6] Part B, Section 4.5.18.1).
+const ABORT_NO_SYNC = 2
+const ABORT_SCHEDULING = 3
+
+// ── Random numbers ──────────────────────────────────────────────────
+
+// xorshift64: the noise of the radio.  The generator of the plan (`ll_cs_drbg.nv`) is another thing.
+struct Rng
+    var s: Int
+
+fn rng_new(seed: Int) -> Rng
+    let x = seed ^ 0x2545F4914F6CDD1D
+    if x == 0
+        return Rng { s: 1 }
+    Rng { s: x }
+
+fn rng_next(var r: Rng) -> Int
+    var x = r.s
+    x = x ^ (x << 13)
+    x = x ^ (x >>> 7)
+    x = x ^ (x << 17)
+    r.s = x
+    x
+
+// A number in [0, 1).
+fn rng_unit(var r: Rng) -> Float
+    int.to_float(rng_next(var r) >>> 11) / 9007199254740992.0
+
+// A number with mean 0 and standard deviation 1: four uniform numbers, summed and scaled.
+fn rng_gauss(var r: Rng) -> Float
+    var s = 0.0
+    for _ in 0..4
+        s = s + rng_unit(var r)
+    (s - 2.0) * 1.7320508075688772
+
+// A number in [0, 1) that depends on the three arguments only (the finalizer of splitmix64 over their combination).
+fn hash_unit(seed: Int, a: Int, b: Int) -> Float
+    var z = int.wrapping_add(seed ^ (a << 40) ^ (b << 8), 0x1E3779B97F4A7C15)
+    z = int.wrapping_mul(z ^ (z >>> 30), 0x3F58476D1CE4E5B9)
+    z = int.wrapping_mul(z ^ (z >>> 27), 0x14D049BB133111EB)
+    z = z ^ (z >>> 31)
+    int.to_float(z >>> 11) / 9007199254740992.0
+
+// ── The world ───────────────────────────────────────────────────────
+
+// What one fault does; see `F_BAD_AA` and the others.
+struct SimFault
+    var kind: Int
+    var step: Int
+    var side: Int
+    var arg: Int
+
+// The physical figures of one device.
+//
+//   ppm            the fractional clock offset against true time
+//   ffo_err        the error of its frequency offset estimate (the initiator), in ppm
+//   fae, fae_tab   the actuation error of each CS channel 0 to 78, the real one and the table the radio reports with `cs_fae`, in 1/32 ppm
+//   fae_known      the initiator knows the reflector's table when it retunes; when it does not, the reflector's actuation error stays in
+//                  the mismatch
+//   tx_ps, rx_ps   the delay from the point a time stamp is taken to the antenna port, for each CS_SYNC PHY (index PHY - 1)
+//   cal            what `cs_cal` reports; `sim_cs_delays` sets it to the real delays
+//   gain_db        the gain of the receive antenna
+//   n0             the noise density of the receiver in dBm/Hz
+//   aa_floor, aa_clean   the signal to noise ratios in dB below which no access address is found and from which an exact one is found
+//                  without errors
+//   tick_ps        the clock tick the time stamps are rounded to, 0 for none
+//   sigma_ps       the standard deviation of the error of a time stamp when `noise_on`
+//   turn_err_ps    an error of the time the reflector takes to turn a packet around
+//   noise_on       whether the generator adds noise to time stamps, tones and the frequency estimate
+//   sounding       whether the sounding sequence is measured (`Packet_PCT1` and `Packet_PCT2`)
+//   seed           the seed of the local oscillator phase
+struct SimDev
+    var ppm: Float
+    var ffo_err: Float
+    var fae: [Int]
+    var fae_tab: [Int]
+    var fae_known: Bool
+    var tx_ps: [Int]
+    var rx_ps: [Int]
+    var cal: CsCal
+    var gain_db: Float
+    var n0: Float
+    var aa_floor: Float
+    var aa_clean: Float
+    var tick_ps: Int
+    var sigma_ps: Int
+    var turn_err_ps: Int
+    var noise_on: Bool
+    var sounding: Bool
+    var seed: Int
+
+@tier(app)
+fn zeros(n: Int) -> [Int]
+    var l: [Int] = []
+    for _ in 0..n
+        list.push(l, 0)
+    l
+
+fn dev_new(seed: Int) -> SimDev
+    SimDev { ppm: 0.0,
+        ffo_err: 0.0,
+        fae: zeros(79),
+        fae_tab: zeros(79),
+        fae_known: true,
+        tx_ps: zeros(3),
+        rx_ps: zeros(3),
+        cal: ll_cs_radio.cs_cal_none(),
+        gain_db: 0.0,
+        n0: -160.0,
+        aa_floor: 6.0,
+        aa_clean: 12.0,
+        tick_ps: 0,
+        sigma_ps: 0,
+        turn_err_ps: 0,
+        noise_on: false,
+        sounding: true,
+        seed: seed }
+
+// What the two devices share: the distance, the antenna paths, the plans registered by the arms, the results of the last resolution and
+// the faults.
+//
+//   dist_mm        the distance between the antenna ports
+//   devs           the two devices, indices 0 and 1
+//   ap_gain, ap_phase   the amplitude and the phase (rad) of each of the four antenna paths
+//   auto_peer      a run with no peer armed fills the peer in from the device's own plan with the role turned (S0)
+//   peer_head, peer_set, peer_steps, peer_steps_set   the peer's plan, when the test sets one
+//   armed, heads, t0, steps, loaded   the plan of each side as the arms and loads registered it
+//   ready, out_head, out_steps, out_len_us   the result of each side once the pair is resolved, and the length of its subevent
+struct CsMedium
+    var dist_mm: Int
+    var devs: [SimDev]
+    var ap_gain: [Float]
+    var ap_phase: [Float]
+    var auto_peer: Bool
+    var peer_head: CsPlan
+    var peer_set: Bool
+    var peer_steps: [CsStep]
+    var peer_steps_set: Bool
+    var armed: [Bool]
+    var heads: [CsPlan]
+    var t0: [Int]
+    var steps: [[CsStep]]
+    var loaded: [Int]
+    var ready: [Bool]
+    var out_head: [CsRaw]
+    var out_steps: [[CsStepRaw]]
+    var out_len_us: [Int]
+    var faults: [SimFault]
+    var rng: Rng
+
+fn medium_new() -> CsMedium
+    var ones: [Float] = []
+    var zero: [Float] = []
+    for _ in 0..4
+        list.push(ones, 1.0)
+        list.push(zero, 0.0)
+    CsMedium { dist_mm: 1000,
+        devs: [dev_new(0x51), dev_new(0xA3)],
+        ap_gain: ones,
+        ap_phase: zero,
+        auto_peer: true,
+        peer_head: ll_cs_radio.cs_plan_new(),
+        peer_set: false,
+        peer_steps: [],
+        peer_steps_set: false,
+        armed: [false, false],
+        heads: [ll_cs_radio.cs_plan_new(), ll_cs_radio.cs_plan_new()],
+        t0: [0, 0],
+        steps: [[], []],
+        loaded: [0, 0],
+        ready: [false, false],
+        out_head: [ll_cs_radio.cs_raw_new(), ll_cs_radio.cs_raw_new()],
+        out_steps: [[], []],
+        out_len_us: [0, 0],
+        faults: [],
+        rng: rng_new(1) }
+
+// The radio: one side of a medium, the capabilities and the timing it reports, and its own clock.
+struct SimCs
+    var med: CsMedium
+    var side: Int
+    var caps: CsCaps
+    var timing: CsTiming
+    var now_us: Int
+    var arms: Int
+    var runs: Int
+    var aborts: Int
+
+// What a radio that runs everything the model can does: both roles, mode 3, every RTT type, LE 1M and LE 2M and LE 2M 2BT, four antenna
+// paths, every optional timing.
+fn cs_caps_full() -> CsCaps
+    CsCaps { supported: true,
+        roles: 3,
+        modes: 1,
+        rtt_types: 0x7F,
+        phys: 7,
+        ant_elements: 4,
+        max_paths: 4,
+        t_ip1: 0x7F,
+        t_ip2: 0x7F,
+        t_fcs: 0x1FF,
+        t_pm: 3,
+        t_sw_us: 0,
+        t_sw_ipt_us: 0,
+        t_ip2_ipt: 0x7F,
+        snr_mask: 0,
+        no_fae: false,
+        ch3c: false,
+        sounding_pct: true,
+        ipt: true,
+        rtt_per_phy: false,
+        tq: true,
+        nadm_sound: 0,
+        nadm_rand: 0,
+        rtt_cap: 1,
+        n_aa: 255,
+        n_sound: 255,
+        n_rand: 255,
+        n_2m_aa: 255,
+        n_2m_sound: 255,
+        n_2m_rand: 255 }
+
+// What a smaller port reports: both roles, modes 0 to 2, access address only, LE 1M and LE 2M, one antenna path, the mandatory timings
+// alone.
+fn cs_caps_basic() -> CsCaps
+    CsCaps { supported: true,
+        roles: 3,
+        modes: 0,
+        rtt_types: 1,
+        phys: 3,
+        ant_elements: 1,
+        max_paths: 1,
+        t_ip1: 0,
+        t_ip2: 0,
+        t_fcs: 0,
+        t_pm: 0,
+        t_sw_us: 0,
+        t_sw_ipt_us: 0,
+        t_ip2_ipt: 0,
+        snr_mask: 0,
+        no_fae: false,
+        ch3c: false,
+        sounding_pct: false,
+        ipt: false,
+        rtt_per_phy: false,
+        tq: false,
+        nadm_sound: 0,
+        nadm_rand: 0,
+        rtt_cap: 1,
+        n_aa: 100,
+        n_sound: 0,
+        n_rand: 0,
+        n_2m_aa: 100,
+        n_2m_sound: 0,
+        n_2m_rand: 0 }
+
+// The timing of the model: a start 400 microseconds ahead, the receiver 20 microseconds early, 160 steps, a run of 20 ms.
+fn cs_timing_default() -> CsTiming
+    CsTiming { arm_lead_us: 400,
+        rx_window_us: 20,
+        turn_us: 200,
+        finish_us: 100,
+        max_steps: 160,
+        max_run_us: 20_000 }
+
+fn sim_cs_new() -> SimCs
+    SimCs { med: medium_new(),
+        side: 0,
+        caps: cs_caps_full(),
+        timing: cs_timing_default(),
+        now_us: 0,
+        arms: 0,
+        runs: 0,
+        aborts: 0 }
+
+// The second radio of the medium of `a` (S1): the pair resolves when both are armed, so the peer is no longer filled in.
+fn sim_cs_other(var a: SimCs) -> SimCs
+    a.med.auto_peer = false
+    SimCs { med: a.med,
+        side: 1 - a.side,
+        caps: cs_caps_full(),
+        timing: cs_timing_default(),
+        now_us: 0,
+        arms: 0,
+        runs: 0,
+        aborts: 0 }
+
+// The figures of the device the radio is, and of the one it talks to.
+fn sim_cs_dev(s: SimCs) -> SimDev
+    s.med.devs[s.side]
+
+fn sim_cs_far(s: SimCs) -> SimDev
+    s.med.devs[1 - s.side]
+
+fn sim_cs_dist(var s: SimCs, mm: Int)
+    s.med.dist_mm = mm
+
+// The capabilities and the timing a port reports, to drive the refusals of the Link Layer (the counterpart of `sim_ramps` in
+// `ctl_air_tests.nv`).
+fn sim_cs_caps(var s: SimCs, c: CsCaps)
+    s.caps = c
+
+fn sim_cs_timing(var s: SimCs, t: CsTiming)
+    s.timing = t
+
+fn sim_cs_fault(var s: SimCs, kind: Int, step: Int, side: Int, arg: Int)
+    list.push(s.med.faults, SimFault { kind: kind, step: step, side: side, arg: arg })
+
+// The delays of a device to its antenna port, for every PHY, and the calibration it reports for them.
+fn sim_cs_delays(var d: SimDev, tx_ps: Int, rx_ps: Int)
+    for i in 0..3
+        d.tx_ps[i] = tx_ps
+        d.rx_ps[i] = rx_ps
+    d.cal = CsCal { tx_1m_ps: tx_ps,
+        tx_2m_ps: tx_ps,
+        tx_2bt_ps: tx_ps,
+        rx_1m_ps: rx_ps,
+        rx_2m_ps: rx_ps,
+        rx_2bt_ps: rx_ps,
+        tone_ps: 0,
+        distance_offset_cm: 0 }
+
+// An actuation error of the channel `ch`, real and in the table, in 1/32 ppm.
+fn sim_cs_fae(var d: SimDev, ch: Int, v: Int)
+    d.fae[ch] = v
+    d.fae_tab[ch] = v
+
+// Every noise source on, with the seed of the generator.
+fn sim_cs_noise(var s: SimCs, seed: Int)
+    s.med.rng = rng_new(seed)
+    s.med.devs[0].noise_on = true
+    s.med.devs[1].noise_on = true
+
+// ── Geometry, signal and permutations ───────────────────────────────
+
+fn ps_of_mm(mm: Int) -> Int
+    (mm * PS_PER_MM_NUM + PS_PER_MM_DEN / 2) / PS_PER_MM_DEN
+
+// The free-space path loss in dB over `mm` millimetres at `f_mhz`, for a distance of at least 5 cm.
+@tier(app)
+fn fspl_db(mm: Int, f_mhz: Float) -> Float
+    let d = math.max(int.to_float(mm) / 1000.0, 0.05)
+    20.0 * math.log10(d) + 20.0 * math.log10(f_mhz) - 27.55
+
+// The antenna path positions of the permutation `perm` for `n_ap` paths, as the digits of Tables 4.13 to 4.15 of Part H.
+@tier(app)
+fn perm_code(n_ap: Int, perm: Int) -> Int
+    if n_ap == 2
+        let t = [12, 21]
+        return t[perm % 2]
+    if n_ap == 3
+        let t = [123, 213, 132, 312, 321, 231]
+        return t[perm % 6]
+    if n_ap == 4
+        let t = [1234, 2134, 1324, 3124, 3214, 2314, 1243, 2143, 1423, 4123, 4213, 2413, 1432, 4132, 1342, 3142, 3412, 4312, 4231, 2431,
+                 4321, 3421, 3241, 2341]
+        return t[perm % 24]
+    1
+
+// The antenna path (0 to 3) in slot `pos` of the permutation; the tone extension slot (`pos` = `n_ap`) takes the last path.
+@tier(app)
+fn perm_path(n_ap: Int, perm: Int, pos: Int) -> Int
+    var p = pos
+    if p > n_ap - 1
+        p = n_ap - 1
+    var div = 1
+    for _ in 0..n_ap - 1 - p
+        div = div * 10
+    (perm_code(n_ap, perm) / div) % 10 - 1
+
+fn popcount(v: Int) -> Int
+    var n = 0
+    var x = v & 0xFFFFFFFF
+    for _ in 0..32
+        n = n + (x & 1)
+        x = x >>> 1
+    n
+
+fn clamp_int(v: Int, lo: Int, hi: Int) -> Int
+    if v < lo
+        return lo
+    if v > hi
+        return hi
+    v
+
+@tier(app)
+fn round_int(f: Float) -> Int
+    float.to_int(math.round(f))
+
+// The nominal time between the arrival of CS_SYNC and the departure of the answer, measured between the two starts, in picoseconds: the
+// `T_SY_CENTER_DELTA` of Part H, Sections 4.3.2 (mode 1) and 4.3.4 (mode 3), the latter with the tone extension slot of the reflector
+// present or not.
+fn center_delta_ps(h: CsPlan, mode: Int, ext_r: Bool) -> Int
+    let sy = ll_cs_plan.sync_ns(h.phy as Int, ll_cs_plan.rtt_bits(h.rtt as Int)) * 1000
+    let rd = ll_cs.T_RD_US * 1_000_000
+    let gd = ll_cs.T_GD_US * 1_000_000
+    let pmsw = ((h.t_pm_us as Int) + (h.t_sw_us as Int)) * 1_000_000
+    if mode == 1
+        return sy + rd + (h.t_ip1_us as Int) * 1_000_000
+    var ext = 1
+    if ext_r
+        ext = 2
+    sy + rd + 2 * gd + 2 * pmsw * (h.n_ap as Int) + ext * pmsw + (h.t_ip2_us as Int) * 1_000_000
+
+// The nominal time between the centres of the initiator's and the reflector's tone on one path, in seconds
+// (`T_PM_CENTER_DELTA` of Part H, Section 4.3.4).
+fn tone_delta_s(h: CsPlan) -> Float
+    let pmsw = (h.t_pm_us as Int) + (h.t_sw_us as Int)
+    int.to_float(pmsw * ((h.n_ap as Int) + 1) + ll_cs.T_RD_US + (h.t_ip2_us as Int)) * 0.000001
+
+// The time stamp of a device: the picoseconds `dt_ps` of true time since its origin on its own clock, with the error and the tick.
+@tier(app)
+fn local_ps(dt_ps: Int, ppm: Float) -> Int
+    round_int(int.to_float(dt_ps) * (1.0 + ppm * 0.000001))
+
+@tier(app)
+fn stamp_ps(var r: Rng, d: SimDev, v: Int) -> Int
+    var x = v
+    if d.noise_on and d.sigma_ps > 0
+        x = x + round_int(rng_gauss(var r) * int.to_float(d.sigma_ps))
+    if d.tick_ps > 0
+        x = ((x + d.tick_ps / 2) / d.tick_ps) * d.tick_ps
+    x
+
+// The 15-bit signed frequency offset of the HCI in 0.01 ppm, as the field holds it.
+@tier(app)
+fn enc_ffo(ppm: Float) -> Int
+    clamp_int(round_int(ppm * 100.0), -10000, 10000) & 0x7FFF
+
+fn dec_ffo(v: Int) -> Float
+    var x = v & 0x7FFF
+    if x >= 0x4000
+        x = x - 0x8000
+    int.to_float(x) / 100.0
+
+fn pack_pct(i: Int, q: Int) -> Int
+    (i & 0xFFF) | ((q & 0xFFF) << 12)
+
+// ── Faults ──────────────────────────────────────────────────────────
+
+fn fault_idx(m: CsMedium, kind: Int, step: Int, side: Int) -> Int
+    for i in 0..list.len(m.faults)
+        let f = m.faults[i]
+        if f.kind == kind and f.side == side and (f.step == step or f.step < 0)
+            return i
+    -1
+
+fn fault_arg(m: CsMedium, kind: Int, step: Int, side: Int) -> Int
+    let i = fault_idx(m, kind, step, side)
+    if i < 0
+        return 0
+    m.faults[i].arg
+
+// Whether the tone slot `slot` that `side` receives in `step` is lost.
+fn tone_lost(m: CsMedium, step: Int, side: Int, slot: Int) -> Bool
+    for i in 0..list.len(m.faults)
+        let f = m.faults[i]
+        if f.kind == F_NO_TONE and f.side == side and (f.step == step or f.step < 0) and (f.arg < 0 or f.arg == slot)
+            return true
+    false
+
+// ── The receiver ────────────────────────────────────────────────────
+
+// What a receiver made of one CS_SYNC: the access address quality, the signal strength, the power, the bit errors of the sequence.
+struct SyncRx
+    var aa_q: Int
+    var rssi: Int
+    var p_dbm: Float
+    var errs: Int
+
+// The access address quality from the signal to noise ratio `snr` (dB) and the bits `nerr` that differ from the expected address: 0 found,
+// 1 found with errors, 2 not found.  Below 6 dB nothing is found; from 12 dB an exact address is found clean; the correlator takes up to 3
+// wrong bits.
+fn aa_quality(snr: Float, nerr: Int, floor: Float, clean: Float) -> Int
+    if snr < floor
+        return 2
+    if nerr == 0 and snr >= clean
+        return 0
+    if nerr <= 3
+        return 1
+    2
+
+@tier(app)
+fn ber(snr: Float) -> Float
+    0.5 * math.exp(-math.pow(10.0, snr / 10.0) / 2.0)
+
+// The tone quality of a tone with carrier to noise density `cn0` (dB-Hz): high from 84, low up to 66, medium between.
+fn tone_quality(cn0: Float) -> Int
+    if cn0 >= 84.0
+        return 0
+    if cn0 <= 66.0
+        return 2
+    1
+
+// The power in dBm that device `rx` receives from a transmitter at `tx_dbm` on a channel of `f_mhz`, over a path of linear gain `g`.
+@tier(app)
+fn rx_power(m: CsMedium, rx: Int, tx_dbm: Int, f_mhz: Float, g: Float) -> Float
+    int.to_float(tx_dbm) + 20.0 * math.log10(g) + m.devs[rx].gain_db - fspl_db(m.dist_mm, f_mhz)
+
+// The receiver of one CS_SYNC.  `heard` says the transmitter sent one that the receiver could hear.
+@tier(app)
+fn sync_rx(var m: CsMedium, rx: Int, heard: Bool, tx_aa: Int, exp_aa: Int, tx_dbm: Int, f_mhz: Float, phy: Int, step: Int,
+           nbits: Int, rand_seq: Bool) -> SyncRx
+    if not heard or fault_idx(m, F_MISS_SYNC, step, rx) >= 0
+        return SyncRx { aa_q: 2, rssi: 127, p_dbm: -200.0, errs: 0 }
+    let p = rx_power(m, rx, tx_dbm, f_mhz, 1.0)
+    var bw = 2.0e6
+    if phy == 1
+        bw = 1.0e6
+    let snr = p - (m.devs[rx].n0 + 10.0 * math.log10(bw))
+    var mask = 0
+    if fault_idx(m, F_BAD_AA, step, rx) >= 0
+        mask = fault_arg(m, F_BAD_AA, step, rx)
+    let q = aa_quality(snr, popcount((tx_aa ^ exp_aa) ^ mask), m.devs[rx].aa_floor, m.devs[rx].aa_clean)
+    var errs = 0
+    if q <= 1 and rand_seq
+        let pe = ber(snr)
+        if m.devs[rx].noise_on
+            for _ in 0..nbits
+                if rng_unit(var m.rng) < pe
+                    errs = errs + 1
+        else
+            errs = round_int(pe * int.to_float(nbits))
+    SyncRx { aa_q: q, rssi: clamp_int(round_int(p), -127, 20), p_dbm: p, errs: errs }
+
+// ── The tones ───────────────────────────────────────────────────────
+
+// The reference power level in dBm that device `rx` reports for the tones it receives from a transmitter at `tx_dbm`: one above the
+// strongest power a tone can have on any channel, so that the 12-bit values stay in range and the level is constant over the subevent.
+@tier(app)
+fn rpl_of(m: CsMedium, rx: Int, tx_dbm: Int) -> Int
+    var gmax = 0.0
+    for p in 0..4
+        gmax = math.max(gmax, m.ap_gain[p])
+    float.to_int(math.ceil(rx_power(m, rx, tx_dbm, 2404.0, gmax))) + 1
+
+// The measurement of one tone slot by device `rx`: the phase `theta` at the amplitude the path gives, rounded to 12 bits against `rpl`.
+// A slot with no tone in it is noise; `real_i` makes the value of the reflector with the initiator phase tone (real and not negative).
+@tier(app)
+fn tone_slot(var m: CsMedium, rx: Int, tx_dbm: Int, f_mhz: Float, g: Float, theta: Float, rpl: Int, present: Bool, real_i: Bool) -> CsTone
+    let n0 = m.devs[rx].n0
+    let noisy = m.devs[rx].noise_on
+    if not present
+        let pn = n0 + 10.0 * math.log10(25000.0)
+        let an = 2048.0 * math.pow(10.0, (pn - int.to_float(rpl)) / 20.0)
+        var ni = 0
+        var nq = 0
+        if noisy
+            ni = round_int(rng_gauss(var m.rng) * an * 0.7071)
+            nq = round_int(rng_gauss(var m.rng) * an * 0.7071)
+        return CsTone { i: clamp_int(ni, -2048, 2047) as i16, q: clamp_int(nq, -2048, 2047) as i16, tq: 2, present: false }
+    let p = rx_power(m, rx, tx_dbm, f_mhz, g)
+    let amp = 2048.0 * math.pow(10.0, (p - int.to_float(rpl)) / 20.0)
+    let sig = amp * math.pow(10.0, -((p - n0 - 10.0 * math.log10(25000.0)) / 20.0)) * 0.7071
+    var x = amp * math.cos(theta)
+    var y = amp * math.sin(theta)
+    if real_i
+        x = amp
+        y = 0.0
+    if noisy
+        x = x + rng_gauss(var m.rng) * sig
+        if not real_i
+            y = y + rng_gauss(var m.rng) * sig
+    var xi = clamp_int(round_int(x), -2048, 2047)
+    if real_i and xi < 0
+        xi = 0
+    CsTone { i: xi as i16, q: clamp_int(round_int(y), -2048, 2047) as i16, tq: tone_quality(p - n0) as u8, present: true }
+
+fn tone_empty() -> CsTone
+    CsTone { i: 0, q: 0, tq: ll_cs_radio.CS_TONE_QUALITY_UNAVAILABLE as u8, present: false }
+
+// The part of a step that one side hands to `cs_step_raw`, and the flags the reflector and the initiator share while it is made.
+struct SideStep
+    var rx: SyncRx
+    var tones: Vec[CsTone; 5]
+    var pct: Int
+    var toa_ps: Int
+    var tod_ps: Int
+    var toa_ok: Bool
+    var tod_ok: Bool
+
+@tier(app)
+fn side_step_new() -> SideStep
+    SideStep { rx: SyncRx { aa_q: 2, rssi: 127, p_dbm: -200.0, errs: 0 },
+        tones: Vec.new(),
+        pct: 0xFFFFFFFF,
+        toa_ps: 0,
+        tod_ps: 0,
+        toa_ok: false,
+        tod_ok: false }
+
+fn raw_of(done: Bool, md: Int, s: SideStep, ffo: Int) -> CsStepRaw
+    if not done
+        return ll_cs_radio.cs_step_raw_none()
+    var aa = s.rx.aa_q
+    var ant = 1
+    if md == 2
+        aa = 0
+        ant = 0
+    CsStepRaw { done: true,
+        aa_q: aa as u8,
+        bit_errors: clamp_int(s.rx.errs, 0, 15) as u8,
+        rssi_dbm: s.rx.rssi as i8,
+        ant: ant as u8,
+        toa_valid: s.toa_ok,
+        tod_valid: s.tod_ok,
+        ffo: ffo as u16,
+        pct1: s.pct as u32,
+        pct2: s.pct as u32,
+        toa_ps: s.toa_ps,
+        tod_ps: s.tod_ps,
+        tones: s.tones }
+
+// ── The resolution of a pair ────────────────────────────────────────
+
+// Resolve the subevent of the pair `ia` (initiator) and `ib` (reflector), either of which may be -1 for a device that is not there, into
+// the heads and the steps of `out_head` and `out_steps`.  The initiator's plan carries the timeline; the reflector answers what it hears.
+@tier(app)
+fn sim_pair(var m: CsMedium, ia: Int, ib: Int)
+    var hh = m.heads[0]
+    if ia >= 0
+        hh = m.heads[ia]
+    else
+        hh = m.heads[ib]
+    let phy = hh.phy as Int
+    let n_ap = hh.n_ap as Int
+    let rtt = hh.rtt as Int
+    let seq_bits = ll_cs_plan.rtt_bits(rtt)
+    let rand_seq = rtt >= 3
+    let snd = rtt == 1 or rtt == 2
+    var n_i = 0
+    if ia >= 0
+        n_i = list.len(m.steps[ia])
+    var n_r = 0
+    if ib >= 0
+        n_r = list.len(m.steps[ib])
+    var n = n_i
+    if ia < 0
+        n = n_r
+    var t0 = 0
+    if ia >= 0
+        t0 = m.t0[ia]
+    else
+        t0 = m.t0[ib]
+    let t0_ps = t0 * 1_000_000
+    var tx_i = 0
+    var tx_r = 0
+    var rpl_i = 0
+    var rpl_r = 0
+    var ppm_i = 0.0
+    var ppm_r = 0.0
+    var ipt = false
+    var late_ns = 0
+    var seed_i = 0x51
+    var seed_r = 0xA3
+    if ia >= 0
+        tx_i = m.heads[ia].tx_dbm as Int
+        ppm_i = m.devs[ia].ppm
+        seed_i = m.devs[ia].seed
+    if ib >= 0
+        tx_r = m.heads[ib].tx_dbm as Int
+        ppm_r = m.devs[ib].ppm
+        seed_r = m.devs[ib].seed
+        ipt = m.heads[ib].ipt
+        if ia >= 0
+            rpl_i = rpl_of(m, ia, tx_r)
+            rpl_r = rpl_of(m, ib, tx_i)
+            late_ns = (m.t0[ib] - m.t0[ia] - (m.heads[ib].window_us as Int)) * 1000
+    let dps = ps_of_mm(m.dist_mm)
+    let dm = int.to_float(m.dist_mm) / 1000.0
+
+    // The leading mode 0 steps of the timeline.
+    var n0run = 0
+    for k in 0..n
+        var md0 = 1
+        if ia >= 0
+            md0 = m.steps[ia][k].mode as Int
+        else
+            md0 = m.steps[ib][k].mode as Int
+        if md0 != 0
+            break
+        n0run = n0run + 1
+
+    var i_on = ia >= 0
+    var r_on = ib >= 0
+    var i_abort = 0
+    var r_abort = 0
+    var i_ok0 = 0
+    var r_ok0 = 0
+    var i_done = 0
+    var r_done = 0
+    var r_ref = false
+    var r_origin = t0_ps
+    var have_comp = false
+    var comp = 0.0
+    var oi: [CsStepRaw] = []
+    var orr: [CsStepRaw] = []
+    var end_ns = 0
+
+    for k in 0..n
+        if i_on and abort_at(m, k, ia) >= 0
+            i_on = false
+            i_abort = m.faults[abort_at(m, k, ia)].arg
+        if r_on and abort_at(m, k, ib) >= 0
+            r_on = false
+            r_abort = m.faults[abort_at(m, k, ib)].arg
+        if k == n0run and n0run > 0
+            if i_on and i_ok0 == 0
+                i_on = false
+                i_abort = ABORT_NO_SYNC
+            if r_on and r_ok0 == 0
+                r_on = false
+                r_abort = ABORT_NO_SYNC
+
+        var si = ll_cs_radio.cs_step_new()
+        var sr = ll_cs_radio.cs_step_new()
+        let i_has = ia >= 0 and k < n_i
+        let r_has = ib >= 0 and k < n_r
+        if i_has
+            si = m.steps[ia][k]
+        if r_has
+            sr = m.steps[ib][k]
+        var tl = si
+        if not i_has
+            tl = sr
+        let md = tl.mode as Int
+        let ch = tl.ch as Int
+        let f_mhz = 2402.0 + int.to_float(ch)
+        let t_tod_i = t0_ps + (tl.start_ns as Int) * 1000
+        end_ns = (tl.start_ns as Int) + (tl.len_ns as Int)
+        var sync_bits = seq_bits
+        if md == 0
+            sync_bits = 0
+        let i_tx = i_on and i_has
+        let deaf = r_has and (tl.start_ns as Int) < late_ns
+
+        var rs = side_step_new()
+        var is = side_step_new()
+
+        // The reflector hears the initiator's CS_SYNC.
+        if md != 2
+            rs.rx = sync_rx(var m, ib, i_tx and r_on and r_has and not deaf, si.aa_i, sr.aa_i, tx_i, f_mhz, phy, k, sync_bits,
+                            rand_seq and md != 0)
+        var r_tx = false
+        if r_on and r_has
+            if md == 0
+                r_tx = rs.rx.aa_q <= 1
+            else
+                r_tx = r_ref
+        if md == 0 and r_on and r_has and rs.rx.aa_q <= 1
+            r_ok0 = r_ok0 + 1
+            if not r_ref
+                r_ref = true
+                r_origin = t_tod_i + dps
+
+        // The initiator hears the reflector's CS_SYNC.
+        if md != 2
+            is.rx = sync_rx(var m, ia, r_tx and i_tx, sr.aa_r, si.aa_r, tx_r, f_mhz, phy, k, sync_bits, rand_seq and md != 0)
+        var ffo_raw = 0.0
+        var ffo_ok = false
+        if md == 0 and i_tx and is.rx.aa_q <= 1
+            let d_i = m.devs[ia]
+            let d_r = m.devs[ib]
+            ffo_raw = d_r.ppm - d_i.ppm + int.to_float(d_r.fae[ch]) / 32.0 + int.to_float(d_i.fae_tab[ch] - d_i.fae[ch]) / 32.0 + d_i.ffo_err
+            if d_i.noise_on
+                ffo_raw = ffo_raw + rng_gauss(var m.rng) * 0.02
+            ffo_ok = true
+            i_ok0 = i_ok0 + 1
+            if not have_comp
+                have_comp = true
+                comp = ffo_raw
+                if d_i.fae_known
+                    comp = comp - int.to_float(d_r.fae_tab[ch]) / 32.0
+
+        // Time stamps of the round trip.
+        if md == 1 or md == 3
+            let tcd = center_delta_ps(hh, md, tl.ext_r)
+            var turn_err = 0
+            if ib >= 0
+                turn_err = m.devs[ib].turn_err_ps
+            let tcd_true = round_int(int.to_float(tcd) / (1.0 + ppm_r * 0.000001)) + turn_err
+            let toa_r_true = t_tod_i + dps
+            let tod_r_true = toa_r_true + tcd_true
+            let toa_i_true = tod_r_true + dps
+            if i_tx
+                let d_i = m.devs[ia]
+                let shift_i = fault_arg(m, F_SHIFT, k, ia)
+                is.tod_ps = stamp_ps(var m.rng, d_i, local_ps(t_tod_i - t0_ps, ppm_i) - d_i.tx_ps[phy - 1])
+                is.tod_ok = true
+                is.toa_ps = stamp_ps(var m.rng, d_i, local_ps(toa_i_true - t0_ps, ppm_i) + d_i.rx_ps[phy - 1]) + shift_i
+                is.toa_ok = is.rx.aa_q <= 1
+            if r_on and r_has
+                let d_r = m.devs[ib]
+                let shift_r = fault_arg(m, F_SHIFT, k, ib)
+                rs.tod_ok = r_tx
+                if r_tx
+                    rs.tod_ps = stamp_ps(var m.rng, d_r, local_ps(tod_r_true - r_origin, ppm_r) - d_r.tx_ps[phy - 1])
+                rs.toa_ps = stamp_ps(var m.rng, d_r, local_ps(toa_r_true - r_origin, ppm_r) + d_r.rx_ps[phy - 1]) + shift_r
+                rs.toa_ok = rs.rx.aa_q <= 1
+
+        // Tones and the phase of a sounding sequence.
+        if md == 2 or md == 3
+            let phi_i = 2.0 * math.pi * hash_unit(seed_i, 0, k)
+            let phi_r = 2.0 * math.pi * hash_unit(seed_r, 1, k)
+            let ang = 2.0 * math.pi * f_mhz * 1.0e6 * dm / int.to_float(C_MPS)
+            let mism = comp - (ppm_r - ppm_i)
+            let resid = -2.0 * math.pi * f_mhz * 1.0e6 * mism * 0.000001 * tone_delta_s(hh)
+            let r_run = r_on and r_has
+            for s in 0..n_ap + 1
+                let ap = perm_path(n_ap, tl.perm as Int, s)
+                let g = m.ap_gain[ap]
+                let ph = m.ap_phase[ap]
+                let i_sends = i_tx and (s < n_ap or si.ext_i)
+                let r_sends = r_tx and r_run and (s < n_ap or sr.ext_r)
+                let th_refl = phi_i - phi_r - ang + ph
+                let hear_r = i_sends and r_run and not tone_lost(m, k, ib, s)
+                let hear_i = r_sends and i_tx and not tone_lost(m, k, ia, s)
+                var phi_r_tx = phi_r
+                if ipt and hear_r
+                    phi_r_tx = phi_r + th_refl
+                let th_init = phi_r_tx - phi_i - ang + ph + resid
+                if r_run
+                    let _a = rs.tones.push(tone_slot(var m, ib, tx_i, f_mhz, g, th_refl, rpl_r, hear_r, ipt and hear_r))
+                if i_tx
+                    var t = tone_empty()
+                    if not (md == 3 and s == n_ap and not r_sends)
+                        t = tone_slot(var m, ia, tx_r, f_mhz, g, th_init, rpl_i, hear_i, false)
+                    let _b = is.tones.push(t)
+        if md == 1 or md == 3
+            if snd
+                let phi_i1 = 2.0 * math.pi * hash_unit(seed_i, 0, k)
+                let phi_r1 = 2.0 * math.pi * hash_unit(seed_r, 1, k)
+                let ang1 = 2.0 * math.pi * f_mhz * 1.0e6 * dm / int.to_float(C_MPS)
+                let ph1 = m.ap_phase[0]
+                let g1 = m.ap_gain[0]
+                let mism1 = comp - (ppm_r - ppm_i)
+                let resid1 = -2.0 * math.pi * f_mhz * 1.0e6 * mism1 * 0.000001 * int.to_float(center_delta_ps(hh, md, tl.ext_r)) * 1.0e-12
+                if r_on and r_has and m.devs[ib].sounding and rs.rx.aa_q <= 1
+                    let t = tone_slot(var m, ib, tx_i, f_mhz, g1, phi_i1 - phi_r1 - ang1 + ph1, rpl_r, true, false)
+                    rs.pct = pack_pct(t.i as Int, t.q as Int)
+                if i_tx and m.devs[ia].sounding and is.rx.aa_q <= 1
+                    let t = tone_slot(var m, ia, tx_r, f_mhz, g1, phi_r1 - phi_i1 - ang1 + ph1 + resid1, rpl_i, true, false)
+                    is.pct = pack_pct(t.i as Int, t.q as Int)
+
+        var ffo_field = ll_cs_radio.CS_FREQ_UNAVAILABLE
+        if ffo_ok
+            ffo_field = enc_ffo(ffo_raw)
+        if ia >= 0
+            list.push(oi, raw_of(i_tx, md, is, ffo_field))
+            if i_tx
+                i_done = i_done + 1
+        if ib >= 0
+            list.push(orr, raw_of(r_on and r_has, md, rs, ll_cs_radio.CS_FREQ_UNAVAILABLE))
+            if r_on and r_has
+                r_done = r_done + 1
+
+    // A subevent with nothing but mode 0 steps ends in the check of the leading steps.
+    if n0run > 0 and n0run >= n
+        if i_on and i_ok0 == 0
+            i_abort = ABORT_NO_SYNC
+        if r_on and r_ok0 == 0
+            r_abort = ABORT_NO_SYNC
+    let len_us = (end_ns + 999) / 1000
+    if ia >= 0
+        var st = ll_cs_radio.CS_OK
+        if i_abort != 0
+            st = ll_cs_radio.CS_ABORTED
+        var ffo_h = ll_cs_radio.CS_FREQ_UNAVAILABLE
+        if have_comp
+            ffo_h = enc_ffo(comp)
+        m.out_head[ia] = CsRaw { status: st as u8, n_done: i_done as u8, abort: i_abort as u8, ffo: ffo_h as u16, rpl_dbm: rpl_i as i8,
+                                 t_ref_us: t0 }
+        m.out_steps[ia] = oi
+        m.out_len_us[ia] = len_us
+        m.ready[ia] = true
+    if ib >= 0
+        var st = ll_cs_radio.CS_OK
+        if r_abort != 0
+            st = ll_cs_radio.CS_ABORTED
+        m.out_head[ib] = CsRaw { status: st as u8, n_done: r_done as u8, abort: r_abort as u8, ffo: ll_cs_radio.CS_FREQ_UNAVAILABLE as u16,
+                                 rpl_dbm: rpl_r as i8, t_ref_us: m.t0[ib] + (r_origin - t0_ps) / 1_000_000 }
+        m.out_steps[ib] = orr
+        m.out_len_us[ib] = len_us
+        m.ready[ib] = true
+
+// ── The radio ───────────────────────────────────────────────────────
+
+fn abort_at(m: CsMedium, step: Int, side: Int) -> Int
+    for i in 0..list.len(m.faults)
+        let f = m.faults[i]
+        if f.kind == F_ABORT and f.side == side and f.step == step
+            return i
+    -1
+
+// The plan with the role turned: the other device of the procedure runs the same steps.
+fn plan_with_role(h: CsPlan, role: Int) -> CsPlan
+    CsPlan { role: role as u8,
+        phy: h.phy,
+        rtt: h.rtt,
+        n_steps: h.n_steps,
+        n_mode0: h.n_mode0,
+        t_ip1_us: h.t_ip1_us,
+        t_ip2_us: h.t_ip2_us,
+        t_fcs_us: h.t_fcs_us,
+        t_pm_us: h.t_pm_us,
+        t_sw_us: h.t_sw_us,
+        ipt: h.ipt,
+        n_ap: h.n_ap,
+        aci: h.aci,
+        tx_dbm: h.tx_dbm,
+        snr_i: h.snr_i,
+        snr_r: h.snr_r,
+        window_us: h.window_us,
+        test: h.test }
+
+// The peer's plan for a test of S0: its head and its steps, when the test does not want the device's own turned round.
+fn sim_cs_peer(var s: SimCs, h: CsPlan, steps: [CsStep])
+    s.med.peer_head = h
+    s.med.peer_set = true
+    s.med.peer_steps = list.clone(steps)
+    s.med.peer_steps_set = true
+
+fn bit_set(mask: Int, bit: Int) -> Bool
+    ((mask >>> bit) & 1) == 1
+
+// Whether the timing `us` is the mandatory one or a bit of `mask` that stands for it in the HCI order.
+fn timing_ok(us: Int, mandatory: Int, table: [Int], mask: Int) -> Bool
+    if us == mandatory
+        return true
+    for i in 0..list.len(table)
+        if table[i] == us
+            return bit_set(mask, i)
+    false
+
+// Whether a radio that reports `c` runs the plan with the head `p`.
+@tier(app)
+fn plan_in_caps(c: CsCaps, p: CsPlan) -> Bool
+    let phy = p.phy as Int
+    let rtt = p.rtt as Int
+    let n_ap = p.n_ap as Int
+    if (p.role as Int) > 1 or not bit_set(c.roles, p.role as Int)
+        return false
+    if phy < 1 or phy > 3 or not bit_set(c.phys, phy - 1)
+        return false
+    if rtt > 6 or not bit_set(c.rtt_types, rtt)
+        return false
+    if n_ap < 1 or n_ap > c.max_paths or (p.ipt and not c.ipt)
+        return false
+    timing_ok(p.t_ip1_us as Int, 145, [10, 20, 30, 40, 50, 60, 80], c.t_ip1) and timing_ok(p.t_ip2_us as Int, 145, [10, 20, 30, 40, 50, 60, 80], c.t_ip2)
+        and timing_ok(p.t_fcs_us as Int, 150, [15, 20, 30, 40, 50, 60, 80, 100, 120], c.t_fcs)
+        and timing_ok(p.t_pm_us as Int, 40, [10, 20], c.t_pm)
+
+fn ch_ok(ch: Int) -> Bool
+    (ch >= 2 and ch <= 22) or (ch >= 26 and ch <= 76)
+
+// Fill in the peer a run of S0 talks to, resolve what is armed, and take the peer out again.
+@tier(app)
+fn sim_run_pair(var m: CsMedium, me: Int)
+    let other = 1 - me
+    var filled = false
+    if m.auto_peer and not m.armed[other]
+        filled = true
+        m.armed[other] = true
+        m.t0[other] = m.t0[me]
+        if m.peer_set
+            m.heads[other] = m.peer_head
+        else
+            m.heads[other] = plan_with_role(m.heads[me], 1 - (m.heads[me].role as Int))
+        if m.peer_steps_set
+            m.steps[other] = m.peer_steps
+        else
+            m.steps[other] = m.steps[me]
+    if m.armed[0] and m.armed[1] and m.heads[0].role != m.heads[1].role
+        var ini = 1
+        if m.heads[0].role == 0
+            ini = 0
+        sim_pair(var m, ini, 1 - ini)
+    else
+        for s in 0..2
+            if m.armed[s]
+                if m.heads[s].role == 0
+                    sim_pair(var m, s, -1)
+                else
+                    sim_pair(var m, -1, s)
+    if filled
+        m.armed[other] = false
+        m.ready[other] = false
+
+impl CsRadio[] for SimCs
+    fn supports_cs(var self) -> Bool
+        self.caps.supported
+
+    fn cs_caps(var self) -> CsCaps
+        self.caps
+
+    fn cs_timing(var self) -> CsTiming
+        self.timing
+
+    fn cs_cal(var self) -> CsCal
+        self.med.devs[self.side].cal
+
+    fn cs_fae(var self, ch: Int) -> Int
+        if ch < 0 or ch > 78
+            return 0
+        self.med.devs[self.side].fae_tab[ch]
+
+    @tier(app)
+    fn cs_arm(var self, var plan: CsPlan, t0_us: Int) -> Int
+        self.arms = self.arms + 1
+        var m = self.med
+        let me = self.side
+        m.armed[me] = false
+        m.ready[me] = false
+        if not self.caps.supported or not plan_in_caps(self.caps, plan)
+            return ll_cs_radio.CS_UNSUPPORTED
+        if (plan.n_steps as Int) > self.timing.max_steps or fault_idx(m, F_RESOURCES, -1, me) >= 0
+            return ll_cs_radio.CS_RESOURCES
+        if t0_us - self.now_us < self.timing.arm_lead_us or fault_idx(m, F_LATE, -1, me) >= 0
+            return ll_cs_radio.CS_LATE
+        m.armed[me] = true
+        m.heads[me] = plan
+        m.t0[me] = t0_us
+        m.steps[me] = []
+        m.loaded[me] = 0
+        ll_cs_radio.CS_OK
+
+    @tier(app)
+    fn cs_load(var self, i: Int, var step: CsStep) -> Int
+        var m = self.med
+        let me = self.side
+        if not m.armed[me] or i != m.loaded[me] or i >= (m.heads[me].n_steps as Int)
+            return ll_cs_radio.CS_UNSUPPORTED
+        let md = step.mode as Int
+        if md > 3 or (md == 3 and (self.caps.modes & 1) == 0) or not ch_ok(step.ch as Int)
+            return ll_cs_radio.CS_UNSUPPORTED
+        list.push(m.steps[me], step)
+        m.loaded[me] = i + 1
+        ll_cs_radio.CS_OK
+
+    @tier(app)
+    fn cs_run(var self, var raw: CsRaw) -> Int
+        var m = self.med
+        let me = self.side
+        if not m.armed[me] or m.loaded[me] != (m.heads[me].n_steps as Int)
+            return ll_cs_radio.CS_UNSUPPORTED
+        if not m.ready[me]
+            sim_run_pair(var m, me)
+        raw = m.out_head[me]
+        self.runs = self.runs + 1
+        let end = m.t0[me] + m.out_len_us[me] + self.timing.finish_us
+        if end > self.now_us
+            self.now_us = end
+        m.armed[me] = false
+        m.ready[me] = false
+        if (m.out_head[me].status as Int) == ll_cs_radio.CS_OK
+            return ll_cs_radio.CS_OK
+        ll_cs_radio.CS_ABORTED
+
+    fn cs_step_raw(var self, i: Int, var out: CsStepRaw) -> Bool
+        let l = self.med.out_steps[self.side]
+        if i < 0 or i >= list.len(l)
+            return false
+        out = l[i]
+        true
+
+    fn cs_abort(var self)
+        self.aborts = self.aborts + 1
+        var m = self.med
+        m.armed[self.side] = false
+        m.ready[self.side] = false
+
+// ── The reference estimator of the tests ────────────────────────────
+//
+// The Host side of the feature, as a reference for the tests ([Vol 1] Part A, Section 9.2: the specification gives no algorithm).  From the
+// two result sets of one subevent it computes the combined `PCT_REFL x PCT_INIT` of each channel, the distance from the phase of the
+// products, and the distance from the round-trip time.
+//
+//   phase      the product of the reflector's and the initiator's value of a tone slot has the phase `-4 pi f d / c`.  The products of the
+//              slots of one step are added, the products of the steps are searched for the distance whose delay makes them add up in phase
+//              (the peak of the inverse Fourier transform: a search over `d`, which holds for any subset of the 72 channels), or fitted by a
+//              line through the unwrapped phase (for a run of adjacent channels).  Only the antenna paths count (the tone extension slot
+//              repeats the last path, so it would add a term that depends on the permutation of the step), and only those both devices
+//              measured with a tone of high or medium quality.
+//   round trip each step of mode 1 or 3 with an access address found clean on both sides gives `2 ToF` as the initiator's difference of
+//              arrival and departure, less its delay to the antenna port and the nominal offset of the step, scaled by the reflector's
+//              frequency offset (the actuation error of the reflector removed), less the reflector's difference of departure and arrival,
+//              less its delays and the nominal offset.  The mean over the steps gives the distance.
+
+// What the estimator found.
+struct Est
+    var d_pbr: Float
+    var n_pbr: Int
+    var peak: Float
+    var d_rtt: Float
+    var n_rtt: Int
+    var ffo: Float
+
+fn est_new() -> Est
+    Est { d_pbr: 0.0, n_pbr: 0, peak: 0.0, d_rtt: 0.0, n_rtt: 0, ffo: 0.0 }
+
+// The result of every step of a run, read through the trait.
+@tier(app)
+fn read_steps<S: CsRadio[s]>(var air: S, n: Int) -> [CsStepRaw] [s]
+    var out: [CsStepRaw] = []
+    for i in 0..n
+        var r = ll_cs_radio.cs_step_raw_none()
+        if air.cs_step_raw(i, var r)
+            list.push(out, r)
+    out
+
+fn cal_tx_ps(c: CsCal, phy: Int) -> Int
+    if phy == 1
+        return c.tx_1m_ps
+    if phy == 2
+        return c.tx_2m_ps
+    c.tx_2bt_ps
+
+fn cal_rx_ps(c: CsCal, phy: Int) -> Int
+    if phy == 1
+        return c.rx_1m_ps
+    if phy == 2
+        return c.rx_2m_ps
+    c.rx_2bt_ps
+
+// The mean fractional frequency offset of the reflector in ppm over the mode 0 steps the initiator measured, less the reflector's table.
+fn est_ffo(ri: [CsStepRaw], steps: [CsStep], fae_r: [Int]) -> Float
+    var sum = 0.0
+    var n = 0
+    for k in 0..list.len(ri)
+        if (steps[k].mode as Int) == 0 and ri[k].done and (ri[k].aa_q as Int) <= 1 and (ri[k].ffo as Int) != ll_cs_radio.CS_FREQ_UNAVAILABLE
+            sum = sum + dec_ffo(ri[k].ffo as Int) - int.to_float(fae_r[steps[k].ch as Int]) / 32.0
+            n = n + 1
+    if n == 0
+        return 0.0
+    sum / int.to_float(n)
+
+// The distance in metres from the round trip.  `ffo` is the frequency offset to scale by, in ppm.
+fn est_rtt(ri: [CsStepRaw], rr: [CsStepRaw], steps: [CsStep], h: CsPlan, cal_i: CsCal, cal_r: CsCal, ffo: Float) -> Est
+    var e = est_new()
+    e.ffo = ffo
+    let phy = h.phy as Int
+    var sum = 0.0
+    var n = 0
+    for k in 0..list.len(ri)
+        let md = steps[k].mode as Int
+        if (md == 1 or md == 3) and k < list.len(rr)
+            let a = ri[k]
+            let b = rr[k]
+            if a.done and b.done and a.toa_valid and a.tod_valid and b.toa_valid and b.tod_valid and (a.aa_q as Int) == 0 and (b.aa_q as Int) == 0
+                let tcd = int.to_float(center_delta_ps(h, md, steps[k].ext_r))
+                let di = int.to_float((a.toa_ps - cal_rx_ps(cal_i, phy)) - (a.tod_ps + cal_tx_ps(cal_i, phy)))
+                let dr = int.to_float((b.tod_ps + cal_tx_ps(cal_r, phy)) - (b.toa_ps - cal_rx_ps(cal_r, phy)))
+                let rep_i = di * (1.0 + ffo * 0.000001) - tcd
+                let rep_r = dr - tcd
+                sum = sum + (rep_i - rep_r)
+                n = n + 1
+    e.n_rtt = n
+    if n > 0
+        e.d_rtt = sum / int.to_float(n) * 1.0e-12 * int.to_float(C_MPS) / 2.0
+    e
+
+// The products `PCT_REFL x PCT_INIT` of the channels of a run: the frequency of each in Hz and the sum over the slots of the step.
+struct Products
+    var f: [Float]
+    var re: [Float]
+    var im: [Float]
+
+fn products(ri: [CsStepRaw], rr: [CsStepRaw], steps: [CsStep], n_ap: Int) -> Products
+    var p = Products { f: [], re: [], im: [] }
+    for k in 0..list.len(ri)
+        let md = steps[k].mode as Int
+        if (md == 2 or md == 3) and k < list.len(rr) and ri[k].done and rr[k].done
+            var re = 0.0
+            var im = 0.0
+            var used = 0
+            for s in 0..n_ap
+                if s < ri[k].tones.len() and s < rr[k].tones.len()
+                    let ti = ri[k].tones[s]
+                    let tr = rr[k].tones[s]
+                    if ti.present and tr.present and (ti.tq as Int) <= 1 and (tr.tq as Int) <= 1
+                        let a = int.to_float(tr.i as Int)
+                        let b = int.to_float(tr.q as Int)
+                        let c = int.to_float(ti.i as Int)
+                        let d = int.to_float(ti.q as Int)
+                        re = re + a * c - b * d
+                        im = im + a * d + b * c
+                        used = used + 1
+            if used > 0
+                list.push(p.f, (2402.0 + int.to_float(steps[k].ch as Int)) * 1.0e6)
+                list.push(p.re, re)
+                list.push(p.im, im)
+    p
+
+// The size of the sum of the products turned by the delay of a distance of `d` metres.
+fn mf_eval(p: Products, d: Float) -> Float
+    var sr = 0.0
+    var si = 0.0
+    for k in 0..list.len(p.f)
+        let ph = 4.0 * math.pi * (p.f[k] - 2402.0e6) * d / int.to_float(C_MPS)
+        let c = math.cos(ph)
+        let s = math.sin(ph)
+        sr = sr + p.re[k] * c - p.im[k] * s
+        si = si + p.re[k] * s + p.im[k] * c
+    math.hypot(sr, si)
+
+// The distance in metres from the peak of `mf_eval` over 0 to 60 m: a search at 2 cm, refined twice.
+fn est_pbr(p: Products) -> Est
+    var e = est_new()
+    e.n_pbr = list.len(p.f)
+    if e.n_pbr == 0
+        return e
+    var best = 0.0
+    var best_v = -1.0
+    for i in 0..3001
+        let d = int.to_float(i) * 0.02
+        let v = mf_eval(p, d)
+        if v > best_v
+            best_v = v
+            best = d
+    var lo = best - 0.02
+    var step = 0.001
+    for _ in 0..2
+        best_v = -1.0
+        for i in 0..41
+            let d = lo + int.to_float(i) * step
+            let v = mf_eval(p, d)
+            if v > best_v
+                best_v = v
+                best = d
+        lo = best - step
+        step = step / 20.0
+    e.d_pbr = best
+    e.peak = best_v
+    e
+
+// The distance in metres from a line fitted through the unwrapped phase of the products, for a set of adjacent channels.
+fn est_slope(p: Products) -> Float
+    let n = list.len(p.f)
+    if n < 2
+        return 0.0
+    // The channels in the order of their frequency.
+    var order: [Int] = []
+    var used = zeros(n)
+    for _ in 0..n
+        var best = -1
+        for j in 0..n
+            if used[j] == 0 and (best < 0 or p.f[j] < p.f[best])
+                best = j
+        used[best] = 1
+        list.push(order, best)
+    var f: [Float] = []
+    var re: [Float] = []
+    var im: [Float] = []
+    for k in 0..n
+        list.push(f, p.f[order[k]])
+        list.push(re, p.re[order[k]])
+        list.push(im, p.im[order[k]])
+    var psi: [Float] = []
+    var acc = math.atan2(im[0], re[0])
+    list.push(psi, acc)
+    for k in 1..n
+        var dlt = math.atan2(im[k], re[k]) - math.atan2(im[k - 1], re[k - 1])
+        dlt = dlt - 2.0 * math.pi * math.round(dlt / (2.0 * math.pi))
+        acc = acc + dlt
+        list.push(psi, acc)
+    var fm = 0.0
+    var pm = 0.0
+    for k in 0..n
+        fm = fm + f[k]
+        pm = pm + psi[k]
+    fm = fm / int.to_float(n)
+    pm = pm / int.to_float(n)
+    var num = 0.0
+    var den = 0.0
+    for k in 0..n
+        num = num + (f[k] - fm) * (psi[k] - pm)
+        den = den + (f[k] - fm) * (f[k] - fm)
+    -(num / den) * int.to_float(C_MPS) / (4.0 * math.pi)
+
+// ── Planning for the tests ──────────────────────────────────────────
+
+// A planned subevent in storage of the tests' own: the head, the steps (as many as the subevent holds, at most 160), and the code that
+// ended it.  `plan_subevent` does the same into the storage the keys size; this keeps all the steps whatever the keys.
+struct PlanBuf
+    var head: CsPlan
+    var steps: [CsStep]
+    var n: Int
+    var code: Int
+
+@tier(app)
+fn t_plan(var cc: ll_ccm.SoftCipher, var g: CsGen, var c: CsCfg, role: Int, anchor_ns: Int) -> PlanBuf
+    ll_cs_plan.gen_begin_subevent(var g, var c, ll_cs.STEPS_PER_SUBEVENT_MAX, anchor_ns)
+    var steps: [CsStep] = []
+    var step = ll_cs_radio.cs_step_new()
+    var n0 = 0
+    var code = ll_cs_plan.PLAN_SUBEVENT_END
+    for _ in 0..ll_cs.STEPS_PER_SUBEVENT_MAX + 1
+        code = ll_cs_plan.plan_next(var cc, var g, var c, var step)
+        if code != ll_cs_plan.PLAN_STEP
+            break
+        list.push(steps, step)
+        if (step.mode as Int) == 0
+            n0 = n0 + 1
+    let n = list.len(steps)
+    PlanBuf { head: ll_cs_plan.plan_head(c, role, n, n0), steps: steps, n: n, code: code }
+
+// Key a generator the way LE CS Test does and begin its first procedure.
+@tier(app)
+fn t_key(var cc: ll_ccm.SoftCipher, var g: CsGen, nonce: Int)
+    ll_cs_plan.gen_instantiate_test(var g, nonce)
+    test.assert(ll_cs_plan.gen_begin_procedure(var cc, var g))
+
+// The configuration of the estimator tests: the shortest step timings of Part H (T_IP 10, T_FCS 15, T_PM 10), a subevent long enough for
+// every channel once, `n0` mode 0 steps and `main` as the mode of the other steps.
+fn t_cfg(main: Int, n0: Int) -> CsCfg
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, main, 0, 1, 1, 0)
+    t_short(var c, n0)
+    c
+
+fn t_short(var c: CsCfg, n0: Int)
+    c.mode0_steps = n0
+    c.t_ip1_us = 10
+    c.t_ip2_us = 10
+    c.t_fcs_us = 15
+    c.t_pm_us = 10
+    c.sub_len_us = 12_000
+
+fn t_main(var c: CsCfg, main: Int, sub: Int, mn: Int, mx: Int, rep: Int)
+    c.main_mode = main
+    c.sub_mode = sub
+    c.main_min = mn
+    c.main_max = mx
+    c.main_rep = rep
+
+// The channels `first` to `last` and no others.
+fn t_chm(var c: CsCfg, first: Int, last: Int)
+    for i in 0..10
+        c.chmap[i] = 0
+    for ch in first..last + 1
+        c.chmap[ch / 8] = (c.chmap[ch / 8] as Int | (1 << (ch % 8))) as u8
+
+fn t_set_rtt(var c: CsCfg, phy: Int, rtt: Int)
+    c.phy = phy
+    c.rtt = rtt
+
+fn t_set_aci(var c: CsCfg, aci: Int)
+    c.aci = aci
+
+// ── Driving the radio through the trait ─────────────────────────────
+
+// Arm the plan and load its steps; the first answer that is not `CS_OK`, or `CS_OK`.
+@tier(app)
+fn arm_load<S: CsRadio[s]>(var air: S, p: PlanBuf, t0_us: Int) -> Int [s]
+    var h = p.head
+    let a = air.cs_arm(var h, t0_us)
+    if a != ll_cs_radio.CS_OK
+        return a
+    for i in 0..p.n
+        var st = p.steps[i]
+        let l = air.cs_load(i, var st)
+        if l != ll_cs_radio.CS_OK
+            return l
+    ll_cs_radio.CS_OK
+
+// Arm, load and run a plan; the answer of the first call that failed, or of the run.
+@tier(app)
+fn run_plan<S: CsRadio[s]>(var air: S, p: PlanBuf, t0_us: Int, var raw: CsRaw) -> Int [s]
+    let a = arm_load(var air, p, t0_us)
+    if a != ll_cs_radio.CS_OK
+        return a
+    air.cs_run(var raw)
+
+// What a test reads of one side of a run.
+struct SideRead
+    var raw: CsRaw
+    var steps: [CsStepRaw]
+    var code: Int
+
+@tier(app)
+fn side_read<S: CsRadio[s]>(var air: S, n: Int, code: Int, raw: CsRaw) -> SideRead [s]
+    SideRead { raw: raw, steps: read_steps(var air, n), code: code }
+
+// Run one plan on a radio and read its steps.
+@tier(app)
+fn go<S: CsRadio[s]>(var air: S, p: PlanBuf, t0_us: Int) -> SideRead [s]
+    var raw = ll_cs_radio.cs_raw_new()
+    let code = run_plan(var air, p, t0_us, var raw)
+    side_read(var air, p.n, code, raw)
+
+// The reflector's table as the FAE procedure would hand it to the initiator.
+@tier(app)
+fn fae_table<S: CsRadio[s]>(var air: S) -> [Int] [s]
+    var t: [Int] = []
+    for ch in 0..79
+        list.push(t, air.cs_fae(ch))
+    t
+
+// ── Helpers of the tests ────────────────────────────────────────────
+
+// The other side's result of the last run of an S0 radio: the model computes both devices, the trait returns one.
+fn sim_cs_peer_steps(s: SimCs) -> [CsStepRaw]
+    list.clone(s.med.out_steps[1 - s.side])
+
+fn sim_cs_peer_head(s: SimCs) -> CsRaw
+    s.med.out_head[1 - s.side]
+
+// The subevent of an initiator with the shortest timings (see `t_cfg`): `n0` steps of mode 0 and then the steps of mode `main`, one
+// pass over the 72 channels.
+fn t_p(main: Int, n0: Int) -> PlanBuf
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_key(var cc, var g, 0x0102)
+    var c = t_cfg(main, n0)
+    t_plan(var cc, var g, var c, 0, 0)
+
+// The same with the configuration `c`.
+fn t_pc(c: CsCfg, nonce: Int) -> PlanBuf
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    var cfg = c
+    t_key(var cc, var g, nonce)
+    t_plan(var cc, var g, var cfg, 0, 0)
+
+// The subevent with the mandatory timings (T_IP 145, T_FCS 150, T_PM 40), which every radio runs.
+@tier(app)
+fn t_pm(main: Int, n0: Int) -> PlanBuf
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_key(var cc, var g, 0x0102)
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, main, 0, 1, 1, 0)
+    t_reps(var c, 1, n0)
+    t_plan(var cc, var g, var c, 0, 0)
+
+fn t_reps(var c: CsCfg, ch_rep: Int, mode0: Int)
+    c.ch_rep = ch_rep
+    c.mode0_steps = mode0
+
+// The plan for the device in `role`: the same steps, the head with the role turned.
+fn t_role(p: PlanBuf, role: Int) -> PlanBuf
+    PlanBuf { head: plan_with_role(p.head, role), steps: list.clone(p.steps), n: p.n, code: p.code }
+
+// The head `h` with some fields changed.
+fn h_edit(h: CsPlan, phy: Int, rtt: Int, n_ap: Int, ip1: Int, ipt: Bool) -> CsPlan
+    CsPlan { role: h.role,
+        phy: phy as u8,
+        rtt: rtt as u8,
+        n_steps: h.n_steps,
+        n_mode0: h.n_mode0,
+        t_ip1_us: ip1 as u8,
+        t_ip2_us: h.t_ip2_us,
+        t_fcs_us: h.t_fcs_us,
+        t_pm_us: h.t_pm_us,
+        t_sw_us: h.t_sw_us,
+        ipt: ipt,
+        n_ap: n_ap as u8,
+        aci: h.aci,
+        tx_dbm: h.tx_dbm,
+        snr_i: h.snr_i,
+        snr_r: h.snr_r,
+        window_us: h.window_us,
+        test: h.test }
+
+fn h_window(h: CsPlan, window_us: Int) -> CsPlan
+    CsPlan { role: h.role,
+        phy: h.phy,
+        rtt: h.rtt,
+        n_steps: h.n_steps,
+        n_mode0: h.n_mode0,
+        t_ip1_us: h.t_ip1_us,
+        t_ip2_us: h.t_ip2_us,
+        t_fcs_us: h.t_fcs_us,
+        t_pm_us: h.t_pm_us,
+        t_sw_us: h.t_sw_us,
+        ipt: h.ipt,
+        n_ap: h.n_ap,
+        aci: h.aci,
+        tx_dbm: h.tx_dbm,
+        snr_i: h.snr_i,
+        snr_r: h.snr_r,
+        window_us: window_us as u32,
+        test: h.test }
+
+fn p_head(p: PlanBuf, h: CsPlan) -> PlanBuf
+    PlanBuf { head: h, steps: list.clone(p.steps), n: p.n, code: p.code }
+
+// The answer of `cs_arm` to a head, through the trait.
+fn arm_head<S: CsRadio[s]>(var air: S, h: CsPlan, t0_us: Int) -> Int [s]
+    var hh = h
+    air.cs_arm(var hh, t0_us)
+
+// Whether two result lists are equal in every field the radio reports.
+fn steps_equal(a: [CsStepRaw], b: [CsStepRaw]) -> Bool
+    if list.len(a) != list.len(b)
+        return false
+    for k in 0..list.len(a)
+        let x = a[k]
+        let y = b[k]
+        if x.done != y.done or x.aa_q != y.aa_q or x.bit_errors != y.bit_errors or x.rssi_dbm != y.rssi_dbm or x.ant != y.ant
+            return false
+        if x.toa_valid != y.toa_valid or x.tod_valid != y.tod_valid or x.ffo != y.ffo or x.pct1 != y.pct1 or x.pct2 != y.pct2
+            return false
+        if x.toa_ps != y.toa_ps or x.tod_ps != y.tod_ps or x.tones.len() != y.tones.len()
+            return false
+        for s in 0..x.tones.len()
+            if x.tones[s].i != y.tones[s].i or x.tones[s].q != y.tones[s].q or x.tones[s].tq != y.tones[s].tq
+                return false
+            if x.tones[s].present != y.tones[s].present
+                return false
+    true
+
+// The estimator's view of an S0 run of an initiator: the phase estimate, the round-trip estimate, the offset used.
+fn t_est(air: SimCs, r: SideRead, p: PlanBuf) -> Est
+    let rr = sim_cs_peer_steps(air)
+    var e = est_pbr(products(r.steps, rr, p.steps, p.head.n_ap as Int))
+    let ffo = est_ffo(r.steps, p.steps, sim_cs_far(air).fae_tab)
+    let rt = est_rtt(r.steps, rr, p.steps, p.head, sim_cs_dev(air).cal, sim_cs_far(air).cal, ffo)
+    e.d_rtt = rt.d_rtt
+    e.n_rtt = rt.n_rtt
+    e.ffo = ffo
+    e
+
+fn err_m(est: Float, mm: Int) -> Float
+    math.abs(est - int.to_float(mm) / 1000.0)
+
+// The phase of a tone in radians.
+fn tone_phase(t: CsTone) -> Float
+    math.atan2(int.to_float(t.q as Int), int.to_float(t.i as Int))
+
+fn tone_amp(t: CsTone) -> Float
+    math.hypot(int.to_float(t.i as Int), int.to_float(t.q as Int))
+
+// The angle `a` brought into (-pi, pi].
+@tier(app)
+fn wrap(a: Float) -> Float
+    a - 2.0 * math.pi * math.round(a / (2.0 * math.pi))
+
+// ── The radio as the trait describes it ─────────────────────────────
+
+@test
+fn test_a_new_radio_reports_the_capabilities_the_timing_and_the_calibration_it_was_given()
+    var air = sim_cs_new()
+    test.assert(air.supports_cs())
+    let c = air.cs_caps()
+    test.assert(c.supported)
+    test.assert_eq(c.roles, ll_cs_radio.CS_ROLES_INITIATOR | ll_cs_radio.CS_ROLES_REFLECTOR)
+    test.assert_eq(c.modes, 1)
+    let t = air.cs_timing()
+    test.assert_eq(t.arm_lead_us, 400)
+    test.assert_eq(t.max_steps, 160)
+    let k = air.cs_cal()
+    test.assert_eq(k.tx_1m_ps, 0)
+    test.assert_eq(k.rx_2m_ps, 0)
+    // The table: zero until a test sets a value, and zero outside the channels 0 to 78.
+    test.assert_eq(air.cs_fae(40), 0)
+    var d = sim_cs_dev(air)
+    sim_cs_fae(var d, 40, -17)
+    test.assert_eq(air.cs_fae(40), -17)
+    test.assert_eq(air.cs_fae(-1), 0)
+    test.assert_eq(air.cs_fae(79), 0)
+    sim_cs_delays(var d, 1500, 2200)
+    let k2 = air.cs_cal()
+    test.assert_eq(k2.tx_1m_ps, 1500)
+    test.assert_eq(k2.tx_2bt_ps, 1500)
+    test.assert_eq(k2.rx_2m_ps, 2200)
+
+@test
+fn test_a_port_that_reports_no_support_or_a_smaller_set_is_read_back_through_the_trait()
+    var air = sim_cs_new()
+    sim_cs_caps(var air, cs_caps_basic())
+    test.assert_eq(air.cs_caps().modes, 0)
+    test.assert_eq(air.cs_caps().rtt_types, 1)
+    test.assert_eq(air.cs_caps().max_paths, 1)
+    var none = sim_cs_new()
+    sim_cs_caps(var none, ll_cs_radio.cs_caps_none())
+    test.assert(not none.supports_cs())
+    // A radio that reports none refuses every plan.
+    let p = t_pm(2, 1)
+    test.assert_eq(arm_load(var none, p, 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    sim_cs_timing(var air, ll_cs_radio.cs_timing_none())
+    test.assert_eq(air.cs_timing().max_steps, 0)
+    // A radio that takes no step at all answers resources for a plan of steps.
+    test.assert_eq(arm_load(var air, p, 100_000), ll_cs_radio.CS_RESOURCES)
+
+@test
+fn test_a_plan_outside_the_reported_capabilities_is_refused_at_the_head()
+    var air = sim_cs_new()
+    sim_cs_caps(var air, cs_caps_basic())
+    let p = t_pm(2, 1)
+    let h = p.head
+    test.assert_eq(arm_head(var air, h, 100_000), ll_cs_radio.CS_OK)
+    // A random sequence, LE 2M 2BT, two antenna paths, a shorter T_IP1 and the initiator phase tone are not in the basic set.
+    test.assert_eq(arm_head(var air, h_edit(h, 1, 3, 1, 145, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var air, h_edit(h, 3, 0, 1, 145, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var air, h_edit(h, 1, 0, 2, 145, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var air, h_edit(h, 1, 0, 1, 40, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var air, h_edit(h, 1, 0, 1, 145, true), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    // LE 2M is in the set, and so is the sounding-free access address.
+    test.assert_eq(arm_head(var air, h_edit(h, 2, 0, 1, 145, false), 100_000), ll_cs_radio.CS_OK)
+    // A radio that reports the shorter timings takes them; one that reports none of the roles refuses.
+    var full = sim_cs_new()
+    test.assert_eq(arm_head(var full, h_edit(h, 1, 0, 1, 40, false), 100_000), ll_cs_radio.CS_OK)
+    test.assert_eq(arm_head(var full, h_edit(h, 1, 6, 4, 80, true), 100_000), ll_cs_radio.CS_OK)
+    test.assert_eq(arm_head(var full, h_edit(h, 1, 0, 1, 45, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var full, h_edit(h, 4, 0, 1, 145, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var full, h_edit(h, 1, 7, 1, 145, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var full, h_edit(h, 1, 0, 5, 145, false), 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var full, p.head, 100_000), ll_cs_radio.CS_OK)
+    var one_role = sim_cs_new()
+    var c1 = cs_caps_full()
+    c1 = CsCaps { supported: c1.supported, roles: ll_cs_radio.CS_ROLES_REFLECTOR, modes: c1.modes, rtt_types: c1.rtt_types, phys: c1.phys,
+                  ant_elements: c1.ant_elements, max_paths: c1.max_paths, t_ip1: c1.t_ip1, t_ip2: c1.t_ip2, t_fcs: c1.t_fcs, t_pm: c1.t_pm,
+                  t_sw_us: 0, t_sw_ipt_us: 0, t_ip2_ipt: c1.t_ip2_ipt, snr_mask: 0, no_fae: false, ch3c: false, sounding_pct: true,
+                  ipt: true, rtt_per_phy: false, tq: true, nadm_sound: 0, nadm_rand: 0, rtt_cap: 1, n_aa: 1, n_sound: 1, n_rand: 1,
+                  n_2m_aa: 1, n_2m_sound: 1, n_2m_rand: 1 }
+    sim_cs_caps(var one_role, c1)
+    test.assert_eq(arm_head(var one_role, h, 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(arm_head(var one_role, plan_with_role(h, 1), 100_000), ll_cs_radio.CS_OK)
+
+@test
+fn test_a_step_the_radio_does_not_run_is_refused_at_its_index_and_a_run_waits_for_every_step()
+    var air = sim_cs_new()
+    sim_cs_caps(var air, cs_caps_basic())
+    // Mode 3 is not in the basic set: the head and the mode 0 step are taken, the first step of mode 3 is refused.
+    let p = t_pm(3, 1)
+    test.assert_eq(arm_load(var air, p, 100_000), ll_cs_radio.CS_UNSUPPORTED)
+    var raw = ll_cs_radio.cs_raw_new()
+    test.assert_eq(air.cs_run(var raw), ll_cs_radio.CS_UNSUPPORTED)
+    var s0 = p.steps[0]
+    var s1 = p.steps[1]
+    // Steps come in order, one for each index of the head.
+    test.assert_eq(air.cs_load(0, var s0), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(air.cs_load(2, var s1), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(air.cs_load(1, var s1), ll_cs_radio.CS_UNSUPPORTED)
+    // A channel outside 2 to 22 and 26 to 76 is no CS channel.
+    var full = sim_cs_new()
+    let q = t_pm(2, 1)
+    var h = q.head
+    test.assert_eq(full.cs_arm(var h, 100_000), ll_cs_radio.CS_OK)
+    var bad = ll_cs_radio.cs_step_new()
+    test.assert_eq(full.cs_load(0, var bad), ll_cs_radio.CS_OK)
+    var ch23 = CsStep { mode: 2, ch: 23, ext_i: false, ext_r: false, perm: 0, seq_bits: 0, aa_i: 0, aa_r: 0, seq_i0: 0, seq_i1: 0,
+                        seq_r0: 0, seq_r1: 0, start_ns: 0, len_ns: 0 }
+    test.assert_eq(full.cs_load(1, var ch23), ll_cs_radio.CS_UNSUPPORTED)
+    var ch77 = CsStep { mode: 2, ch: 77, ext_i: false, ext_r: false, perm: 0, seq_bits: 0, aa_i: 0, aa_r: 0, seq_i0: 0, seq_i1: 0,
+                        seq_r0: 0, seq_r1: 0, start_ns: 0, len_ns: 0 }
+    test.assert_eq(full.cs_load(1, var ch77), ll_cs_radio.CS_UNSUPPORTED)
+    var mode4 = CsStep { mode: 4, ch: 30, ext_i: false, ext_r: false, perm: 0, seq_bits: 0, aa_i: 0, aa_r: 0, seq_i0: 0, seq_i1: 0,
+                         seq_r0: 0, seq_r1: 0, start_ns: 0, len_ns: 0 }
+    test.assert_eq(full.cs_load(1, var mode4), ll_cs_radio.CS_UNSUPPORTED)
+    // A step past the head is refused, and a run before the last step was loaded does not start.
+    test.assert_eq(full.cs_run(var raw), ll_cs_radio.CS_UNSUPPORTED)
+    var late_step = ll_cs_radio.cs_step_new()
+    test.assert_eq(full.cs_load(q.n, var late_step), ll_cs_radio.CS_UNSUPPORTED)
+    // The steps of a radio that was not armed are refused, and nothing is stored for a step that was refused.
+    var cold = sim_cs_new()
+    var s2 = p.steps[0]
+    test.assert_eq(cold.cs_load(0, var s2), ll_cs_radio.CS_UNSUPPORTED)
+    test.assert_eq(cold.cs_run(var raw), ll_cs_radio.CS_UNSUPPORTED)
+    var none_raw = ll_cs_radio.cs_step_raw_none()
+    test.assert(not cold.cs_step_raw(0, var none_raw))
+
+@test
+fn test_a_plan_of_more_steps_than_the_radio_takes_answers_resources()
+    var air = sim_cs_new()
+    let p = t_p(2, 1)
+    test.assert(p.n > 40)
+    var t = cs_timing_default()
+    t = CsTiming { arm_lead_us: t.arm_lead_us, rx_window_us: t.rx_window_us, turn_us: t.turn_us, finish_us: t.finish_us, max_steps: 40,
+                   max_run_us: t.max_run_us }
+    sim_cs_timing(var air, t)
+    test.assert_eq(arm_load(var air, p, 100_000), ll_cs_radio.CS_RESOURCES)
+    // The radio is not armed by the refusal.
+    var raw = ll_cs_radio.cs_raw_new()
+    test.assert_eq(air.cs_run(var raw), ll_cs_radio.CS_UNSUPPORTED)
+    // A radio that takes 160 steps takes this plan, and a fault makes the same radio answer resources whatever the size.
+    sim_cs_timing(var air, cs_timing_default())
+    test.assert_eq(arm_load(var air, p, 100_000), ll_cs_radio.CS_OK)
+    sim_cs_fault(var air, F_RESOURCES, -1, 0, 0)
+    test.assert_eq(arm_load(var air, p, 100_000), ll_cs_radio.CS_RESOURCES)
+
+@test
+fn test_a_start_nearer_than_the_lead_answers_late_and_the_clock_moves_with_the_run()
+    var air = sim_cs_new()
+    let p = t_p(2, 1)
+    test.assert_eq(arm_load(var air, p, 399), ll_cs_radio.CS_LATE)
+    test.assert_eq(arm_load(var air, p, 400), ll_cs_radio.CS_OK)
+    var raw = ll_cs_radio.cs_raw_new()
+    test.assert_eq(air.cs_run(var raw), ll_cs_radio.CS_OK)
+    // The run took the subevent and the time to readable results: the next start must be a lead after that.
+    let end = air.now_us
+    let last = p.steps[p.n - 1]
+    test.assert_eq(end, 400 + (((last.start_ns as Int) + (last.len_ns as Int) + 999) / 1000) + 100)
+    test.assert_eq(arm_load(var air, p, end + 399), ll_cs_radio.CS_LATE)
+    test.assert_eq(arm_load(var air, p, end + 400), ll_cs_radio.CS_OK)
+    // The reference of the run is the start of the plan.
+    test.assert_eq(raw.t_ref_us, 400)
+    // A late start can be forced.
+    sim_cs_fault(var air, F_LATE, -1, 0, 0)
+    test.assert_eq(arm_load(var air, p, 10_000_000), ll_cs_radio.CS_LATE)
+
+@test
+fn test_cs_abort_takes_an_armed_radio_to_rest()
+    var air = sim_cs_new()
+    let p = t_p(2, 1)
+    test.assert_eq(arm_load(var air, p, 1000), ll_cs_radio.CS_OK)
+    air.cs_abort()
+    test.assert_eq(air.aborts, 1)
+    var raw = ll_cs_radio.cs_raw_new()
+    test.assert_eq(air.cs_run(var raw), ll_cs_radio.CS_UNSUPPORTED)
+    // A radio at rest is armed again.
+    test.assert_eq(arm_load(var air, p, 1000), ll_cs_radio.CS_OK)
+    test.assert_eq(air.cs_run(var raw), ll_cs_radio.CS_OK)
+    air.cs_abort()
+    test.assert_eq(air.aborts, 2)
+    // The results of the run stay readable after an abort.
+    var r = ll_cs_radio.cs_step_raw_none()
+    test.assert(air.cs_step_raw(0, var r))
+    test.assert(not air.cs_step_raw(p.n, var r))
+    test.assert(not air.cs_step_raw(-1, var r))
+
+// ── A planned subevent runs ─────────────────────────────────────────
+
+@test
+fn test_the_subevent_of_plan_subevent_runs_and_its_steps_come_back_by_index()
+    var cc = ll_ccm.soft_cipher_new()
+    var g = ll_cs_plan.gen_new()
+    t_key(var cc, var g, 0x0102)
+    var c = t_cfg(2, 1)
+    var sub = ll_cs_plan.plan_new()
+    let code = ll_cs_plan.plan_subevent(var cc, var g, var c, var sub, 0, 0)
+    // The subevent holds as many steps as the keys give room for, or as the procedure has for it.
+    let cap = ll_cs_plan.max1(noble_controller_config.CTL_CS_STEPS)
+    // The same plan made into the tests' own storage, which holds all of it.
+    var cc2 = ll_ccm.soft_cipher_new()
+    var g2 = ll_cs_plan.gen_new()
+    t_key(var cc2, var g2, 0x0102)
+    var c2 = t_cfg(2, 1)
+    let own = t_plan(var cc2, var g2, var c2, 0, 0)
+    test.assert_eq(sub.n, math.min(cap, own.n))
+    var air = sim_cs_new()
+    test.assert_eq(ll_cs_plan.plan_arm(var air, var sub, 1000), ll_cs_radio.CS_OK)
+    var raw = ll_cs_radio.cs_raw_new()
+    test.assert_eq(air.cs_run(var raw), ll_cs_radio.CS_OK)
+    test.assert_eq(raw.n_done as Int, sub.n)
+    test.assert_eq(raw.abort as Int, 0)
+    // Every index answers, the one past the end does not.
+    for i in 0..sub.n
+        var r = ll_cs_radio.cs_step_raw_none()
+        test.assert(air.cs_step_raw(i, var r))
+        test.assert(r.done)
+    var past = ll_cs_radio.cs_step_raw_none()
+    test.assert(not air.cs_step_raw(sub.n, var past))
+    // The first step is the mode 0 step: a frequency offset, no time stamps, no tones.
+    var first = ll_cs_radio.cs_step_raw_none()
+    test.assert(air.cs_step_raw(0, var first))
+    test.assert_eq(first.ffo as Int, enc_ffo(0.0))
+    test.assert(not first.toa_valid and not first.tod_valid)
+    test.assert_eq(first.tones.len(), 0)
+    test.assert_eq(first.aa_q as Int, 0)
+    test.assert(own.n >= sub.n)
+    for i in 0..sub.n
+        test.assert_eq(sub.steps[i].ch as Int, own.steps[i].ch as Int)
+        test.assert_eq(sub.steps[i].aa_i as Int, own.steps[i].aa_i as Int)
+    test.assert(code == ll_cs_plan.PLAN_SUBEVENT_END or code == ll_cs_plan.PLAN_PROCEDURE_END)
+
+@test
+fn test_the_steps_of_a_run_follow_the_modes_and_the_channels_of_the_plan()
+    // Mode 2 steps with a mode 1 step inserted after two to four of them, three mode 0 steps at the start.
+    var c = t_cfg(2, 3)
+    t_main(var c, 2, 1, 2, 4, 0)
+    let p = t_pc(c, 0x0201)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 3000)
+    // The actuation error of the reflector on a channel is a function of the channel: the frequency offset the initiator measures in a
+    // mode 0 step shows which channel the radio used.
+    var far = sim_cs_far(air)
+    for ch in 0..79
+        sim_cs_fae(var far, ch, ch - 40)
+    let r = go(var air, p, 1000)
+    test.assert_eq(r.code, ll_cs_radio.CS_OK)
+    test.assert_eq(list.len(r.steps), p.n)
+    var modes = zeros(4)
+    for k in 0..p.n
+        let st = p.steps[k]
+        let x = r.steps[k]
+        let md = st.mode as Int
+        modes[md] = modes[md] + 1
+        test.assert(x.done)
+        if md == 0
+            test.assert(math.abs(dec_ffo(x.ffo as Int) - int.to_float((st.ch as Int) - 40) / 32.0) < 0.006)
+            test.assert(not x.toa_valid)
+            test.assert_eq(x.tones.len(), 0)
+        else if md == 1
+            test.assert(x.toa_valid and x.tod_valid)
+            test.assert_eq(x.ffo as Int, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+            test.assert_eq(x.tones.len(), 0)
+        else
+            test.assert_eq(x.tones.len(), 2)
+            test.assert(not x.toa_valid)
+            test.assert_eq(x.ffo as Int, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    test.assert_eq(modes[0], 3)
+    test.assert(modes[1] >= 1)
+    test.assert(modes[2] > 20)
+    // The channel of a tone step shows in the phase of the product: it is the same constant plus 4 pi f d / c on every channel.
+    let rr = sim_cs_peer_steps(air)
+    var ref = 0.0
+    var seen = 0
+    for k in 0..p.n
+        let st = p.steps[k]
+        if (st.mode as Int) == 2
+            let a = r.steps[k].tones[0]
+            let b = rr[k].tones[0]
+            let prod = wrap(tone_phase(a) + tone_phase(b) + 4.0 * math.pi * (2402.0 + int.to_float(st.ch as Int)) * 1.0e6 * 3.0 / int.to_float(C_MPS))
+            if seen == 0
+                ref = prod
+            test.assert(math.abs(wrap(prod - ref)) < 0.01)
+            seen = seen + 1
+    test.assert(seen > 20)
+
+// ── Tones: phase, amplitude, quality, antennas ──────────────────────
+
+// The distances of the estimator tests: 0.5 m to 20 m.
+fn t_dists() -> [Int]
+    [500, 1000, 2000, 3500, 5000, 10000, 20000]
+
+@test
+fn test_the_product_of_the_two_tones_of_a_channel_has_the_phase_of_the_round_trip()
+    let p = t_p(2, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 7300)
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    var ref = 0.0
+    var n = 0
+    for k in 0..p.n
+        let st = p.steps[k]
+        if (st.mode as Int) == 2
+            let a = r.steps[k].tones[0]
+            let b = rr[k].tones[0]
+            test.assert(a.present and b.present)
+            test.assert_eq(a.tq as Int, 0)
+            test.assert_eq(b.tq as Int, 0)
+            // -4 pi f d / c, up to one constant that the oscillators of the two devices leave.
+            let psi = wrap(tone_phase(a) + tone_phase(b) + 4.0 * math.pi * (2402.0 + int.to_float(st.ch as Int)) * 1.0e6 * 7.3 / int.to_float(C_MPS))
+            if n == 0
+                ref = psi
+            test.assert(math.abs(wrap(psi - ref)) < 0.005)
+            n = n + 1
+    test.assert_eq(n, 72)
+
+@test
+fn test_the_phase_estimate_recovers_the_distance_from_half_a_metre_to_twenty()
+    let p = t_p(2, 1)
+    let ds = t_dists()
+    for i in 0..list.len(ds)
+        var air = sim_cs_new()
+        sim_cs_dist(var air, ds[i])
+        let r = go(var air, p, 1000)
+        test.assert_eq(r.code, ll_cs_radio.CS_OK)
+        let e = t_est(air, r, p)
+        test.assert_eq(e.n_pbr, 72)
+        // The 12-bit values leave a phase error of 0.4 mrad on a tone; over the 72 MHz of the band that is under a millimetre.
+        test.assert(err_m(e.d_pbr, ds[i]) < 0.002)
+
+@test
+fn test_a_clock_offset_between_the_devices_does_not_move_the_phase_estimate()
+    let p = t_p(2, 3)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 6000)
+    var me = sim_cs_dev(air)
+    var far = sim_cs_far(air)
+    me.ppm = -31.0
+    far.ppm = 24.0
+    let r = go(var air, p, 1000)
+    let e = t_est(air, r, p)
+    test.assert(err_m(e.d_pbr, 6000) < 0.002)
+    // The initiator measured the offset and retuned by it: the Frequency_Compensation of the subevent is the offset, in 0.01 ppm.
+    test.assert_eq(dec_ffo(r.raw.ffo as Int), 55.0)
+    test.assert(math.abs(e.ffo - 55.0) < 0.01)
+    // Three mode 0 steps measured it, each the same.
+    var n0 = 0
+    for k in 0..p.n
+        if (p.steps[k].mode as Int) == 0
+            test.assert_eq(dec_ffo(r.steps[k].ffo as Int), 55.0)
+            n0 = n0 + 1
+    test.assert_eq(n0, 3)
+
+@test
+fn test_an_error_in_the_frequency_estimate_turns_the_initiators_tones_by_the_mismatch_over_the_time_between_the_tones()
+    let p = t_p(2, 1)
+    var base = sim_cs_new()
+    sim_cs_dist(var base, 4000)
+    let rb = go(var base, p, 1000)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 4000)
+    var me = sim_cs_dev(air)
+    me.ffo_err = 0.4
+    let r = go(var air, p, 1000)
+    let e = t_est(air, r, p)
+    // The mismatch of 0.4 ppm turns the phase by 2 pi f x 0.4 ppm x 35 microseconds (T_PM_CENTER_DELTA, 10 + 10 + 5 + 10): 0.21 rad at the
+    // lowest channel, 0.22 at the highest.
+    var n = 0
+    var lo = 10.0
+    var hi = 0.0
+    for k in 0..p.n
+        if (p.steps[k].mode as Int) == 2
+            let f = (2402.0 + int.to_float(p.steps[k].ch as Int)) * 1.0e6
+            let want = -2.0 * math.pi * f * 0.4e-6 * 35.0e-6
+            let got = wrap(tone_phase(r.steps[k].tones[0]) - tone_phase(rb.steps[k].tones[0]))
+            test.assert(math.abs(wrap(got - want)) < 0.003)
+            lo = math.min(lo, math.abs(want))
+            hi = math.max(hi, math.abs(want))
+            n = n + 1
+    test.assert_eq(n, 72)
+    test.assert(lo > 0.21 and lo < 0.215)
+    test.assert(hi > 0.215 and hi < 0.222)
+    // The offset is nearly the same on every channel, so the slope hardly moves: 3 millimetres here.
+    test.assert(err_m(e.d_pbr, 4000) < 0.01)
+    test.assert(err_m(e.d_pbr, 4000) > 0.0005)
+
+@test
+fn test_the_actuation_error_of_the_reflector_is_removed_when_the_initiator_knows_the_table_and_stays_when_it_does_not()
+    let p = t_p(2, 3)
+    var known = sim_cs_new()
+    var unknown = sim_cs_new()
+    sim_cs_dist(var known, 8000)
+    sim_cs_dist(var unknown, 8000)
+    for w in 0..2
+        var air = known
+        if w == 1
+            air = unknown
+        var far = sim_cs_far(air)
+        for ch in 0..79
+            sim_cs_fae(var far, ch, ((ch * 37) % 255) - 127)
+        far.ppm = 12.0
+        var me = sim_cs_dev(air)
+        me.ppm = -8.0
+    var far_u = sim_cs_far(unknown)
+    far_u.fae_known = false
+    var me_u = sim_cs_dev(unknown)
+    me_u.fae_known = false
+    let rk = go(var known, p, 1000)
+    let ru = go(var unknown, p, 1000)
+    let ek = t_est(known, rk, p)
+    let eu = t_est(unknown, ru, p)
+    // With the table, the offset the initiator applied is the true one (20 ppm); without it, the actuation error of the reflector on the
+    // first mode 0 channel stays in it.
+    test.assert(math.abs(dec_ffo(rk.raw.ffo as Int) - 20.0) < 0.01)
+    let ch0 = p.steps[0].ch as Int
+    let fae0 = int.to_float(((ch0 * 37) % 255) - 127) / 32.0
+    test.assert(math.abs(dec_ffo(ru.raw.ffo as Int) - (20.0 + fae0)) < 0.01)
+    test.assert(err_m(ek.d_pbr, 8000) < 0.002)
+    // What the estimator is told is the table either way: it removes the actuation error from the raw measurement.
+    test.assert(math.abs(ek.ffo - 20.0) < 0.01)
+    test.assert(math.abs(eu.ffo - 20.0) < 0.01)
+    // The mismatch of the unknown case turns the tones by a constant and by a small amount more from channel to channel.
+    test.assert(err_m(eu.d_pbr, 8000) < 0.05)
+
+@test
+fn test_the_phase_slope_through_adjacent_channels_gives_the_distance_too()
+    var c = t_cfg(2, 1)
+    t_chm(var c, 30, 49)
+    let p = t_pc(c, 0x0102)
+    test.assert_eq(p.n, 21)
+    let ds = [500, 2500, 9000, 20000]
+    for i in 0..4
+        var air = sim_cs_new()
+        sim_cs_dist(var air, ds[i])
+        let r = go(var air, p, 1000)
+        let pr = products(r.steps, sim_cs_peer_steps(air), p.steps, 1)
+        test.assert_eq(list.len(pr.f), 20)
+        test.assert(math.abs(est_slope(pr) - int.to_float(ds[i]) / 1000.0) < 0.005)
+        test.assert(err_m(est_pbr(pr).d_pbr, ds[i]) < 0.005)
+
+@test
+fn test_tones_are_12_bit_values_against_a_reference_power_level_that_is_constant_over_the_subevent()
+    let p = t_p(2, 1)
+    for i in 0..3
+        let mm = [1000, 4000, 15000][i]
+        var air = sim_cs_new()
+        sim_cs_dist(var air, mm)
+        let r = go(var air, p, 1000)
+        let rr = sim_cs_peer_steps(air)
+        let rpl_i = r.raw.rpl_dbm as Int
+        let rpl_r = sim_cs_peer_head(air).rpl_dbm as Int
+        // The level is one above the strongest tone a channel can give: about 1800 against 2047.
+        var amax = 0.0
+        for k in 0..p.n
+            if (p.steps[k].mode as Int) == 2
+                let a = r.steps[k].tones[0]
+                let b = rr[k].tones[0]
+                test.assert(a.i >= -2048 and a.i <= 2047 and a.q >= -2048 and a.q <= 2047)
+                // EQ 6 of Part H, Section 4.6: the power of the tone from its amplitude and the level.
+                let pa = 20.0 * math.log10(tone_amp(a) / 2048.0) + int.to_float(rpl_i)
+                let pb = 20.0 * math.log10(tone_amp(b) / 2048.0) + int.to_float(rpl_r)
+                let want = 0.0 - fspl_db(mm, 2402.0 + int.to_float(p.steps[k].ch as Int))
+                test.assert(math.abs(pa - want) < 0.1)
+                test.assert(math.abs(pb - want) < 0.1)
+                amax = math.max(amax, tone_amp(a))
+        test.assert(amax > 1000.0)
+        test.assert(amax < 2047.0)
+
+@test
+fn test_the_tone_quality_follows_the_carrier_to_noise_density_of_part_h()
+    let p = t_p(2, 1)
+    // At 5 m the tone is -54 dBm: 96 dB-Hz over -150 dBm/Hz, 75 over -129, 61 over -115.
+    let n0s = [-150.0, -129.0, -115.0]
+    for i in 0..3
+        var air = sim_cs_new()
+        sim_cs_dist(var air, 5000)
+        var me = sim_cs_dev(air)
+        var far = sim_cs_far(air)
+        me.n0 = n0s[i]
+        far.n0 = n0s[i]
+        // A receiver that still finds the access address at these levels.
+        me.aa_floor = -30.0
+        far.aa_floor = -30.0
+        let r = go(var air, p, 1000)
+        let rr = sim_cs_peer_steps(air)
+        for k in 0..p.n
+            if (p.steps[k].mode as Int) == 2
+                test.assert_eq(r.steps[k].tones[0].tq as Int, i)
+                test.assert_eq(rr[k].tones[0].tq as Int, i)
+    test.assert_eq(tone_quality(84.0), 0)
+    test.assert_eq(tone_quality(83.9), 1)
+    test.assert_eq(tone_quality(66.1), 1)
+    test.assert_eq(tone_quality(66.0), 2)
+
+@test
+fn test_a_tone_of_low_quality_is_left_out_of_the_estimate_and_the_estimate_still_holds()
+    let p = t_p(2, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 5000)
+    let r = go(var air, p, 1000)
+    // Mark a quarter of the products low quality, as a radio would when a channel is interfered with.
+    var rr = sim_cs_peer_steps(air)
+    var n_low = 0
+    var steps2: [CsStepRaw] = []
+    for k in 0..list.len(rr)
+        var x = rr[k]
+        if (p.steps[k].mode as Int) == 2 and k % 4 == 0
+            let t = CsTone { i: x.tones[0].i, q: x.tones[0].q, tq: 2, present: true }
+            x = CsStepRaw { done: x.done, aa_q: x.aa_q, bit_errors: x.bit_errors, rssi_dbm: x.rssi_dbm, ant: x.ant, toa_valid: x.toa_valid,
+                            tod_valid: x.tod_valid, ffo: x.ffo, pct1: x.pct1, pct2: x.pct2, toa_ps: x.toa_ps, tod_ps: x.tod_ps,
+                            tones: one_tone(t, CsTone { i: x.tones[1].i, q: x.tones[1].q, tq: 2, present: x.tones[1].present }) }
+            n_low = n_low + 1
+        list.push(steps2, x)
+    let e = est_pbr(products(r.steps, steps2, p.steps, 1))
+    test.assert_eq(e.n_pbr, 72 - n_low)
+    test.assert(err_m(e.d_pbr, 5000) < 0.002)
+
+fn one_tone(a: CsTone, b: CsTone) -> Vec[CsTone; 5]
+    var v: Vec[CsTone; 5] = Vec.new()
+    let _a = v.push(a)
+    let _b = v.push(b)
+    v
+
+@test
+fn test_the_signal_strength_and_the_access_address_quality_follow_the_distance_and_the_noise()
+    let p = t_p(1, 2)
+    // The signal strength of CS_SYNC is the transmit power less the path loss.
+    for i in 0..3
+        let mm = [1000, 5000, 20000][i]
+        var air = sim_cs_new()
+        sim_cs_dist(var air, mm)
+        let r = go(var air, p, 1000)
+        for k in 0..p.n
+            let want = 0.0 - fspl_db(mm, 2402.0 + int.to_float(p.steps[k].ch as Int))
+            test.assert(math.abs(int.to_float(r.steps[k].rssi_dbm as Int) - want) <= 0.51)
+            test.assert_eq(r.steps[k].aa_q as Int, 0)
+    // The noise that puts the signal to noise ratio of LE 1M at 8 dB (-54 dBm over -122 dBm/Hz less 60 dB-Hz) finds the address with errors,
+    // at 4 dB it finds none, at 16 dB it finds it clean.
+    let n0s = [-130.0, -122.0, -118.0]
+    let aas = [0, 1, 2]
+    for i in 0..3
+        var air = sim_cs_new()
+        sim_cs_dist(var air, 5000)
+        var me = sim_cs_dev(air)
+        var far = sim_cs_far(air)
+        me.n0 = n0s[i]
+        far.n0 = n0s[i]
+        let r = go(var air, p, 1000)
+        let rr = sim_cs_peer_steps(air)
+        for k in 0..p.n
+            test.assert_eq(r.steps[k].aa_q as Int, aas[i])
+            test.assert_eq(rr[k].aa_q as Int, aas[i])
+
+@test
+fn test_the_bit_errors_of_a_random_sequence_follow_the_signal_to_noise_ratio()
+    var c = t_cfg(1, 1)
+    t_set_rtt(var c, 1, 6)
+    let p = t_pc(c, 0x0102)
+    var clean = sim_cs_new()
+    sim_cs_dist(var clean, 5000)
+    let rc = go(var clean, p, 1000)
+    var noisy = sim_cs_new()
+    sim_cs_dist(var noisy, 5000)
+    var me = sim_cs_dev(noisy)
+    var far = sim_cs_far(noisy)
+    me.n0 = -122.0
+    far.n0 = -122.0
+    let rn = go(var noisy, p, 1000)
+    var e_clean = 0
+    var e_noisy = 0
+    var n1 = 0
+    for k in 0..p.n
+        if (p.steps[k].mode as Int) == 1
+            n1 = n1 + 1
+            e_clean = e_clean + (rc.steps[k].bit_errors as Int)
+            e_noisy = e_noisy + (rn.steps[k].bit_errors as Int)
+    test.assert_eq(e_clean, 0)
+    // 8 dB: the bit error ratio is 2 per cent, 3 errors of 128 bits for a step, the field holds 15 at most.
+    test.assert(n1 > 20)
+    test.assert_eq(e_noisy, n1 * 3)
+    // With the generator on, the count is a draw: the same seed gives the same count and another seed another one.
+    var a = sim_cs_new()
+    var b = sim_cs_new()
+    var c2 = sim_cs_new()
+    for w in 0..3
+        var air = a
+        if w == 1
+            air = b
+        if w == 2
+            air = c2
+        sim_cs_dist(var air, 5000)
+        var d0 = sim_cs_dev(air)
+        var d1 = sim_cs_far(air)
+        d0.n0 = -122.0
+        d1.n0 = -122.0
+    sim_cs_noise(var a, 7)
+    sim_cs_noise(var b, 7)
+    sim_cs_noise(var c2, 8)
+    let ra = go(var a, p, 1000)
+    let rb = go(var b, p, 1000)
+    let rc2 = go(var c2, p, 1000)
+    test.assert(steps_equal(ra.steps, rb.steps))
+    test.assert(not steps_equal(ra.steps, rc2.steps))
+
+@test
+fn test_a_sounding_sequence_gives_a_phase_correction_term_and_the_other_rtt_types_say_it_is_not_available()
+    var c = t_cfg(1, 1)
+    t_set_rtt(var c, 1, 1)
+    let ps = t_pc(c, 0x0102)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 6000)
+    let r = go(var air, ps, 1000)
+    let rr = sim_cs_peer_steps(air)
+    // Mode 1 steps hold a PCT at each end: I and Q of 12 bits in the low 24 bits, and the product has the phase of the round trip.
+    var pr = Products { f: [], re: [], im: [] }
+    for k in 0..ps.n
+        if (ps.steps[k].mode as Int) == 1
+            let a = r.steps[k].pct1 as Int
+            let b = rr[k].pct1 as Int
+            test.assert(a != 0xFFFFFFFF and b != 0xFFFFFFFF)
+            test.assert_eq(a >>> 24, 0)
+            test.assert_eq(r.steps[k].pct1 as Int, r.steps[k].pct2 as Int)
+            let ai = int.to_float(sext12(a & 0xFFF))
+            let aq = int.to_float(sext12((a >>> 12) & 0xFFF))
+            let bi = int.to_float(sext12(b & 0xFFF))
+            let bq = int.to_float(sext12((b >>> 12) & 0xFFF))
+            list.push(pr.f, (2402.0 + int.to_float(ps.steps[k].ch as Int)) * 1.0e6)
+            list.push(pr.re, ai * bi - aq * bq)
+            list.push(pr.im, ai * bq + aq * bi)
+        else
+            test.assert_eq(r.steps[k].pct1 as Int, 0xFFFFFFFF)
+    test.assert_eq(list.len(pr.f), ps.n - 1)
+    test.assert(ps.n > 40)
+    test.assert(err_m(est_pbr(pr).d_pbr, 6000) < 0.002)
+    // A radio that does not measure the sequence, and the other RTT types, report it as not available.
+    var off = sim_cs_new()
+    var d0 = sim_cs_dev(off)
+    d0.sounding = false
+    let ro = go(var off, ps, 1000)
+    test.assert_eq(ro.steps[1].pct1 as Int, 0xFFFFFFFF)
+    let p0 = t_p(1, 1)
+    var aa = sim_cs_new()
+    let ra = go(var aa, p0, 1000)
+    test.assert_eq(ra.steps[1].pct1 as Int, 0xFFFFFFFF)
+
+fn sext12(v: Int) -> Int
+    if v >= 2048
+        return v - 4096
+    v
+
+// ── Antennas, the tone extension slot, the initiator phase tone ─────
+
+@test
+fn test_the_permutation_of_a_step_maps_each_slot_to_its_antenna_path_and_the_extension_slot_repeats_the_last()
+    var c = t_cfg(2, 1)
+    t_set_aci(var c, 3)
+    t_chm(var c, 20, 60)
+    let p = t_pc(c, 0x0344)
+    test.assert_eq(p.head.n_ap as Int, 4)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 2500)
+    let phases = [0.0, 0.6, -1.1, 2.0]
+    let gains = [1.0, 0.5, 1.8, 0.7]
+    for i in 0..4
+        air.med.ap_phase[i] = phases[i]
+        air.med.ap_gain[i] = gains[i]
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    var perms_seen = zeros(24)
+    var ext_seen = 0
+    for k in 0..p.n
+        let st = p.steps[k]
+        if (st.mode as Int) == 2
+            let perm = st.perm as Int
+            perms_seen[perm] = 1
+            let base_ap = perm_path(4, perm, 0)
+            for s in 1..5
+                let ap = perm_path(4, perm, s)
+                let slot = rr[k].tones[s]
+                let first = rr[k].tones[0]
+                if slot.present
+                    // The phase of the slot against the first slot is the difference of the phases of their paths.
+                    test.assert(math.abs(wrap(tone_phase(slot) - tone_phase(first) - (phases[ap] - phases[base_ap]))) < 0.02)
+                    // The amplitude is the gain of the path.
+                    test.assert(math.abs(tone_amp(slot) / tone_amp(first) / (gains[ap] / gains[base_ap]) - 1.0) < 0.02)
+                    if s == 4
+                        ext_seen = ext_seen + 1
+                        test.assert(st.ext_i)
+                else if s == 4
+                    test.assert(not st.ext_i)
+                // The same permutation applies to the initiator's slots.
+                let islot = r.steps[k].tones[s]
+                if islot.present
+                    test.assert(math.abs(wrap(tone_phase(islot) - tone_phase(r.steps[k].tones[0]) - (phases[ap] - phases[base_ap]))) < 0.05)
+    // The step lists used several permutations, among the 24 of Table 4.15.
+    var distinct = 0
+    for q in 0..24
+        distinct = distinct + perms_seen[q]
+    test.assert(distinct >= 6)
+    test.assert(ext_seen > 5)
+    // Table 4.15 itself: the four permutations of Figure 4.12.
+    test.assert_eq(perm_code(4, 0), 1234)
+    test.assert_eq(perm_code(4, 15), 3142)
+    test.assert_eq(perm_code(4, 9), 4123)
+    test.assert_eq(perm_code(4, 5), 2314)
+    test.assert_eq(perm_code(3, 4), 321)
+    test.assert_eq(perm_code(2, 1), 21)
+    test.assert_eq(perm_path(4, 15, 4), 1)
+    test.assert_eq(perm_path(2, 1, 2), 0)
+    test.assert_eq(perm_path(1, 0, 1), 0)
+    // The estimate takes every path of every step and still finds the distance.
+    let e = est_pbr(products(r.steps, rr, p.steps, 4))
+    test.assert(err_m(e.d_pbr, 2500) < 0.005)
+
+@test
+fn test_a_slot_without_a_tone_is_an_empty_measurement_in_mode_3_and_a_measurement_of_noise_elsewhere()
+    // Mode 3 steps with the mandatory timings; the plan chooses the tone extension slots at random.
+    let p = t_pm(3, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 3000)
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    var n_ext_r = 0
+    var n_no_ext_r = 0
+    var n_ext_i = 0
+    var n_no_ext_i = 0
+    for k in 0..p.n
+        let st = p.steps[k]
+        if (st.mode as Int) == 3
+            let mine = r.steps[k].tones[1]
+            let theirs = rr[k].tones[1]
+            // Reflector to initiator: the initiator's measurement of the extension slot.
+            if st.ext_r
+                test.assert(mine.present)
+                test.assert_eq(mine.tq as Int, 0)
+                n_ext_r = n_ext_r + 1
+            else
+                test.assert(not mine.present)
+                test.assert_eq(mine.i as Int, 0)
+                test.assert_eq(mine.q as Int, 0)
+                test.assert_eq(mine.tq as Int, ll_cs_radio.CS_TONE_QUALITY_UNAVAILABLE)
+                n_no_ext_r = n_no_ext_r + 1
+            // Initiator to reflector: no tone means a measurement of the empty channel, with the quality low.
+            if st.ext_i
+                test.assert(theirs.present)
+                n_ext_i = n_ext_i + 1
+            else
+                test.assert(not theirs.present)
+                test.assert_eq(theirs.tq as Int, 2)
+                n_no_ext_i = n_no_ext_i + 1
+            // The path slot is there in every case.
+            test.assert(r.steps[k].tones[0].present)
+            test.assert_eq(r.steps[k].tones.len(), 2)
+    test.assert(n_ext_r > 0 and n_no_ext_r > 0 and n_ext_i > 0 and n_no_ext_i > 0)
+    // Mode 2: the same plan holds, and the initiator's measurement of an absent extension tone is a noise measurement too.
+    let p2 = t_pm(2, 1)
+    var air2 = sim_cs_new()
+    let r2 = go(var air2, p2, 1000)
+    var seen = 0
+    for k in 0..p2.n
+        let st = p2.steps[k]
+        if (st.mode as Int) == 2 and not st.ext_r
+            test.assert(not r2.steps[k].tones[1].present)
+            test.assert_eq(r2.steps[k].tones[1].tq as Int, 2)
+            seen = seen + 1
+    test.assert(seen > 0)
+
+@test
+fn test_with_the_initiator_phase_tone_the_reflector_reports_a_real_value_and_the_initiator_the_whole_round_trip()
+    let p = t_p(2, 1)
+    let pi = p_head(p, h_edit(p.head, 1, 0, 1, 10, true))
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 4200)
+    let r = go(var air, pi, 1000)
+    let rr = sim_cs_peer_steps(air)
+    var ref = 0.0
+    var n = 0
+    for k in 0..p.n
+        if (p.steps[k].mode as Int) == 2
+            let b = rr[k].tones[0]
+            test.assert_eq(b.q as Int, 0)
+            test.assert(b.i > 0)
+            // The initiator's own value carries -4 pi f d / c without the product.
+            let psi = wrap(tone_phase(r.steps[k].tones[0]) + 4.0 * math.pi * (2402.0 + int.to_float(p.steps[k].ch as Int)) * 1.0e6 * 4.2 / int.to_float(C_MPS))
+            if n == 0
+                ref = psi
+            test.assert(math.abs(wrap(psi - ref)) < 0.005)
+            n = n + 1
+    test.assert_eq(n, 72)
+    let e = est_pbr(products(r.steps, rr, p.steps, 1))
+    test.assert(err_m(e.d_pbr, 4200) < 0.002)
+    // A radio that does not report the phase tone refuses the plan.
+    var basic = sim_cs_new()
+    sim_cs_caps(var basic, cs_caps_basic())
+    test.assert_eq(arm_head(var basic, h_edit(p.head, 1, 0, 1, 145, true), 1000), ll_cs_radio.CS_UNSUPPORTED)
+
+@test
+fn test_noise_on_the_tones_and_the_frequency_estimate_moves_the_values_and_the_estimate_stays_within_the_noise()
+    let p = t_p(2, 3)
+    var quiet = sim_cs_new()
+    sim_cs_dist(var quiet, 8000)
+    let rq = go(var quiet, p, 1000)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 8000)
+    sim_cs_noise(var air, 3)
+    // At -54 dBm over -145 dBm/Hz the tone is 85 dB-Hz: 41 dB over the 25 kHz of a 40 microsecond window, a phase error of a few mrad.
+    var me = sim_cs_dev(air)
+    var far = sim_cs_far(air)
+    me.n0 = -145.0
+    far.n0 = -145.0
+    let r = go(var air, p, 1000)
+    test.assert(not steps_equal(r.steps, rq.steps))
+    let e = t_est(air, r, p)
+    test.assert(err_m(e.d_pbr, 8000) < 0.02)
+    // The frequency estimate of each mode 0 step is the true offset (zero) with an error of a few hundredths of a ppm.
+    var spread = 0.0
+    for k in 0..3
+        let f = dec_ffo(r.steps[k].ffo as Int)
+        spread = math.max(spread, math.abs(f))
+    test.assert(spread > 0.0)
+    test.assert(spread < 0.15)
+    // The noise measured in an empty slot has a size: a few LSB at the level the tones have.
+    var big = 0
+    for k in 0..p.n
+        let t = r.steps[k]
+        if (p.steps[k].mode as Int) == 2 and t.tones.len() == 2 and not t.tones[1].present
+            big = big + math.max(math.abs_int(t.tones[1].i as Int), math.abs_int(t.tones[1].q as Int))
+    test.assert(big > 0)
+
+// ── Round-trip time ─────────────────────────────────────────────────
+
+// The subevent of an initiator on `phy` with the mandatory timings, `n0` mode 0 steps and steps of mode `main`.
+fn t_pphy(main: Int, n0: Int, phy: Int) -> PlanBuf
+    var c = ll_cs_plan.cfg_new()
+    t_main(var c, main, 0, 1, 1, 0)
+    t_reps(var c, 1, n0)
+    t_set_rtt(var c, phy, 0)
+    t_pc(c, 0x0102)
+
+fn cal_shift(c: CsCal, tx: Int, rx: Int) -> CsCal
+    CsCal { tx_1m_ps: c.tx_1m_ps + tx,
+        tx_2m_ps: c.tx_2m_ps + tx,
+        tx_2bt_ps: c.tx_2bt_ps + tx,
+        rx_1m_ps: c.rx_1m_ps + rx,
+        rx_2m_ps: c.rx_2m_ps + rx,
+        rx_2bt_ps: c.rx_2bt_ps + rx,
+        tone_ps: c.tone_ps,
+        distance_offset_cm: c.distance_offset_cm }
+
+@test
+fn test_the_nominal_offsets_of_part_h_stand_between_the_arrival_and_the_departure_of_the_answer()
+    // LE 2M, access address only, the mandatory timings: T_SY is 26 microseconds, so the interval between the two starts is
+    // T_SY + T_RD + T_IP1 = 26 + 5 + 145 = 176 microseconds in mode 1 and, with N_AP 1, 316 or 356 in mode 3 (Part H, 4.3.2 and 4.3.4).
+    let p1 = t_pphy(1, 1, 2)
+    test.assert_eq(center_delta_ps(p1.head, 1, false), 176_000_000)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 6000)
+    let r = go(var air, p1, 1000)
+    let rr = sim_cs_peer_steps(air)
+    let one_way = ps_of_mm(6000)
+    test.assert_eq(one_way, 20_014)
+    for k in 1..p1.n
+        // The initiator's departure is the plan's start, its arrival the reflector's departure and the flight back.
+        test.assert_eq(r.steps[k].tod_ps, (p1.steps[k].start_ns as Int) * 1000)
+        test.assert_eq(r.steps[k].toa_ps - r.steps[k].tod_ps, 2 * one_way + 176_000_000)
+        test.assert_eq(rr[k].tod_ps - rr[k].toa_ps, 176_000_000)
+        test.assert(r.steps[k].toa_valid and r.steps[k].tod_valid and rr[k].toa_valid and rr[k].tod_valid)
+    let p3 = t_pphy(3, 1, 2)
+    test.assert_eq(center_delta_ps(p3.head, 3, true), 356_000_000)
+    test.assert_eq(center_delta_ps(p3.head, 3, false), 316_000_000)
+    var air3 = sim_cs_new()
+    sim_cs_dist(var air3, 6000)
+    let r3 = go(var air3, p3, 1000)
+    let rr3 = sim_cs_peer_steps(air3)
+    var with_ext = 0
+    var without = 0
+    for k in 1..p3.n
+        if p3.steps[k].ext_r
+            test.assert_eq(rr3[k].tod_ps - rr3[k].toa_ps, 356_000_000)
+            with_ext = with_ext + 1
+        else
+            test.assert_eq(rr3[k].tod_ps - rr3[k].toa_ps, 316_000_000)
+            without = without + 1
+        test.assert_eq(r3.steps[k].toa_ps - r3.steps[k].tod_ps - (rr3[k].tod_ps - rr3[k].toa_ps), 2 * one_way)
+    test.assert(with_ext > 0 and without > 0)
+
+@test
+fn test_the_round_trip_estimate_recovers_the_distance_from_half_a_metre_to_twenty_in_mode_1_and_mode_3()
+    let ds = t_dists()
+    for m in 0..2
+        let main = [1, 3][m]
+        let p = t_p(main, 1)
+        for i in 0..list.len(ds)
+            var air = sim_cs_new()
+            sim_cs_dist(var air, ds[i])
+            let r = go(var air, p, 1000)
+            let e = t_est(air, r, p)
+            test.assert(e.n_rtt > 30)
+            test.assert(err_m(e.d_rtt, ds[i]) < 0.005)
+            if main == 3
+                test.assert(err_m(e.d_pbr, ds[i]) < 0.005)
+
+@test
+fn test_the_delays_to_the_antenna_port_are_removed_with_the_calibration_and_a_wrong_calibration_shows()
+    let p = t_p(1, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 5000)
+    var me = sim_cs_dev(air)
+    var far = sim_cs_far(air)
+    sim_cs_delays(var me, 1500, 2200)
+    sim_cs_delays(var far, 900, 1700)
+    let r = go(var air, p, 1000)
+    // The time stamps hold the delays: the departure is early by the transmit delay, the arrival late by the receive delay.
+    test.assert_eq(r.steps[1].tod_ps, (p.steps[1].start_ns as Int) * 1000 - 1500)
+    let e = t_est(air, r, p)
+    test.assert(err_m(e.d_rtt, 5000) < 0.005)
+    // A calibration that is 1 nanosecond too long on the receive side of the initiator shortens the distance by c / 2 nanoseconds.
+    me.cal = cal_shift(me.cal, 0, 1000)
+    let e2 = t_est(air, r, p)
+    test.assert(math.abs(e2.d_rtt - (5.0 - 0.1499)) < 0.003)
+    // The delay of the reflector counts the other way.
+    me.cal = cal_shift(me.cal, 0, -1000)
+    far.cal = cal_shift(far.cal, -1000, 0)
+    let e3 = t_est(air, r, p)
+    test.assert(math.abs(e3.d_rtt - (5.0 + 0.1499)) < 0.003)
+
+@test
+fn test_the_offset_of_the_reflector_clock_is_removed_from_the_turnaround_with_the_frequency_offset_the_initiator_measured()
+    let p = t_p(1, 3)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 9000)
+    var me = sim_cs_dev(air)
+    var far = sim_cs_far(air)
+    me.ppm = -30.0
+    far.ppm = 40.0
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    let e = t_est(air, r, p)
+    test.assert(math.abs(e.ffo - 70.0) < 0.01)
+    test.assert(err_m(e.d_rtt, 9000) < 0.005)
+    // Without the correction, 70 ppm of the 59 microseconds between the two starts (T_SY 44, T_RD 5, T_IP1 10) is 4 ns: 62 cm.
+    let e0 = est_rtt(r.steps, rr, p.steps, p.head, me.cal, far.cal, 0.0)
+    test.assert(math.abs((9.0 - e0.d_rtt) - 0.619) < 0.005)
+    // The reflector's difference is in its own clock: the nominal interval, whatever its offset.
+    test.assert_eq(rr[3].tod_ps - rr[3].toa_ps, 59_000_000)
+
+@test
+fn test_the_actuation_error_of_the_reflector_changes_the_scale_of_the_round_trip_and_the_table_removes_it()
+    let p = t_p(1, 3)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 9000)
+    var far = sim_cs_far(air)
+    for ch in 0..79
+        sim_cs_fae(var far, ch, 120)
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    let me = sim_cs_dev(air)
+    // The measurement holds the error: 3.75 ppm on every channel.
+    test.assert(math.abs(dec_ffo(r.steps[0].ffo as Int) - 3.75) < 0.01)
+    let e = t_est(air, r, p)
+    test.assert(math.abs(e.ffo) < 0.01)
+    test.assert(err_m(e.d_rtt, 9000) < 0.005)
+    let raw_ffo = est_ffo(r.steps, p.steps, zeros(79))
+    test.assert(math.abs(raw_ffo - 3.75) < 0.01)
+    let e2 = est_rtt(r.steps, rr, p.steps, p.head, me.cal, far.cal, raw_ffo)
+    // 3.75 ppm of 59 microseconds is 221 ps, 3.3 cm.
+    test.assert(math.abs(e2.d_rtt - 9.0 - 0.0331) < 0.003)
+
+@test
+fn test_time_stamps_are_rounded_to_a_tick_and_a_noisy_clock_averages_out_over_the_steps()
+    let p = t_p(1, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 5500)
+    var me = sim_cs_dev(air)
+    var far = sim_cs_far(air)
+    me.tick_ps = 1000
+    far.tick_ps = 1000
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    for k in 1..p.n
+        test.assert_eq(r.steps[k].tod_ps % 1000, 0)
+        test.assert_eq(r.steps[k].toa_ps % 1000, 0)
+        test.assert_eq(rr[k].tod_ps % 1000, 0)
+    // Every step has the same fraction of a tick, so the rounding does not average out; it stays under the tick.
+    let e = t_est(air, r, p)
+    test.assert(err_m(e.d_rtt, 5500) < 0.15)
+    // With an error on the stamps as large as the tick the rounding is dithered and the mean falls toward the distance.
+    var noisy = sim_cs_new()
+    sim_cs_dist(var noisy, 5500)
+    sim_cs_noise(var noisy, 11)
+    var nm = sim_cs_dev(noisy)
+    var nf = sim_cs_far(noisy)
+    nm.tick_ps = 1000
+    nf.tick_ps = 1000
+    nm.sigma_ps = 800
+    nf.sigma_ps = 800
+    let rn = go(var noisy, p, 1000)
+    let en = t_est(noisy, rn, p)
+    test.assert(err_m(en.d_rtt, 5500) < 0.06)
+    // The same seed repeats the run, another seed gives another.
+    var again = sim_cs_new()
+    sim_cs_dist(var again, 5500)
+    sim_cs_noise(var again, 11)
+    var am = sim_cs_dev(again)
+    var af = sim_cs_far(again)
+    am.tick_ps = 1000
+    af.tick_ps = 1000
+    am.sigma_ps = 800
+    af.sigma_ps = 800
+    let ra = go(var again, p, 1000)
+    test.assert(steps_equal(rn.steps, ra.steps))
+    var other = sim_cs_new()
+    sim_cs_dist(var other, 5500)
+    sim_cs_noise(var other, 12)
+    var om = sim_cs_dev(other)
+    var of = sim_cs_far(other)
+    om.tick_ps = 1000
+    of.tick_ps = 1000
+    om.sigma_ps = 800
+    of.sigma_ps = 800
+    let ro = go(var other, p, 1000)
+    test.assert(not steps_equal(rn.steps, ro.steps))
+
+@test
+fn test_a_run_does_not_touch_the_generator_of_the_plan_and_the_noise_does_not_depend_on_it()
+    // Two generators of one key; the subevents of the first are run on a radio that draws noise, the second is only planned.
+    var cc1 = ll_ccm.soft_cipher_new()
+    var cc2 = ll_ccm.soft_cipher_new()
+    var g1 = ll_cs_plan.gen_new()
+    var g2 = ll_cs_plan.gen_new()
+    t_key(var cc1, var g1, 0x0777)
+    t_key(var cc2, var g2, 0x0777)
+    var c1 = ll_cs_plan.cfg_new()
+    var c2 = ll_cs_plan.cfg_new()
+    var air = sim_cs_new()
+    sim_cs_noise(var air, 99)
+    var t = 5000
+    for n in 0..3
+        let a = t_plan(var cc1, var g1, var c1, 0, n * 5_000_000)
+        let b = t_plan(var cc2, var g2, var c2, 0, n * 5_000_000)
+        test.assert_eq(a.n, b.n)
+        for k in 0..a.n
+            test.assert_eq(a.steps[k].ch as Int, b.steps[k].ch as Int)
+            test.assert_eq(a.steps[k].aa_i as Int, b.steps[k].aa_i as Int)
+            test.assert_eq(a.steps[k].aa_r as Int, b.steps[k].aa_r as Int)
+            test.assert_eq(a.steps[k].perm as Int, b.steps[k].perm as Int)
+            test.assert_eq(a.steps[k].start_ns as Int, b.steps[k].start_ns as Int)
+        let r = go(var air, a, t)
+        test.assert_eq(r.code, ll_cs_radio.CS_OK)
+        t = air.now_us + 500
+    // The noise generator of the radio is not the generator of the plan: with the noise off, the seed changes nothing.
+    var quiet1 = sim_cs_new()
+    var quiet2 = sim_cs_new()
+    quiet2.med.rng = rng_new(12345)
+    let pa = t_p(2, 1)
+    let q1 = go(var quiet1, pa, 1000)
+    let q2 = go(var quiet2, pa, 1000)
+    test.assert(steps_equal(q1.steps, q2.steps))
+
+// ── Faults ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_wrong_access_address_is_found_with_errors_or_not_found_and_the_step_leaves_the_estimate()
+    let p = t_p(1, 3)
+    var base = sim_cs_new()
+    sim_cs_dist(var base, 4000)
+    let rb = go(var base, p, 1000)
+    let eb = t_est(base, rb, p)
+    test.assert_eq(eb.n_rtt, p.n - 3)
+    // One wrong bit: the address is found with errors (1), the time stamps are taken but the step is not a clean one.
+    var one = sim_cs_new()
+    sim_cs_dist(var one, 4000)
+    sim_cs_fault(var one, F_BAD_AA, 10, 0, 0x01)
+    let r1 = go(var one, p, 1000)
+    test.assert_eq(r1.steps[10].aa_q as Int, 1)
+    test.assert(r1.steps[10].toa_valid)
+    test.assert_eq(r1.steps[9].aa_q as Int, 0)
+    test.assert_eq(t_est(one, r1, p).n_rtt, p.n - 4)
+    // Eight wrong bits: not found, no arrival time.
+    var many = sim_cs_new()
+    sim_cs_dist(var many, 4000)
+    sim_cs_fault(var many, F_BAD_AA, 10, 0, 0xFF)
+    let r8 = go(var many, p, 1000)
+    test.assert_eq(r8.steps[10].aa_q as Int, 2)
+    test.assert(not r8.steps[10].toa_valid)
+    test.assert(r8.steps[10].tod_valid)
+    test.assert_eq(t_est(many, r8, p).n_rtt, p.n - 4)
+    test.assert(err_m(t_est(many, r8, p).d_rtt, 4000) < 0.005)
+    // On the reflector's side, in a mode 0 step: the reflector finds the address with errors and answers all the same.
+    var refl = sim_cs_new()
+    sim_cs_dist(var refl, 4000)
+    sim_cs_fault(var refl, F_BAD_AA, 1, 1, 0x03)
+    let rf = go(var refl, p, 1000)
+    test.assert_eq(sim_cs_peer_steps(refl)[1].aa_q as Int, 1)
+    test.assert_eq(rf.steps[1].aa_q as Int, 0)
+    // An address of the wrong step of the plan, as the generators out of step would give, is not found.
+    var wrong = sim_cs_new()
+    sim_cs_dist(var wrong, 4000)
+    sim_cs_fault(var wrong, F_BAD_AA, -1, 0, 0xA5A5A5A5)
+    let rw = go(var wrong, p, 1000)
+    test.assert_eq(rw.steps[3].aa_q as Int, 2)
+    test.assert_eq(rw.raw.abort as Int, ABORT_NO_SYNC)
+
+@test
+fn test_a_missed_mode_0_step_is_a_step_without_a_frequency_offset_and_a_subevent_without_any_is_lost()
+    let p = t_p(2, 3)
+    // The reflector misses the first mode 0 step: it does not answer, the initiator hears nothing, the subevent goes on.
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 4000)
+    sim_cs_fault(var air, F_MISS_SYNC, 0, 1, 0)
+    let r = go(var air, p, 1000)
+    test.assert_eq(r.code, ll_cs_radio.CS_OK)
+    test.assert_eq(r.steps[0].aa_q as Int, 2)
+    test.assert_eq(r.steps[0].ffo as Int, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    test.assert_eq(r.steps[1].aa_q as Int, 0)
+    test.assert(r.steps[1].ffo as Int != ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    test.assert_eq(r.raw.n_done as Int, p.n)
+    let e = t_est(air, r, p)
+    test.assert(err_m(e.d_pbr, 4000) < 0.002)
+    // The reflector takes its time reference from the first mode 0 step it heard: the second.
+    test.assert_eq(sim_cs_peer_head(air).t_ref_us, 1000 + ((p.steps[1].start_ns as Int) * 1000 + ps_of_mm(4000)) / 1_000_000)
+    // All three missed at the reflector: both sides lose the subevent, the initiator after the mode 0 steps it sent.
+    var lost = sim_cs_new()
+    sim_cs_dist(var lost, 4000)
+    sim_cs_fault(var lost, F_MISS_SYNC, -1, 1, 0)
+    let rl = go(var lost, p, 1000)
+    test.assert_eq(rl.code, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(rl.raw.status as Int, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(rl.raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(rl.raw.n_done as Int, 3)
+    test.assert_eq(rl.raw.ffo as Int, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    test.assert(rl.steps[2].done)
+    test.assert(not rl.steps[3].done)
+    test.assert_eq(sim_cs_peer_head(lost).abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(sim_cs_peer_head(lost).n_done as Int, 3)
+    // The initiator misses what the reflector sent in every mode 0 step: the initiator loses, the reflector goes on with nobody there.
+    var deaf = sim_cs_new()
+    sim_cs_dist(var deaf, 4000)
+    sim_cs_fault(var deaf, F_MISS_SYNC, -1, 0, 0)
+    let rd = go(var deaf, p, 1000)
+    test.assert_eq(rd.raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(rd.raw.n_done as Int, 3)
+    test.assert_eq(sim_cs_peer_head(deaf).abort as Int, 0)
+    test.assert_eq(sim_cs_peer_head(deaf).n_done as Int, p.n)
+    // Without the initiator's tones the reflector measures noise in the steps after the mode 0 steps.
+    test.assert(not sim_cs_peer_steps(deaf)[5].tones[0].present)
+
+@test
+fn test_a_missing_tone_is_a_noise_measurement_and_a_shifted_time_stamp_moves_the_mean_by_its_share()
+    let p = t_p(2, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 5000)
+    sim_cs_fault(var air, F_NO_TONE, 7, 0, 0)
+    sim_cs_fault(var air, F_NO_TONE, 8, 0, -1)
+    sim_cs_fault(var air, F_NO_TONE, 9, 1, 0)
+    let r = go(var air, p, 1000)
+    let rr = sim_cs_peer_steps(air)
+    test.assert(not r.steps[7].tones[0].present)
+    test.assert_eq(r.steps[7].tones[0].tq as Int, 2)
+    test.assert(not r.steps[8].tones[0].present)
+    test.assert(not r.steps[8].tones[1].present)
+    test.assert(r.steps[9].tones[0].present)
+    test.assert(not rr[9].tones[0].present)
+    test.assert(rr[7].tones[0].present)
+    let e = t_est(air, r, p)
+    test.assert_eq(e.n_pbr, 72 - 3)
+    test.assert(err_m(e.d_pbr, 5000) < 0.002)
+    // A time stamp moved by 3 ns: the one step's difference is 3 ns long, so the mean over the steps moves by a share of it.
+    let q = t_p(1, 1)
+    var base = sim_cs_new()
+    sim_cs_dist(var base, 5000)
+    let rb = go(var base, q, 1000)
+    let eb = t_est(base, rb, q)
+    var shifted = sim_cs_new()
+    sim_cs_dist(var shifted, 5000)
+    sim_cs_fault(var shifted, F_SHIFT, 12, 0, 3000)
+    let rs = go(var shifted, q, 1000)
+    test.assert_eq(rs.steps[12].toa_ps - rb.steps[12].toa_ps, 3000)
+    test.assert_eq(rs.steps[11].toa_ps - rb.steps[11].toa_ps, 0)
+    let es = t_est(shifted, rs, q)
+    test.assert_eq(es.n_rtt, eb.n_rtt)
+    test.assert(math.abs((es.d_rtt - eb.d_rtt) - 0.45 / int.to_float(eb.n_rtt)) < 0.0005)
+
+@test
+fn test_a_device_that_stops_leaves_the_steps_after_it_undone_and_its_peer_hears_nothing_more()
+    let p = t_p(2, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 5000)
+    sim_cs_fault(var air, F_ABORT, 40, 0, ABORT_SCHEDULING)
+    let r = go(var air, p, 1000)
+    test.assert_eq(r.code, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(r.raw.status as Int, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(r.raw.abort as Int, ABORT_SCHEDULING)
+    test.assert_eq(r.raw.n_done as Int, 40)
+    test.assert_eq(list.len(r.steps), p.n)
+    test.assert(r.steps[39].done)
+    test.assert(not r.steps[40].done)
+    test.assert_eq(r.steps[40].aa_q as Int, 2)
+    test.assert_eq(r.steps[40].tones.len(), 0)
+    // The reflector goes on to the end and measures noise where the initiator should have sent.
+    let rr = sim_cs_peer_steps(air)
+    test.assert_eq(sim_cs_peer_head(air).abort as Int, 0)
+    test.assert_eq(sim_cs_peer_head(air).n_done as Int, p.n)
+    test.assert(rr[39].tones[0].present)
+    test.assert(not rr[40].tones[0].present)
+    // A stop in the reflector: the initiator hears no tone from there on.
+    var refl = sim_cs_new()
+    sim_cs_dist(var refl, 5000)
+    sim_cs_fault(var refl, F_ABORT, 30, 1, 0xF)
+    let r2 = go(var refl, p, 1000)
+    test.assert_eq(r2.raw.abort as Int, 0)
+    test.assert(r2.steps[29].tones[0].present)
+    test.assert(not r2.steps[30].tones[0].present)
+    test.assert_eq(sim_cs_peer_head(refl).abort as Int, 0xF)
+    test.assert_eq(sim_cs_peer_head(refl).n_done as Int, 30)
+
+@test
+fn test_a_peer_given_to_the_radio_answers_with_the_steps_it_was_given()
+    let p = t_p(2, 1)
+    var air = sim_cs_new()
+    sim_cs_dist(var air, 5000)
+    var half: [CsStep] = []
+    for k in 0..30
+        list.push(half, p.steps[k])
+    sim_cs_peer(var air, plan_with_role(p.head, 1), half)
+    let r = go(var air, p, 1000)
+    test.assert_eq(r.code, ll_cs_radio.CS_OK)
+    // The initiator ran every step; the peer answered the first 30.
+    test.assert_eq(r.raw.n_done as Int, p.n)
+    test.assert(r.steps[29].tones[0].present)
+    test.assert(not r.steps[30].tones[0].present)
+    test.assert(sim_cs_peer_steps(air)[29].done)
+    test.assert(not sim_cs_peer_steps(air)[30].done)
+    test.assert_eq(sim_cs_peer_head(air).n_done as Int, 30)
+    // A peer that is not the turned plan of the radio can also be a different antenna configuration or timing; the head is its own.
+    let hp = h_edit(plan_with_role(p.head, 1), 1, 0, 1, 10, true)
+    var air2 = sim_cs_new()
+    sim_cs_dist(var air2, 5000)
+    sim_cs_peer(var air2, hp, p.steps)
+    let r2 = go(var air2, p, 1000)
+    test.assert_eq(sim_cs_peer_steps(air2)[5].tones[0].q as Int, 0)
+    test.assert_eq(r2.code, ll_cs_radio.CS_OK)
+
+// ── Two radios on one medium (S1) ───────────────────────────────────
+
+// The two sides of a pair run.
+struct PairRead
+    var a: SideRead
+    var b: SideRead
+
+// Arm and load both radios, run them in the given order and read both; the answers are those of the first call that failed, or of the run.
+fn pair_go<S: CsRadio[s]>(var a: S, var b: S, pa: PlanBuf, pb: PlanBuf, t0_a: Int, t0_b: Int, b_first: Bool) -> PairRead [s]
+    var ra = ll_cs_radio.cs_raw_new()
+    var rb = ll_cs_radio.cs_raw_new()
+    var xa = arm_load(var a, pa, t0_a)
+    var xb = arm_load(var b, pb, t0_b)
+    if b_first
+        if xb == ll_cs_radio.CS_OK
+            xb = b.cs_run(var rb)
+        if xa == ll_cs_radio.CS_OK
+            xa = a.cs_run(var ra)
+    else
+        if xa == ll_cs_radio.CS_OK
+            xa = a.cs_run(var ra)
+        if xb == ll_cs_radio.CS_OK
+            xb = b.cs_run(var rb)
+    PairRead { a: side_read(var a, pa.n, xa, ra), b: side_read(var b, pb.n, xb, rb) }
+
+fn heads_equal(x: CsRaw, y: CsRaw) -> Bool
+    x.status == y.status and x.n_done == y.n_done and x.abort == y.abort and x.ffo == y.ffo and x.rpl_dbm == y.rpl_dbm
+        and x.t_ref_us == y.t_ref_us
+
+// The estimators on a pair: `ini` read the initiator's result and `rfl` the reflector's.
+fn t_est_pair(ini: SideRead, rfl: SideRead, p: PlanBuf, cal_i: CsCal, cal_r: CsCal, fae_r: [Int]) -> Est
+    var e = est_pbr(products(ini.steps, rfl.steps, p.steps, p.head.n_ap as Int))
+    let ffo = est_ffo(ini.steps, p.steps, fae_r)
+    let rt = est_rtt(ini.steps, rfl.steps, p.steps, p.head, cal_i, cal_r, ffo)
+    e.d_rtt = rt.d_rtt
+    e.n_rtt = rt.n_rtt
+    e.ffo = ffo
+    e
+
+// A pair in the state of the S0 radio `air`: the same distance, the same figures for the two devices.
+fn t_pair_like() -> SimCs
+    var a = sim_cs_new()
+    sim_cs_dist(var a, 6200)
+    var d0 = sim_cs_dev(a)
+    var d1 = sim_cs_far(a)
+    d0.ppm = 13.0
+    d1.ppm = -22.0
+    sim_cs_delays(var d0, 1200, 2100)
+    sim_cs_delays(var d1, 800, 1900)
+    for ch in 0..79
+        sim_cs_fae(var d1, ch, (ch % 9) - 4)
+    a.med.ap_phase[0] = 0.3
+    a
+
+@test
+fn test_each_radio_of_a_pair_returns_its_own_side_and_the_pair_agrees_with_the_analytic_run()
+    let p = t_p(3, 3)
+    let pa = p
+    let pb = t_role(p, 1)
+    // S0: one radio, the peer filled in.
+    var s0 = t_pair_like()
+    let r0 = go(var s0, pa, 1000)
+    let peer0 = sim_cs_peer_steps(s0)
+    let peer_head0 = sim_cs_peer_head(s0)
+    // S1: two radios, each runs its own plan.
+    var a = t_pair_like()
+    var b = sim_cs_other(var a)
+    let pr = pair_go(var a, var b, pa, pb, 1000, 1000, false)
+    test.assert_eq(pr.a.code, ll_cs_radio.CS_OK)
+    test.assert_eq(pr.b.code, ll_cs_radio.CS_OK)
+    test.assert(steps_equal(pr.a.steps, r0.steps))
+    test.assert(steps_equal(pr.b.steps, peer0))
+    test.assert(heads_equal(pr.a.raw, r0.raw))
+    test.assert(heads_equal(pr.b.raw, peer_head0))
+    // The two sides are not the same data: the initiator holds the frequency offset, the reflector never does.
+    test.assert(pr.a.steps[0].ffo as Int != ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    test.assert_eq(pr.b.steps[0].ffo as Int, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    test.assert_eq(pr.b.raw.ffo as Int, ll_cs_radio.CS_FREQ_UNAVAILABLE)
+    // The order of the runs does not matter.
+    var a2 = t_pair_like()
+    var b2 = sim_cs_other(var a2)
+    let pr2 = pair_go(var a2, var b2, pa, pb, 1000, 1000, true)
+    test.assert(steps_equal(pr2.a.steps, pr.a.steps))
+    test.assert(steps_equal(pr2.b.steps, pr.b.steps))
+    // Each radio reports its own time: the pair ran the same subevent.
+    test.assert_eq(a.now_us, b.now_us)
+    // The results agree with the geometry.
+    let e = t_est_pair(pr.a, pr.b, p, sim_cs_dev(a).cal, sim_cs_dev(b).cal, sim_cs_dev(b).fae_tab)
+    test.assert(err_m(e.d_pbr, 6200) < 0.005)
+    test.assert(err_m(e.d_rtt, 6200) < 0.005)
+
+@test
+fn test_a_pair_recovers_the_distance_with_the_roles_either_way_round_and_across_the_range()
+    let p = t_p(3, 2)
+    let ds = t_dists()
+    for i in 0..list.len(ds)
+        for w in 0..2
+            var a = sim_cs_new()
+            var b = sim_cs_other(var a)
+            sim_cs_dist(var a, ds[i])
+            var d0 = sim_cs_dev(a)
+            var d1 = sim_cs_far(a)
+            d0.ppm = 8.0
+            d1.ppm = -17.0
+            if w == 0
+                // The first radio is the initiator.
+                let pr = pair_go(var a, var b, p, t_role(p, 1), 1000, 1000, false)
+                let e = t_est_pair(pr.a, pr.b, p, d0.cal, d1.cal, d1.fae_tab)
+                test.assert(err_m(e.d_pbr, ds[i]) < 0.005)
+                test.assert(err_m(e.d_rtt, ds[i]) < 0.005)
+                test.assert(math.abs(e.ffo - (-25.0)) < 0.01)
+            else
+                // The second one is, and the first reflects.
+                let pr = pair_go(var a, var b, t_role(p, 1), p, 1000, 1000, true)
+                let e = t_est_pair(pr.b, pr.a, p, d1.cal, d0.cal, d0.fae_tab)
+                test.assert(err_m(e.d_pbr, ds[i]) < 0.005)
+                test.assert(err_m(e.d_rtt, ds[i]) < 0.005)
+                test.assert(math.abs(e.ffo - 25.0) < 0.01)
+
+@test
+fn test_a_radio_run_alone_hears_nothing_and_loses_the_subevent()
+    let p = t_p(2, 2)
+    var a = sim_cs_new()
+    var b = sim_cs_other(var a)
+    sim_cs_dist(var a, 3000)
+    // The initiator sends its mode 0 steps and gets no answer.
+    var raw = ll_cs_radio.cs_raw_new()
+    test.assert_eq(run_plan(var a, p, 1000, var raw), ll_cs_radio.CS_ABORTED)
+    test.assert_eq(raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(raw.n_done as Int, 2)
+    var s0 = ll_cs_radio.cs_step_raw_none()
+    test.assert(a.cs_step_raw(0, var s0))
+    test.assert(s0.done)
+    test.assert_eq(s0.aa_q as Int, 2)
+    var s5 = ll_cs_radio.cs_step_raw_none()
+    test.assert(a.cs_step_raw(5, var s5))
+    test.assert(not s5.done)
+    // The reflector listens in its mode 0 steps and hears nobody.
+    var raw2 = ll_cs_radio.cs_raw_new()
+    test.assert_eq(run_plan(var b, t_role(p, 1), 1000, var raw2), ll_cs_radio.CS_ABORTED)
+    test.assert_eq(raw2.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(raw2.n_done as Int, 2)
+    // Two initiators do not hear one another either.
+    var c = sim_cs_new()
+    var d = sim_cs_other(var c)
+    let pr = pair_go(var c, var d, p, p, 1000, 1000, false)
+    test.assert_eq(pr.a.raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(pr.b.raw.abort as Int, ABORT_NO_SYNC)
+
+@test
+fn test_a_reflector_that_starts_late_misses_the_early_steps_and_a_window_takes_them_back()
+    let p = t_p(2, 3)
+    let pb = t_role(p, 1)
+    let late = (p.steps[1].start_ns as Int) / 1000 - 50
+    test.assert(late > 100)
+    // Late by more than the first step's start, less than the second's: the first mode 0 step is lost, the others go on.
+    var a = sim_cs_new()
+    var b = sim_cs_other(var a)
+    sim_cs_dist(var a, 3000)
+    let pr = pair_go(var a, var b, p, pb, 1000, 1000 + late, false)
+    test.assert_eq(pr.a.code, ll_cs_radio.CS_OK)
+    test.assert_eq(pr.a.steps[0].aa_q as Int, 2)
+    test.assert_eq(pr.a.steps[1].aa_q as Int, 0)
+    test.assert_eq(pr.b.steps[0].aa_q as Int, 2)
+    test.assert_eq(pr.a.raw.abort as Int, 0)
+    test.assert_eq(pr.b.raw.abort as Int, 0)
+    // The reflector took its reference from the second step.
+    test.assert_eq(pr.b.raw.t_ref_us, 1000 + late + ((p.steps[1].start_ns as Int) * 1000 + ps_of_mm(3000)) / 1_000_000)
+    // Late by a whole subevent: every mode 0 step is lost, on both sides.
+    var c = sim_cs_new()
+    var d = sim_cs_other(var c)
+    sim_cs_dist(var c, 3000)
+    let pr2 = pair_go(var c, var d, p, pb, 1000, 6000, false)
+    test.assert_eq(pr2.a.raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(pr2.b.raw.abort as Int, ABORT_NO_SYNC)
+    // A window on the reflector's head that covers the lateness brings the steps back.
+    var e = sim_cs_new()
+    var f = sim_cs_other(var e)
+    sim_cs_dist(var e, 3000)
+    let pr3 = pair_go(var e, var f, p, p_head(pb, h_window(pb.head, 6000)), 1000, 6000, false)
+    test.assert_eq(pr3.a.raw.abort as Int, 0)
+    test.assert_eq(pr3.b.raw.abort as Int, 0)
+
+@test
+fn test_a_mode_0_exchange_lost_on_either_side_costs_that_side_the_subevent()
+    let p = t_p(2, 2)
+    let pb = t_role(p, 1)
+    // The second radio, the reflector, misses both mode 0 steps: both lose the subevent.
+    var a = sim_cs_new()
+    var b = sim_cs_other(var a)
+    sim_cs_dist(var a, 3000)
+    sim_cs_fault(var a, F_MISS_SYNC, -1, 1, 0)
+    let pr = pair_go(var a, var b, p, pb, 1000, 1000, false)
+    test.assert_eq(pr.a.code, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(pr.b.code, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(pr.a.raw.n_done as Int, 2)
+    test.assert_eq(pr.b.raw.n_done as Int, 2)
+    // The first radio, the initiator, misses the answers: the initiator loses, the reflector runs to the end.
+    var c = sim_cs_new()
+    var d = sim_cs_other(var c)
+    sim_cs_dist(var c, 3000)
+    sim_cs_fault(var c, F_MISS_SYNC, -1, 0, 0)
+    let pr2 = pair_go(var c, var d, p, pb, 1000, 1000, false)
+    test.assert_eq(pr2.a.code, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(pr2.b.code, ll_cs_radio.CS_OK)
+    test.assert_eq(pr2.b.raw.n_done as Int, p.n)
+    // One mode 0 step of two is enough on both sides: the reflector misses the first, so there is no answer to it, and the second goes
+    // through.
+    var e = sim_cs_new()
+    var f = sim_cs_other(var e)
+    sim_cs_dist(var e, 3000)
+    sim_cs_fault(var e, F_MISS_SYNC, 0, 1, 0)
+    let pr3 = pair_go(var e, var f, p, pb, 1000, 1000, false)
+    test.assert_eq(pr3.a.code, ll_cs_radio.CS_OK)
+    test.assert_eq(pr3.b.code, ll_cs_radio.CS_OK)
+    test.assert_eq(pr3.a.steps[0].aa_q as Int, 2)
+    test.assert_eq(pr3.a.steps[1].aa_q as Int, 0)
+    test.assert_eq(pr3.b.steps[0].aa_q as Int, 2)
+    test.assert_eq(pr3.b.steps[1].aa_q as Int, 0)
+    // When the two misses are in different steps the exchange is lost on one side only: the reflector heard the first step, answered it
+    // and the initiator missed the answer; the reflector missed the second step, so there was no answer to hear.
+    var g = sim_cs_new()
+    var h = sim_cs_other(var g)
+    sim_cs_dist(var g, 3000)
+    sim_cs_fault(var g, F_MISS_SYNC, 0, 0, 0)
+    sim_cs_fault(var g, F_MISS_SYNC, 1, 1, 0)
+    let pr4 = pair_go(var g, var h, p, pb, 1000, 1000, false)
+    test.assert_eq(pr4.a.code, ll_cs_radio.CS_ABORTED)
+    test.assert_eq(pr4.b.code, ll_cs_radio.CS_OK)
+    test.assert_eq(pr4.b.steps[0].aa_q as Int, 0)
+    test.assert_eq(pr4.b.steps[1].aa_q as Int, 2)
+
+@test
+fn test_two_devices_whose_plans_differ_find_no_access_address_and_lose_the_subevent()
+    // The key of one device differs from the other's, as after a missed Security Start: the access addresses are not the ones expected.
+    var cca = ll_ccm.soft_cipher_new()
+    var ccb = ll_ccm.soft_cipher_new()
+    var ga = ll_cs_plan.gen_new()
+    var gb = ll_cs_plan.gen_new()
+    t_key(var cca, var ga, 0x0BAD)
+    t_key(var ccb, var gb, 0x0BAE)
+    var c = t_cfg(2, 2)
+    let pa = t_plan(var cca, var ga, var c, 0, 0)
+    let pb = t_plan(var ccb, var gb, var c, 1, 0)
+    var diff = 0
+    for k in 0..pa.n
+        if pa.steps[k].aa_i != pb.steps[k].aa_i
+            diff = diff + 1
+    test.assert(diff > 0)
+    var a = sim_cs_new()
+    var b = sim_cs_other(var a)
+    let pr = pair_go(var a, var b, pa, pb, 1000, 1000, false)
+    test.assert_eq(pr.a.raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(pr.b.raw.abort as Int, ABORT_NO_SYNC)
+    test.assert_eq(pr.a.steps[0].aa_q as Int, 2)
+    test.assert_eq(pr.b.steps[0].aa_q as Int, 2)
+
+fn plans_equal(a: PlanBuf, b: PlanBuf) -> Bool
+    if a.n != b.n
+        return false
+    for k in 0..a.n
+        let x = a.steps[k]
+        let y = b.steps[k]
+        if x.mode != y.mode or x.ch != y.ch or x.aa_i != y.aa_i or x.aa_r != y.aa_r or x.perm != y.perm or x.ext_i != y.ext_i
+            return false
+        if x.ext_r != y.ext_r or x.start_ns != y.start_ns or x.seq_bits != y.seq_bits
+            return false
+    true
+
+@test
+fn test_the_generators_of_two_devices_stay_in_step_over_three_procedures_with_a_missed_subevent()
+    var cca = ll_ccm.soft_cipher_new()
+    var ccb = ll_ccm.soft_cipher_new()
+    var ccc = ll_ccm.soft_cipher_new()
+    var ga = ll_cs_plan.gen_new()
+    var gb = ll_cs_plan.gen_new()
+    var gc = ll_cs_plan.gen_new()
+    t_key(var cca, var ga, 0x0AAA)
+    t_key(var ccb, var gb, 0x0AAA)
+    t_key(var ccc, var gc, 0x0AAA)
+    // 14 channels in subevents of 5 ms: a procedure of two or three subevents.
+    var c = ll_cs_plan.cfg_new()
+    t_chm(var c, 20, 33)
+    var a = sim_cs_new()
+    var b = sim_cs_other(var a)
+    sim_cs_dist(var a, 4100)
+    var t = 1000
+    var runs = 0
+    var skipped = 0
+    var third_in_step = zeros(3)
+    var third_off = zeros(3)
+    for proc in 0..3
+        if proc > 0
+            test.assert(ll_cs_plan.gen_begin_procedure(var cca, var ga))
+            test.assert(ll_cs_plan.gen_begin_procedure(var ccb, var gb))
+            test.assert(ll_cs_plan.gen_begin_procedure(var ccc, var gc))
+        var sub = 0
+        var anchor = 0
+        for _ in 0..6
+            if ga.done
+                break
+            let pa = t_plan(var cca, var ga, var c, 0, anchor)
+            let pb = t_plan(var ccb, var gb, var c, 1, anchor)
+            test.assert(plans_equal(pa, pb))
+            // The device whose radio missed the first subevent of the second procedure still planned it.
+            let missed = proc == 1 and sub == 0
+            if missed
+                skipped = skipped + 1
+            else
+                let pc = t_plan(var ccc, var gc, var c, 0, anchor)
+                if plans_equal(pa, pc)
+                    third_in_step[proc] = third_in_step[proc] + 1
+                else
+                    third_off[proc] = third_off[proc] + 1
+                let pr = pair_go(var a, var b, pa, pb, t, t, false)
+                test.assert_eq(pr.a.code, ll_cs_radio.CS_OK)
+                test.assert_eq(pr.b.code, ll_cs_radio.CS_OK)
+                test.assert_eq(pr.a.raw.abort as Int, 0)
+                runs = runs + 1
+                // At least three channels of tones in the subevent: the distance is there in the results of both devices.
+                let e = t_est_pair(pr.a, pr.b, pa, sim_cs_dev(a).cal, sim_cs_dev(b).cal, sim_cs_dev(b).fae_tab)
+                if e.n_pbr >= 3
+                    test.assert(err_m(e.d_pbr, 4100) < 0.005)
+                test.assert(err_m(e.d_rtt, 4100) < 0.005 or e.n_rtt == 0)
+                t = a.now_us + 500
+            sub = sub + 1
+            anchor = anchor + 5_000_000
+    test.assert_eq(skipped, 1)
+    test.assert(runs >= 5)
+    // The generator that did not plan the subevent it missed is out of step from there on within the procedure, and in step again with
+    // the next procedure; before the miss and in the procedure without one it matches.
+    test.assert(third_in_step[0] >= 2)
+    test.assert_eq(third_off[0], 0)
+    test.assert(third_off[1] >= 1)
+    test.assert(third_in_step[2] >= 2)
+    test.assert_eq(third_off[2], 0)
