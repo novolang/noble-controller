@@ -288,6 +288,9 @@ const DLE_RX_OCTETS = 251
 const DLE_RX_TIME = 2120
 const DLE_TIME_UNCODED_PEER = 2128
 
+// The words of the record of the length PDUs (`dl_rec`), two for each of five kinds.
+const DLE_REC_WORDS = 10
+
 // The queues of PDUs.  An LL Control PDU waits in a slot of `ctrl_slot()`
 // octets, the header and at most 38 of CtrData (LL_CIS_REQ has 35); in a build with Channel Sounding the slot is 76 octets, which holds
 // LL_CS_FAE_RSP, 75 octets with its header.  The Host gets `ACL_SLOTS` buffers,
@@ -368,7 +371,18 @@ const CATCH_UP_MAX = 64
 // Host was last told.  `dl_wait` says an LL_LENGTH_REQ of this end is out (since `dl_t0`),
 // `dl_unsup` that the peer answered with LL_UNKNOWN_RSP, `dl_started` that the request a
 // new connection makes by itself went out, and `dl_resend` that the values changed while a
-// request was out, so another follows.  `txq_off` is the octets of the packet at the head of
+// request was out, so another follows.  The record of the control PDUs that touched the data
+// length state (`dle_note`) holds the newest of five kinds in `dl_rec`, two words each: 0 an
+// LL_LENGTH_REQ queued by this end, 1 one heard, 2 an LL_LENGTH_RSP queued, 3 one heard, 4 a
+// refusal of LL_LENGTH_REQ heard.  The first word is MaxRxOctets, MaxRxTime, the connection
+// event (`ev_count`, 16 bits) and the outcome code in 16-bit fields from the least significant,
+// the second MaxTxOctets and MaxTxTime; for a refusal the first field is the opcode of the PDU
+// (LL_UNKNOWN_RSP, LL_REJECT_IND or LL_REJECT_EXT_IND) and the second its reject code.  The
+// outcome of a length PDU is 0 when its values were taken, 1 when they were out of range, 2 when
+// it answered no request of this end and 3 when the queue had no room for it.  `dl_last` is the
+// kind written last (-1 before any), `dl_n_req_tx`, `dl_n_req_rx`, `dl_n_rsp_tx` and
+// `dl_n_rsp_rx` count the length PDUs queued and heard, `dl_n_refused` the refusals and `dl_n_full`
+// the PDUs the queue had no room for.  `txq_off` is the octets of the packet at the head of
 // the ACL queue already sent in earlier fragments.
 //
 // The PHY ([Vol 6] Part B, Section 5.1.10): `phy` is the PHY in force, in both directions,
@@ -542,6 +556,14 @@ struct Link
     dl_unsup: Bool
     dl_started: Bool
     dl_resend: Bool
+    dl_n_req_tx: Int
+    dl_n_req_rx: Int
+    dl_n_rsp_tx: Int
+    dl_n_rsp_rx: Int
+    dl_n_refused: Int
+    dl_n_full: Int
+    dl_rec: Vec[Int; 10]
+    dl_last: Int
     phy: Int
     phy_opt: Int
     txp: [i8; 4]
@@ -613,6 +635,8 @@ fn link_new() -> Link
         dl_rem_tx_octets: 0, dl_rem_tx_time: 0, dl_rem_rx_octets: 0, dl_rem_rx_time: 0,
         dl_ev_tx_octets: 0, dl_ev_tx_time: 0, dl_ev_rx_octets: 0, dl_ev_rx_time: 0,
         dl_wait: false, dl_t0: 0, dl_unsup: false, dl_started: false, dl_resend: false,
+        dl_n_req_tx: 0, dl_n_req_rx: 0, dl_n_rsp_tx: 0, dl_n_rsp_rx: 0, dl_n_refused: 0, dl_n_full: 0,
+        dl_rec: Vec.new(), dl_last: -1,
         phy: 1, phy_opt: 0, txp: [0, 0, 0, 0], phy_pref_tx: 0, phy_pref_rx: 0, phy_pref_set: false,
         phy_state: PHY_IDLE, phy_t0: 0, phy_off: 0, phy_pending: false, phy_instant: 0,
         phy_new: 0, phy_host: false, phy_status: 0, phy_unsup: false, phy_auto: false, enc_wait: false,
@@ -620,6 +644,8 @@ fn link_new() -> Link
         host_sub: false, sub_factor: 1, sub_res: 0, sub_cont: 0, sub_left: 0, sub_busy: false, sub_gap: 1, sub_tr: false, sub_nf: 1, sub_nres: 0,
         sub_ncont: 0, sub_nlat: 0, sub_nto: 0, sub_owed: false, sub_host: false, sub_status: 0,
         fx: (ctl_limits.page1_bits() & 0xFFFF) << FX_LOCAL }
+    for _ in 0..DLE_REC_WORDS
+        let _w = l.dl_rec.push(0)
     link_reset_data(var l)
     for _ in 0..6
         let _u = l.peer_rpa.push(0)
@@ -668,6 +694,15 @@ fn link_reset_data(var l: Link)
     l.dl_unsup = false
     l.dl_started = true
     l.dl_resend = false
+    l.dl_n_req_tx = 0
+    l.dl_n_req_rx = 0
+    l.dl_n_rsp_tx = 0
+    l.dl_n_rsp_rx = 0
+    l.dl_n_refused = 0
+    l.dl_n_full = 0
+    l.dl_last = -1
+    for i in 0..DLE_REC_WORDS
+        l.dl_rec[i] = 0
     l.phy = ll_phy.PHY_1M
     l.phy_opt = ll_phy.OPT_NONE
     l.phy_pref_tx = PHYS_SUPPORTED
@@ -1677,7 +1712,7 @@ fn ctrl_unknown_received(var l: Link, var rx: Pdu)
     let op = ll_data.dpdu_byte(var rx, 1)
     enc_unknown(var l, op)
     if op == ll_data.OP_LENGTH_REQ
-        dle_refused(var l, true)
+        dle_refused(var l, true, ll_data.OP_UNKNOWN_RSP, 0)
     else if op == ll_data.OP_PHY_REQ
         phy_refused(var l, true, 0)
     if l.proc == PROC_FEATURES and op == features_request_opcode(var l)
@@ -1710,7 +1745,7 @@ fn ctrl_reject_received(var l: Link, var rx: Pdu)
         enc_rejected(var l, ll_data.dpdu_byte(var rx, 1))
         param_rejected(var l, ll_data.dpdu_byte(var rx, 1))
         phy_rejected(var l, ll_data.dpdu_byte(var rx, 1))
-        dle_refused(var l, false)
+        dle_refused(var l, false, ll_data.OP_REJECT_IND, ll_data.dpdu_byte(var rx, 1))
     else if ll_data.dpdu_byte(var rx, 1) == ll_data.OP_ENC_REQ
         enc_rejected(var l, ll_data.dpdu_byte(var rx, 2))
     else if ctl_limits.feat_on() and ll_data.dpdu_byte(var rx, 1) == ll_data.OP_FEATURE_EXT_REQ
@@ -1724,7 +1759,7 @@ fn ctrl_reject_received(var l: Link, var rx: Pdu)
     else if ll_data.dpdu_byte(var rx, 1) == ll_data.OP_PHY_REQ
         phy_rejected(var l, ll_data.dpdu_byte(var rx, 2))
     else if ll_data.dpdu_byte(var rx, 1) == ll_data.OP_LENGTH_REQ
-        dle_refused(var l, false)
+        dle_refused(var l, false, ll_data.OP_REJECT_EXT_IND, ll_data.dpdu_byte(var rx, 2))
 
 // Refuse the PDU with opcode `rejected` for `code`: with LL_REJECT_EXT_IND, or
 // with LL_REJECT_IND to a peer known to lack Extended Reject Indication
@@ -2899,6 +2934,36 @@ fn dle_wire_time(var l: Link, t: Int) -> Int
         return t
     ll_phy.lesser(t, DLE_TIME_UNCODED_PEER)
 
+// Record a control PDU of the kind `kind` (see `dl_rec`) with the four values `a` to `d` and the
+// outcome `code`.
+@tier(embedded)
+fn dle_note(var l: Link, kind: Int, a: Int, b: Int, c: Int, d: Int, code: Int)
+    l.dl_rec[2 * kind] = (a & 0xFFFF) | ((b & 0xFFFF) << 16) | ((l.ev_count & 0xFFFF) << 32) | ((code & 0xFFFF) << 48)
+    l.dl_rec[2 * kind + 1] = (c & 0xFFFF) | ((d & 0xFFFF) << 16)
+    l.dl_last = kind
+
+// One field of the record of kind `kind`: 0 the connection event, 1 to 4 the values a to d, 5 the code.
+@tier(embedded)
+pub fn dle_rec_field(var l: Link, kind: Int, field: Int) -> Int
+    let w0 = l.dl_rec[2 * kind]
+    let w1 = l.dl_rec[2 * kind + 1]
+    match field
+        0 => (w0 >>> 32) & 0xFFFF
+        1 => w0 & 0xFFFF
+        2 => (w0 >>> 16) & 0xFFFF
+        3 => w1 & 0xFFFF
+        4 => (w1 >>> 16) & 0xFFFF
+        _ => (w0 >>> 48) & 0xFFFF
+
+// Record the length PDU in `rx` that has just arrived, with the outcome `code`.
+@tier(embedded)
+fn dle_note_rx(var l: Link, var rx: Pdu, code: Int)
+    var kind = 1
+    if ll_data.dpdu_opcode(var rx) == ll_data.OP_LENGTH_RSP
+        kind = 3
+    dle_note(var l, kind, ll_data.dpdu_u16(var rx, 1), ll_data.dpdu_u16(var rx, 3),
+        ll_data.dpdu_u16(var rx, 5), ll_data.dpdu_u16(var rx, 7), code)
+
 // Queue LL_LENGTH_REQ (`rsp` false) or LL_LENGTH_RSP with this end's four values.  False
 // when the queue is full.
 @tier(embedded)
@@ -2906,13 +2971,24 @@ fn dle_queue(var l: Link, rsp: Bool) -> Bool
     var op = ll_data.OP_LENGTH_REQ
     if rsp
         op = ll_data.OP_LENGTH_RSP
-    ll_data.ctrl_length(var l.tmp,
-        op,
-        l.dl_rx_octets,
-        dle_wire_time(var l, l.dl_rx_time),
-        l.dl_tx_octets,
-        dle_wire_time(var l, l.dl_tx_time))
-    ctrl_queue(var l, var l.tmp)
+    let t_rx = dle_wire_time(var l, l.dl_rx_time)
+    let t_tx = dle_wire_time(var l, l.dl_tx_time)
+    ll_data.ctrl_length(var l.tmp, op, l.dl_rx_octets, t_rx, l.dl_tx_octets, t_tx)
+    let ok = ctrl_queue(var l, var l.tmp)
+    var code = 0
+    if ok
+        if rsp
+            l.dl_n_rsp_tx = l.dl_n_rsp_tx + 1
+        else
+            l.dl_n_req_tx = l.dl_n_req_tx + 1
+    else
+        l.dl_n_full = l.dl_n_full + 1
+        code = 3
+    var kind = 0
+    if rsp
+        kind = 2
+    dle_note(var l, kind, l.dl_rx_octets, t_rx, l.dl_tx_octets, t_tx, code)
+    ok
 
 // Start the Data Length Update procedure: LL_LENGTH_REQ goes to the peer unless one is
 // out already, in which case another follows its answer (the values changed under it).
@@ -2955,12 +3031,15 @@ fn dle_take(var l: Link, var rx: Pdu)
 @satisfies("REQ-BLE-CTL-040")
 @tier(embedded)
 fn ctrl_length_request(var l: Link, var rx: Pdu)
+    l.dl_n_req_rx = l.dl_n_req_rx + 1
     if not dle_values_ok(ll_data.dpdu_u16(var rx, 1),
         ll_data.dpdu_u16(var rx, 3),
         ll_data.dpdu_u16(var rx, 5),
         ll_data.dpdu_u16(var rx, 7))
+        dle_note_rx(var l, var rx, 1)
         send_reject(var l, ll_data.OP_LENGTH_REQ, CODE_INVALID_LL_PARAMETERS)
         return
+    dle_note_rx(var l, var rx, 0)
     dle_take(var l, var rx)
     let _q = dle_queue(var l, true)
 
@@ -2969,22 +3048,31 @@ fn ctrl_length_request(var l: Link, var rx: Pdu)
 @satisfies("REQ-BLE-CTL-040")
 @tier(embedded)
 fn ctrl_length_response(var l: Link, var rx: Pdu)
+    l.dl_n_rsp_rx = l.dl_n_rsp_rx + 1
     if not l.dl_wait
+        dle_note_rx(var l, var rx, 2)
         return
     if dle_values_ok(ll_data.dpdu_u16(var rx, 1),
         ll_data.dpdu_u16(var rx, 3),
         ll_data.dpdu_u16(var rx, 5),
         ll_data.dpdu_u16(var rx, 7))
+        dle_note_rx(var l, var rx, 0)
         dle_take(var l, var rx)
+    else
+        dle_note_rx(var l, var rx, 1)
     l.dl_wait = false
     if l.dl_resend
         l.dl_resend = false
         dle_start(var l)
 
 // The refusal of LL_LENGTH_REQ, by LL_UNKNOWN_RSP (`unknown`) or LL_REJECT_EXT_IND, ends the
-// procedure: the peer keeps its 27 octets.
+// procedure: the peer keeps its 27 octets.  `op` is the opcode of the refusal and `code` its
+// reject code (0 for LL_UNKNOWN_RSP), which the record keeps; an LL_REJECT_IND names no
+// procedure, so one that answers another procedure is recorded here too.
 @tier(embedded)
-fn dle_refused(var l: Link, unknown: Bool)
+fn dle_refused(var l: Link, unknown: Bool, op: Int, code: Int)
+    l.dl_n_refused = l.dl_n_refused + 1
+    dle_note(var l, 4, op, code, 0, 0, 0)
     l.dl_wait = false
     l.dl_resend = false
     if unknown

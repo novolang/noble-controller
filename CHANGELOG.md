@@ -6,6 +6,8 @@ consumer deciding whether to upgrade can read.
 
 ## Unreleased
 
+The Link Layer keeps a record of the control PDUs of the Data Length Update procedure (`ll_link.dle_note`, `dle_rec_field`): the newest LL_LENGTH_REQ and LL_LENGTH_RSP this end queued and the newest it heard, each with the connection event, the four values and an outcome code (taken, out of range, answered no request, queue full), the newest refusal with its opcode and reject code, the kind written last, and five counters.  The record is 10 words, 6 counters and the kind written last in each `Link` (3,144 to 3,288 octets in the build report of the rig image) and is read through the image's status line (`ll dle`).  No behaviour changes.
+
 `ll_cs_plan.sync_ns` takes the length of a CS_SYNC packet from `ll_cs_radio.cs_sync_bits` and `cs_sync_bit_ns`.  The figures do not change (44 microseconds on LE 1M and 26 on LE 2M and LE 2M 2BT for an access address alone).  The profile `ctl_cs` turns `ctl_cs_mode3` and `ctl_cs_rtt_seq` on, so the Controller's tests of mode 3, of the sounding and random sequences and of LE 2M run under it; a radio that does not report them still cuts them out of the capabilities.
 
 `ll_cs_plan.gen_new`, `gen_instantiate_test`, `gen_begin_procedure`, `plan_new`, `plan_subevent` and `plan_arm` are public, so that a

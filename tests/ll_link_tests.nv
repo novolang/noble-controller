@@ -12,7 +12,7 @@ use ll_sub
 use ll_rate
 use ll_fs
 use ll_feat
-use ll_link.{ AUTO_PHY_EVENTS, CATCH_UP_MAX, CODE_BUSY, CODE_COLLISION, CODE_DIFFERENT_COLLISION, CODE_INVALID_LL_PARAMETERS, CTRL_SLOTS, ENC_C_PAUSE_WAIT_RSP, ENC_IDLE, ENC_NEED_RANDOM, ENC_P_WAIT_LTK, ENC_P_WAIT_START_RSP, EV_APTO, EV_COMPLETED, EV_CONNECTED, EV_DATA_LENGTH, EV_DISCONNECTED, EV_FEATEXT, EV_FEATURES, EV_PARAM_REQUEST, EV_PHY, EV_SUBRATE, EV_UPDATED, EV_VERSION, FEAT1_2M, FEAT1_CODED, FEAT3_PAST, FEATURES_OCTET0, FEATURES_OCTET2, FX_HAVE, FX_LOCAL, FX_PEER, FX_RATE, FX_RATEEV, INSTANT_LEAD, INSTANT_SLACK, K_ACL, K_ACL_PART, K_CTRL, K_EMPTY, LL_COMPANY, LL_SUBVERSION, LL_VERSION, Link, PHYS_SUPPORTED, PHY_DEFERRED, PHY_IDLE, PHY_RESPONDED, PHY_WAIT_IND, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, PROC_PARAM, PROC_PING, PROC_VERSION, REASON_FAILED_TO_ESTABLISH, REASON_INSTANT_PASSED, REASON_LOCAL_HOST, REASON_RESPONSE_TIMEOUT, REASON_TIMEOUT, REASON_UNSUPPORTED_PARAMETER, RX_NOTHING, RX_TO_HOST, STATUS_COMMAND_DISALLOWED, STATUS_INVALID_PARAMETERS, STATUS_SUCCESS, STATUS_UNKNOWN_CONNECTION, STATUS_UNSUPPORTED_FEATURE, STATUS_UNSUPPORTED_REMOTE, anchor_offset, auto_tasks, chan_next, connect_request, connect_valid, csa2_channel, csa2_permute, csa2_prn, ctrl_queue, ctrl_rx, dle_refresh, dle_start, dle_wire_time, eff_rx_octets, eff_rx_time, eff_tx_octets, eff_tx_time, enc_begin, features_request_opcode, first_offset, fs_peer_lacks, fx_get, fx_put, interval_us, link_answers_bad, link_auth_rx, link_book_us, link_catch_up, link_close, link_connection_update, link_disconnect, link_ended, link_event_begin, link_event_done, link_event_late, link_first_header, link_host_range, link_is_central, link_listen_end, link_listen_start, link_live, link_new, link_note_rx, link_open, link_open_central, link_owes, link_param_negative, link_param_reply, link_prepare, link_queue_acl, link_read_features, link_read_version, link_released, link_request_min_used, link_reset, link_rx_bad, link_rx_fast, link_rx_slow, link_sent, link_set_apto, link_set_auth, link_set_data_length, link_set_defaults, link_set_host_map, link_set_host_rate, link_set_indicate, link_set_phy, link_set_room, link_start_encryption, link_take_completed, nth_used, pad_map, params_valid, peer_has_phy, phy_begin, phy_best, phy_wanted, pick_interval, popcount, rate_central_start, rate_fetch, rate_fetch_over, rate_host, rate_peer_ok, reverse_octet, sca_ppm, slot_get_cq, sub_can_start, sub_set, tx_limit, wanted_map, widening }
+use ll_link.{ AUTO_PHY_EVENTS, CATCH_UP_MAX, CODE_BUSY, CODE_COLLISION, CODE_DIFFERENT_COLLISION, CODE_INVALID_LL_PARAMETERS, CTRL_SLOTS, ENC_C_PAUSE_WAIT_RSP, ENC_IDLE, ENC_NEED_RANDOM, ENC_P_WAIT_LTK, ENC_P_WAIT_START_RSP, EV_APTO, EV_COMPLETED, EV_CONNECTED, EV_DATA_LENGTH, EV_DISCONNECTED, EV_FEATEXT, EV_FEATURES, EV_PARAM_REQUEST, EV_PHY, EV_SUBRATE, EV_UPDATED, EV_VERSION, FEAT1_2M, FEAT1_CODED, FEAT3_PAST, FEATURES_OCTET0, FEATURES_OCTET2, FX_HAVE, FX_LOCAL, FX_PEER, FX_RATE, FX_RATEEV, INSTANT_LEAD, INSTANT_SLACK, K_ACL, K_ACL_PART, K_CTRL, K_EMPTY, LL_COMPANY, LL_SUBVERSION, LL_VERSION, Link, PHYS_SUPPORTED, PHY_DEFERRED, PHY_IDLE, PHY_RESPONDED, PHY_WAIT_IND, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, PROC_PARAM, PROC_PING, PROC_VERSION, REASON_FAILED_TO_ESTABLISH, REASON_INSTANT_PASSED, REASON_LOCAL_HOST, REASON_RESPONSE_TIMEOUT, REASON_TIMEOUT, REASON_UNSUPPORTED_PARAMETER, RX_NOTHING, RX_TO_HOST, STATUS_COMMAND_DISALLOWED, STATUS_INVALID_PARAMETERS, STATUS_SUCCESS, STATUS_UNKNOWN_CONNECTION, STATUS_UNSUPPORTED_FEATURE, STATUS_UNSUPPORTED_REMOTE, anchor_offset, auto_tasks, chan_next, connect_request, connect_valid, csa2_channel, csa2_permute, csa2_prn, ctrl_queue, ctrl_rx, dle_refresh, dle_rec_field, dle_start, dle_wire_time, eff_rx_octets, eff_rx_time, eff_tx_octets, eff_tx_time, enc_begin, features_request_opcode, first_offset, fs_peer_lacks, fx_get, fx_put, interval_us, link_answers_bad, link_auth_rx, link_book_us, link_catch_up, link_close, link_connection_update, link_disconnect, link_ended, link_event_begin, link_event_done, link_event_late, link_first_header, link_host_range, link_is_central, link_listen_end, link_listen_start, link_live, link_new, link_note_rx, link_open, link_open_central, link_owes, link_param_negative, link_param_reply, link_prepare, link_queue_acl, link_read_features, link_read_version, link_released, link_request_min_used, link_reset, link_rx_bad, link_rx_fast, link_rx_slow, link_sent, link_set_apto, link_set_auth, link_set_data_length, link_set_defaults, link_set_host_map, link_set_host_rate, link_set_indicate, link_set_phy, link_set_room, link_start_encryption, link_take_completed, nth_used, pad_map, params_valid, peer_has_phy, phy_begin, phy_best, phy_wanted, pick_interval, popcount, rate_central_start, rate_fetch, rate_fetch_over, rate_host, rate_peer_ok, reverse_octet, sca_ppm, slot_get_cq, sub_can_start, sub_set, tx_limit, wanted_map, widening }
 
 // An LL Control PDU from the peer: the opcode and the payload octets after it.
 fn t_ctrl(op: Int, rest: [Int]) -> Pdu
@@ -2131,6 +2131,114 @@ fn test_the_procedure_is_refused_or_not_known_and_a_peer_without_it_is_not_asked
     t_fill_cq(var p)
     dle_start(var p)
     test.assert(not p.dl_wait)
+
+// The record the status line prints (`dle_rec_field`): kind 0 an LL_LENGTH_REQ queued, 1 one heard, 2 an
+// LL_LENGTH_RSP queued, 3 one heard, 4 a refusal; the fields are the connection event, the four values and the code.
+@test
+fn test_the_record_of_a_data_length_exchange_keeps_the_pdu_with_its_event_and_its_values()
+    var l = t_link()
+    test.assert_eq(l.dl_last, -1)
+    t_set_ev_count(var l, 7)
+    dle_start(var l)
+    test.assert_eq(l.dl_n_req_tx, 1)
+    test.assert_eq(l.dl_last, 0)
+    test.assert_eq(dle_rec_field(var l, 0, 0), 7)
+    test.assert_eq(dle_rec_field(var l, 0, 1), 251)
+    test.assert_eq(dle_rec_field(var l, 0, 2), 2120)
+    test.assert_eq(dle_rec_field(var l, 0, 3), 251)
+    test.assert_eq(dle_rec_field(var l, 0, 4), 2120)
+    test.assert_eq(dle_rec_field(var l, 0, 5), 0)
+    // The peer's answer, heard in event 9, is the newest and holds the peer's four values.
+    t_set_ev_count(var l, 9)
+    var r = t_length_pdu(ll_data.OP_LENGTH_RSP, 180, 1600, 120, 1200)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert_eq(l.dl_n_rsp_rx, 1)
+    test.assert_eq(l.dl_last, 3)
+    test.assert_eq(dle_rec_field(var l, 3, 0), 9)
+    test.assert_eq(dle_rec_field(var l, 3, 1), 180)
+    test.assert_eq(dle_rec_field(var l, 3, 2), 1600)
+    test.assert_eq(dle_rec_field(var l, 3, 3), 120)
+    test.assert_eq(dle_rec_field(var l, 3, 4), 1200)
+    test.assert_eq(dle_rec_field(var l, 3, 5), 0)
+    // The request that went out stays in its own record.
+    test.assert_eq(dle_rec_field(var l, 0, 0), 7)
+    // A new connection starts the record again.
+    link_reset(var l)
+    test.assert_eq(l.dl_last, -1)
+    test.assert_eq(l.dl_n_req_tx, 0)
+    test.assert_eq(dle_rec_field(var l, 3, 1), 0)
+
+@test
+fn test_the_record_tells_a_request_heard_a_bad_value_a_stray_answer_a_refusal_and_a_full_queue()
+    // A request heard: the peer's values and the answer queued with this end's.
+    var l = t_link()
+    t_set_ev_count(var l, 3)
+    var q = t_length_pdu(ll_data.OP_LENGTH_REQ, 251, 2120, 180, 1600)
+    let _a = t_packet(var l, var q, 0, 0, 0)
+    test.assert_eq(l.dl_n_req_rx, 1)
+    test.assert_eq(l.dl_n_rsp_tx, 1)
+    test.assert_eq(l.dl_last, 2)
+    test.assert_eq(dle_rec_field(var l, 1, 0), 3)
+    test.assert_eq(dle_rec_field(var l, 1, 3), 180)
+    test.assert_eq(dle_rec_field(var l, 1, 5), 0)
+    test.assert_eq(dle_rec_field(var l, 2, 1), 251)
+    // Values out of range: code 1, and the request is refused.
+    var m = t_link()
+    var bad = t_length_pdu(ll_data.OP_LENGTH_REQ, 26, 2120, 251, 2120)
+    let _b = t_packet(var m, var bad, 0, 0, 0)
+    test.assert_eq(dle_rec_field(var m, 1, 1), 26)
+    test.assert_eq(dle_rec_field(var m, 1, 5), 1)
+    // An answer nothing asked for: code 2, nothing kept.
+    var n = t_link()
+    var stray = t_length_pdu(ll_data.OP_LENGTH_RSP, 251, 2120, 251, 2120)
+    let _c = t_packet(var n, var stray, 0, 0, 0)
+    test.assert_eq(n.dl_n_rsp_rx, 1)
+    test.assert_eq(dle_rec_field(var n, 3, 5), 2)
+    test.assert_eq(n.dl_rem_rx_octets, 27)
+    // A peer that answers with values out of range: code 1 and the procedure ends.
+    var o = t_link()
+    dle_start(var o)
+    var wrong = t_length_pdu(ll_data.OP_LENGTH_RSP, 20, 2120, 251, 2120)
+    let _d = t_packet(var o, var wrong, 0, 0, 0)
+    test.assert_eq(dle_rec_field(var o, 3, 5), 1)
+    test.assert(not o.dl_wait)
+    // A refusal names its PDU and its reject code.
+    var p = t_link()
+    dle_start(var p)
+    var rej = t_ctrl(ll_data.OP_REJECT_EXT_IND, [ll_data.OP_LENGTH_REQ, 0x23])
+    let _e = t_packet(var p, var rej, 0, 0, 0)
+    test.assert_eq(p.dl_n_refused, 1)
+    test.assert_eq(p.dl_last, 4)
+    test.assert_eq(dle_rec_field(var p, 4, 1), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(dle_rec_field(var p, 4, 2), 0x23)
+    var u = t_link()
+    dle_start(var u)
+    var unk = t_ctrl(ll_data.OP_UNKNOWN_RSP, [ll_data.OP_LENGTH_REQ])
+    let _f = t_packet(var u, var unk, 0, 0, 0)
+    test.assert_eq(dle_rec_field(var u, 4, 1), ll_data.OP_UNKNOWN_RSP)
+    // A full queue: the request is not out, code 3 and the count.
+    var f = t_link()
+    t_fill_cq(var f)
+    dle_start(var f)
+    test.assert_eq(f.dl_n_full, 1)
+    test.assert_eq(f.dl_n_req_tx, 0)
+    test.assert_eq(dle_rec_field(var f, 0, 5), 3)
+
+// A peer whose receive limit is 27 octets (the SoftDevice Controller of the bench with an event length of 0
+// offers 27 octets and 328 us in LL_LENGTH_RSP) ends the procedure with its values taken: the effective values
+// stay at 27 and the Host is told of no change, which is the right answer to such a peer.
+@test
+fn test_a_peer_that_offers_27_octets_ends_the_procedure_with_no_change_for_the_host()
+    var l = t_link()
+    dle_start(var l)
+    link_sent(var l, EV_DATA_LENGTH)
+    var r = t_length_pdu(ll_data.OP_LENGTH_RSP, 27, 328, 27, 328)
+    let _a = t_packet(var l, var r, 0, 0, 0)
+    test.assert(not l.dl_wait)
+    test.assert_eq(eff_tx_octets(var l), 27)
+    test.assert_eq(eff_rx_octets(var l), 27)
+    test.assert(not link_owes(var l, EV_DATA_LENGTH))
+    test.assert_eq(dle_rec_field(var l, 3, 5), 0)
 
 @test
 fn test_the_host_sets_the_data_length_and_the_peer_is_told()
