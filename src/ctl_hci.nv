@@ -12834,7 +12834,21 @@ fn ctl_cis_sub(var c: Controller, i: Int) -> Int
 
 @tier(embedded)
 fn ctl_cis_start(var c: Controller, i: Int) -> Int
-    ll_iso.sub_start(var c.cis[i], c.cis[i].sub)
+    let t = ll_iso.sub_start(var c.cis[i], c.cis[i].sub)
+    if c.cis[i].central and c.cis[i].off_cig > 0
+        return t - CIS_LATER_TRIM_US
+    t
+
+// The microseconds a Central starts the subevents of every stream after the first of its group before their time on the group's
+// grid.  The PTS dongle (the Lower Tester) places the first event of a later stream from the timeline of the earlier one and
+// listens for it in a window of about 40 us around a time that lies a few microseconds before the Central's nominal one
+// (`bugs/orbit/the-novo-controller-fails-to-establish-the-second-cis-of-a-two-cis-group-with-the-pts-dongle-status-0x3e.md`).
+// Measured 2026-11-08 on the nRF54LM20 DK against the dongle with BAP/UCL/STR/BV-527-C, 529-C, 545-C and 548-C, three runs of the four
+// rows each: 12 of 16 runs ended with LE CIS Established 0x3E for the second stream at 0 us, 2 of 12 at this value; 2026-10-31, the
+// second stream alone moved by -20 us: 2 of 40, by -30 us: 38 of 40.  The value lies inside the 2 x `ll_link.JITTER_US` a Peripheral
+// widens its window by; it is not a claim about the specification's Central, and not measured against another Peripheral than the
+// dongle.
+const CIS_LATER_TRIM_US = 16
 
 // The channel of the next subevent of the stream in slot `i` when the radio program will run it straight after the one just heard
 // (the packet was read at `now`; `good` says its CRC was right), -1 when it will not: the event has no other subevent or the Central

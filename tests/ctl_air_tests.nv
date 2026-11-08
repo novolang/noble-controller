@@ -3211,6 +3211,23 @@ fn test_two_streams_of_one_group_are_created_one_after_the_other_in_sequence()
     test.assert_eq(rf.cis_aborts, 0)
 
 @test
+fn test_the_streams_after_the_first_of_a_group_start_their_subevents_early_by_the_trim()
+    if not ctl_limits.iso_on() or ctl_limits.cis_slots() < 2
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    cis_cen_up(var c, var rf, var air, 2, 0, 50, false)
+    // The first stream of the group starts at its nominal time, the second CIS_LATER_TRIM_US before its own.
+    test.assert_eq(c.cis[0].off_cig, 0)
+    test.assert(c.cis[1].off_cig > 0)
+    test.assert_eq(ctl_hci.ctl_cis_start(var c, 0), ll_iso.sub_start(var c.cis[0], c.cis[0].sub))
+    test.assert_eq(ctl_hci.ctl_cis_start(var c, 1), ll_iso.sub_start(var c.cis[1], c.cis[1].sub) - ctl_hci.CIS_LATER_TRIM_US)
+    // The trim is a few microseconds, inside the jitter a Peripheral allows for.
+    test.assert(ctl_hci.CIS_LATER_TRIM_US > 0)
+    test.assert(ctl_hci.CIS_LATER_TRIM_US <= 2 * ll_link.JITTER_US)
+
+@test
 fn test_two_streams_of_one_group_interleaved()
     if not ctl_limits.iso_on() or ctl_limits.cis_slots() < 2
         return
