@@ -369,7 +369,7 @@ fn make_aa(var t: PerAdv) -> Int
 @satisfies("REQ-BLE-CTL-093")
 @tier(embedded)
 fn padv_start(var t: PerAdv, chmap: Int, due: Int)
-    t.aa = make_aa(t)
+    t.aa = make_aa(var t)
     t.rng = ll_adv.rng_step(t.rng)
     t.crc = t.rng & 0xFFFFFF
     t.rng = ll_adv.rng_step(t.rng)
@@ -413,11 +413,11 @@ fn padv_advance(var t: PerAdv)
         t.sub = t.sub + 1
         if t.sub >= t.n_sub
             t.sub = 0
-            t.ev_start = t.ev_start + interval_us(t)
+            t.ev_start = t.ev_start + interval_us(var t)
             t.counter = (t.counter + 1) & 0xFFFF
         t.due = t.ev_start + t.sub * t.si_us
         return
-    t.due = t.due + interval_us(t)
+    t.due = t.due + interval_us(var t)
     t.counter = (t.counter + 1) & 0xFFFF
 
 // The start and the counter of the next event a SyncInfo can name: the one `due` and `counter` belong to, or, for a train with responses that
@@ -427,7 +427,7 @@ fn ev_due(var t: PerAdv) -> Int
     if not ctl_limits.pawr_adv_on()
         return t.due
     if t.pawr and t.sub > 0
-        return t.ev_start + interval_us(t)
+        return t.ev_start + interval_us(var t)
     if t.pawr
         return t.ev_start
     t.due
@@ -444,7 +444,7 @@ fn intervals_to(var t: PerAdv, min_time: Int) -> Int
     let at = ev_due(var t)
     if at >= min_time
         return 0
-    (min_time - at + interval_us(t) - 1) / interval_us(t)
+    (min_time - at + interval_us(var t) - 1) / interval_us(var t)
 
 // ── SyncInfo ────────────────────────────────────────────────────────
 
@@ -496,7 +496,7 @@ fn syncinfo_put(var si: Vec[u8; 18], offset_us: Int, interval: Int, chmap: Int, 
 @tier(embedded)
 fn plan_syncinfo(var t: PerAdv, var si: Vec[u8; 18], aux_at: Int, min_gap: Int) -> Int
     let n = intervals_to(var t, aux_at + min_gap)
-    let at = ev_due(var t) + n * interval_us(t)
+    let at = ev_due(var t) + n * interval_us(var t)
     let counter = (ev_ctr(var t) + n) & 0xFFFF
     var off = at - aux_at
     var shift = 0

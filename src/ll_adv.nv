@@ -435,7 +435,7 @@ fn adv_pdu_end(var a: Adv, end: Int)
         if next - a.entered >= HIGH_DUTY_TIMEOUT_US
             a.timed_out = true
     else
-        let wanted = a.anchor + interval_us(a) + adv_delay(a)
+        let wanted = a.anchor + interval_us(var a) + adv_delay(var a)
         if wanted > next
             next = wanted
     a.due = next

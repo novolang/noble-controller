@@ -1024,7 +1024,7 @@ fn cis_req_gap(var x: Cis, prof: ll_radio.RadioProfile) -> Int
 // moved by whole ISO intervals.
 @tier(embedded)
 fn event_anchor(var x: Cis, e: Int) -> Int
-    x.anchor + (e - x.ev) * iso_us(x)
+    x.anchor + (e - x.ev) * iso_us(var x)
 
 // The start of subevent `s` (1 to NSE) of the event under way.
 @tier(embedded)
@@ -1798,9 +1798,9 @@ fn sdu_stamp(var x: Cis, idx: Int) -> Int
         j = idx % uspi
     var t = 0
     if x.central
-        t = ref + x.cis_sync - x.cig_sync + rx_sdu_int(var x) - iso_us(x) + j * rx_sdu_int(var x)
+        t = ref + x.cis_sync - x.cig_sync + rx_sdu_int(var x) - iso_us(var x) + j * rx_sdu_int(var x)
     else
-        t = ref + x.cis_sync + (rx_ft(var x) - 1) * iso_us(x) + j * rx_sdu_int(var x)
+        t = ref + x.cis_sync + (rx_ft(var x) - 1) * iso_us(var x) + j * rx_sdu_int(var x)
     t & 0xFFFFFFFF
 
 // Finish the SDU in the recombination: valid when its end fragment arrived and nothing was missing,
@@ -1857,7 +1857,7 @@ fn fr_stamp(var x: Cis, num: Int, toff: Int) -> Int
         // A BIS (it has no ACL): BIG anchor point + BIG_Sync_Delay + ISO_Interval + Framing_Delay_B - Time_Offset (Part G, Section 3.2.2).
         if x.acl < 0 and x.handle >= HANDLE_BIS
             ft = 1
-        t = t + x.cig_sync + delay + ft * iso_us(x)
+        t = t + x.cig_sync + delay + ft * iso_us(var x)
     t & 0xFFFFFFFF
 
 // A framed SDU is done: it is queued for the Host with its status, and the next one is begun.
@@ -2128,12 +2128,12 @@ fn event_begin(var x: Cis)
 fn event_end(var x: Cis, now: Int) -> Int
     if not x.ev_synced
         x.n_missed = x.n_missed + 1
-    x.anchor = x.anchor + iso_us(x)
+    x.anchor = x.anchor + iso_us(var x)
     x.ev = x.ev + 1
     x.sub = 1
     x.ev_open = false
     if not x.synced
-        if now - x.first_us > ESTABLISH_INTERVALS * iso_us(x)
+        if now - x.first_us > ESTABLISH_INTERVALS * iso_us(var x)
             return STATUS_FAILED_TO_ESTABLISH
     else if now - x.last_rx > x.sup_us
         return REASON_TIMEOUT

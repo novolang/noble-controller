@@ -342,7 +342,7 @@ fn central_event(var c: ctl_hci.Controller, slot: Int, var per: Per) -> Int
             else
                 per.heard = per.heard + 1
                 var next = ll_pdu.pdu_new()
-                let nh = rx_fast(c, slot, h, next)
+                let nh = rx_fast(var c, slot, h, var next)
                 ctl_hci.ctl_conn_rx_slow(var c, slot, var reply)
                 t = t + ll_pdu.airtime_us(reply.n) + 150
                 n = n + 1
@@ -1466,7 +1466,7 @@ fn test_data_the_central_sends_on_the_second_link_reaches_the_host_with_its_hand
     host_read(var c, var host)
     var pdu = data_pdu(ll_data.LLID_START, 5, 0x70)
     var next = ll_pdu.pdu_new()
-    let _h = rx_fast(c, 1, 2 | ((c.links[1].sn ^ 1) << 2) | (c.links[1].nesn << 3), next)
+    let _h = rx_fast(var c, 1, 2 | ((c.links[1].sn ^ 1) << 2) | (c.links[1].nesn << 3), var next)
     ctl_hci.ctl_conn_rx_slow(var c, 1, var pdu)
     host_read(var c, var host)
     let acl = acl_packets(host)

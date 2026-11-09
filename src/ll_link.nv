@@ -1299,7 +1299,7 @@ fn widening(var l: Link) -> Int
         return 0
     let elapsed = l.due - l.t_ref
     var w = (sca_ppm(l.sca) + OWN_PPM) * elapsed / 1000000 + JITTER_US
-    let cap = l.sub_gap as Int * interval_us(l) / 2 - T_IFS_US
+    let cap = l.sub_gap as Int * interval_us(var l) / 2 - T_IFS_US
     if w > cap
         w = cap
     w
@@ -1335,7 +1335,7 @@ fn link_event_time(var l: Link, evc: Int) -> Int
     var base = l.due
     if l.ev_anchor
         base = l.anchor
-    base + ahead * interval_us(l)
+    base + ahead * interval_us(var l)
 
 // The time a booking of the radio for a connection event covers beyond its window: two
 // exchanges of the longest packets in force on the PHY in force, each a packet of this end,
@@ -1349,7 +1349,7 @@ fn link_book_us(var l: Link, base: Int) -> Int
         ll_phy.greater(ll_phy.PAYLOAD_MIN, ll_phy.fit_octets(l.phy, true, eff_rx_time(var l, l.phy))))
     let rx = ll_phy.air_us(l.phy, true, 2 + rx_octets + ll_phy.MIC_OCTETS)
     var b = 2 * (tx + rx + 2 * T_IFS_US)
-    let cap = interval_us(l) - 1000
+    let cap = interval_us(var l) - 1000
     if b > cap
         b = cap
     ll_phy.greater(base, b)
@@ -1446,16 +1446,16 @@ fn link_event_done(var l: Link, now: Int)
     if (ctl_limits.features_octet4() & FEAT4_SUB) != 0
         sub_wrap(var l)
     if l.upd_pending and l.ev_count == l.upd_instant
-        l.due = base + interval_us(l) + l.upd_win_offset * UNIT_US
+        l.due = base + interval_us(var l) + l.upd_win_offset * UNIT_US
         l.win_len = l.upd_win_size * UNIT_US
     else
-        l.due = base + interval_us(l)
+        l.due = base + interval_us(var l)
         if not miss
             l.win_len = 0
     if (ctl_limits.features_octet4() & FEAT4_SUB) != 0
         sub_skip(var l)
     if not l.synced
-        if now > l.first_due + MAX_WINDOW_US + ESTABLISH_EVENTS * interval_us(l)
+        if now > l.first_due + MAX_WINDOW_US + ESTABLISH_EVENTS * interval_us(var l)
             link_close(var l, REASON_FAILED_TO_ESTABLISH)
     else if now - l.last_rx > l.timeout * TIMEOUT_UNIT_US
         if l.term_sent
@@ -1877,11 +1877,11 @@ fn ctrl_rx(var l: Link, var rx: Pdu)
         l.ctl_in = true
         return
     match op
-        0x0  => ctrl_connection_update(l, rx)
-        0x1  => ctrl_channel_map(l, rx)
+        0x0  => ctrl_connection_update(var l, var rx)
+        0x1  => ctrl_channel_map(var l, var rx)
         0x2  => link_close(var l, ll_data.dpdu_byte(var rx, 1))
-        0x3  => ctrl_enc_req(l, rx)
-        0x4  => ctrl_enc_rsp(l, rx)
+        0x3  => ctrl_enc_req(var l, var rx)
+        0x4  => ctrl_enc_rsp(var l, var rx)
         0x5  => ctrl_start_enc_req(var l)
         0x6  => ctrl_start_enc_rsp(var l)
         0x7  => ctrl_unknown_received(var l, var rx)
@@ -2264,7 +2264,7 @@ fn sub_skip(var l: Link)
         let _c = chan_next(var l)
         l.ev_count = (l.ev_count + 1) & 0xFFFF
         sub_wrap(var l)
-        l.due = l.due + interval_us(l)
+        l.due = l.due + interval_us(var l)
         n = n + 1
     l.sub_gap = (1 + n) as u16
 
@@ -2826,7 +2826,7 @@ fn apto_tasks(var l: Link)
         l.auth_t0 = l.now
         l.pinged = false
         return
-    var lead = 4 * (1 + l.latency) * interval_us(l)
+    var lead = 4 * (1 + l.latency) * interval_us(var l)
     if lead > apto_us(var l) / 2
         lead = apto_us(var l) / 2
     if elapsed >= apto_us(var l) - lead and l.proc == PROC_NONE and l.ping_ok and not l.pinged
@@ -2887,7 +2887,7 @@ fn eff_tx_time(var l: Link, phy: Int) -> Int
     if phy != ll_phy.PHY_CODED
         return u
     let required = 2 * T_IFS_US + ll_phy.lesser(eff_rx_time(var l, phy), eff_rx_octets(var l) * 64 + 976)
-    ll_phy.greater(ll_phy.TIME_CODED_MIN, ll_phy.lesser(u, interval_us(l) - required))
+    ll_phy.greater(ll_phy.TIME_CODED_MIN, ll_phy.lesser(u, interval_us(var l) - required))
 
 // The most payload octets a PDU sent on `phy` may carry, by time alone.
 @tier(embedded)
@@ -3885,7 +3885,7 @@ fn link_rx_slow(var l: Link, var rx: Pdu) -> Int
     if l.rx_new
         let llid = ll_data.dpdu_llid(var rx)
         if llid == ll_data.LLID_CONTROL
-            ctrl_rx(l, rx)
+            ctrl_rx(var l, var rx)
         else if llid != 0 and ll_data.dpdu_len(var rx) > 0
             if enc_strict(var l)
                 link_close(var l, REASON_MIC_FAILURE)
@@ -4068,7 +4068,7 @@ fn link_param_negative(var l: Link, reason: Int) -> Int
 fn link_set_apto(var l: Link, apto: Int) -> Int
     if not l.live or l.closing
         return STATUS_UNKNOWN_CONNECTION
-    if apto < 1 or apto > 0xFFFF or apto * TIMEOUT_UNIT_US < interval_us(l) * (1 + l.latency)
+    if apto < 1 or apto > 0xFFFF or apto * TIMEOUT_UNIT_US < interval_us(var l) * (1 + l.latency)
         return STATUS_INVALID_PARAMETERS
     l.apto = apto
     l.auth_t0 = l.now

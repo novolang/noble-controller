@@ -1152,7 +1152,7 @@ fn conn_run_adv(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start:
             ctl_hci.ctl_set_time(var c, now)
             cen_next(var cen)
         else if cls == ll_arb.class_adv()
-            now = adv_event(c, cen, air, now)
+            now = adv_event(var c, var cen, var air, now)
         else
             let t = wake_time(var c)
             if t < 0 or t > until

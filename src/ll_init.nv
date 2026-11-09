@@ -287,13 +287,13 @@ fn both_phys(var i: Init) -> Bool
 // The microseconds of the first window of an interval (LE 1M when the initiator takes turns) and of all it listens.
 @tier(embedded)
 fn init_first_us(var i: Init) -> Int
-    if both_phys(i)
+    if both_phys(var i)
         return ll_phy.split_first(init_interval_us(var i), init_window_us(var i), i.k_window * ll_adv.UNIT_US)
     init_window_us(var i)
 
 @tier(embedded)
 fn init_listen_us(var i: Init) -> Int
-    if both_phys(i)
+    if both_phys(var i)
         return init_first_us(var i) + ll_phy.split_second(init_interval_us(var i), init_window_us(var i), i.k_window * ll_adv.UNIT_US)
     init_window_us(var i)
 
@@ -338,7 +338,7 @@ fn init_channel(var i: Init, now: Int) -> Int
 @tier(embedded)
 fn init_window_end(var i: Init, now: Int) -> Int
     var len = init_listen_us(var i)
-    if both_phys(i) and (now - i.start) % init_interval_us(var i) < init_first_us(var i)
+    if both_phys(var i) and (now - i.start) % init_interval_us(var i) < init_first_us(var i)
         len = init_first_us(var i)
     i.start + init_index(var i, now) * init_interval_us(var i) + len
 
@@ -421,7 +421,7 @@ fn put_le16(var p: Pdu, v: Int)
 // an AdvA to be filled in; the LLData of the connection.
 @tier(embedded)
 fn prepare(var i: Init, chmap: Int, avoid_a: Int, avoid_b: Int)
-    let aa = make_aa(i, avoid_a, avoid_b)
+    let aa = make_aa(var i, avoid_a, avoid_b)
     let crc = draw(var i) & 0xFFFFFF
     let hop = 5 + draw(var i) % 12
     ll_pdu.pdu_begin(var i.req, ll_pdu.CONNECT_IND, i.addr_type as Int, 0)

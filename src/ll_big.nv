@@ -792,7 +792,7 @@ fn info_at(var b: Big, off_us: Int, count: Int)
 // from it.
 @tier(embedded)
 fn anchor_after(var b: Big, t: Int) -> Int
-    let iso = iso_us(b)
+    let iso = iso_us(var b)
     if t <= b.anchor
         return b.anchor
     b.anchor + (t - b.anchor + iso - 1) / iso * iso
@@ -800,7 +800,7 @@ fn anchor_after(var b: Big, t: Int) -> Int
 // The event counter of the event whose anchor point is `anchor`.
 @tier(embedded)
 fn anchor_event(var b: Big, anchor: Int) -> Int
-    b.ev + (anchor - b.anchor) / iso_us(b)
+    b.ev + (anchor - b.anchor) / iso_us(var b)
 
 // Prepare the BIGInfo for the AUX_SYNC_IND that starts at `due`: the next anchor point at least `INFO_LEAD_US` after it, as an offset
 // from `due` less `phase_us` (the start error of the PDU, so that the anchor falls in the unit the offset names), and the
@@ -1165,7 +1165,7 @@ fn rx_widen(var b: Big, at: Int) -> Int
     if elapsed < 0
         elapsed = 0
     var w = (b.ppm + ll_link.OWN_PPM) * elapsed / 1000000 + ll_link.JITTER_US
-    let cap = iso_us(b) / 2 - T_MSS_US
+    let cap = iso_us(var b) / 2 - T_MSS_US
     if w > cap
         w = cap
     w
@@ -1206,9 +1206,9 @@ fn sync_fill(var b: Big, v: InfoView, ppm: Int)
     var pre = 0
     if v.irc < v.nse / v.bn
         pre = v.pto * (v.nse / v.bn - v.irc)
-    b.latency = b.sync_delay + pre * iso_us(b) + iso_us(b) - v.sdu_int
+    b.latency = b.sync_delay + pre * iso_us(var b) + iso_us(var b) - v.sdu_int
     if v.framed
-        b.latency = b.sync_delay + pre * iso_us(b) + iso_us(b) + v.sdu_int
+        b.latency = b.sync_delay + pre * iso_us(var b) + iso_us(var b) + v.sdu_int
 
 // The GIV and the GSKD of an encrypted group from the 57 octets of its BIGInfo in `raw` (the content of the AD structure).
 @tier(embedded)
@@ -1227,7 +1227,7 @@ fn sync_anchor(var b: Big, t_first: Int, off_us: Int, unit: Int, count: Int, now
     b.anchor = t_first + off_us
     b.ev = count / b.bn
     b.win = unit
-    let iso = iso_us(b)
+    let iso = iso_us(var b)
     for _ in 0..4096
         if b.anchor >= now + lead
             break

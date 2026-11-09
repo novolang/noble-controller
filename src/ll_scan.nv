@@ -367,14 +367,14 @@ fn both_phys(var s: Scan) -> Bool
 // and the whole time it listens in an interval.
 @tier(embedded)
 fn first_window_us(var s: Scan) -> Int
-    if both_phys(s)
-        return ll_phy.split_first(interval_us(s), window_us(var s), s.c_window * ll_adv.UNIT_US)
+    if both_phys(var s)
+        return ll_phy.split_first(interval_us(var s), window_us(var s), s.c_window * ll_adv.UNIT_US)
     window_us(var s)
 
 @tier(embedded)
 fn listen_us(var s: Scan) -> Int
-    if both_phys(s)
-        return first_window_us(var s) + ll_phy.split_second(interval_us(s), window_us(var s), s.c_window * ll_adv.UNIT_US)
+    if both_phys(var s)
+        return first_window_us(var s) + ll_phy.split_second(interval_us(var s), window_us(var s), s.c_window * ll_adv.UNIT_US)
     window_us(var s)
 
 // The PHY the window `now` is in or follows listens on: LE Coded for a scanner of LE Coded alone and in the second window
@@ -388,14 +388,14 @@ fn scan_phy(var s: Scan, now: Int) -> Int
         return ll_phy.PHY_CODED
     if now < s.start
         return ll_phy.PHY_1M
-    if (now - s.start) % interval_us(s) < first_window_us(var s)
+    if (now - s.start) % interval_us(var s) < first_window_us(var s)
         return ll_phy.PHY_1M
     ll_phy.PHY_CODED
 
 // The Scan_Type in force for the window being run: the type of the PHY it listens on (`cur_phy`, set by the program).
 @tier(embedded)
 fn type_now(var s: Scan) -> Int
-    if both_phys(s) and (s.cur_phy as Int) == ll_phy.PHY_CODED
+    if both_phys(var s) and (s.cur_phy as Int) == ll_phy.PHY_CODED
         return s.c_ty as Int
     s.ty as Int
 
@@ -414,7 +414,7 @@ fn period_us(var s: Scan) -> Int
 fn scan_index(var s: Scan, now: Int) -> Int
     if now < s.start
         return 0
-    (now - s.start) / interval_us(s)
+    (now - s.start) / interval_us(var s)
 
 // Whether `now` is inside a scan window.
 @satisfies("REQ-BLE-CTL-009")
@@ -424,7 +424,7 @@ fn scan_in_window(var s: Scan, now: Int) -> Bool
         return false
     if s.dur > 0 and now >= s.start + duration_us(var s)
         return false
-    (now - s.start) % interval_us(s) < listen_us(var s)
+    (now - s.start) % interval_us(var s) < listen_us(var s)
 
 // The channel of the window `now` is in or follows: each window listens on
 // the next advertising channel.
@@ -439,9 +439,9 @@ fn scan_window_end(var s: Scan, now: Int) -> Int
     if s.dur > 0 and now >= s.start + duration_us(var s)
         return s.start + period_us(var s) + first_window_us(var s)
     var len = listen_us(var s)
-    if both_phys(s) and (now - s.start) % interval_us(s) < first_window_us(var s)
+    if both_phys(var s) and (now - s.start) % interval_us(var s) < first_window_us(var s)
         len = first_window_us(var s)
-    s.start + scan_index(var s, now) * interval_us(s) + len
+    s.start + scan_index(var s, now) * interval_us(var s) + len
 
 // The start of the next window at or after `now`; `now` itself inside a
 // window.
@@ -451,7 +451,7 @@ fn scan_next_start(var s: Scan, now: Int) -> Int
         return s.start
     if scan_in_window(var s, now)
         return now
-    let next = s.start + (scan_index(var s, now) + 1) * interval_us(s)
+    let next = s.start + (scan_index(var s, now) + 1) * interval_us(var s)
     if s.dur > 0 and next >= s.start + duration_us(var s)
         // The scan duration is over: the next period begins.  With no period the tick has ended the state.
         if s.period > 0

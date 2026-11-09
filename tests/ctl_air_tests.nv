@@ -4634,7 +4634,7 @@ fn xa_set(var c: ctl_hci.Controller, handle: Int, props: Int, own: Int, sid: Int
         test.assert_eq(status_of(var c, 0x2037, xa_data(handle, 3, data)), 0)
 
 // The k-th PDU the Controller sent, as a `Pdu`.
-fn tx_pdu(var air: SimAir, k: Int) -> Pdu
+fn tx_pdu(air: SimAir, k: Int) -> Pdu
     var p = ll_pdu.pdu_new()
     let body = air.tx_body[k]
     for j in 0..list.len(body)

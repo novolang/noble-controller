@@ -673,7 +673,7 @@ fn xset_event_end(var s: XSet, end: Int) -> Bool
             return false
         next = end + ll_adv.PDU_GAP_US
     else
-        let wanted = s.anchor + interval_us(s) + adv_delay(s)
+        let wanted = s.anchor + interval_us(var s) + adv_delay(var s)
         if wanted > next
             next = wanted
     s.due = next

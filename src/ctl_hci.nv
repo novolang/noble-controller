@@ -3064,7 +3064,7 @@ fn past_send(var c: Controller, ls: Int) -> Bool
     if not ok
         c.past_tx[ls].used = false
         return true
-    if iso_send(c, ls)
+    if iso_send(var c, ls)
         c.past_tx[ls].used = false
         return true
     false
@@ -8595,7 +8595,7 @@ fn pcl_req(var c: Controller, ls: Int, var rx: Pdu)
     c.pcl[ls].asked = true
     let flags = ll_pcl.level_flags(new, TX_POWER_MIN_DBM, TX_POWER_MAX_DBM)
     ll_pcl.put_rsp(var c.links[ls].tmp, flags, new - old, new, ll_pcl.APR_UNKNOWN)
-    let _s = iso_send(c, ls)
+    let _s = iso_send(var c, ls)
     if new != old and c.pcl[ls].local_rep
         pcl_event(var c, ls, STATUS_SUCCESS, ll_pcl.REASON_LOCAL, idx, new, flags, new - old)
 
@@ -8689,7 +8689,7 @@ fn ctl_pcl_poll(var c: Controller) -> Bool
                     ll_pcl.index_mask(idx),
                     0,
                     ll_pcl.own_level(var c.pcl[ls], idx))
-                if iso_send(c, ls)
+                if iso_send(var c, ls)
                     c.pcl[ls].sent = true
                     did = true
     did
@@ -11108,7 +11108,7 @@ fn ctl_sub_poll(var c: Controller) -> Bool
                     c.sub[ls].lat,
                     c.sub[ls].cont,
                     c.sub[ls].to)
-                if iso_send(c, ls)
+                if iso_send(var c, ls)
                     c.sub[ls].sent = true
                     did = true
     did
@@ -11353,7 +11353,7 @@ fn rate_wait(var c: Controller, ls: Int) -> Bool
         0,
         c.links[ls].ev_count,
         0xFFFF)
-    if iso_send(c, ls)
+    if iso_send(var c, ls)
         c.sub[ls].sent = true
         return true
     false
@@ -11529,7 +11529,7 @@ fn fs_rx(var c: Controller, ls: Int, op: Int, var rx: Pdu)
         iso_reject(var c, ls, op, code)
     else
         ll_fs.put_rsp(var c.links[ls].tmp, ll_fs.FS_US, 0, 0)
-        let _s = iso_send(c, ls)
+        let _s = iso_send(var c, ls)
 
 // The work of Frame Space Update that is not in a radio event: the request the Host asked for goes out (the queue may be full, so it is tried
 // again), and one the peer leaves unanswered is given up after `ll_sub.WAIT_US`, as is one on a connection that ended.  True when something
@@ -11549,7 +11549,7 @@ fn ctl_fs_poll(var c: Controller) -> Bool
     if c.sub_def[0].sent
         return false
     ll_fs.put_req(var c.links[ls].tmp, ll_fs.FS_US, ll_fs.FS_US, c.sub_def[0].lat, c.sub_def[0].cont)
-    if iso_send(c, ls)
+    if iso_send(var c, ls)
         c.sub_def[0].sent = true
         return true
     false
@@ -12216,7 +12216,7 @@ fn cis_disconnect(var c: Controller, i: Int, reason: Int)
         cis_release(var c, i)
         return
     ll_iso.put_cis_terminate(var c.links[ls].tmp, c.cis[i].cig_id, c.cis[i].cis_id, reason)
-    let _q = iso_send(c, ls)
+    let _q = iso_send(var c, ls)
     cis_close(var c, i, ll_iso.REASON_LOCAL_HOST)
 
 // The stream in slot `i` is over with `reason` (a Disconnection Complete reason, or for a stream that never
@@ -12417,7 +12417,7 @@ fn ctl_iso_poll(var c: Controller) -> Bool
         if st == ll_iso.S_ACCEPTED and (c.cis[i].owed & ll_iso.EV_SEND_RSP) != 0
             if ll_link.link_live(var c.links[ls]) and not c.links[ls].closing
                 ll_iso.put_cis_rsp(var c.links[ls].tmp, var c.cis[i])
-                if iso_send(c, ls)
+                if iso_send(var c, ls)
                     c.cis[i].owed = c.cis[i].owed & (0xFFFF ^ ll_iso.EV_SEND_RSP)
                     did = true
         else if st == ll_iso.S_REQUESTED and c.now - c.cis[i].first_us > CIS_ACCEPT_TIMEOUT_US
@@ -13431,7 +13431,7 @@ fn ctl_iso_central_poll(var c: Controller) -> Bool
                         did = true
                     else
                         ll_iso.put_cis_req(var c.links[ls].tmp, var c.cis[i])
-                        if iso_send(c, ls)
+                        if iso_send(var c, ls)
                             c.cis[i].owed = (c.cis[i].owed & (0xFFFF ^ ll_iso.EV_SEND_REQ)) | ll_iso.EV_WAIT_RSP
                             c.cis[i].first_us = c.now
                             did = true
@@ -13456,7 +13456,7 @@ fn cis_send_ind(var c: Controller, i: Int) -> Bool
     c.cis[i].cis_offset = c.cis[i].off_min
     c.cis[i].ind_ev = c.cis[i].off_ev
     ll_iso.put_cis_ind(var c.links[ls].tmp, var c.cis[i])
-    if not iso_send(c, ls)
+    if not iso_send(var c, ls)
         return false
     c.cis[i].owed = c.cis[i].owed & (0xFFFF ^ ll_iso.EV_SEND_IND)
     c.cis[i].e_ind = c.links[ls].ev_count
