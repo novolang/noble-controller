@@ -31,7 +31,7 @@
 //
 // The state is a value with inline storage; no function here allocates.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ll_pdu
 use ll_data
@@ -302,7 +302,7 @@ struct Cis
     sent_num: Int
     tx_hi: Int
     rx_num: Int
-    txd: Vec[u8; if noble_controller_config.CTL_CIS > 0 then 2048 else 8]
+    txd: Vec[u8; if noble_controller.CONFIG.CTL_CIS > 0 then 2048 else 8]
     txl: Vec[Int; 8]
     txf: Vec[Int; 8]
     f_ack: Bool
@@ -310,7 +310,7 @@ struct Cis
     f_cie: Bool
     f_npi: Bool
     use_nxt: Bool
-    hbuf: Vec[u8; if noble_controller_config.CTL_CIS > 0 then 512 else 8]
+    hbuf: Vec[u8; if noble_controller.CONFIG.CTL_CIS > 0 then 512 else 8]
     h_n: Int
     h_exp: Int
     h_open: Bool
@@ -339,7 +339,7 @@ struct Cis
     asm_got: Bool
     asm_end: Bool
     asm_bad: Bool
-    outd: Vec[u8; if noble_controller_config.CTL_CIS > 0 then 1024 else 8]
+    outd: Vec[u8; if noble_controller.CONFIG.CTL_CIS > 0 then 1024 else 8]
     outl: Vec[Int; 2]
     outs: Vec[Int; 2]
     outt: Vec[Int; 2]

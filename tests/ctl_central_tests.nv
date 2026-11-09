@@ -14,7 +14,7 @@
 // `airtime_us` microseconds.
 
 use std.test
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ctl_hci
 use ctl_pool
@@ -382,7 +382,7 @@ fn run_events(var c: ctl_hci.Controller, var per: Per, until: Int, var host: [In
 
 // ── Entering the Initiating state ───────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_create_connection_enters_the_initiating_state_and_books_its_windows()
     var c = fresh()
@@ -404,7 +404,7 @@ fn test_create_connection_enters_the_initiating_state_and_books_its_windows()
     test.assert_eq(ctl_hci.ctl_ll_next_start(var c), 101000)
     test.assert(ctl_hci.ctl_ll_scan_limit(var c) > 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_create_connection_is_refused_in_the_states_and_with_the_values_the_command_names()
     var c = fresh()
@@ -435,7 +435,7 @@ fn test_create_connection_is_refused_in_the_states_and_with_the_values_the_comma
     // Stopping a scan that is not on is a success.
     test.assert_eq(status_of(var c, 0x200C, [0, 0]), 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_random_own_address_is_used_when_the_host_set_it()
     var c = fresh()
@@ -445,7 +445,7 @@ fn test_a_random_own_address_is_used_when_the_host_set_it()
     test.assert_eq(c.init.addr[0] as Int, 0x01)
     test.assert_eq(ll_pdu.pdu_tx_add(var c.init.req), 1)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_create_connection_cancel_ends_the_state_and_tells_the_host_after_its_answer()
     var c = fresh()
@@ -474,7 +474,7 @@ fn test_create_connection_cancel_ends_the_state_and_tells_the_host_after_its_ans
     test.assert_eq(c.init.cancels, 1)
     test.assert(not ctl_hci.ctl_ll_on(var c))
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_event_of_a_cancel_is_enhanced_or_masked_as_the_host_chose()
     var c = fresh()
@@ -500,7 +500,7 @@ fn zeros(n: Int) -> [Int]
         list.push(v, 0)
     v
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_cancel_event_waits_for_a_free_slot()
     var c = fresh()
@@ -522,7 +522,7 @@ fn test_the_cancel_event_waits_for_a_free_slot()
 
 // ── The filter policy ───────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_initiator_connects_to_the_named_peer_only()
     var c = fresh()
@@ -536,7 +536,7 @@ fn test_the_initiator_connects_to_the_named_peer_only()
     test.assert(ctl_hci.ctl_init_decide(var c, var peer, 11))
     test.assert(c.init.sent)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_list_policy_connects_to_a_listed_device_and_freezes_the_list()
     var c = fresh()
@@ -562,7 +562,7 @@ fn t_addr(first: Int) -> Vec[u8; 6]
         let _a = x.push((first + k) as u8)
     x
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_connect_ind_that_did_not_go_on_air_lets_the_state_go_on()
     var c = fresh()
@@ -576,7 +576,7 @@ fn test_a_connect_ind_that_did_not_go_on_air_lets_the_state_go_on()
 
 // ── The connection as Central ───────────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_connect_ind_opens_the_central_link_and_ends_the_initiating_state()
     var c = central_up(5000)
@@ -599,7 +599,7 @@ fn test_the_connect_ind_opens_the_central_link_and_ends_the_initiating_state()
     // The Host is told nothing until the Peripheral has answered.
     test.assert_eq(list.len(events_coded(run(var c, 0x1001, []), 0x3E)), 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_host_gets_le_connection_complete_with_role_central_after_the_first_answer()
     var c = central_up(5000)
@@ -629,7 +629,7 @@ fn test_the_host_gets_le_connection_complete_with_role_central_after_the_first_a
     test.assert_eq(per.log_t[0], 6250)
     test.assert_eq(per.log_ch[0], c.links[0].hop % 37)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_enhanced_event_replaces_the_plain_one_for_a_central()
     var c = fresh()
@@ -650,7 +650,7 @@ fn test_the_enhanced_event_replaces_the_plain_one_for_a_central()
     test.assert_eq(ev[0][7], 0)
     test.assert_eq(ev[0][9], 0x10)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_connection_events_keep_the_interval_and_hop_through_the_channels()
     var c = central_up(5000)
@@ -669,7 +669,7 @@ fn test_connection_events_keep_the_interval_and_hop_through_the_channels()
         test.assert_eq(per.log_ch[i], unmapped)
     test.assert(ll_link.link_live(var c.links[0]))
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_data_crosses_both_ways_in_order_with_flow_control()
     var c = central_up(5000)
@@ -713,7 +713,7 @@ fn test_data_crosses_both_ways_in_order_with_flow_control()
     test.assert_eq(c.links[0].data_in, 2)
     test.assert_eq(c.links[0].data_out, 3)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_sixty_rounds_of_data_both_ways_arrive_once()
     var c = central_up(5000)
@@ -740,7 +740,7 @@ fn test_sixty_rounds_of_data_both_ways_arrive_once()
     test.assert_eq(list.len(acl_packets(host)), 60)
     test.assert(ll_link.link_live(var c.links[0]))
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_bad_answer_ends_the_event_and_the_pdu_is_sent_again()
     var c = central_up(5000)
@@ -767,7 +767,7 @@ fn test_a_bad_answer_ends_the_event_and_the_pdu_is_sent_again()
             n = n + 1
     test.assert_eq(n, 1)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_central_sends_what_the_peripheral_did_not_acknowledge_again()
     var c = central_up(5000)
@@ -792,7 +792,7 @@ fn test_the_central_sends_what_the_peripheral_did_not_acknowledge_again()
 
 // ── Ending the connection ───────────────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_central_that_gets_no_answer_fails_to_establish_and_the_host_is_told()
     var c = central_up(5000)
@@ -821,7 +821,7 @@ fn test_a_central_that_gets_no_answer_fails_to_establish_and_the_host_is_told()
 fn assert_slot_free(var c: ctl_hci.Controller)
     test.assert(ctl_hci.free_slot(var c) == 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_supervision_timeout_ends_a_made_connection_with_disconnection_complete()
     var c = central_up(5000)
@@ -844,7 +844,7 @@ fn test_supervision_timeout_ends_a_made_connection_with_disconnection_complete()
     // 400 units of 10 ms is 4 s: 133 events of 30 ms.
     test.assert(n >= 130 and n <= 140)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_host_disconnects_a_central_link_and_the_peripheral_acknowledges()
     var c = central_up(5000)
@@ -866,7 +866,7 @@ fn test_the_host_disconnects_a_central_link_and_the_peripheral_acknowledges()
     test.assert_eq(list.len(ds), 1)
     test.assert_eq(ds[0][6], 0x16)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_peripheral_terminates_the_connection()
     var c = central_up(5000)
@@ -880,7 +880,7 @@ fn test_the_peripheral_terminates_the_connection()
     test.assert_eq(ds[0][6], 0x13)
     test.assert(not ll_link.link_live(var c.links[0]))
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
     var c = central_up(5000)
@@ -898,7 +898,7 @@ fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
 
 // ── Remote information ──────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_central_reads_the_features_and_version_of_the_peripheral()
     var c = central_up(5000)
@@ -959,7 +959,7 @@ fn adv_params(ty: Int) -> [Int]
     list.push(p, 0)
     p
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_a_peripheral_link_opens_beside_the_central_link()
     var c = two_links()
@@ -1039,7 +1039,7 @@ fn advertise_connectable(var c: ctl_hci.Controller)
     test.assert_eq(status_of(var c, 0x2006, adv_params(0)), 0)
     test.assert_eq(status_of(var c, 0x200A, [1]), 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_the_initiating_state_runs_beside_advertising_and_the_peripheral_link()
     var c = fresh()
@@ -1052,7 +1052,7 @@ fn test_the_initiating_state_runs_beside_advertising_and_the_peripheral_link()
     test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_adv()))
     test.assert(ll_arb.arb_booked(var c.arb, ll_arb.class_scan()))
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_both_links_run_their_events_against_their_own_peers_through_the_arbiter()
     var c = two_links()
@@ -1143,7 +1143,7 @@ fn wake_time(var c: ctl_hci.Controller) -> Int
                 best = t
     best
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_commands_name_the_link_by_handle_and_a_handle_that_is_not_on_is_unknown()
     var c = two_links()
@@ -1173,7 +1173,7 @@ fn test_commands_name_the_link_by_handle_and_a_handle_that_is_not_on_is_unknown(
     test.assert(c.links[1].term_sent)
     test.assert(not c.links[0].term_sent)
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_the_second_slot_reports_its_events_and_ends_on_its_own()
     var c = two_links()
@@ -1225,7 +1225,7 @@ fn has_addr(p: Pdu, off: Int, first: Int) -> Bool
     var a = t_addr(first)
     ll_pdu.pdu_addr_is(var w, off, var a)
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_the_second_slot_is_caught_up_and_queried_by_slot()
     var c = two_links()
@@ -1243,7 +1243,7 @@ fn test_the_second_slot_is_caught_up_and_queried_by_slot()
     test.assert(not ctl_hci.ctl_conn_active(var c, 1))
     test.assert_eq(ctl_hci.slot_aa(var c, 1), 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_a_new_central_access_address_differs_from_the_ones_in_use()
     var c = central_up(5000)
@@ -1287,7 +1287,7 @@ fn test_a_connect_ind_sent_with_no_link_free_is_reported_as_a_limit()
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][4], 0x09)
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_reset_ends_the_initiating_state_and_both_links_without_events()
     var c = two_links()
@@ -1307,7 +1307,7 @@ fn test_reset_ends_the_initiating_state_and_both_links_without_events()
 
 // ── The channel map ─────────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_the_host_classification_is_the_map_of_the_next_connection_as_central()
     var c = fresh()
@@ -1336,7 +1336,7 @@ fn test_the_host_classification_is_the_map_of_the_next_connection_as_central()
     for ch in per.log_ch
         test.assert(ch < 12 or ch == 36)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_fewer_than_two_classified_channels_connect_with_all_37()
     var c = fresh()
@@ -1390,7 +1390,7 @@ fn ext_params2(handle: Int, sub: Int, phys: Int, sets: [[Int]]) -> [Int]
         list.push(p, b)
     p
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_v2_is_the_v1_command_for_a_handle_and_a_subevent_of_0xff()
     var c = fresh()
@@ -1427,7 +1427,7 @@ fn test_extended_create_connection_v2_is_the_v1_command_for_a_handle_and_a_subev
 
 // ── A program that was away ─────────────────────────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_a_link_whose_booking_ran_out_while_the_program_was_away_is_run_again()
     var c = central_up(5000)
@@ -1443,7 +1443,7 @@ fn test_a_link_whose_booking_ran_out_while_the_program_was_away_is_run_again()
     ctl_hci.ctl_set_time(var c, c.links[0].due)
     test.assert_eq(ctl_hci.ctl_ll_pick(var c, false), ll_arb.class_acl())
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_a_peripheral_link_is_run_again_after_the_program_was_away_too()
     var c = two_links()
@@ -1458,7 +1458,7 @@ fn test_a_peripheral_link_is_run_again_after_the_program_was_away_too()
 
 // ── The second slot as Peripheral, and the seed ─────────────────────
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_data_the_central_sends_on_the_second_link_reaches_the_host_with_its_handle()
     var c = two_links()
@@ -1475,7 +1475,7 @@ fn test_data_the_central_sends_on_the_second_link_reaches_the_host_with_its_hand
     test.assert_eq(acl[0][2] >>> 4, 2)
     test.assert_eq(acl[0][5], 0x70)
 
-@when(noble_controller_config.CTL_CENTRAL > 0 and noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0 and noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_events_of_the_second_link_wait_for_a_free_slot()
     var c = two_links()
@@ -1494,7 +1494,7 @@ fn test_events_of_the_second_link_wait_for_a_free_slot()
         let _r = drain(var c)
     test.assert_eq(c.links[1].owed, 0)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_seeding_changes_the_access_address_the_next_connection_asks_for()
     var a = fresh()
@@ -1530,7 +1530,7 @@ fn ext_params(policy: Int, peer_type: Int, own: Int, phys: Int, sets: [[Int]]) -
 fn ext_create(var c: ctl_hci.Controller) -> Int
     cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400)]))
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_enters_the_initiating_state_with_the_sets_of_its_phys()
     var c = fresh()
@@ -1562,7 +1562,7 @@ fn test_extended_create_connection_enters_the_initiating_state_with_the_sets_of_
     test.assert_eq(create(var d), 0)
     test.assert(not d.init.ext)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_checks_the_phys_the_sets_and_the_state()
     var c = fresh()
@@ -1611,7 +1611,7 @@ fn test_extended_create_connection_checks_the_phys_the_sets_and_the_state()
     test.assert_eq(create(var c), 0x0C)
     test.assert_eq(status_of(var c, 0x200C, [1, 0]), 0x0C)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_to_a_connected_peer_answers_connection_already_exists()
     var c = central_up(5000)
@@ -1620,13 +1620,13 @@ fn test_extended_create_connection_to_a_connected_peer_answers_connection_alread
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(0, 0, 0, 1, [ext_set(24, 24, 400)])), 0x0B)
 
 // A build with one Central slot has none left once the connection is on: a request for another peer is refused for the limit.
-@when(noble_controller_config.CTL_CENTRAL == 1)
+@when(noble_controller.CONFIG.CTL_CENTRAL == 1)
 @test
 fn test_extended_create_connection_beyond_the_central_slots_answers_connection_limit_exceeded()
     var c = central_up(5000)
     test.assert_eq(cmd_status(var c, 0x2043, ext_params(1, 0, 0, 1, [ext_set(24, 24, 400)])), 0x09)
 
-@when(noble_controller_config.CTL_CENTRAL > 0)
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
 fn test_extended_create_connection_in_the_list_policy_and_with_a_random_own_address()
     var c = fresh()

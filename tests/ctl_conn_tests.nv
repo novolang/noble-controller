@@ -13,7 +13,7 @@
 
 use ctl_limits
 use std.test
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ctl_pool
 use ll_pdu
@@ -445,7 +445,7 @@ fn first_central(interval: Int) -> Cen
 
 // ── Taking the connection ───────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_connect_ind_opens_the_connection_and_stops_advertising()
     var c = connected(24, 200)
@@ -472,7 +472,7 @@ fn test_connect_ind_opens_the_connection_and_stops_advertising()
     test.assert_eq(e[19] | (e[20] << 8), 200)
     test.assert_eq(e[21], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_connection_complete_is_not_sent_when_the_host_masked_it_and_enhanced_replaces_it()
     var c = fresh()
@@ -501,7 +501,7 @@ fn test_connection_complete_is_not_sent_when_the_host_masked_it_and_enhanced_rep
     test.assert_eq(enhanced[0][26], 0)
     test.assert_eq(enhanced[0][27] | (enhanced[0][28] << 8), 24)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_connect_ind_that_fails_the_checks_or_the_policy_leaves_the_advertiser_on()
     var c = fresh()
@@ -575,7 +575,7 @@ fn test_the_link_layer_features_and_states_name_the_connection()
 
 // ── The events of a connection ──────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_an_idle_connection_runs_its_events_on_time_on_the_right_channels()
     var c = connected(24, 200)
@@ -601,7 +601,7 @@ fn test_an_idle_connection_runs_its_events_on_time_on_the_right_channels()
     // The events spaced by the interval.
     test.assert_eq(cen.log_t[1] - cen.log_t[0], 30000)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_windows_follow_a_central_clock_that_runs_fast()
     var c = connected(24, 400)
@@ -615,7 +615,7 @@ fn test_the_windows_follow_a_central_clock_that_runs_fast()
     test.assert_eq(cen.window_miss, 0)
     test.assert(cen.events > 150)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_central_that_misses_events_is_waited_for_with_a_wider_window()
     var c = connected(24, 400)
@@ -630,7 +630,7 @@ fn test_a_central_that_misses_events_is_waited_for_with_a_wider_window()
     test.assert_eq(cen.window_miss, 0)
     test.assert(cen.heard > 40)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_central_that_never_shows_fails_the_connection_to_establish()
     var c = connected(24, 200)
@@ -645,7 +645,7 @@ fn test_a_central_that_never_shows_fails_the_connection_to_establish()
     test.assert_eq(ds[0][4] | (ds[0][5] << 8), 1)
     test.assert_eq(ds[0][6], 0x3E)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_central_that_goes_quiet_ends_the_connection_with_a_supervision_timeout()
     var c = connected(24, 100)
@@ -664,7 +664,7 @@ fn test_a_central_that_goes_quiet_ends_the_connection_with_a_supervision_timeout
 
 // ── Data ────────────────────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_acl_data_from_the_host_reaches_the_central_and_its_buffer_is_returned()
     var c = connected(24, 200)
@@ -689,7 +689,7 @@ fn test_acl_data_from_the_host_reaches_the_central_and_its_buffer_is_returned()
     test.assert_eq(total, 2)
     test.assert_eq(c.dropped_acl, 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_data_from_the_central_reaches_the_host_as_acl_packets()
     var c = connected(24, 200)
@@ -711,7 +711,7 @@ fn test_data_from_the_central_reaches_the_host_as_acl_packets()
     test.assert_eq(acl[1][5], 0x50)
     test.assert_eq(acl[1][31], 0x50 + 26)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_data_both_ways_over_many_events_loses_nothing_and_keeps_order()
     var c = connected(6, 200)
@@ -747,7 +747,7 @@ fn test_data_both_ways_over_many_events_loses_nothing_and_keeps_order()
         test.assert_eq(t_byte(cen.got[i], 0), i)
     test.assert_eq(c.dropped_acl, 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_host_cannot_send_more_than_the_buffers_it_was_told()
     var c = connected(24, 200)
@@ -757,7 +757,7 @@ fn test_the_host_cannot_send_more_than_the_buffers_it_was_told()
         feed(var c, host_acl(1, 0, [k, 0, 0, 0]))
     test.assert_eq(c.dropped_acl, 2)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_acl_data_for_another_handle_is_dropped_and_one_over_the_buffer_loses_the_stream()
     var c = connected(24, 200)
@@ -781,7 +781,7 @@ fn test_acl_data_for_another_handle_is_dropped_and_one_over_the_buffer_loses_the
     feed(var d, host_acl(1, 0, [1, 2]))
     test.assert_eq(d.dropped_acl, 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_packet_for_a_full_pool_is_held_back_until_the_host_reads()
     var c = connected(24, 200)
@@ -804,7 +804,7 @@ fn test_a_packet_for_a_full_pool_is_held_back_until_the_host_reads()
 
 // ── Procedures ──────────────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_disconnect_terminates_the_link_and_reports_local_host()
     var c = connected(24, 200)
@@ -827,7 +827,7 @@ fn test_disconnect_terminates_the_link_and_reports_local_host()
     test.assert_eq(ds[0][6], 0x16)
     test.assert(not ll_link.link_live(var c.links[0]))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_disconnect_checks_its_handle_and_its_reason()
     var c = connected(24, 200)
@@ -839,7 +839,7 @@ fn test_disconnect_checks_its_handle_and_its_reason()
     var d = connected(24, 200)
     test.assert_eq(cmd_status(var d, 0x0406, [1, 0, 0x15]), 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_central_terminating_reports_its_reason()
     var c = connected(24, 200)
@@ -853,7 +853,7 @@ fn test_the_central_terminating_reports_its_reason()
     test.assert_eq(ds[0][6], 0x13)
     test.assert(not ll_link.link_live(var c.links[0]))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_disconnection_complete_the_host_masked_is_not_sent()
     var c = connected(24, 200)
@@ -866,7 +866,7 @@ fn test_a_disconnection_complete_the_host_masked_is_not_sent()
     test.assert(not ll_link.link_live(var c.links[0]))
     test.assert_eq(list.len(events_coded(host, 0x05)), 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_read_remote_version_runs_the_exchange_and_reports_the_central()
     var c = connected(24, 200)
@@ -897,7 +897,7 @@ fn test_read_remote_version_runs_the_exchange_and_reports_the_central()
     test.assert_eq(list.len(events_coded(again, 0x0C)), 1)
     test.assert_eq(cmd_status(var c, 0x041D, [3, 0]), 0x02)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_central_asking_for_the_version_is_answered_and_the_host_reads_it_at_once()
     var c = connected(24, 200)
@@ -914,7 +914,7 @@ fn test_the_central_asking_for_the_version_is_answered_and_the_host_reads_it_at_
     test.assert_eq(cmd_status(var c, 0x041D, [1, 0]), 0)
     test.assert_eq(list.len(events_coded(run(var c, 0x1001, []), 0x0C)), 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_le_read_remote_features_runs_the_peripheral_initiated_procedure()
     var c = connected(24, 200)
@@ -938,7 +938,7 @@ fn test_le_read_remote_features_runs_the_peripheral_initiated_procedure()
     test.assert_eq(found[0][7], 0x1F)
     test.assert_eq(found[0][8], 0x22)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_central_that_does_not_know_the_features_request_is_reported_unsupported()
     var c = connected(24, 200)
@@ -953,7 +953,7 @@ fn test_a_central_that_does_not_know_the_features_request_is_reported_unsupporte
     test.assert_eq(found[0][4], 0x1A)
     test.assert_eq(found[0][7], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_central_reading_the_features_gets_the_common_set()
     var c = connected(24, 200)
@@ -972,7 +972,7 @@ fn test_the_central_reading_the_features_gets_the_common_set()
     test.assert_eq(list.len(meta_events(run(var c, 0x1001, []), 0x04)), 1)
     test.assert_eq(cmd_status(var c, 0x2016, [5, 0]), 0x02)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_ping_and_unknown_control_pdus_are_answered()
     var c = connected(24, 200)
@@ -992,7 +992,7 @@ fn test_ping_and_unknown_control_pdus_are_answered()
     test.assert_eq(rsp, 1)
     test.assert_eq(unk, 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_connection_update_changes_the_interval_and_tells_the_host()
     var c = connected(24, 400)
@@ -1021,7 +1021,7 @@ fn test_connection_update_changes_the_interval_and_tells_the_host()
     test.assert_eq(us[0][7] | (us[0][8] << 8), 48)
     test.assert_eq(us[0][11] | (us[0][12] << 8), 400)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_channel_map_update_and_read_channel_map()
     var c = connected(24, 200)
@@ -1051,7 +1051,7 @@ fn test_channel_map_update_and_read_channel_map()
 
 // ── Errors on the air ───────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_bad_crc_is_answered_without_acknowledging_and_the_central_sends_again()
     var c = connected(24, 200)
@@ -1068,7 +1068,7 @@ fn test_a_bad_crc_is_answered_without_acknowledging_and_the_central_sends_again(
     test.assert_eq(acl[0][5], 0x20)
     test.assert_eq(acl[1][5], 0x70)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_two_bad_packets_in_a_row_close_the_event_without_an_answer()
     var c = connected(24, 200)
@@ -1086,7 +1086,7 @@ fn test_two_bad_packets_in_a_row_close_the_event_without_an_answer()
 
 // ── The radio shared with advertising ───────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_non_connectable_advertising_runs_between_connection_events_and_never_into_them()
     var c = connected(24, 200)
@@ -1163,7 +1163,7 @@ fn conn_run_adv(var c: ctl_hci.Controller, var cen: Cen, var air: AdvAir, start:
                 now = now + 1
     test.assert(guard < 200000)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_reset_drops_the_connection_without_an_event()
     var c = connected(24, 200)
@@ -1202,7 +1202,7 @@ fn set_completed(var c: ctl_hci.Controller, v: Int)
 fn set_feat_status(var c: ctl_hci.Controller, v: Int)
     c.links[0].feat_status = v
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_events_wait_for_a_free_slot_and_go_out_in_the_order_they_came()
     var c = connected(24, 200)
@@ -1247,7 +1247,7 @@ fn test_events_wait_for_a_free_slot_and_go_out_in_the_order_they_came()
     ctl_hci.ctl_flush_events(var c)
     test.assert(ll_link.link_owes(var c.links[0], ll_link.EV_DISCONNECTED))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_masked_events_are_dropped_not_kept()
     var c = connected(24, 200)
@@ -1263,7 +1263,7 @@ fn test_masked_events_are_dropped_not_kept()
     test.assert_eq(list.len(meta_events(out, 0x03)), 0)
     test.assert_eq(list.len(meta_events(out, 0x04)), 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_features_that_failed_are_reported_with_zeros()
     var c = connected(24, 200)
@@ -1275,7 +1275,7 @@ fn test_features_that_failed_are_reported_with_zeros()
     test.assert_eq(found[0][4], 0x1A)
     test.assert_eq(found[0][7], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_data_for_the_host_is_dropped_and_counted_when_the_pool_is_full()
     var c = connected(24, 200)
@@ -1285,7 +1285,7 @@ fn test_data_for_the_host_is_dropped_and_counted_when_the_pool_is_full()
     ctl_hci.forward_acl(var c, 1, var rx)
     test.assert_eq(c.dropped_acl, 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
     var c = connected(24, 200)
@@ -1298,7 +1298,7 @@ fn test_a_connection_lost_while_the_program_was_away_is_ended_by_the_catch_up()
     test.assert_eq(list.len(ds), 1)
     test.assert_eq(ds[0][6], 0x3E)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0 and noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0 and noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_a_connect_ind_takes_the_free_slot_while_the_last_connection_is_unreported()
     var c = connected(24, 200)
@@ -1323,7 +1323,7 @@ fn link_end(var c: ctl_hci.Controller)
     ll_link.link_close(var c.links[0], 0x08)
     ctl_hci.ctl_conn_done(var c, 0, 9000)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_central_that_changes_nothing_but_the_anchor_leaves_the_host_unnotified_of_a_move()
     var c = connected(24, 400)
@@ -1412,7 +1412,7 @@ fn test_the_phy_commands_check_the_masks_and_the_handle_without_a_connection()
     var bare = ctl_hci.controller_new(0)
     test.assert_eq(status_of(var bare, 0x2031, [0, 1, 1]), 0x01)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_new_connection_asks_for_the_data_length_and_the_host_hears_the_change()
     var c = connected(24, 400)
@@ -1437,7 +1437,7 @@ fn test_a_new_connection_asks_for_the_data_length_and_the_host_hears_the_change(
     test.assert_eq(ev[0][12] | (ev[0][13] << 8), 2120)
     test.assert(not c.links[0].dl_wait)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_central_without_the_data_length_extension_keeps_the_connection_at_27_octets()
     var c = connected(24, 400)
@@ -1450,7 +1450,7 @@ fn test_a_central_without_the_data_length_extension_keeps_the_connection_at_27_o
     test.assert_eq(list.len(meta_events(host, 0x07)), 0)
     test.assert_eq(ll_link.tx_limit(var c.links[0]), 27)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_set_data_length_tells_the_peer_and_cuts_a_longer_packet_into_pieces_for_one_buffer()
     var c = connected(24, 400)
@@ -1489,7 +1489,7 @@ fn test_set_data_length_tells_the_peer_and_cuts_a_longer_packet_into_pieces_for_
     let bad = run(var c, 0x2022, [1, 0, 20, 0, 0xE8, 0x03])
     test.assert_eq(bad[6], 0x12)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_peer_request_for_the_data_length_is_answered_and_masked_events_are_not_sent()
     var c = connected(24, 400)
@@ -1508,7 +1508,7 @@ fn test_a_peer_request_for_the_data_length_is_answered_and_masked_events_are_not
     test.assert_eq(c.links[0].dl_rem_tx_octets, 100)
     test.assert_eq(c.links[0].dl_ev_rx_octets, 100)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_set_phy_asks_the_central_and_the_host_hears_the_result_at_the_instant()
     var c = connected(24, 400)
@@ -1544,7 +1544,7 @@ fn test_set_phy_asks_the_central_and_the_host_hears_the_result_at_the_instant()
     test.assert_eq(r1[10], 2)
     test.assert_eq(c.links[0].phy, 2)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_masked_phy_update_complete_is_not_sent_and_a_second_set_phy_is_disallowed_while_one_runs()
     var c = connected(24, 400)
@@ -1562,7 +1562,7 @@ fn test_a_masked_phy_update_complete_is_not_sent_and_a_second_set_phy_is_disallo
     test.assert_eq(list.len(meta_events(host, 0x0C)), 0)
     test.assert(not ll_link.link_owes(var c.links[0], ll_link.EV_PHY))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_default_phy_of_the_host_is_asked_for_by_the_new_connection_itself()
     var c = fresh()
@@ -1604,7 +1604,7 @@ fn linked(le_low: Int, chsel: Bool) -> ctl_hci.Controller
 fn bytes_of_status(opcode: Int, status: Int) -> [Int]
     [0x04, 0x0E, 0x04, 0x01, opcode & 0xFF, (opcode >>> 8) & 0xFF, status]
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_channel_selection_algorithm_event_follows_the_connection_complete()
     // The event is bit 19 of the LE event mask, which a Host sets: algorithm #1 and #2.
@@ -1626,7 +1626,7 @@ fn test_the_channel_selection_algorithm_event_follows_the_connection_complete()
     test.assert_eq(ed[0][3], 0x0A)
     test.assert_eq(ed[1][3], 0x14)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_channel_selection_algorithm_event_is_not_sent_when_masked()
     var c = linked(0x1F, true)
@@ -1635,7 +1635,7 @@ fn test_the_channel_selection_algorithm_event_is_not_sent_when_masked()
     test.assert_eq(e[0][3], 0x01)
     test.assert(not ll_link.link_owes(var c.links[0], ll_link.EV_CHSEL))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_read_transmit_power_level_answers_for_a_connection()
     var c = linked(0x1F, false)
@@ -1651,7 +1651,7 @@ fn test_read_transmit_power_level_answers_for_a_connection()
     // The command takes three parameters.
     test.assert_eq(run(var c, 0x0C2D, [1, 0]), bytes_of_status(0x0C2D, 0x12))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_read_rssi_reports_the_last_packet_of_the_link()
     var c = linked(0x1F, false)

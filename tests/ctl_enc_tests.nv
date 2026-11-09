@@ -14,7 +14,7 @@
 // octet changed on air (`bad_to_b`, `bad_to_a`).
 
 use std.test
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ctl_pool
 use ll_pdu
@@ -1002,7 +1002,7 @@ fn test_the_cipher_that_fails_the_key_ends_the_connection_with_hardware_failure(
     for i in 0..16
         test.assert_eq(w.a.links[0].ltk[i] as Int, 0)
 
-@when(noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_a_cipher_fault_ends_the_connection_of_either_slot()
     var w = world()
@@ -1164,7 +1164,7 @@ fn test_a_full_packet_pool_holds_the_events_back()
 
 // ── The second slot ─────────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_LINKS >= 2)
+@when(noble_controller.CONFIG.CTL_LINKS >= 2)
 @test
 fn test_the_procedure_runs_on_the_second_link_of_both_ends()
     var w = world_in(1)

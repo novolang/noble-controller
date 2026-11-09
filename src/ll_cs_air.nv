@@ -117,7 +117,7 @@ struct CsAir
     skips: Int
     grid_skips: Int
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 pub @tier(embedded)
 @no_alloc
 fn cs_air_new() -> CsAir
@@ -125,7 +125,7 @@ fn cs_air_new() -> CsAir
             done: 0, off_us: 0, lead_us: 0, t0: 0, booked: false, under_way: false, skips: 0, grid_skips: 0 }
 
 // Hold the radio for a run: a receiver a scan window left on is stopped.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn take_radio<R: Radio[e]>(var air: R, var rf: ll_air.Rf) [e]
     if rf.rx_on or rf.held
@@ -133,14 +133,14 @@ fn take_radio<R: Radio[e]>(var air: R, var rf: ll_air.Rf) [e]
     air.hold()
 
 // Give the radio back after a run: the configuration of the advertising channels and the power state released.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn give_radio<R: Radio[e]>(var air: R) [e]
     air.config(ll_radio.ADV_ACCESS_ADDRESS, ll_radio.ADV_CRC_INIT, ll_radio.ADV_MAXLEN)
     air.release()
 
 // Run one subevent of the LE CS Test, starting at `t0`.  The answer is that of `ctl_cs_test_subevent`.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn run_test<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, var c: Controller, var rf: ll_air.Rf, var cc: C, var st: ll_cs_plan.CsState,
                                                                    t0: Int) -> Int [e, t, s, k]
@@ -151,7 +151,7 @@ fn run_test<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, va
     r
 
 // The LE CS Test in progress, which has run `n` subevents: start the next when it is due and the radio is clear for it.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn test_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, var c: Controller, var rf: ll_air.Rf, var cc: C, var st: ll_cs_plan.CsState,
                                                                     var a: CsAir, n: Int) [e, t, s, k]
@@ -180,7 +180,7 @@ fn test_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, v
 
 // Whether the arbiter has nothing booked in the `span` microseconds from `now`.  The bookings are made again first: the poll of the radio program that ran a connection event
 // came before this slot, and the booking of the event that has just ended stands until the arbiter is asked what is due next.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn clear_for(var c: Controller, now: Int, span: Int) -> Bool
     let _next = ctl_hci.ctl_ll_next_start(var c)
@@ -189,23 +189,23 @@ fn clear_for(var c: Controller, now: Int, span: Int) -> Bool
 // ── The procedures ──────────────────────────────────────────────────
 
 // The first connection with a series open, -1 when none.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn open_link(var c: Controller) -> Int
-    for ls in 0..noble_controller_config.CTL_LINKS
+    for ls in 0..noble_controller.CONFIG.CTL_LINKS
         if ctl_hci.ctl_cs_series_open(var c, ls)
             return ls
     -1
 
 // The connection event the subevent at (`inst`, `ev_i`) is anchored to: the first event of the series, whole procedure intervals and event intervals on.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn subevent_event(var sc: ctl_hci.CsSched, inst: Int, ev_i: Int) -> Int
     (sc.conn_event + inst * sc.proc_interval + ev_i * sc.event_interval) & 0xFFFF
 
 // The start of the subevent at (`inst`, `ev_i`, `sub_i`) of the series with the schedule `sc`, on the connection in slot `ls`, on the radio's timebase; -1 when the
 // connection event is behind the one the link is to run next, or a Connection Update moves it.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn subevent_time(var c: Controller, ls: Int, var sc: ctl_hci.CsSched, inst: Int, ev_i: Int, sub_i: Int) -> Int
     let anchor = ctl_hci.ctl_cs_event_time(var c, ls, subevent_event(var sc, inst, ev_i))
@@ -214,13 +214,13 @@ fn subevent_time(var c: Controller, ls: Int, var sc: ctl_hci.CsSched, inst: Int,
     anchor + sc.offset_us + sub_i * sc.subevent_interval_us
 
 // The event at the program's position is under way (its first subevent ran).
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn under_way_set(var a: CsAir, on: Bool)
     a.under_way = on
 
 // Move on to the next subevent: the next in the event, the first of the next event, or, when the procedure is complete (`done`), the first of the next instance.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn advance(var a: CsAir, var sc: ctl_hci.CsSched, done: Bool)
     a.prepared = false
@@ -239,7 +239,7 @@ fn advance(var a: CsAir, var sc: ctl_hci.CsSched, done: Bool)
 
 // Plan the subevent the program is at: begin the instance when it is the first of it, and plan.  False when the series is over (an instance that finds too few channels, or a
 // cipher that failed).
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn plan_one<R: Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var cc: C, var st: ll_cs_plan.CsState, var a: CsAir, var sc: ctl_hci.CsSched,
                                           t0: Int) -> Bool [t, k]
@@ -264,7 +264,7 @@ fn plan_one<R: Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var cc:
     true
 
 // The procedures of the connection with a series open: plan the next subevent while the radio is idle, and run it at its time.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn proc_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, var c: Controller, var rf: ll_air.Rf, var cc: C, var st: ll_cs_plan.CsState,
                                                                     var a: CsAir) [e, t, s, k]
@@ -360,7 +360,7 @@ fn proc_slot<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, v
 // The slot of the radio program for Channel Sounding: called once for every turn of the main loop, after `ll_poll`.  It runs the subevents of the LE CS Test and of the
 // procedures that are due.  `a` is the program's record (`cs_air_new`) and `st` the storage of the planning (`ll_cs_plan.state_new`); the image holds both, since a build
 // without the feature has neither.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 pub @tier(embedded)
 fn cs_poll<R: Radio[e] + Timebase[t] + CsRadio[s], C: Cipher[k]>(var air: R, var c: Controller, var rf: ll_air.Rf, var cc: C, var st: ll_cs_plan.CsState,
                                                                  var a: CsAir) [e, t, s, k]

@@ -18,7 +18,7 @@
 //
 // This module holds no radio.  The sets are values with inline storage; no function here allocates.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ll_pdu
 use ll_phy
@@ -58,7 +58,7 @@ const OP_UNCHANGED = 4
 // The advertising sets the Controller holds (`ctl_adv_sets`), the most data octets one holds for its advertising data and for its scan
 // response data (`ctl_adv_data`), and whether the build has extended advertising at all (`ctl_limits.xadv_on()`: no sets, none of it).  A build
 // without it keeps one set with 8 octets of data.
-pub alias AdvData = Vec[u8; if noble_controller_config.CTL_ADV_SETS > 0 then noble_controller_config.CTL_ADV_DATA else 8]
+pub alias AdvData = Vec[u8; if noble_controller.CONFIG.CTL_ADV_SETS > 0 then noble_controller.CONFIG.CTL_ADV_DATA else 8]
 
 // A handle the Host may use ([Vol 4] Part E, Section 7.8.53: 0x00 to 0xEF).
 const HANDLE_MAX = 0xEF

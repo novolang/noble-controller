@@ -36,8 +36,8 @@ noble-hci   = { path = "../noble-hci" }
 noble-radio = { path = "../noble-radio" }
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Controller.  A consumer writes a
-# [noble-controller] section in its config file; the generated module is `noble_controller_config`, read in the sources as
-# `noble_controller_config.CTL_LINKS`.  The keys keep the names they had in the schema of orbit/ble, where they were `ctl_*`.
+# [noble-controller] section in its config file; the generated module is `noble_controller.CONFIG`, read in the sources as
+# `noble_controller.CONFIG.CTL_LINKS`.  The keys keep the names they had in the schema of orbit/ble, where they were `ctl_*`.
 # The storage the keys add up to is stated by `bytes`, `bytes_expr`, `floor` and `floor_when`, one term for each record the
 # Controller declares, so that `novo config explain` prints the figure `src/ctl_budget.nv` recomputes.
 [config.ctl_links]

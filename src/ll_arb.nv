@@ -28,7 +28,7 @@
 //
 // The state is a value with inline storage; no function here allocates.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ll_radio
 
@@ -105,9 +105,9 @@ const MIN_SLOT_US = 1000
 // `on` says the class has a booking, `start` and `end` are its times.
 @value
 struct Arb
-    on: Vec[Bool; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_LINKS + 6 else noble_controller_config.CTL_LINKS + 4]
-    start: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_LINKS + 6 else noble_controller_config.CTL_LINKS + 4]
-    end: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_LINKS + 6 else noble_controller_config.CTL_LINKS + 4]
+    on: Vec[Bool; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_LINKS + 6 else noble_controller.CONFIG.CTL_LINKS + 4]
+    start: Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_LINKS + 6 else noble_controller.CONFIG.CTL_LINKS + 4]
+    end: Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_LINKS + 6 else noble_controller.CONFIG.CTL_LINKS + 4]
     lead: Int
     guard: Int
     stream_guard: Int
@@ -221,7 +221,7 @@ fn arb_clear(var a: Arb, cls: Int, now: Int, until: Int) -> Bool
 
 // Whether the class `cls` alone has no booking inside the stretch from `from` to `until` (less the guard): the test of a subevent against the connection events
 // of the link that carries the procedure, whose class it is.  A class that is out of range is clear.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn arb_clear_class(var a: Arb, cls: Int, from: Int, until: Int) -> Bool
     if cls < 0 or cls >= classes()
@@ -230,7 +230,7 @@ fn arb_clear_class(var a: Arb, cls: Int, from: Int, until: Int) -> Bool
 
 // The class a subevent of a Channel Sounding event takes: `class_cs_next()` for a later subevent of an event that is under way (`under_way`), `class_cs()` for the first
 // subevent of an event, and for a later one whose event never began.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn cs_class(first: Bool, under_way: Bool) -> Int
     if not first and under_way
@@ -240,7 +240,7 @@ fn cs_class(first: Bool, under_way: Bool) -> Int
 // Whether a subevent that starts at `t0` and lasts `len` may run: the radio is booked from `t0 - lead` until `t0 + len + finish`, and no class above `cls` (the class
 // `cs_class` gave) is booked to begin inside that stretch or is under way at `now`, and the connection events of the link in the class `link_cls` that carries the
 // procedure are not inside it either, whatever the class.  A build without the feature never fits.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn arb_cs_fits(var a: Arb, cls: Int, link_cls: Int, now: Int, t0: Int, lead: Int, len: Int, finish: Int) -> Bool
     if cls < 0 or cls >= classes()
@@ -254,7 +254,7 @@ fn arb_cs_fits(var a: Arb, cls: Int, link_cls: Int, now: Int, t0: Int, lead: Int
 
 // Book the radio for a subevent in the class `cls`: from `lead` before `t0` until `finish` after the end of its `len`, replacing the class's earlier booking.  The
 // booking is made after `arb_cs_fits` agreed, and stays until it ends or `arb_cancel` takes it away.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @tier(embedded)
 fn arb_book_cs(var a: Arb, cls: Int, t0: Int, lead: Int, len: Int, finish: Int)
     arb_book(var a, cls, t0 - lead, t0 + len + finish)

@@ -52,7 +52,7 @@ ll_air.ll_poll(var air, var c, var rf, var rx, var policy, var cc)
 The sizes of the tables are keys of the package configuration.  A consumer
 writes a `[noble-controller]` section in its config file (the `ctl_*` keys:
 `ctl_links`, `ctl_cis`, `ctl_bigs`, `ctl_adv_sets`, `ctl_per_adv` and the
-others); the build writes them as `noble_controller_config.CTL_LINKS` and
+others); the build writes them as `noble_controller.CONFIG.CTL_LINKS` and
 the like, and a feature whose count is `0` is out of the image and answers
 its commands with Unknown HCI Command.  `novo config explain` prints the
 storage the keys imply.  `configs/` holds the profiles this package's tests

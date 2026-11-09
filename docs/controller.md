@@ -126,7 +126,7 @@ private.  `novo doc` prints them.
 | `ll_privacy` (8), `ll_adv` (4), `ll_iso` (4), `ll_scan` (3), `ll_arb` (2), `ctl_pool` (2), `ll_big`, `ll_ccm`, `ll_link` (1 each) | the records and constants the glue reads, among them `rl_new` and `rl_add` of the resolving list and `soft_cipher_new` |
 | `ctl_limits` (6), `ll_per`, `ll_xadv` | the derived limits the images size their tables with (`cis_slots`, `big_slots`, `bis_slots`, `arb_classes`, `big_on`, `per_on`) and the aliases `PerData` and `AdvData` |
 
-The configuration module `noble_controller_config` is generated from the keys of `novo.toml`; a consumer reads its constants
+The configuration module `noble_controller.CONFIG` is generated from the keys of `novo.toml`; a consumer reads its constants
 and sets them in its own config file.
 
 ## Tests
@@ -141,6 +141,6 @@ scripted `Radio` with no registers), and `ll_privacy_tests`.
 
 `novo pkg publish` runs every suite under the minimum configuration, the maximum configuration and each file of
 `configs/`.  A test whose subject a configuration leaves out does not exist there: it carries `@when` on the keys it
-needs, for example `@when(noble_controller_config.CTL_CENTRAL > 0)` above a test that opens a connection as Central, and the
+needs, for example `@when(noble_controller.CONFIG.CTL_CENTRAL > 0)` above a test that opens a connection as Central, and the
 build under `ctl_central = 0` does not compile it.  A test that reads a limit computes the figure it expects from the
-configuration key (`ctl_limits.data_max()`, `noble_controller_config.CTL_ADV_SETS`) and not from the default.
+configuration key (`ctl_limits.data_max()`, `noble_controller.CONFIG.CTL_ADV_SETS`) and not from the default.

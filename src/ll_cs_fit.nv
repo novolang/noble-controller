@@ -16,7 +16,7 @@
 // Subevents_Per_Event and Subevent_Interval are not re-suggested.  Procedure_Interval is not in the list, so a request whose
 // interval is not a multiple of the factor is refused.  The times are on the radio's timebase, in microseconds.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_cs
 use ll_sub
 
@@ -54,7 +54,7 @@ const STRETCH_TRIES = 12
 //
 // A booking is added with `busy_add`: the carrying link first, then the other links, the streams and the groups, as many as `BOOKINGS`; a booking beyond them is not seen by
 // the placing, and the arbiter meets it at run time.
-pub alias Busy = Vec[Int; if noble_controller_config.CTL_CS > 0 then 130 else 1]
+pub alias Busy = Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then 130 else 1]
 
 const BOOKINGS = 24
 const B_ON = 0
@@ -138,7 +138,7 @@ fn busy_add(var b: Busy, first: Int, period: Int, len: Int, ahead: Int, hard: Bo
 // The parameters of a Start the placing reads and may change, as a table of integers (`Q_` indices, as `Busy` is one): connEventCount, Offset_Min and Offset_Max
 // (microseconds), Max_Procedure_Len (units of 625 microseconds), Event_Interval (connection events), Subevents_Per_Event, Subevent_Interval (units of 625 microseconds),
 // Subevent_Len (microseconds) and Procedure_Interval (connection events).  `ll_cs_proc.start_req` makes one from an LL_CS_REQ and `ll_cs_proc.place_start` puts the result back.
-pub alias Req = Vec[Int; if noble_controller_config.CTL_CS > 0 then 9 else 1]
+pub alias Req = Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then 9 else 1]
 
 const Q_CONN = 0
 const Q_OMIN = 1

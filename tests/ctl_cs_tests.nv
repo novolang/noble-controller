@@ -12,7 +12,7 @@
 
 use ctl_limits
 use std.test
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ll_pdu
 use ll_data
@@ -296,7 +296,7 @@ fn control_pdu(op: Int, n: Int) -> Pdu
 fn pdu_lengths() -> [Int]
     [20, 25, 25, 27, 1, 28, 21, 18, 4, 0, 72, 12, 20, 4]
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_the_fourteen_control_opcodes_are_answered_with_unknown_response_when_the_feature_is_out()
     if ctl_limits.cs_on()

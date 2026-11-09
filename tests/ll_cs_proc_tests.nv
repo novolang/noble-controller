@@ -10,7 +10,7 @@
 
 use std.test
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_pdu
 use ll_data
 use ll_cs
@@ -3976,10 +3976,10 @@ fn test_the_capabilities_a_build_reports_follow_its_keys_and_are_valid()
     ll_cs_proc.local_caps(var c)
     test.assert(ll_cs_proc.caps_valid(var c))
     test.assert_eq(c.v2, ctl_limits.cs_ipt_on())
-    test.assert_eq(c.num_ant, noble_controller_config.CTL_CS_ANT)
-    test.assert_eq(c.max_path, noble_controller_config.CTL_CS_ANT)
-    test.assert_eq(c.role, noble_controller_config.CTL_CS_ROLES)
-    test.assert_eq(c.num_configs, noble_controller_config.CTL_CS_CONFIGS)
+    test.assert_eq(c.num_ant, noble_controller.CONFIG.CTL_CS_ANT)
+    test.assert_eq(c.max_path, noble_controller.CONFIG.CTL_CS_ANT)
+    test.assert_eq(c.role, noble_controller.CONFIG.CTL_CS_ROLES)
+    test.assert_eq(c.num_configs, noble_controller.CONFIG.CTL_CS_CONFIGS)
     test.assert_eq((c.mode_types & 1) == 1, ctl_limits.cs_mode3_on())
     test.assert_eq(c.ch3c == 1, ctl_limits.cs_3c_on())
     test.assert_eq(c.ipt == 1, ctl_limits.cs_ipt_on())
@@ -4066,9 +4066,9 @@ fn test_the_store_holds_the_fixed_part_and_one_slot_for_each_configuration_of_th
     if skip()
         return
     let cs = ll_cs_proc.cs_new()
-    test.assert_eq(ll_cs_proc.bulk_octets(), 224 + 56 * noble_controller_config.CTL_CS_CONFIGS)
+    test.assert_eq(ll_cs_proc.bulk_octets(), 224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS)
     test.assert_eq(cs.bulk.len(), ll_cs_proc.bulk_octets())
-    test.assert_eq(ll_cs_proc.cfg_slots(), noble_controller_config.CTL_CS_CONFIGS)
+    test.assert_eq(ll_cs_proc.cfg_slots(), noble_controller.CONFIG.CTL_CS_CONFIGS)
     // The areas of the store follow one another without overlap.
     test.assert(ll_cs_proc.OFF_FAE >= ll_cs_proc.OFF_CAPS + 32)
     test.assert(ll_cs_proc.OFF_SEC >= ll_cs_proc.OFF_FAE + 72)
@@ -4090,12 +4090,12 @@ fn test_the_storage_of_a_connection_is_its_words_and_its_store_in_the_budget_of_
     test.assert_eq(ctl_budget.CTL_CS_RESULT_STEP, ll_cs_proc.RES_STEP_OCT)
     test.assert_eq(ctl_budget.CTL_CS_STORE, ll_cs_proc.OFF_CFG)
     test.assert_eq(ctl_budget.CTL_CS_CONFIG, ll_cs_proc.CFG_OCT)
-    let store = ctl_budget.CTL_CS_STORE + ctl_budget.CTL_CS_CONFIG * noble_controller_config.CTL_CS_CONFIGS
+    let store = ctl_budget.CTL_CS_STORE + ctl_budget.CTL_CS_CONFIG * noble_controller.CONFIG.CTL_CS_CONFIGS
     // The planning (`ll_cs_plan`) is the other part of the figure: a generator for each connection, the plan's head and its steps.
-    let planning = ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_GEN_RECORD) + ctl_budget.CTL_CS_PLAN_FIXED + ctl_budget.vec_bytes(noble_controller_config.CTL_CS_STEPS, ctl_budget.CTL_CS_STEP_RECORD)
-    test.assert_eq(ctl_budget.controller_cs_bytes(), planning + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.CTL_CS_GLOBAL_WORDS + ctl_budget.vec_bytes(noble_controller_config.CTL_CS, store) + ctl_budget.CTL_CS_GLOBAL_OCTETS + ctl_budget.CTL_CS_RESULT_STEP * noble_controller_config.CTL_CS_STEPS + ctl_budget.CTL_CS_ARB)
+    let planning = ctl_budget.vec_bytes(noble_controller.CONFIG.CTL_CS, ctl_budget.CTL_CS_GEN_RECORD) + ctl_budget.CTL_CS_PLAN_FIXED + ctl_budget.vec_bytes(noble_controller.CONFIG.CTL_CS_STEPS, ctl_budget.CTL_CS_STEP_RECORD)
+    test.assert_eq(ctl_budget.controller_cs_bytes(), planning + ctl_budget.vec_bytes(noble_controller.CONFIG.CTL_CS, ctl_budget.CTL_CS_WORDS) + ctl_budget.CTL_CS_GLOBAL_WORDS + ctl_budget.vec_bytes(noble_controller.CONFIG.CTL_CS, store) + ctl_budget.CTL_CS_GLOBAL_OCTETS + ctl_budget.CTL_CS_RESULT_STEP * noble_controller.CONFIG.CTL_CS_STEPS + ctl_budget.CTL_CS_ARB)
     test.assert_eq(ctl_budget.CTL_CS_ARB, 32)
-    test.assert_eq(ctl_limits.cs_slots(), noble_controller_config.CTL_CS)
+    test.assert_eq(ctl_limits.cs_slots(), noble_controller.CONFIG.CTL_CS)
     test.assert_eq(ll_cs_proc.bulk_octets(), store)
     test.assert_eq(store % 8, 0)
 
@@ -4109,12 +4109,12 @@ fn test_a_build_without_the_feature_keeps_the_two_tables_at_one_element_each_in_
 // ── The records in the Controller's tables ──────────────────────────
 
 // The tables of a Controller with `ctl_cs` records.
-fn tables() -> Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1]
-    var w: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1] = Vec.new()
+fn tables() -> Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * 38 + 40 else 1]
+    var w: Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * 38 + 40 else 1] = Vec.new()
     w
 
-fn store_tables() -> Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1]
-    var b: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1] = Vec.new()
+fn store_tables() -> Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * (224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS) + 232 + noble_controller.CONFIG.CTL_CS_STEPS * 40 else 1]
+    var b: Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * (224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS) + 232 + noble_controller.CONFIG.CTL_CS_STEPS * 40 else 1] = Vec.new()
     b
 
 @test
@@ -4124,9 +4124,9 @@ fn test_the_tables_start_with_every_record_free()
     var w = tables()
     var b = store_tables()
     ll_cs_proc.tables_fill(var w, var b)
-    test.assert_eq(w.len(), noble_controller_config.CTL_CS * ll_cs_proc.CS_WORDS + ll_cs_proc.GLOBAL_WORDS)
-    test.assert_eq(b.len(), noble_controller_config.CTL_CS * ll_cs_proc.bulk_octets() + ll_cs_proc.GLOBAL_OCTETS + noble_controller_config.CTL_CS_STEPS * ll_cs_proc.RES_STEP_OCT)
-    for slot in 0..noble_controller_config.CTL_CS
+    test.assert_eq(w.len(), noble_controller.CONFIG.CTL_CS * ll_cs_proc.CS_WORDS + ll_cs_proc.GLOBAL_WORDS)
+    test.assert_eq(b.len(), noble_controller.CONFIG.CTL_CS * ll_cs_proc.bulk_octets() + ll_cs_proc.GLOBAL_OCTETS + noble_controller.CONFIG.CTL_CS_STEPS * ll_cs_proc.RES_STEP_OCT)
+    for slot in 0..noble_controller.CONFIG.CTL_CS
         test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_OWNER], -1)
         test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_WAIT], ll_cs_proc.W_NONE)
         test.assert_eq(w[slot * ll_cs_proc.CS_WORDS + ll_cs_proc.WD_CHM_LO], ll_cs_pdu.CHM_LO_ALLOWED)
@@ -4139,7 +4139,7 @@ fn test_a_record_stored_and_loaded_comes_back_whole_in_every_slot()
     var w = tables()
     var b = store_tables()
     ll_cs_proc.tables_fill(var w, var b)
-    for slot in 0..noble_controller_config.CTL_CS
+    for slot in 0..noble_controller.CONFIG.CTL_CS
         var cen = fresh()
         var per = fresh()
         ready(var cen, var per, 0)

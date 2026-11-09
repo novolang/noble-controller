@@ -4,7 +4,7 @@
 
 use std.test
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_pdu
 use ll_phy
 use ll_init
@@ -101,7 +101,7 @@ fn t_room(have: Int, len: Int) -> Int
     else
         OK
 
-@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_data_commands_follow_the_operations()
     var t = t_train(0, 0)
@@ -137,7 +137,7 @@ fn test_the_data_commands_follow_the_operations()
     test.assert_eq(pdata_status(var t, OP_UNCHANGED, 0), OK)
     test.assert_eq(pdata_status(var t, OP_UNCHANGED, 1), E_INVALID)
 
-@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_interval_is_the_shortest_that_holds_an_event()
     var t = t_train(0, 20)
@@ -184,7 +184,7 @@ fn test_syncinfo_holds_the_fields_of_the_train()
         let _z = ll_pdu.pdu_put_data(var r, si[k] as Int)
     test.assert_eq(si_offset_us(var r, 0), 0)
 
-@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_next_event_and_the_shift_put_the_offset_in_its_unit()
     var t = t_train(0, 10)
@@ -242,7 +242,7 @@ fn test_an_event_advances_the_due_time_and_the_counter()
     test.assert_eq(intervals_to(var t, 130001), 1)
     test.assert_eq(intervals_to(var t, 255001), 2)
 
-@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
     var t = t_train(ll_xadv.P_TXP, 251)
@@ -277,7 +277,7 @@ fn test_the_pdus_of_an_event_carry_the_pointer_and_the_data()
     test.assert_eq(r.n, sync_octets(var e, 0, false))
     test.assert_eq(ll_ext.ext_parse(var r).data_len, 0)
 
-@when(noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 and noble_controller_config.CTL_PER_LIST >= 3)
+@when(noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0 and noble_controller.CONFIG.CTL_PER_LIST >= 3)
 @test
 fn test_the_periodic_advertiser_list_adds_finds_and_removes()
     var l = pal_new()

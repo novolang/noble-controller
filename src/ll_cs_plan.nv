@@ -18,7 +18,7 @@
 // `plan_next` makes one step and `plan_subevent` makes a subevent into a `CsSubevent`, whose storage the keys size.  `plan_arm` hands a `CsSubevent`
 // to a radio through the `CsRadio` trait.  No function here allocates.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_cipher
 use ll_cs
 use ll_cs_drbg
@@ -679,7 +679,7 @@ struct CsSubevent
     head: CsPlan
     n: Int
     code: Int
-    steps: Vec[CsStep; max1(noble_controller_config.CTL_CS_STEPS)]
+    steps: Vec[CsStep; max1(noble_controller.CONFIG.CTL_CS_STEPS)]
 
 // A plan with no step.  Public for the bench rig of `orbit/ble`.
 pub @tier(embedded)
@@ -692,7 +692,7 @@ fn plan_new() -> CsSubevent
 // has the feature off holds none of it and links none of this module.
 @value
 struct CsState
-    gens: Vec[CsGen; max1(noble_controller_config.CTL_CS)]
+    gens: Vec[CsGen; max1(noble_controller.CONFIG.CTL_CS)]
     plan: CsSubevent
 
 // The storage of the planning with a generator for each of `n` connections (`ctl_cs`), none of them keyed, and an empty plan.

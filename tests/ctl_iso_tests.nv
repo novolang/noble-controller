@@ -17,7 +17,7 @@ use ll_iso
 use ll_policy
 use h4_rx
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 
 // A @value struct is changed through a `var` parameter, so the tests set fields through this
 // function, by name.
@@ -1442,14 +1442,14 @@ fn test_slots_and_literals_match_the_profile()
     var feat = 0
     if limits_cis() > 0
         feat = 0x34
-    if noble_controller_config.CTL_BIGS > 0
+    if noble_controller.CONFIG.CTL_BIGS > 0
         feat = 0xF4
     if ctl_limits.past_on()
         feat = feat | 0x03
     test.assert_eq(ctl_limits.features_octet3(), feat)
-    test.assert_eq(ctl_limits.big_slots(), max_one(noble_controller_config.CTL_BIGS))
-    test.assert_eq(ctl_limits.bis_slots(), max_one(noble_controller_config.CTL_BIS))
-    test.assert_eq(ctl_limits.big_on(), noble_controller_config.CTL_BIGS > 0)
+    test.assert_eq(ctl_limits.big_slots(), max_one(noble_controller.CONFIG.CTL_BIGS))
+    test.assert_eq(ctl_limits.bis_slots(), max_one(noble_controller.CONFIG.CTL_BIS))
+    test.assert_eq(ctl_limits.big_on(), noble_controller.CONFIG.CTL_BIGS > 0)
     test.assert_eq(ctl_limits.iso_on(), limits_cis() > 0)
     let c = ctl_hci.controller_new(ctl_hci.CAP_LL)
     test.assert_eq(c.cis.capacity(), ctl_limits.cis_slots())
@@ -1464,10 +1464,10 @@ fn max_one(n: Int) -> Int
         n
 
 fn limits_cis() -> Int
-    noble_controller_config.CTL_CIS
+    noble_controller.CONFIG.CTL_CIS
 
 fn limits_cigs() -> Int
-    noble_controller_config.CTL_CIGS
+    noble_controller.CONFIG.CTL_CIGS
 
 // ── The requests of an Android Central ───────────────────────────────
 
@@ -1629,7 +1629,7 @@ fn test_a_request_for_a_stream_the_central_gave_up_replaces_the_earlier_attempt(
 
 // A third request finds the second still waiting for the Host, and the first slot not yet free: no duplicate is left.  The
 // replacement takes a third slot, so a build with two streams refuses the third request for want of one.
-@when(noble_controller_config.CTL_CIS >= 3)
+@when(noble_controller.CONFIG.CTL_CIS >= 3)
 @test
 fn test_a_third_request_for_the_stream_the_central_gave_up_leaves_no_duplicate()
     var c = connected()

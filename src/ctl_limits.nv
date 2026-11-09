@@ -1,8 +1,8 @@
 // src/ctl_limits.nv -- the values the build limits of the Controller derive.
 //
 // The limits are the package configuration (docs/config.md): the keys `ctl_*` of orbit/ble/novo.toml,
-// read as `noble_controller_config.CTL_CIS`.  This module holds what the keys do not say by themselves, each a
-// parameterless `const fn` over `ble_config`:
+// read as `noble_controller.CONFIG.CTL_CIS`.  This module holds what the keys do not say by themselves, each a
+// parameterless `const fn` over `ble.CONFIG`:
 //
 //   * the switches of the features (`iso_on`, `per_on`, `past_on`, ...): a feature is in when its key
 //     says so and the features it needs are in;
@@ -13,10 +13,10 @@
 //
 // A `const` item cannot read a constant of the configuration module, and a capacity cannot call a
 // `const fn` of another module, so a type that sizes a `Vec` from a key writes the expression in its
-// own module with that module's `max1` (`Vec[Cis; max1(noble_controller_config.CTL_CIS)]`), and a test beside it
+// own module with that module's `max1` (`Vec[Cis; max1(noble_controller.CONFIG.CTL_CIS)]`), and a test beside it
 // compares the capacity with the function here.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_cs
 
 // The larger of `n` and 1: a table of an absent feature keeps one record.
@@ -34,41 +34,41 @@ const fn max1(n: Int) -> Int
 // Isochronous channels (ll_iso.nv).
 @tier(embedded)
 const fn iso_on() -> Bool
-    noble_controller_config.CTL_CIS > 0
+    noble_controller.CONFIG.CTL_CIS > 0
 
 // The ISO test commands: isochronous channels and broadcast groups.
 @tier(embedded)
 const fn test_on() -> Bool
-    noble_controller_config.CTL_CIS > 0 and noble_controller_config.CTL_BIGS > 0
+    noble_controller.CONFIG.CTL_CIS > 0 and noble_controller.CONFIG.CTL_BIGS > 0
 
 // Broadcast isochronous groups (ll_big.nv).
 pub @tier(embedded)
 const fn big_on() -> Bool
-    noble_controller_config.CTL_BIGS > 0 and noble_controller_config.CTL_CIS > 0
+    noble_controller.CONFIG.CTL_BIGS > 0 and noble_controller.CONFIG.CTL_CIS > 0
 
 // Extended advertising (ll_xadv.nv).
 @tier(embedded)
 const fn xadv_on() -> Bool
-    noble_controller_config.CTL_ADV_SETS > 0
+    noble_controller.CONFIG.CTL_ADV_SETS > 0
 
 // Periodic advertising and synchronization (ll_per.nv).
 pub @tier(embedded)
 const fn per_on() -> Bool
-    noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0
+    noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0
 
 // Periodic Advertising Sync Transfer (ll_past.nv).
 @tier(embedded)
 const fn past_on() -> Bool
-    noble_controller_config.CTL_PAST and per_on()
+    noble_controller.CONFIG.CTL_PAST and per_on()
 
 // Periodic advertising with responses (ll_pawr.nv): the advertiser, the synchronizer, either.
 @tier(embedded)
 const fn pawr_adv_on() -> Bool
-    noble_controller_config.CTL_PAWR_ADV and per_on()
+    noble_controller.CONFIG.CTL_PAWR_ADV and per_on()
 
 @tier(embedded)
 const fn pawr_sync_on() -> Bool
-    noble_controller_config.CTL_PAWR_SYNC and per_on()
+    noble_controller.CONFIG.CTL_PAWR_SYNC and per_on()
 
 @tier(embedded)
 const fn pawr_on() -> Bool
@@ -78,103 +78,103 @@ const fn pawr_on() -> Bool
 // path loss monitoring (ll_ploss.nv), the Sleep Clock Accuracy request (ll_sca.nv) and Frame Space Update (ll_fs.nv).
 @tier(embedded)
 const fn pcl_on() -> Bool
-    noble_controller_config.CTL_PCL
+    noble_controller.CONFIG.CTL_PCL
 
 @tier(embedded)
 const fn sub_on() -> Bool
-    noble_controller_config.CTL_SUBRATE
+    noble_controller.CONFIG.CTL_SUBRATE
 
 @tier(embedded)
 const fn feat_on() -> Bool
-    noble_controller_config.CTL_FEATPAGES
+    noble_controller.CONFIG.CTL_FEATPAGES
 
 @tier(embedded)
 const fn rate_on() -> Bool
-    noble_controller_config.CTL_CONNRATE
+    noble_controller.CONFIG.CTL_CONNRATE
 
 @tier(embedded)
 const fn ploss_on() -> Bool
-    noble_controller_config.CTL_PLOSS
+    noble_controller.CONFIG.CTL_PLOSS
 
 @tier(embedded)
 const fn sca_on() -> Bool
-    noble_controller_config.CTL_PEERSCA
+    noble_controller.CONFIG.CTL_PEERSCA
 
 @tier(embedded)
 const fn fs_on() -> Bool
-    noble_controller_config.CTL_FRAMESPACE
+    noble_controller.CONFIG.CTL_FRAMESPACE
 
 // Channel Sounding (ll_cs.nv): a build with `ctl_cs` above 0 (the schema holds it to a build with LE Power Control).  The options follow their
 // keys, which the schema holds to `ctl_cs`; the initiator phase tone and Enhancement #1 also follow the feature pages that carry feature 75.
 @tier(embedded)
 const fn cs_on() -> Bool
-    noble_controller_config.CTL_CS > 0
+    noble_controller.CONFIG.CTL_CS > 0
 
 @tier(embedded)
 const fn cs_initiator_on() -> Bool
-    cs_on() and (noble_controller_config.CTL_CS_ROLES & 1) != 0
+    cs_on() and (noble_controller.CONFIG.CTL_CS_ROLES & 1) != 0
 
 @tier(embedded)
 const fn cs_reflector_on() -> Bool
-    cs_on() and (noble_controller_config.CTL_CS_ROLES & 2) != 0
+    cs_on() and (noble_controller.CONFIG.CTL_CS_ROLES & 2) != 0
 
 @tier(embedded)
 const fn cs_mode3_on() -> Bool
-    cs_on() and noble_controller_config.CTL_CS_MODE3
+    cs_on() and noble_controller.CONFIG.CTL_CS_MODE3
 
 @tier(embedded)
 const fn cs_rtt_seq_on() -> Bool
-    cs_on() and noble_controller_config.CTL_CS_RTT_SEQ
+    cs_on() and noble_controller.CONFIG.CTL_CS_RTT_SEQ
 
 @tier(embedded)
 const fn cs_3c_on() -> Bool
-    cs_on() and noble_controller_config.CTL_CS_3C
+    cs_on() and noble_controller.CONFIG.CTL_CS_3C
 
 @tier(embedded)
 const fn cs_ipt_on() -> Bool
-    cs_on() and noble_controller_config.CTL_CS_IPT and feat_on()
+    cs_on() and noble_controller.CONFIG.CTL_CS_IPT and feat_on()
 
 @tier(embedded)
 const fn cs_test_on() -> Bool
-    cs_on() and noble_controller_config.CTL_CS_TEST
+    cs_on() and noble_controller.CONFIG.CTL_CS_TEST
 
 // ── The Controller's tables: the slots of each, at least 1 ──────────────────────────────────────────
 // The slots of the table of connected isochronous streams: `ctl_cis`, and 1 when the build has none.
 pub @tier(embedded)
 const fn cis_slots() -> Int
-    max1(noble_controller_config.CTL_CIS)
+    max1(noble_controller.CONFIG.CTL_CIS)
 
 @tier(embedded)
 const fn cig_slots() -> Int
-    max1(noble_controller_config.CTL_CIGS)
+    max1(noble_controller.CONFIG.CTL_CIGS)
 
 // The slots of the table of broadcast isochronous groups: `ctl_bigs`, and 1 when the build has none.
 pub @tier(embedded)
 const fn big_slots() -> Int
-    max1(noble_controller_config.CTL_BIGS)
+    max1(noble_controller.CONFIG.CTL_BIGS)
 
 // The slots of the table of broadcast isochronous streams: `ctl_bis`, and 1 when the build has none.
 pub @tier(embedded)
 const fn bis_slots() -> Int
-    max1(noble_controller_config.CTL_BIS)
+    max1(noble_controller.CONFIG.CTL_BIS)
 
 // Advertising sets, periodic trains, synchronizations and the entries of the Periodic Advertiser List.
 @tier(embedded)
 const fn sets() -> Int
-    max1(noble_controller_config.CTL_ADV_SETS)
+    max1(noble_controller.CONFIG.CTL_ADV_SETS)
 
 @tier(embedded)
 const fn padv_n() -> Int
-    max1(noble_controller_config.CTL_PER_ADV)
+    max1(noble_controller.CONFIG.CTL_PER_ADV)
 
 @tier(embedded)
 const fn psync_n() -> Int
-    max1(noble_controller_config.CTL_PER_SYNC)
+    max1(noble_controller.CONFIG.CTL_PER_SYNC)
 
 @tier(embedded)
 const fn pal_n() -> Int
     if per_on()
-        max1(noble_controller_config.CTL_PER_LIST)
+        max1(noble_controller.CONFIG.CTL_PER_LIST)
     else
         1
 
@@ -184,7 +184,7 @@ const fn pal_n() -> Int
 @tier(embedded)
 const fn data_max() -> Int
     if xadv_on()
-        noble_controller_config.CTL_ADV_DATA
+        noble_controller.CONFIG.CTL_ADV_DATA
     else
         8
 
@@ -197,65 +197,65 @@ const fn per_data() -> Int
 @tier(embedded)
 const fn pw_bufs() -> Int
     if pawr_on()
-        noble_controller_config.CTL_PAWR_BUFS
+        noble_controller.CONFIG.CTL_PAWR_BUFS
     else
         1
 
 @tier(embedded)
 const fn pw_data() -> Int
     if pawr_on()
-        noble_controller_config.CTL_PAWR_DATA
+        noble_controller.CONFIG.CTL_PAWR_DATA
     else
         8
 
 @tier(embedded)
 const fn pw_rsp() -> Int
     if pawr_on()
-        2 * noble_controller_config.CTL_PAWR_DATA + 8
+        2 * noble_controller.CONFIG.CTL_PAWR_DATA + 8
     else
         8
 
 // The records of the trains and the synchronizations with responses.
 @tier(embedded)
 const fn pwa_slots() -> Int
-    if noble_controller_config.CTL_PAWR_ADV
-        max1(noble_controller_config.CTL_PER_ADV)
+    if noble_controller.CONFIG.CTL_PAWR_ADV
+        max1(noble_controller.CONFIG.CTL_PER_ADV)
     else
         1
 
 @tier(embedded)
 const fn pws_slots() -> Int
-    if noble_controller_config.CTL_PAWR_SYNC
-        max1(noble_controller_config.CTL_PER_SYNC)
+    if noble_controller.CONFIG.CTL_PAWR_SYNC
+        max1(noble_controller.CONFIG.CTL_PER_SYNC)
     else
         1
 
 // The records of Connection Subrating and LE Power Control: one for each link, or one when the feature is out.
 @tier(embedded)
 const fn sub_slots() -> Int
-    if noble_controller_config.CTL_SUBRATE
-        noble_controller_config.CTL_LINKS
+    if noble_controller.CONFIG.CTL_SUBRATE
+        noble_controller.CONFIG.CTL_LINKS
     else
         1
 
 @tier(embedded)
 const fn pcl_slots() -> Int
-    if noble_controller_config.CTL_PCL
-        noble_controller_config.CTL_LINKS
+    if noble_controller.CONFIG.CTL_PCL
+        noble_controller.CONFIG.CTL_LINKS
     else
         1
 
 // The records of Channel Sounding (ll_cs_proc.nv): one for each connection that runs it (`ctl_cs`), or one when the feature is out.
 @tier(embedded)
 const fn cs_slots() -> Int
-    max1(noble_controller_config.CTL_CS)
+    max1(noble_controller.CONFIG.CTL_CS)
 
 // The classes of the arbiter of ll_arb.nv that belong to a connection: one for each link.  The arbiter holds
 // four more (the isochronous events, the periodic trains, the advertising events and the scan windows) and, in a build with Channel Sounding, two
 // (the first and the later subevents of an event), so its columns have `arb_cols()` elements.
 pub @tier(embedded)
 const fn arb_classes() -> Int
-    noble_controller_config.CTL_LINKS
+    noble_controller.CONFIG.CTL_LINKS
 
 // The classes of the arbiter that belong to Channel Sounding: two in a build with the feature, none in one without.
 pub @tier(embedded)
@@ -268,7 +268,7 @@ const fn arb_cs_classes() -> Int
 // The columns of the arbiter's tables: the connection classes, the four others and the classes of Channel Sounding.
 pub @tier(embedded)
 const fn arb_cols() -> Int
-    noble_controller_config.CTL_LINKS + 4 + arb_cs_classes()
+    noble_controller.CONFIG.CTL_LINKS + 4 + arb_cs_classes()
 
 // The buffers of ll_iso.nv: the transmit data, the Host's fragments and the SDUs for the Host.
 @tier(embedded)
@@ -309,7 +309,7 @@ const fn features_octet1() -> Int
 @tier(embedded)
 const fn features_octet3() -> Int
     let iso = if iso_on()
-        if noble_controller_config.CTL_BIGS > 0
+        if noble_controller.CONFIG.CTL_BIGS > 0
             0xF4
         else
             0x34

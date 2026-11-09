@@ -23,7 +23,7 @@
 use std.test
 use std.math
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ctl_pool
 use ll_pdu
@@ -1353,7 +1353,7 @@ fn conn_req(aa: Int) -> Pdu
     p
 
 // A Controller whose Host enables every event and sets Channel Sounding (Host Support) before any connection, over the radio `air`.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn host_ctl(first: Int, var air: SimCs) -> ctl_hci.Controller
     var c = ctl_hci.controller_new(ctl_hci.CAP_LL)
     for i in 0..6
@@ -1368,7 +1368,7 @@ fn host_ctl(first: Int, var air: SimCs) -> ctl_hci.Controller
 // The two Controllers, their radios, the logs of what each Host read, and the planning of each.  `a` is the Central of the connection, `b` the Peripheral; `ra` and
 // `rb` are the two sides of one medium.  `ia` and `ib` are the first octet of the logs that no reader of results has looked at, `tw_a` and `tw_b` the tweak a radio applies to what it reads back
 // (`PairRadio`).
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 struct Air
     var a: ctl_hci.Controller
     var b: ctl_hci.Controller
@@ -1393,14 +1393,14 @@ struct Air
     var tw_a: Int
     var tw_b: Int
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn air_new() -> Air
     var ra = sim_cs_new()
     return air_from(var ra)
 
 // The two Controllers over the radio `ra` and the other side of its medium.  A Controller reads the table of frequency actuation errors of its radio when it starts, so the
 // figures of the devices are set before this.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn air_from(var ra: SimCs) -> Air
     var rb = sim_cs_other(var ra)
     var a = host_ctl(0xA0, var ra)
@@ -1410,7 +1410,7 @@ fn air_from(var ra: SimCs) -> Air
     ll_link.link_open(var b.links[0], 1, var req, 1000)
     var w = Air { a: a, b: b, ca: ll_ccm.soft_cipher_new(), cb: ll_ccm.soft_cipher_new(), ma: ll_pdu.pdu_new(), na: ll_pdu.pdu_new(), mb: ll_pdu.pdu_new(),
                   nb: ll_pdu.pdu_new(), ha: [], hb: [], air_a: [], air_b: [], rnd_a: s_rnd_central(), rnd_b: s_rnd_peripheral(), ra: ra, rb: rb,
-                  sa: ll_cs_plan.state_new(noble_controller_config.CTL_CS), sb: ll_cs_plan.state_new(noble_controller_config.CTL_CS), ia: 0, ib: 0, tw_a: 0, tw_b: 0 }
+                  sa: ll_cs_plan.state_new(noble_controller.CONFIG.CTL_CS), sb: ll_cs_plan.state_new(noble_controller.CONFIG.CTL_CS), ia: 0, ib: 0, tw_a: 0, tw_b: 0 }
     host_read(var w.a, var w.ha)
     host_read(var w.b, var w.hb)
     w
@@ -1433,7 +1433,7 @@ fn rnd_next(var v: [Int])
         v[i] = (v[i] + 17) & 0xFF
 
 // The program's turn between events: give a link that waits for random octets or for the cipher what it needs.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn secure(var w: Air)
     if ctl_hci.ctl_secure_wanted(var w.a)
         var ra = rnd_vec(w.rnd_a)
@@ -1458,7 +1458,7 @@ fn flight(var l: ll_link.Link, var m: Pdu, var n: Pdu, var out: Pdu)
 
 // One connection event of the connection in the slot 0, run as the radio program runs it.  `mute`: the Peripheral hears nothing.  `lose`: the Central does not hear the
 // Peripheral's answers.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn event(var w: Air, mute: Bool, lose: Bool)
     if not ctl_hci.ctl_conn_active(var w.a, 0)
         return
@@ -1528,24 +1528,24 @@ fn event(var w: Air, mute: Bool, lose: Bool)
     host_read(var w.a, var w.ha)
     host_read(var w.b, var w.hb)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn events(var w: Air, n: Int)
     for _ in 0..n
         event(var w, false, false)
 
 // The Hosts read what the Controllers owe them, a few times over, since a Controller sends the events of a result as the pool has slots.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn settle(var w: Air)
     for _ in 0..6
         host_read(var w.a, var w.ha)
         host_read(var w.b, var w.hb)
 
 // The Central's Host and the Peripheral's.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn ca_cmd(var w: Air, op: Int, p: [Int]) -> [Int]
     cmd(var w.a, var w.ha, op, p)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn pe_cmd(var w: Air, op: Int, p: [Int]) -> [Int]
     cmd(var w.b, var w.hb, op, p)
 
@@ -1587,7 +1587,7 @@ const SUB_CONT = 0x32
 
 // The Host establishes the encrypted connection, long packets in both directions, the capabilities of the peer, CS security and the default settings.  `central_reads`
 // says the Central's Host asks for the capabilities too (the Peripheral's does in any case: its Controller has to ask for the features first).
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn connect(var w: Air)
     events(var w, 2)
     test.assert_eq(status_of(var w.a, var w.ha, 0x2019, start_params(s_rand(), 0x2474, s_ltk())), 0)
@@ -1676,7 +1676,7 @@ struct Two
     var b: Int
 
 // One subevent of the pair, planned, armed, run and stored by the two Controllers at `t0` and `anchor_ns` after the start of their procedure, in the connection event `ev`.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn lock_step(var w: Air, ev: Int, t0: Int, anchor_ns: Int) -> Two
     // The copy of the Peripheral's Controller plans what it will plan and registers the plan with the medium.
     var pc = w.b
@@ -1732,13 +1732,13 @@ fn le24(v: Int) -> [Int]
 fn proc_params(s: Setup) -> [Int]
     cat(cat(cat([1, 0, 0], le16(400)), cat(le16(9), le16(16))), cat(cat(le16(s.count), cat(le24(s.sub_len), le24(s.sub_len))), [s.aci, 1, 0x80, 1, 0xFF, 0xFF]))
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn ini_cmd(var w: Air, s: Setup, op: Int, p: [Int]) -> [Int]
     if s.init_central
         return ca_cmd(var w, op, p)
     pe_cmd(var w, op, p)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn rfl_cmd(var w: Air, s: Setup, op: Int, p: [Int]) -> [Int]
     if s.init_central
         return pe_cmd(var w, op, p)
@@ -1752,7 +1752,7 @@ fn caps_sub() -> Int
 
 // The Hosts walk the whole way to a series that is on: the capabilities of the peer (the Peripheral's Host asks first, with the features of the Central unknown to its
 // Controller), CS security, the default settings, the table of the reflector, the configuration and the procedure parameters, and the Start.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn open_series(var w: Air, s: Setup)
     connect(var w)
     if not s.lazy
@@ -1782,7 +1782,7 @@ fn open_series(var w: Air, s: Setup)
     test.assert_eq(cstatus(ini_cmd(var w, s, 0x2094, [1, 0, 0, 1]), 0x2094), 0)
     events(var w, 10)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn complete_of_cmd(var w: Air, s: Setup, op: Int, p: [Int]) -> Int
     let r = ini_cmd(var w, s, op, p)
     let done = events_coded(r, 0x0E)
@@ -2044,7 +2044,7 @@ struct Round
 const SUB_SPACING_NS = 30_000_000
 
 // Both Controllers begin a procedure instance in the connection event `ev`; the answer is the octets of the Hosts' logs that the instance starts at.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn round_begin(var w: Air, ev: Int) -> Two
     let mark = Two { a: list.len(w.ha), b: list.len(w.hb) }
     test.assert_eq(ctl_hci.ctl_cs_instance(var w.a, var w.ca, var w.sa, 0, ev), ctl_hci.RUN_OK)
@@ -2052,7 +2052,7 @@ fn round_begin(var w: Air, ev: Int) -> Two
     mark
 
 // The next subevent, number `k` of the instance, of both Controllers, in lock step; the radios start it a millisecond after the later one ended.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn sub_step(var w: Air, ev: Int, k: Int) -> Two
     var t0 = w.ra.now_us
     if w.rb.now_us > t0
@@ -2060,7 +2060,7 @@ fn sub_step(var w: Air, ev: Int, k: Int) -> Two
     lock_step(var w, ev, t0 + 1000, k * SUB_SPACING_NS)
 
 // One procedure instance in the connection event `ev`: both Controllers begin it and run its subevents in lock step, each followed by the Hosts reading what is owed.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn run_round(var w: Air, ev: Int, subs_max: Int) -> Round
     let mark = round_begin(var w, ev)
     var xa: [Int] = []
@@ -2088,13 +2088,13 @@ fn rfl_subs(r: Round, s: Setup) -> [HSub]
 // ── Helpers of the tests ────────────────────────────────────────────
 
 // The log of the initiator's Host and of the reflector's.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn ini_log(w: Air, s: Setup) -> [Int]
     if s.init_central
         return w.ha[:]
     w.hb[:]
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn rfl_log(w: Air, s: Setup) -> [Int]
     if s.init_central
         return w.hb[:]
@@ -2116,7 +2116,7 @@ fn fae_event(log: [Int]) -> [Int]
 
 // The geometry and the figures of the two devices of the model (the device 0 is the radio of the Central): the distance, a clock offset for each, the delays between the
 // time stamps and the antenna ports, a table of frequency actuation errors for each (the reported one is the real one), and a phase of the first antenna path.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn world_figures(var ra: SimCs, mm: Int, ppm0: Float, ppm1: Float)
     sim_cs_dist(var ra, mm)
     var d0 = sim_cs_dev(ra)
@@ -2131,14 +2131,14 @@ fn world_figures(var ra: SimCs, mm: Int, ppm0: Float, ppm1: Float)
     ra.med.ap_phase[0] = 0.3
 
 // The two Controllers over a medium with those figures.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn air_with(mm: Int, ppm0: Float, ppm1: Float) -> Air
     var ra = sim_cs_new()
     world_figures(var ra, mm, ppm0, ppm1)
     air_from(var ra)
 
 // The table the radio of the reflector reports for the 72 allowed channels.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn table_of(w: Air, s: Setup) -> [Int]
     var d = sim_cs_dev(w.ra)
     if s.init_central
@@ -2157,7 +2157,7 @@ const RTT_TOL_M = 0.08
 
 // The setup as the Hosts saw it: the feature exchange the Peripheral's Controller made for its Host, the capabilities each Host was told, Security Enable Complete, the
 // Config Complete event with the role of each end, the Procedure Enable Complete event of the initiator.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn check_setup(w: Air, s: Setup)
     // The Controller of the Host that asked for the capabilities (the Host that made the configuration, when it was the Controllers that exchanged them) had no features of
     // the other end: the Host hears LE Read Remote Features Complete, once, from the exchange the Controller made.
@@ -2223,7 +2223,7 @@ fn data_octets(mode: Int, role: Int, rtt: Int, n_ap: Int) -> Int
         return 1 + 4 * (n_ap + 1)
     6 + pcts + 1 + 4 * (n_ap + 1)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn check_round(r: Round, s: Setup, ev: Int, proc: Int, n_ap: Int)
     let ini = ini_subs(r, s)
     let rfl = rfl_subs(r, s)
@@ -2275,7 +2275,7 @@ fn check_round(r: Round, s: Setup, ev: Int, proc: Int, n_ap: Int)
 
 // The Hosts walk the whole path with the initiator at `init_central`, the devices `mm` millimetres apart with the clock offsets `ppm0` (the Central's) and `ppm1`, and read
 // one procedure.  What they were told on the way and what they read in the results is checked here; the estimate is the answer.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn walk(init_central: Bool, mm: Int, ppm0: Float, ppm1: Float) -> Est
     var w = air_with(mm, ppm0, ppm1)
     var s = setup_new()
@@ -2288,8 +2288,8 @@ fn walk(init_central: Bool, mm: Int, ppm0: Float, ppm1: Float) -> Est
     check_round(r, s, 100, 0, 1)
     h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_hosts_walk_the_whole_path_and_the_estimate_gives_the_distance_with_the_central_as_the_initiator()
     let e = walk(true, 3200, 11.0, -14.0)
@@ -2300,8 +2300,8 @@ fn test_the_hosts_walk_the_whole_path_and_the_estimate_gives_the_distance_with_t
     test.assert_eq(e.n_pbr, 72)
     test.assert(e.n_rtt >= 20)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_hosts_walk_the_whole_path_and_the_estimate_gives_the_distance_with_the_peripheral_as_the_initiator()
     let e = walk(false, 3200, 11.0, -14.0)
@@ -2311,8 +2311,8 @@ fn test_the_hosts_walk_the_whole_path_and_the_estimate_gives_the_distance_with_t
     test.assert(math.abs(e.ffo - 25.0) < 0.01)
     test.assert_eq(e.n_pbr, 72)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_estimate_follows_the_distance_from_half_a_metre_to_twenty_with_either_end_the_initiator()
     let ds = [500, 2000, 7300, 15000, 20000]
@@ -2344,7 +2344,7 @@ fn expect_tdiff(raw: CsStepRaw, cal: CsCal, phy: Int, initiator: Bool, nominal_p
 // What one Host read of a step against what the radio under it measured: the access address check, the signal strength, the antenna, the frequency offset of the
 // initiator, the time difference (delays off, the nominal offset `nominal_ps` of the step off, half nanoseconds) and the tones.  `initiator` says the end is the initiator of
 // the configuration.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn check_step(x: HStep, raw: CsStepRaw, cal: CsCal, initiator: Bool, hc: HCfg, nominal_ps: Int)
     test.assert(raw.done)
     var rtt = 0
@@ -2389,8 +2389,8 @@ fn check_step(x: HStep, raw: CsStepRaw, cal: CsCal, initiator: Bool, hc: HCfg, n
                 test.assert(hi == 1 or hi == 2)
                 test.assert_eq(hi == 2, raw.tones[k].present)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_events_carry_what_the_radios_measured_with_the_delays_off_and_in_half_nanoseconds_whichever_end_is_the_initiator()
     for who in 0..2
@@ -2445,7 +2445,7 @@ fn test_the_events_carry_what_the_radios_measured_with_the_delays_off_and_in_hal
 // ── The delays, the scaling, the clocks ─────────────────────────────
 
 // A series with the radios of the Central and the Peripheral both reporting no calibration, or one of them; the estimates of one procedure.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn est_with_cal(init_central: Bool, none0: Bool, none1: Bool) -> Est
     var w = air_with(5300, 6.0, -9.0)
     var s = setup_new()
@@ -2461,8 +2461,8 @@ fn est_with_cal(init_central: Bool, none0: Bool, none1: Bool) -> Est
     let r = run_round(var w, 100, 8)
     h_estimate(ini_subs(r, s), rfl_subs(r, s), hcfg_of(s, 1, false), table)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_delays_of_the_radios_are_taken_off_the_round_trip_by_the_calibration_each_reports()
     // The delays of the model: the Central's radio 1200 and 2100 picoseconds (departure, arrival), the Peripheral's 800 and 1900.  A radio that reports no calibration
@@ -2481,8 +2481,8 @@ fn test_the_delays_of_the_radios_are_taken_off_the_round_trip_by_the_calibration
         // The delays do not move the phase.
         test.assert(err_m(both.d_pbr, 5300) < PBR_TOL_M)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_clock_offset_of_85_ppm_is_scaled_out_of_the_round_trip_with_the_offset_the_initiator_reported()
     for who in 0..2
@@ -2509,8 +2509,8 @@ fn test_a_clock_offset_of_85_ppm_is_scaled_out_of_the_round_trip_with_the_offset
 
 // ── The exchanges the Controllers make for the Hosts, seen from the Hosts ──
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_controllers_make_the_feature_exchange_and_the_capabilities_exchange_a_host_leaves_out_and_the_distance_is_there()
     for who in 0..2
@@ -2528,8 +2528,8 @@ fn test_the_controllers_make_the_feature_exchange_and_the_capabilities_exchange_
         test.assert(err_m(e.d_pbr, 6100) < PBR_TOL_M)
         test.assert(err_m(e.d_rtt, 6100) < RTT_TOL_M)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_central_that_asks_for_the_capabilities_first_gets_the_feature_exchange_of_its_own_controller()
     var w = air_with(2400, 5.0, -3.0)
@@ -2542,8 +2542,8 @@ fn test_the_central_that_asks_for_the_capabilities_first_gets_the_feature_exchan
 
 // ── The table of the reflector ──────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_table_the_host_reads_is_the_table_of_the_reflectors_radio_and_a_radio_with_a_different_table_gives_a_different_one()
     for who in 0..2
@@ -2590,8 +2590,8 @@ fn same_steps(a: HSub, b: HSub) -> Bool
             return false
     true
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_generators_of_the_two_controllers_stay_in_step_over_three_procedures_with_a_mode_0_lost_on_either_side()
     // 0: the initiator misses the answers of the reflector in a subevent of the second procedure; 1: the reflector misses the initiator's CS_SYNC.
@@ -2697,7 +2697,7 @@ fn mark_of(m: Two, s: Setup, initiator: Bool) -> Int
 
 // The radio of the device `dev` answers `CS_RESOURCES` (a subevent beyond its steps) in the first subevent of the round, then runs.  What the Hosts read: the end that could
 // not run it says so, the other finds nobody to answer it, and the next subevent is whole and in step.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn refused_case(init_central: Bool, dev: Int, kind: Int) -> Int
     var w = air_with(2600, 3.0, -3.0)
     var s = setup_new()
@@ -2773,8 +2773,8 @@ fn refused_case(init_central: Bool, dev: Int, kind: Int) -> Int
     test.assert(err_m(e.d_rtt, 2600) < RTT_TOL_M)
     e.n_pbr
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_that_does_not_fit_the_radio_is_reported_aborted_for_lack_of_resources_and_the_next_one_runs_in_step()
     for init_central in [true, false]
@@ -2788,8 +2788,8 @@ fn test_a_subevent_that_does_not_fit_the_radio_is_reported_aborted_for_lack_of_r
     let m2 = refused_case(false, 0, 1)
     test.assert(m2 >= 15)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_plan_the_radio_does_not_run_is_reported_aborted_for_another_reason()
     let n = refused_case(true, 1, 2)
@@ -2799,8 +2799,8 @@ fn test_a_plan_the_radio_does_not_run_is_reported_aborted_for_another_reason()
 
 // ── A result the Host does not read ─────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_result_the_host_has_not_read_when_the_next_comes_is_reported_aborted_and_the_third_is_dropped()
     var w = air_with(3700, 3.0, -3.0)
@@ -2850,8 +2850,8 @@ fn test_a_result_the_host_has_not_read_when_the_next_comes_is_reported_aborted_a
 
 // ── Terminate, channel map update, disconnect ───────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_series_without_an_end_runs_until_the_initiators_host_stops_it_and_both_controllers_stop()
     for who in 0..2
@@ -2890,8 +2890,8 @@ fn test_a_series_without_an_end_runs_until_the_initiators_host_stops_it_and_both
 fn chm_without_low() -> [Int]
     [0x00, 0x00, 0x40, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F]
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_channel_map_the_host_sets_in_the_middle_of_a_series_applies_at_the_next_procedure_on_both_ends()
     for who in 0..2
@@ -2932,8 +2932,8 @@ fn test_a_channel_map_the_host_sets_in_the_middle_of_a_series_applies_at_the_nex
         let e2 = h_estimate(ini_subs(r2, s), rfl_subs(r2, s), all0, table)
         test.assert_eq(e2.n_pbr, 52)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_connection_that_ends_in_the_middle_of_a_procedure_ends_the_series_and_frees_the_records()
     var w = air_with(3300, 7.0, -2.0)
@@ -2967,8 +2967,8 @@ fn test_a_connection_that_ends_in_the_middle_of_a_procedure_ends_the_series_and_
 
 // ── The noise of the radio, the clock of the time stamps ────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_noise_in_the_tones_and_the_time_stamps_moves_the_estimates_within_the_noise_over_three_procedures()
     for who in 0..2
@@ -3004,8 +3004,8 @@ fn test_noise_in_the_tones_and_the_time_stamps_moves_the_estimates_within_the_no
 
 // ── The assembly with what a model never makes ──────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_radio_that_measured_no_tone_is_reported_with_zeros_and_not_available_and_the_estimate_finds_none()
     for who in 0..2
@@ -3039,8 +3039,8 @@ fn test_a_radio_that_measured_no_tone_is_reported_with_zeros_and_not_available_a
         test.assert_eq(e.n_pbr, 0)
         test.assert(err_m(e.d_rtt, 2500) < RTT_TOL_M)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_phase_correction_terms_of_a_sounding_sequence_are_24_bits_each_or_not_available_and_in_their_own_fields()
     if not ctl_limits.cs_rtt_seq_on()
@@ -3089,13 +3089,13 @@ fn test_the_phase_correction_terms_of_a_sounding_sequence_are_24_bits_each_or_no
 // ── The options of the build: mode 3, the sequences, more than one antenna path ──
 
 // A series in the build's option, the result of one procedure read by the Hosts, and the estimate; `n_ap` paths.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn option_case(init_central: Bool, main: Int, sub: Int, rtt: Int, aci: Int, n_ap: Int, mm: Int) -> Est
     option_case_phy(init_central, main, sub, rtt, 1, aci, n_ap, mm)
 
 // The same on the CS_SYNC PHY `phy` (1 LE 1M, 2 LE 2M, 3 LE 2M 2BT).  The delays of each PHY differ, so the calibration of the PHY of the step is the one that
 // brings the round trip to the distance.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn option_case_phy(init_central: Bool, main: Int, sub: Int, rtt: Int, phy: Int, aci: Int, n_ap: Int, mm: Int) -> Est
     var ra = sim_cs_new()
     world_figures(var ra, mm, 6.0, -8.0)
@@ -3124,8 +3124,8 @@ fn option_case_phy(init_central: Bool, main: Int, sub: Int, rtt: Int, phy: Int, 
     test.assert(err_m(e.d_rtt, mm) < RTT_TOL_M)
     e
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_mode_3_gives_the_phase_and_the_round_trip_in_every_step_and_the_hosts_read_both()
     if not ctl_limits.cs_mode3_on()
@@ -3136,8 +3136,8 @@ fn test_mode_3_gives_the_phase_and_the_round_trip_in_every_step_and_the_hosts_re
         // Every step is a round trip too.
         test.assert_eq(e.n_rtt, 72)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_events_of_mode_3_steps_carry_what_the_radios_measured()
     if not ctl_limits.cs_mode3_on()
@@ -3174,8 +3174,8 @@ fn test_the_events_of_mode_3_steps_carry_what_the_radios_measured()
         test.assert(mode3 >= 20)
         test.assert_eq(r.a, ctl_hci.RUN_OK)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_events_of_steps_on_le_2m_and_le_2m_2bt_carry_the_time_differences_of_the_calibration_and_the_packet_of_that_phy()
     if not ctl_limits.cs_mode3_on()
@@ -3225,8 +3225,8 @@ fn test_the_events_of_steps_on_le_2m_and_le_2m_2bt_carry_the_time_differences_of
                     mode3 = mode3 + 1
             test.assert(mode3 >= 15)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_every_round_trip_type_gives_the_distance_and_the_sequences_change_the_nominal_offsets()
     if not ctl_limits.cs_rtt_seq_on()
@@ -3236,8 +3236,8 @@ fn test_every_round_trip_type_gives_the_distance_and_the_sequences_change_the_no
         let e = option_case(rtt % 2 == 0, 2, 1, rtt, 0, 1, 2900)
         test.assert(e.n_rtt >= 20)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_le_2m_and_le_2m_2bt_give_the_distance_with_the_delays_and_the_packet_lengths_of_their_own()
     // The radios of the model take part on all three CS_SYNC PHYs, each with delays of its own to the antenna port: the Controller removes the calibration of the PHY of the
@@ -3249,8 +3249,8 @@ fn test_le_2m_and_le_2m_2bt_give_the_distance_with_the_delays_and_the_packet_len
             test.assert(e.n_rtt >= 20)
             test.assert(e.n_pbr >= 20)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_mode_3_with_every_random_sequence_on_every_cs_sync_phy_gives_the_phase_and_the_round_trip()
     if not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
@@ -3263,8 +3263,8 @@ fn test_mode_3_with_every_random_sequence_on_every_cs_sync_phy_gives_the_phase_a
             test.assert_eq(e.n_pbr, 72)
             test.assert_eq(e.n_rtt, 72)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_mode_3_with_a_sounding_sequence_on_le_2m_gives_the_phase_the_round_trip_and_the_two_phase_correction_terms()
     if not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
@@ -3275,8 +3275,8 @@ fn test_mode_3_with_a_sounding_sequence_on_le_2m_gives_the_phase_the_round_trip_
             test.assert_eq(e.n_pbr, 72)
             test.assert_eq(e.n_rtt, 72)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_mode_3_as_the_sub_mode_of_mode_2_with_a_random_sequence_gives_both_estimates()
     if not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
@@ -3286,11 +3286,11 @@ fn test_mode_3_as_the_sub_mode_of_mode_2_with_a_random_sequence_gives_both_estim
         test.assert(e.n_rtt >= 10)
         test.assert(e.n_pbr >= 40)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_two_antenna_paths_give_three_tone_slots_and_the_extension_slot_repeats_the_last_path()
-    if noble_controller_config.CTL_CS_ANT < 2
+    if noble_controller.CONFIG.CTL_CS_ANT < 2
         return
     for who in 0..2
         var ra = sim_cs_new()

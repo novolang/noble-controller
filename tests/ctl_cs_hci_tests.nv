@@ -9,7 +9,7 @@
 
 use std.test
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ll_pdu
 use ll_data
@@ -220,14 +220,14 @@ fn pop_queued(var c: ctl_hci.Controller)
     ll_data.dpdu_empty(var c.links[0].nxt)
     ll_link.link_prepare(var c.links[0])
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn snap(var c: ctl_hci.Controller) -> ll_cs_proc.Cs
     var cs = ll_cs_proc.cs_new()
     ctl_hci.cs_get(var c, ctl_hci.cs_find(var c, 0), var cs)
     cs
 
 // The Host Support bit set, the link encrypted, the peer known to have Channel Sounding with its Host Support bit, long packets.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn ready() -> ctl_hci.Controller
     var c = connected_with(true)
     encrypt(var c)
@@ -310,7 +310,7 @@ fn config_rsp_pdu(id: Int) -> Pdu
     p
 
 // The peer, a Central, asks for the capabilities; the answer is dropped.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn exchange_caps(var c: ctl_hci.Controller)
     var req = caps_pdu(ll_cs.OP_CS_CAPABILITIES_REQ)
     peer_sends(var c, var req)
@@ -318,7 +318,7 @@ fn exchange_caps(var c: ctl_hci.Controller)
     pop_queued(var c)
 
 // The peer asks for the security procedure and the Controller answers once it has its random octets.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn secure(var c: ctl_hci.Controller)
     var sec = sec_req_pdu()
     peer_sends(var c, var sec)
@@ -328,7 +328,7 @@ fn secure(var c: ctl_hci.Controller)
     pop_queued(var c)
 
 // The Host enables both roles, creates the configuration `id` with the peer in the role `role`, and the peer accepts.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn configure(var c: ctl_hci.Controller, id: Int, role: Int)
     test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
     test.assert_eq(cmd_status(run(var c, 0x2090, create_params(id, 1, role)), 0x2090), 0)
@@ -366,7 +366,7 @@ fn params_for(op: Int, handle: Int) -> [Int]
     p[1] = (handle >>> 8) & 0xFF
     p
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_every_command_with_a_handle_refuses_a_handle_that_is_no_connection()
     if not ctl_limits.cs_on()
@@ -379,8 +379,8 @@ fn test_every_command_with_a_handle_refuses_a_handle_that_is_no_connection()
         else
             test.assert_eq(status_of(r, op), 0x02)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_read_local_capabilities_is_refused_until_the_host_sets_the_support_bit()
     if not ctl_limits.cs_on()
@@ -396,14 +396,14 @@ fn test_read_local_capabilities_is_refused_until_the_host_sets_the_support_bit()
     test.assert_eq(ok[6], 0)
     test.assert_eq(list.len(ok), 7 + 28)
     // Num_Config_Supported, Num_Antennae_Supported, Roles_Supported and RTT_AA_Only_N of the build; the optional step timings are not offered.
-    test.assert_eq(ok[7], noble_controller_config.CTL_CS_CONFIGS)
-    test.assert_eq(ok[10], noble_controller_config.CTL_CS_ANT)
-    test.assert_eq(ok[12], noble_controller_config.CTL_CS_ROLES)
+    test.assert_eq(ok[7], noble_controller.CONFIG.CTL_CS_CONFIGS)
+    test.assert_eq(ok[10], noble_controller.CONFIG.CTL_CS_ANT)
+    test.assert_eq(ok[12], noble_controller.CONFIG.CTL_CS_ROLES)
     test.assert_eq(ok[15], 255)
     test.assert_eq(ok[7 + 16] & 0x02, 0x02)
     test.assert_eq(ok[7 + 26], 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_v2_capability_record_is_answered_by_a_build_with_enhancement_1()
     if not ctl_limits.cs_ipt_on()
@@ -419,7 +419,7 @@ fn test_the_v2_capability_record_is_answered_by_a_build_with_enhancement_1()
 
 // ── LE Set Host Feature, bit 47 ─────────────────────────────────────
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_bit_47_is_set_by_the_host_and_shows_in_the_features_of_the_controller_and_not_before()
     if not ctl_limits.cs_on()
@@ -437,8 +437,8 @@ fn test_bit_47_is_set_by_the_host_and_shows_in_the_features_of_the_controller_an
     test.assert_eq(off[7 + 5] & ll_cs.FEAT5_CS_HOST, 0)
     test.assert_eq(status_of(run(var c, 0x2074, [47, 2]), 0x2074), 0x11)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_bit_47_cannot_be_changed_while_a_connection_is_on_and_goes_with_a_reset()
     if not ctl_limits.cs_on()
@@ -453,8 +453,8 @@ fn test_bit_47_cannot_be_changed_while_a_connection_is_on_and_goes_with_a_reset(
     let f = complete_of(run(var d, 0x2003, []), 0x2003)
     test.assert_eq(f[7 + 5] & ll_cs.FEAT5_CS_HOST, 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_bit_47_goes_to_the_peer_in_the_feature_set_and_stays_over_the_end_of_a_connection()
     if not ctl_limits.cs_on()
@@ -478,7 +478,7 @@ fn test_bit_47_goes_to_the_peer_in_the_feature_set_and_stays_over_the_end_of_a_c
     ll_link.link_reset(var c.links[0])
     test.assert_eq(ll_link.fx_get(c.links[0], ll_link.FX_CSHOST, 1), 1)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_v2_host_feature_command_takes_bit_47_in_a_build_with_connection_rate()
     if not ctl_limits.cs_on() or not ctl_limits.rate_on()
@@ -503,8 +503,8 @@ fn caps_len() -> Int
     else
         28
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_read_remote_capabilities_asks_the_peer_and_the_event_carries_its_record()
     if not ctl_limits.cs_on()
@@ -526,8 +526,8 @@ fn test_read_remote_capabilities_asks_the_peer_and_the_event_carries_its_record(
     for k in 0..28
         test.assert_eq(ev[0][7 + k], rec[k])
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_read_remote_capabilities_reports_a_peer_that_refused_and_a_peer_without_the_feature()
     if not ctl_limits.cs_on()
@@ -556,8 +556,8 @@ fn test_read_remote_capabilities_reports_a_peer_that_refused_and_a_peer_without_
     peer_has_cs(var e, true)
     test.assert_eq(cmd_status(run(var e, 0x208A, [1, 0]), 0x208A), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_capabilities_the_peer_sent_are_the_answer_of_a_later_read_without_a_new_exchange()
     if not ctl_limits.cs_on()
@@ -572,8 +572,8 @@ fn test_the_capabilities_the_peer_sent_are_the_answer_of_a_later_read_without_a_
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][4], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_capabilities_a_peer_sends_are_reported_to_the_host_whether_it_asked_or_not()
     if not ctl_limits.cs_on()
@@ -585,8 +585,8 @@ fn test_the_capabilities_a_peer_sends_are_reported_to_the_host_whether_it_asked_
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][4], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_masked_events_are_not_sent_and_the_v2_event_is_chosen_when_the_build_and_the_mask_allow_it()
     if not ctl_limits.cs_on()
@@ -611,8 +611,8 @@ fn test_the_masked_events_are_not_sent_and_the_v2_event_is_chosen_when_the_build
         exchange_caps(var e)
         test.assert_eq(list.len(meta(flush(var e), 0x2C)), 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_write_cached_capabilities_keeps_the_record_and_is_refused_after_the_peer_sent_its_own()
     if not ctl_limits.cs_on()
@@ -640,8 +640,8 @@ fn test_write_cached_capabilities_keeps_the_record_and_is_refused_after_the_peer
     var e = fresh()
     test.assert_eq(cmd_status(run(var e, 0x208A, [1, 0]), 0x208A), 0x02)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_v2_cached_record_carries_the_2m_counts_and_the_v1_record_gives_them_the_1m_ones()
     if not ctl_limits.cs_ipt_on()
@@ -662,8 +662,8 @@ fn test_the_v2_cached_record_carries_the_2m_counts_and_the_v1_record_gives_them_
 
 // ── Security ────────────────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_security_enable_is_a_central_procedure_and_waits_for_encryption_and_host_support()
     if not ctl_limits.cs_on()
@@ -679,8 +679,8 @@ fn test_security_enable_is_a_central_procedure_and_waits_for_encryption_and_host
     peer_has_cs(var e, true)
     test.assert_eq(cmd_status(run(var e, 0x208C, [1, 0]), 0x208C), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_security_enable_by_a_central_collects_the_random_octets_sends_the_request_and_reports_the_answer()
     if not ctl_limits.cs_on()
@@ -704,8 +704,8 @@ fn test_security_enable_by_a_central_collects_the_random_octets_sends_the_reques
     test.assert_eq(ev[0][5] | (ev[0][6] << 8), 1)
     test.assert_eq(list.len(ev[0]), 7)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_peripheral_that_answered_a_security_request_tells_the_host()
     if not ctl_limits.cs_on()
@@ -718,8 +718,8 @@ fn test_the_peripheral_that_answered_a_security_request_tells_the_host()
 
 // ── The default settings ────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_default_settings_are_kept_and_checked_against_the_roles_and_the_antennas_of_the_build()
     if not ctl_limits.cs_on()
@@ -736,7 +736,7 @@ fn test_default_settings_are_kept_and_checked_against_the_roles_and_the_antennas
         test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 1, ant, 0xE0]), 0x208D), 0)
     test.assert_eq(snap(var c).def_txp, 0xE0)
     test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 1, 0, 0]), 0x208D), 0x11)
-    test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 1, noble_controller_config.CTL_CS_ANT + 1, 0]), 0x208D), 0x11)
+    test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 1, noble_controller.CONFIG.CTL_CS_ANT + 1, 0]), 0x208D), 0x11)
     // A role the build lacks, a reserved bit, a power beyond +20 dBm.
     test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 4, 1, 0]), 0x208D), 0x11)
     test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 1, 1, 21]), 0x208D), 0x12)
@@ -745,8 +745,8 @@ fn test_default_settings_are_kept_and_checked_against_the_roles_and_the_antennas
     var d = fresh()
     test.assert_eq(status_of(run(var d, 0x208D, [1, 0, 1, 1, 0]), 0x208D), 0x02)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_role_with_a_configuration_cannot_be_switched_off()
     if not ctl_limits.cs_on()
@@ -793,8 +793,8 @@ const CC_CHREP = 23
 const CC_CHSEL = 24
 const CC_ENH = 27
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_configuration_kept_here_alone_is_reported_at_once_with_the_timings_the_controller_picked()
     if not ctl_limits.cs_on()
@@ -823,8 +823,8 @@ fn test_a_configuration_kept_here_alone_is_reported_at_once_with_the_timings_the
     var cs = snap(var c)
     test.assert(ll_cs_proc.cfg_used(var cs, 0))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_configuration_made_with_the_peer_is_reported_when_the_peer_has_accepted_it()
     if not ctl_limits.cs_on()
@@ -855,8 +855,8 @@ fn test_a_configuration_made_with_the_peer_is_reported_when_the_peer_has_accepte
     let ev2 = meta(flush(var c), 0x2F)
     test.assert_eq(ev2[0][4], ll_cs_proc.E_UNSUPPORTED_LL)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_create_config_refuses_what_the_specification_forbids_and_what_the_build_lacks()
     if not ctl_limits.cs_on()
@@ -902,8 +902,8 @@ fn test_create_config_refuses_what_the_specification_forbids_and_what_the_build_
     if not ctl_limits.cs_ipt_on()
         cfg_status(var c, "case 20", with(ok, CC_ENH, 1), 0x11)
     // A configuration beyond the build's.
-    if noble_controller_config.CTL_CS_CONFIGS < 4
-        cfg_status(var c, "case 21", create_params(noble_controller_config.CTL_CS_CONFIGS, 0, 0), 0x11)
+    if noble_controller.CONFIG.CTL_CS_CONFIGS < 4
+        cfg_status(var c, "case 21", create_params(noble_controller.CONFIG.CTL_CS_CONFIGS, 0, 0), 0x11)
     // The peer's capabilities unknown: a configuration with the peer cannot be made.
     var d = ready()
     test.assert_eq(status_of(run(var d, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
@@ -917,8 +917,8 @@ fn test_create_config_refuses_what_the_specification_forbids_and_what_the_build_
     var f = connected()
     cfg_status(var f, "case 24", create_params(0, 0, 0), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_remove_config_removes_it_here_and_in_the_peer_and_reports_the_action()
     if not ctl_limits.cs_on()
@@ -948,8 +948,8 @@ fn test_remove_config_removes_it_here_and_in_the_peer_and_reports_the_action()
     var s1 = snap(var c)
     test.assert(not ll_cs_proc.cfg_used(var s1, 0))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_configuration_made_with_no_peer_known_is_removed_here_alone()
     if not ctl_limits.cs_on()
@@ -966,8 +966,8 @@ fn test_a_configuration_made_with_no_peer_known_is_removed_here_alone()
 
 // ── The channel classification ──────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_channel_classification_is_kept_sent_to_the_peer_and_limited_to_one_in_a_second()
     if not ctl_limits.cs_on()
@@ -997,8 +997,8 @@ fn test_the_channel_classification_is_kept_sent_to_the_peer_and_limited_to_one_i
     test.assert_eq(status_of(run(var c, 0x2092, with(chm_all(), 0, 0xFD)), 0x2092), 0x12)
     test.assert_eq(status_of(run(var c, 0x2092, with(chm_all(), 9, 0xFF)), 0x2092), 0x12)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_classification_applies_to_a_connection_that_comes_later_and_a_reset_forgets_it()
     if not ctl_limits.cs_on()
@@ -1043,7 +1043,7 @@ fn pp(var c: ctl_hci.Controller, what: Str, p: [Int], want: Int)
 
 // A Controller whose Host has set the parameters of configuration 0, in which this end is the initiator, with the peer's capabilities known (it needs no FAE table),
 // the security started and the procedure parameters for `count` procedures set.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn with_params(count: Int) -> ctl_hci.Controller
     var c = ready()
     exchange_caps(var c)
@@ -1053,7 +1053,7 @@ fn with_params(count: Int) -> ctl_hci.Controller
     c
 
 // The peer, a Central, answers the LL_CS_REQ the Controller queued with an LL_CS_IND.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn peer_starts(var c: ctl_hci.Controller)
     test.assert_eq(queued_op(var c), ll_cs.OP_CS_REQ)
     var req = ll_cs_pdu.start_new()
@@ -1065,8 +1065,8 @@ fn peer_starts(var c: ctl_hci.Controller)
     ll_cs_pdu.put_ind(var p, var ind)
     peer_sends(var c, var p)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_procedure_parameters_are_kept_for_the_configuration_and_checked_against_the_specification_and_the_capabilities()
     if not ctl_limits.cs_on()
@@ -1106,8 +1106,8 @@ fn test_procedure_parameters_are_kept_for_the_configuration_and_checked_against_
     let r = complete_of(run(var d, 0x2093, ok), 0x2093)
     test.assert_eq(r[6], 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_fewer_than_15_channels_after_the_filtering_stop_the_parameters_and_the_enable()
     if not ctl_limits.cs_on()
@@ -1121,8 +1121,8 @@ fn test_fewer_than_15_channels_after_the_filtering_stop_the_parameters_and_the_e
     pp(var c, "14 channels", pp_params(0, 1), 0x48)
     test.assert_eq(cmd_status(run(var c, 0x2094, [1, 0, 0, 1]), 0x2094), 0x48)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_procedure_enable_starts_the_series_with_the_peer_and_reports_what_the_start_fixed()
     if not ctl_limits.cs_on()
@@ -1164,8 +1164,8 @@ fn test_procedure_enable_starts_the_series_with_the_peer_and_reports_what_the_st
     test.assert_eq(cmd_status(run(var c, 0x2090, create_params(0, 0, 0)), 0x2090), 0x0C)
     pp(var c, "while enabled", pp_params(0, 1), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_peer_refusing_the_start_is_reported_with_state_0()
     if not ctl_limits.cs_on()
@@ -1182,8 +1182,8 @@ fn test_the_peer_refusing_the_start_is_reported_with_state_0()
     test.assert_eq(ev[0][7], 0)
     test.assert_eq(ev[0][8], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_procedure_enable_refuses_what_the_specification_lists()
     if not ctl_limits.cs_on()
@@ -1211,8 +1211,8 @@ fn test_procedure_enable_refuses_what_the_specification_lists()
     test.assert_eq(status_of(run(var f, 0x2095, t), 0x2095), 0)
     test.assert_eq(cmd_status(run(var f, 0x2094, [1, 0, 0, 1]), 0x2094), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_series_of_one_procedure_is_stopped_by_the_host_without_a_message_to_the_peer()
     if not ctl_limits.cs_on()
@@ -1234,8 +1234,8 @@ fn test_a_series_of_one_procedure_is_stopped_by_the_host_without_a_message_to_th
     // And the configuration can go again.
     test.assert_eq(cmd_status(run(var c, 0x2091, [1, 0, 0]), 0x2091), 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_series_without_an_end_is_stopped_with_the_terminate_procedure_and_the_event_follows_its_answer()
     if not ctl_limits.cs_on()
@@ -1270,8 +1270,8 @@ fn fae_rsp_pdu() -> Pdu
     ll_cs_pdu.put_fae_end(var p)
     p
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_peer_that_needs_no_table_is_not_asked_for_one_and_a_table_is_not_taken_for_it()
     if not ctl_limits.cs_on()
@@ -1292,8 +1292,8 @@ fn test_a_peer_that_needs_no_table_is_not_asked_for_one_and_a_table_is_not_taken
     peer_has_cs(var f, true)
     test.assert_eq(cmd_status(run(var f, 0x208E, [1, 0]), 0x208E), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_table_of_the_peer_is_asked_for_reported_kept_and_not_overwritten()
     if not ctl_limits.cs_on()
@@ -1323,8 +1323,8 @@ fn test_the_table_of_the_peer_is_asked_for_reported_kept_and_not_overwritten()
     test.assert_eq(queued_op(var c), -1)
     test.assert_eq(list.len(meta(again, 0x2D)), 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_table_the_host_wrote_is_the_answer_of_a_read_and_cannot_be_written_once_a_configuration_exists()
     if not ctl_limits.cs_on()
@@ -1354,8 +1354,8 @@ fn test_a_table_the_host_wrote_is_the_answer_of_a_read_and_cannot_be_written_onc
 
 // ── The security requirements ───────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_security_requirements_of_a_connection_are_kept_and_refused_for_what_the_controller_cannot_enforce()
     if not ctl_limits.cs_ipt_on()
@@ -1379,8 +1379,8 @@ fn test_the_security_requirements_of_a_connection_are_kept_and_refused_for_what_
     var e = connected()
     test.assert_eq(status_of(run(var e, 0x20A7, [1, 0, 3, 0, 0, 0, 0, 0, 0, 0]), 0x20A7), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_requirements_cannot_change_while_a_procedure_is_enabled()
     if not ctl_limits.cs_ipt_on()
@@ -1391,8 +1391,8 @@ fn test_the_requirements_cannot_change_while_a_procedure_is_enabled()
     let _b = flush(var c)
     test.assert_eq(status_of(run(var c, 0x20A7, [1, 0, 3, 0, 0, 0, 0, 0, 0, 0]), 0x20A7), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_default_requirements_go_to_the_connections_that_come_later()
     if not ctl_limits.cs_ipt_on()
@@ -1407,8 +1407,8 @@ fn test_the_default_requirements_go_to_the_connections_that_come_later()
     ctl_hci.cs_get(var c, rec, var cs)
     test.assert_eq(cs.sec_req, 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_start_the_requirements_do_not_allow_is_refused_with_rejected_due_to_security_reasons()
     if not ctl_limits.cs_ipt_on()
@@ -1561,12 +1561,12 @@ impl CsRadio[] for Fake
 
 // ── The state of the planning and one series ────────────────────────
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn state() -> ll_cs_plan.CsState
-    ll_cs_plan.state_new(noble_controller_config.CTL_CS)
+    ll_cs_plan.state_new(noble_controller.CONFIG.CTL_CS)
 
 // A Controller whose configuration 0 (this end the initiator, main mode `mode`) is enabled for `count` procedures, with the scripted peer's Start accepted.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn series_of(count: Int, mode: Int, role: Int) -> ctl_hci.Controller
     var c = ready()
     exchange_caps(var c)
@@ -1606,8 +1606,8 @@ fn step_records(evs: [[Int]]) -> [[Int]]
             at = at + 3 + len
     out
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_of_mode_2_is_reported_with_the_tones_of_every_path_of_every_step()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1667,8 +1667,8 @@ fn test_a_subevent_of_mode_2_is_reported_with_the_tones_of_every_path_of_every_s
     // The Controller reports the part of the procedure it has run and keeps the counter at 0 for the first instance.
     test.assert_eq(snap(var c).proc_count, 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_reflector_reports_three_octets_of_mode_0_and_the_time_it_took_to_answer_in_mode_1()
     if not ctl_limits.cs_on() or not ctl_limits.cs_reflector_on()
@@ -1698,8 +1698,8 @@ fn test_a_reflector_reports_three_octets_of_mode_0_and_the_time_it_took_to_answe
     test.assert_eq(recs[1][6] | (recs[1][7] << 8), 0)
     test.assert_eq(recs[1][8], 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_an_initiator_reports_the_round_trip_it_measured_less_the_nominal_offsets()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1714,8 +1714,8 @@ fn test_an_initiator_reports_the_round_trip_it_measured_less_the_nominal_offsets
     // 20 nanoseconds of flight in units of 0.5 nanosecond.
     test.assert_eq(recs[1][6] | (recs[1][7] << 8), 40)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_step_the_radio_did_not_run_is_reported_without_data_and_an_aborted_run_says_why()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1753,8 +1753,8 @@ fn test_a_step_the_radio_did_not_run_is_reported_without_data_and_an_aborted_run
     test.assert_eq(e2[15], 0xF)
     test.assert_eq(e2[16], 0xF0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_plan_the_radio_cannot_take_is_reported_as_a_subevent_aborted_for_scheduling_or_other_reasons()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1779,8 +1779,8 @@ fn test_a_plan_the_radio_cannot_take_is_reported_as_a_subevent_aborted_for_sched
         test.assert_eq(list.len(recs), 5)
         test.assert_eq(recs[1][2], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_procedure_runs_in_subevents_until_its_channels_are_used_and_the_series_ends_with_the_last_procedure()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1819,8 +1819,8 @@ fn test_a_procedure_runs_in_subevents_until_its_channels_are_used_and_the_series
     test.assert_eq(ctl_hci.ctl_cs_subevent(var c, var air, var cc, var st, 0, 10, 100000, 0), ctl_hci.RUN_NONE)
     test.assert_eq(ctl_hci.ctl_cs_instance(var c, var cc, var st, 0, 12), ctl_hci.RUN_NONE)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_series_that_finds_fewer_than_15_channels_ends_with_a_procedure_aborted_for_that()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1846,8 +1846,8 @@ fn test_a_series_that_finds_fewer_than_15_channels_ends_with_a_procedure_aborted
     test.assert_eq(evs[0][18], 0)
     test.assert(not snap(var c).run_open)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_generator_is_keyed_from_the_values_of_the_security_procedure_peripheral_part_first()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -1890,7 +1890,7 @@ fn flush_all(var c: ctl_hci.Controller) -> [Int]
     out
 
 // Keep a result of `steps` steps of `len` octets of data, the octets of step `j` being `j + k`, as the subevent of a procedure whose results end with `pdone` and `sdone`.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn inject(var c: ctl_hci.Controller, steps: Int, len: Int, pdone: Int, sdone: Int, abort: Int)
     ctl_hci.cs_res_head(var c, false, 1, 0, 7, 3, pdone, sdone, abort)
     ctl_hci.cs_gw_put(var c, ll_cs_proc.GW_RES_FREQ, 0xC000)
@@ -1907,13 +1907,13 @@ fn inject(var c: ctl_hci.Controller, steps: Int, len: Int, pdone: Int, sdone: In
             ctl_hci.cs_go_put(var c, ll_cs_proc.GO_RESULT + at + 3 + k, j + k)
         at = at + 3 + len
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_result_longer_than_an_event_goes_as_a_result_event_and_continue_events_of_at_most_255_octets()
     if not ctl_limits.cs_on()
         return
     var c = fresh()
-    let steps = noble_controller_config.CTL_CS_STEPS
+    let steps = noble_controller.CONFIG.CTL_CS_STEPS
     inject(var c, steps, 35, 0, 0, 0)
     let evs = results(flush_all(var c))
     // Six records of 38 octets fit in the 239 octets the Result event has for them and in the 246 of a Continue event; the cut of 160 steps is 27 events.
@@ -1961,7 +1961,7 @@ fn test_a_result_longer_than_an_event_goes_as_a_result_event_and_continue_events
     // Nothing is left.
     test.assert_eq(ctl_hci.cs_gw(var c, ll_cs_proc.GW_RES_STATE), 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_last_event_of_a_result_carries_the_aborted_statuses_and_the_reasons_of_the_nibbles_that_match()
     if not ctl_limits.cs_on()
@@ -1981,13 +1981,13 @@ fn test_the_last_event_of_a_result_carries_the_aborted_statuses_and_the_reasons_
     inject(var c, 0, 0, 1, 0, 0x32)
     test.assert_eq(results(flush_all(var c))[0][16], 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_result_waits_for_a_free_slot_and_the_events_of_the_commands_wait_for_none()
     if not ctl_limits.cs_on()
         return
     var c = fresh()
-    inject(var c, noble_controller_config.CTL_CS_STEPS, 35, 0, 0, 0)
+    inject(var c, noble_controller.CONFIG.CTL_CS_STEPS, 35, 0, 0, 0)
     // The pool holds four packets and the Controller leaves one for a command: a step queues three of them and the Host has not read any.
     let _a = ctl_hci.ctl_step(var c)
     let first = drain(var c)
@@ -1995,8 +1995,8 @@ fn test_a_result_waits_for_a_free_slot_and_the_events_of_the_commands_wait_for_n
     test.assert_eq(ctl_hci.cs_gw(var c, ll_cs_proc.GW_RES_STATE), 1)
     test.assert(ctl_hci.cs_gw(var c, ll_cs_proc.GW_RES_SENT_STEPS) > 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_second_result_while_the_first_waits_is_reported_by_its_header_and_a_third_is_dropped()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -2019,8 +2019,8 @@ fn test_a_second_result_while_the_first_waits_is_reported_by_its_header_and_a_th
     test.assert_eq(evs[1][16], 0x30)
     test.assert_eq(air.runs, 3)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_result_the_host_masked_is_not_kept_and_a_continue_event_it_masked_is_skipped()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -2039,7 +2039,7 @@ fn test_a_result_the_host_masked_is_not_kept_and_a_continue_event_it_masked_is_s
     // Bit 49 (the Continue event) clear: the Result event goes, the Continue events do not, and the result is over.
     var d = fresh()
     let _n = run(var d, 0x2001, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD, 0xFF])
-    inject(var d, noble_controller_config.CTL_CS_STEPS, 35, 0, 0, 0)
+    inject(var d, noble_controller.CONFIG.CTL_CS_STEPS, 35, 0, 0, 0)
     let evs = results(flush_all(var d))
     test.assert_eq(list.len(evs), 1)
     test.assert_eq(evs[0][3], 0x31)
@@ -2047,7 +2047,7 @@ fn test_a_result_the_host_masked_is_not_kept_and_a_continue_event_it_masked_is_s
 
 // ── The radio's capabilities ────────────────────────────────────────
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_capabilities_are_the_builds_cut_down_to_the_radios_and_the_tone_quality_follows_the_radio()
     if not ctl_limits.cs_on()
@@ -2089,7 +2089,7 @@ fn test_the_capabilities_are_the_builds_cut_down_to_the_radios_and_the_tone_qual
     test.assert_eq(status_of(run(var d, 0x208D, [1, 0, 2, 1, 0]), 0x208D), 0)
     cfg_status(var d, "initiator on a reflector's radio", create_params(0, 0, 0), 0x12)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_radio_that_takes_no_part_leaves_the_controller_no_role_and_no_tone_quality()
     if not ctl_limits.cs_on()
@@ -2116,7 +2116,7 @@ fn set_mode3_cfg(var cfg: ll_cs_plan.CsCfg, rtt: Int, phy: Int)
     cfg.rtt = rtt
 
 // A Controller with a link ready for Channel Sounding over the radio `air` (its capabilities read), the Host having enabled both roles.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn for_radio(var air: Fake) -> ctl_hci.Controller
     var d = connected_with(true)
     ctl_hci.ctl_cs_radio_init(var d, var air)
@@ -2127,13 +2127,13 @@ fn for_radio(var air: Fake) -> ctl_hci.Controller
     d
 
 // The Host's LE CS Test with `p` on a Controller over the radio `air`: its status, and a Test End so that the next call starts clean.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn test_status_on(var air: Fake, p: [Int]) -> Int
     var c = fresh()
     ctl_hci.ctl_cs_radio_init(var c, var air)
     status_of(run(var c, 0x2095, p), 0x2095)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_radio_that_lacks_mode_3_le_2m_or_a_kind_of_sequence_refuses_them_in_le_cs_test_and_in_create_config_with_unsupported_feature()
     if not ctl_limits.cs_test_on() or not ctl_limits.cs_initiator_on()
@@ -2204,8 +2204,8 @@ fn test_a_radio_that_lacks_mode_3_le_2m_or_a_kind_of_sequence_refuses_them_in_le
     test.assert_eq(r[7 + 10], 0)
     test.assert_eq(r[7 + 15], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_le_cs_test_runs_mode_3_with_each_kind_of_sequence_on_le_2m_and_le_2m_2bt_and_arms_the_radio_with_the_plan_it_names()
     if not ctl_limits.cs_test_on() or not ctl_limits.cs_initiator_on() or not ctl_limits.cs_mode3_on() or not ctl_limits.cs_rtt_seq_on()
@@ -2270,7 +2270,7 @@ fn control_pdu_of(op: Int) -> Pdu
     p
 
 // A Controller as `ready` makes it, but the features of the peer are not known.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn unknown_features() -> ctl_hci.Controller
     var c = ready()
     c.links[0].have_feat = false
@@ -2278,8 +2278,8 @@ fn unknown_features() -> ctl_hci.Controller
         feat_set(var c.links[0], i, 0)
     c
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_read_remote_capabilities_completes_the_feature_exchange_first()
     if not ctl_limits.cs_on()
@@ -2309,8 +2309,8 @@ fn test_read_remote_capabilities_completes_the_feature_exchange_first()
     for k in 0..28
         test.assert_eq(ev[0][7 + k], rec[k])
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_read_remote_capabilities_reports_a_peer_whose_features_rule_it_out_and_one_that_never_answers()
     if not ctl_limits.cs_on()
@@ -2350,8 +2350,8 @@ fn test_read_remote_capabilities_reports_a_peer_whose_features_rule_it_out_and_o
     test.assert_eq(list.len(ev), 1)
     test.assert_eq(ev[0][4], ll_cs_proc.E_RESPONSE_TIMEOUT)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_feature_exchange_is_not_started_for_a_link_that_cannot_take_it()
     if not ctl_limits.cs_on()
@@ -2376,8 +2376,8 @@ fn test_the_feature_exchange_is_not_started_for_a_link_that_cannot_take_it()
     exhaust_records(var d)
     test.assert_eq(cmd_status(run(var d, 0x208A, [1, 0]), 0x208A), 0x0D)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_capabilities_the_host_wrote_are_the_answer_when_the_features_arrive()
     if not ctl_limits.cs_on()
@@ -2397,7 +2397,7 @@ fn test_capabilities_the_host_wrote_are_the_answer_when_the_features_arrive()
     test.assert_eq(queued_op(var c), -1)
 
 // A Controller in which the Host enabled both roles and the capabilities of the peer are not known.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn for_config(known_features: Bool) -> ctl_hci.Controller
     var c = ready()
     if not known_features
@@ -2407,8 +2407,8 @@ fn for_config(known_features: Bool) -> ctl_hci.Controller
     test.assert_eq(status_of(run(var c, 0x208D, [1, 0, 3, 1, 0]), 0x208D), 0)
     c
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_create_config_asks_for_the_capabilities_first()
     if not ctl_limits.cs_on()
@@ -2439,8 +2439,8 @@ fn test_create_config_asks_for_the_capabilities_first()
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_create_config_completes_the_feature_exchange_and_the_capabilities_exchange_first()
     if not ctl_limits.cs_on()
@@ -2470,8 +2470,8 @@ fn test_create_config_completes_the_feature_exchange_and_the_capabilities_exchan
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4], 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_configuration_that_waits_is_reported_failed_with_the_reason_the_exchange_failed()
     if not ctl_limits.cs_on()
@@ -2526,8 +2526,8 @@ fn test_a_configuration_that_waits_is_reported_failed_with_the_reason_the_exchan
     test.assert_eq(list.len(done), 1)
     test.assert_eq(done[0][4], ll_cs_proc.E_RESPONSE_TIMEOUT)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_create_config_that_the_specification_forbids_is_refused_before_the_exchange_starts()
     if not ctl_limits.cs_on()
@@ -2550,8 +2550,8 @@ fn test_create_config_that_the_specification_forbids_is_refused_before_the_excha
     test.assert_eq(snap(var d).wait, ll_cs_proc.W_NONE)
     test.assert(not ctl_hci.cs_staged(var d, ctl_hci.cs_find(var d, 0)))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_request_for_a_configuration_that_waits_is_sent_when_the_queue_has_room()
     if not ctl_limits.cs_on()
@@ -2572,8 +2572,8 @@ fn test_the_request_for_a_configuration_that_waits_is_sent_when_the_queue_has_ro
 
 // ── The table of the radio ──────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_peers_request_for_the_fae_table_is_answered_with_the_table_of_the_radio_in_the_order_of_the_allowed_channels()
     if not ctl_limits.cs_on()
@@ -2605,8 +2605,8 @@ fn test_a_peers_request_for_the_fae_table_is_answered_with_the_table_of_the_radi
     test.assert_eq(ctl_hci.cs_go(var c, ll_cs_proc.GO_LFAE), 0x80)
     test.assert_eq(ctl_hci.cs_go(var c, ll_cs_proc.GO_LFAE + 71), 127)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_radio_that_needs_no_table_or_takes_no_part_leaves_a_table_of_zeros_and_the_request_is_refused()
     if not ctl_limits.cs_on()
@@ -2670,7 +2670,7 @@ fn ts(var c: ctl_hci.Controller, what: Str, p: [Int], want: Int)
     if got != want
         test.fail("LE CS Test, ${what}: status ${got}, expected ${want}")
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_le_cs_test_needs_no_connection_and_no_host_support_and_refuses_a_second_test()
     if not ctl_limits.cs_test_on()
@@ -2689,7 +2689,7 @@ fn test_le_cs_test_needs_no_connection_and_no_host_support_and_refuses_a_second_
     // Over: another test can be made.
     ts(var c, "after the end", test_params(), 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_le_cs_test_refuses_what_the_specification_forbids_and_what_the_build_lacks()
     if not ctl_limits.cs_test_on()
@@ -2727,7 +2727,7 @@ fn test_le_cs_test_refuses_what_the_specification_forbids_and_what_the_build_lac
     ts(var c, "main steps with no sub mode", cat(with(with(with(ok, T_OVERRIDE, 4), T_OVERRIDE_LEN, 14), T_SUB, 0xFF), [5]), 0x12)
     ts(var c, "main steps of 0", cat(with(with(with(ok, T_OVERRIDE, 4), T_OVERRIDE_LEN, 14), T_SUB, 1), [0]), 0x12)
     ts(var c, "Channel Selection Algorithm #3c", with(ok, T_CHM + 10, 1), 0x11)
-    if noble_controller_config.CTL_CS_ANT == 1
+    if noble_controller.CONFIG.CTL_CS_ANT == 1
         ts(var c, "switch time with one antenna", with(ok, T_SW, 10), 0x11)
     if not ctl_limits.cs_mode3_on()
         ts(var c, "mode 3", with(ok, T_MAIN, 3), 0x11)
@@ -2752,8 +2752,8 @@ fn set_test_cfg(var cfg: ll_cs_plan.CsCfg)
     cfg.main_min = 6
     cfg.main_max = 10
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_test_runs_its_subevents_with_the_key_of_zeros_and_reports_them_with_the_handle_0xfff()
     if not ctl_limits.cs_test_on() or not ctl_limits.cs_initiator_on()
@@ -2788,8 +2788,8 @@ fn test_a_test_runs_its_subevents_with_the_key_of_zeros_and_reports_them_with_th
         test.assert_eq(recs[j][0], plan.steps[j].mode as Int)
         test.assert_eq(recs[j][1], plan.steps[j].ch as Int)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_test_of_several_subevents_ends_with_the_last_and_a_test_end_follows_the_pending_results()
     if not ctl_limits.cs_test_on() or not ctl_limits.cs_reflector_on()
@@ -2827,8 +2827,8 @@ fn test_a_test_of_several_subevents_ends_with_the_last_and_a_test_end_follows_th
     // 72 channels once round, four main mode steps in a subevent.
     test.assert_eq(n, 18)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_test_waits_for_the_procedure_that_runs_and_the_override_of_the_main_mode_steps_is_taken()
     if not ctl_limits.cs_test_on() or not ctl_limits.cs_initiator_on()
@@ -2853,9 +2853,9 @@ fn test_a_test_waits_for_the_procedure_that_runs_and_the_override_of_the_main_mo
 // ── Records taken, the control queue full, the pool starved ─────────
 
 // Every record of the Controller belongs to a connection that is not on.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn exhaust_records(var c: ctl_hci.Controller)
-    for k in 0..noble_controller_config.CTL_CS
+    for k in 0..noble_controller.CONFIG.CTL_CS
         test.assert(ctl_hci.cs_claim(var c, 10 + k) >= 0)
 
 // The control queue of the link in slot 0 holds all it can.
@@ -2875,8 +2875,8 @@ fn status_any(var c: ctl_hci.Controller, op: Int, p: [Int]) -> Int
         return cmd_status(r, op)
     status_of(r, op)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_command_that_needs_a_record_is_rejected_for_limited_resources_when_every_record_belongs_to_another_connection()
     if not ctl_limits.cs_on()
@@ -2905,8 +2905,8 @@ fn test_a_command_that_needs_a_record_is_rejected_for_limited_resources_when_eve
         exhaust_records(var d)
         test.assert_eq(status_of(run(var d, 0x20A7, [1, 0, 3, 0, 0, 0, 0, 0, 0, 0]), 0x20A7), 0x0D)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_command_that_sends_a_pdu_is_refused_while_the_control_queue_is_full()
     if not ctl_limits.cs_on()
@@ -2943,8 +2943,8 @@ fn test_a_command_that_sends_a_pdu_is_refused_while_the_control_queue_is_full()
     fill_queue(var f)
     test.assert_eq(cmd_status(run(var f, 0x208A, [1, 0]), 0x208A), 0x0C)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_procedure_of_the_link_layer_that_is_under_way_keeps_a_start_from_being_made()
     if not ctl_limits.cs_on()
@@ -2957,7 +2957,7 @@ fn test_a_procedure_of_the_link_layer_that_is_under_way_keeps_a_start_from_being
         busy_sub(var d)
         test.assert_eq(cmd_status(run(var d, 0x2094, [1, 0, 0, 1]), 0x2094), 0x0C)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_random_octets_go_to_no_one_when_no_procedure_waits_for_them()
     if not ctl_limits.cs_on()
@@ -2966,8 +2966,8 @@ fn test_the_random_octets_go_to_no_one_when_no_procedure_waits_for_them()
     test.assert(not ctl_hci.cs_feed(var c, rnd12(1)))
 
 // The events a record owes, with a pool that has no slot to spare: they wait, and come when the Host has read the packets.
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_an_event_owed_waits_for_a_free_slot_and_comes_when_there_is_one()
     if not ctl_limits.cs_on()
@@ -2991,7 +2991,7 @@ fn test_an_event_owed_waits_for_a_free_slot_and_comes_when_there_is_one()
         test.assert_eq(list.len(events_coded(flush(var c), 0x3E)), 1)
         test.assert_eq(snap(var c).owed, 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_result_and_the_end_of_a_test_wait_for_a_free_slot_too()
     if not ctl_limits.cs_on()
@@ -3025,8 +3025,8 @@ fn test_a_result_and_the_end_of_a_test_wait_for_a_free_slot_too()
 
 // ── A procedure that ends for lack of channels while a result waits ──
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_abort_of_a_procedure_for_lack_of_channels_is_reported_after_a_result_that_waits_and_dropped_after_two()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3089,8 +3089,8 @@ impl Cipher[] for Flaky
     fn faults(var self) -> Int
         0
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_cipher_that_fails_ends_the_instance_the_subevent_and_the_test_with_a_fault()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3126,7 +3126,7 @@ fn test_a_cipher_that_fails_ends_the_instance_the_subevent_and_the_test_with_a_f
     ts(var f, "start", test_params(), 0)
     test.assert_eq(ctl_hci.ctl_cs_test_subevent(var f, var air, var bad, var st4, 100000), ctl_hci.RUN_FAULT)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_or_an_instance_of_a_link_with_no_record_has_nothing_to_run()
     if not ctl_limits.cs_on()
@@ -3140,8 +3140,8 @@ fn test_a_subevent_or_an_instance_of_a_link_with_no_record_has_nothing_to_run()
 
 // ── The transmit power, a sub mode, a long override, the last of the parameters ─
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_transmit_power_of_the_hosts_default_settings_and_of_a_test_goes_into_the_plan()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3176,8 +3176,8 @@ fn test_the_transmit_power_of_the_hosts_default_settings_and_of_a_test_goes_into
         test.assert_eq(st2.plan.head.tx_dbm as Int, want[1])
         test.assert_eq(st2.plan.head.test as Int, 1)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_antenna_of_the_default_settings_and_the_peers_fae_table_go_into_the_plan()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3231,8 +3231,8 @@ fn test_the_antenna_of_the_default_settings_and_the_peers_fae_table_go_into_the_
     test.assert_eq(st2.plan.head.fae_peer.len(), 0)
     test.assert_eq(ll_cs_radio.cs_peer_fae(var st2.plan.head, 40), 0)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_configuration_with_a_sub_mode_plans_sub_mode_steps()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3263,7 +3263,7 @@ fn test_a_configuration_with_a_sub_mode_plans_sub_mode_steps()
             seen = seen + 1
     test.assert(seen >= 1)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_command_longer_than_the_buffer_with_an_override_that_is_not_taken_is_refused_as_unsupported()
     if not ctl_limits.cs_test_on()
@@ -3273,8 +3273,8 @@ fn test_a_command_longer_than_the_buffer_with_an_override_that_is_not_taken_is_r
     let p = cat(with(with(test_params()[:30], T_OVERRIDE + 1, 1), T_OVERRIDE_LEN, 19), zeros(19))
     ts(var c, "long override", p, 0x11)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_peer_antennas_the_host_prefers_must_be_as_many_as_the_configuration_needs()
     if not ctl_limits.cs_on()
@@ -3471,12 +3471,12 @@ impl CsRadio[] for AirSim
         self.f.cs_step_raw(i, var out)
 
 // The Controller says the link in slot 0 has run the connection event `ev_ran` and will run the next at `due`.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn link_at(var c: ctl_hci.Controller, ev_next: Int, due: Int)
     c.links[0].ev_count = ev_next & 0xFFFF
     c.links[0].due = due
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_runs_an_le_cs_test_when_the_radio_is_clear_and_gives_the_radio_back_configured()
     if not ctl_limits.cs_test_on()
@@ -3512,7 +3512,7 @@ fn test_the_slot_runs_an_le_cs_test_when_the_radio_is_clear_and_gives_the_radio_
     test.assert(list.len(evs) >= 1)
     test.assert(not ctl_hci.ctl_cs_result_waiting(var c))
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_starts_the_later_subevents_of_a_test_an_interval_after_the_one_before_and_waits_for_the_result_to_go()
     if not ctl_limits.cs_test_on()
@@ -3557,7 +3557,7 @@ fn test_the_slot_starts_the_later_subevents_of_a_test_an_interval_after_the_one_
 fn scan_on(var rf: ll_air.Rf)
     rf.rx_on = true
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_leaves_a_test_alone_while_the_arbiter_has_a_booking_in_its_span_and_stops_a_receiver_first()
     if not ctl_limits.cs_test_on()
@@ -3592,13 +3592,13 @@ fn begun_set(var a: ll_cs_air.CsAir)
     a.begun = true
 
 // The schedule of the series of the Controller `c`, whose link is a Peripheral with the interval of 30 milliseconds.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn sched_of(var c: ctl_hci.Controller) -> ctl_hci.CsSched
     var sc = ctl_hci.cs_sched_new()
     test.assert(ctl_hci.ctl_cs_sched(var c, 0, var sc))
     sc
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_schedule_of_a_series_and_the_anchor_of_its_events_are_read_from_the_start_and_the_link()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3638,7 +3638,7 @@ fn test_the_schedule_of_a_series_and_the_anchor_of_its_events_are_read_from_the_
     test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 3), -2)
     test.assert_eq(ctl_hci.ctl_cs_event_time(var c, 0, 65535), 5_000_000)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_plans_a_procedure_ahead_and_runs_each_subevent_after_the_event_it_is_offset_from()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3688,7 +3688,7 @@ fn test_the_slot_plans_a_procedure_ahead_and_runs_each_subevent_after_the_event_
     test.assert_eq(air.holds, 3)
     test.assert_eq(air.releases, 3)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_waits_for_the_event_the_subevent_is_offset_from_and_hands_a_subevent_it_cannot_place_to_the_radio_late()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3723,7 +3723,7 @@ fn test_the_slot_waits_for_the_event_the_subevent_is_offset_from_and_hands_a_sub
     test.assert_eq(r[0][3 + 13], 0x30)
     test.assert_eq(a.last, ctl_hci.RUN_OK)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_reports_a_subevent_whose_connection_event_cannot_be_placed_as_a_conflict_and_ends_the_series_when_the_cipher_fails()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3772,7 +3772,7 @@ fn test_the_slot_reports_a_subevent_whose_connection_event_cannot_be_placed_as_a
     test.assert_eq(a3.ls, -1)
     test.assert(not a3.prepared)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_plans_only_when_the_radio_is_idle_for_as_long_as_the_planning_takes()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3797,7 +3797,7 @@ fn test_the_slot_plans_only_when_the_radio_is_idle_for_as_long_as_the_planning_t
     test.assert_eq(a.plan_us, 0)
     test.assert_eq(a.inst, 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_position_in_a_series_moves_to_the_next_subevent_the_next_event_or_the_next_instance_and_the_start_follows_it()
     if not ctl_limits.cs_on()
@@ -3834,7 +3834,7 @@ fn begin_at(var a: ll_cs_air.CsAir)
 fn tick_set(var air: AirSim, tick: Int)
     air.tick = tick
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_slot_times_the_planning_and_waits_for_a_run_that_is_between_the_lead_and_the_poll_threshold()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3875,7 +3875,7 @@ fn test_the_slot_times_the_planning_and_waits_for_a_run_that_is_between_the_lead
     test.assert(a.prepared)
     test.assert_eq(a.plan_us, 7)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_in_an_event_of_two_is_planned_with_the_start_of_the_next_inside_the_event_and_the_end_of_the_series_is_told()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3903,7 +3903,7 @@ fn test_a_subevent_in_an_event_of_two_is_planned_with_the_start_of_the_next_insi
     test.assert(ll_cs_air.plan_one(var air, var d, var cc, var st2, var a2, var late, 0))
     test.assert(st2.gens[0].done)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_program_gives_up_a_series_whose_instance_or_planning_fails_and_a_run_for_a_series_that_is_over_has_nothing_to_run()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3951,12 +3951,12 @@ fn test_the_program_gives_up_a_series_whose_instance_or_planning_fails_and_a_run
 // ── The arbiter and the placing, in the Controller ──────────────────
 
 // The link in slot 0 has the subrate factor `factor` and the base event `base`.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn link_subrated(var c: ctl_hci.Controller, factor: Int, base: Int)
     c.links[0].sub_factor = factor as u16
     c.links[0].sub_res = (base % factor) as u16
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_placing_is_given_the_events_of_the_link_with_its_subrated_grid_and_the_lead_of_the_radio()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -3994,7 +3994,7 @@ fn test_the_placing_is_given_the_events_of_the_link_with_its_subrated_grid_and_t
     ctl_hci.ctl_cs_radio_init(var c, var air)
     test.assert_eq(ctl_hci.ctl_cs_lead_us(var c), ll_cs.WORK_US + air.cs_timing().arm_lead_us)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_is_booked_and_tested_against_the_events_of_the_link_that_carries_the_procedure_in_either_class()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -4035,7 +4035,7 @@ fn test_a_subevent_is_booked_and_tested_against_the_events_of_the_link_that_carr
     // A test has no link: its booking is tested against the classes above alone.
     test.assert(ctl_hci.ctl_cs_fits(var c, -1, true, false, 1_990_000, 2_000_000 + 100000, 2500))
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_offset_from_an_event_that_is_not_a_subrated_event_is_given_up_and_counted()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -4066,7 +4066,7 @@ fn test_a_subevent_offset_from_an_event_that_is_not_a_subrated_event_is_given_up
     // The generator stayed in step: the procedure is over after this subevent, as it would have been had the subevent run.
     test.assert_eq(a.last, ctl_hci.RUN_OK)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_subevent_that_is_given_up_does_not_make_the_event_one_that_is_under_way_and_one_that_ran_does()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on()
@@ -4084,7 +4084,7 @@ fn test_a_subevent_that_is_given_up_does_not_make_the_event_one_that_is_under_wa
     test.assert_eq(a.ev_i, 1)
 
 // The Controller with the configuration and the procedure parameters of series_of, the procedures not enabled.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn configured_for_start() -> ctl_hci.Controller
     var c = ready()
     exchange_caps(var c)
@@ -4098,7 +4098,7 @@ fn configured_for_start() -> ctl_hci.Controller
     pp(var c, "set", pp_params(0, 1), 0)
     c
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_start_waits_for_a_power_control_or_a_subrate_procedure_that_is_out_and_goes_when_it_is_over()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on() or not ctl_limits.pcl_on() or not ctl_limits.sub_on()
@@ -4114,7 +4114,7 @@ fn test_the_start_waits_for_a_power_control_or_a_subrate_procedure_that_is_out_a
     c.sub[0].wait = false
     test.assert_eq(cmd_status(run(var c, 0x2094, [1, 0, 0, 1]), 0x2094), 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_transmit_level_of_a_procedure_is_the_hosts_and_does_not_follow_the_power_control_of_the_acl()
     if not ctl_limits.cs_on() or not ctl_limits.cs_initiator_on() or not ctl_limits.pcl_on()
@@ -4132,7 +4132,7 @@ fn test_the_transmit_level_of_a_procedure_is_the_hosts_and_does_not_follow_the_p
     c.pcl[0].lvl[1] = -20
     test.assert_eq(st.plan.head.tx_dbm as Int, before)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_peripheral_with_latency_uses_the_subrated_event_a_channel_sounding_event_is_offset_from()
     if not ctl_limits.cs_on() or not ctl_limits.sub_on()

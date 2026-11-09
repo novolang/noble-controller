@@ -9,7 +9,7 @@
 
 use ctl_limits
 use std.test
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ll_pdu
 use ll_data
@@ -207,7 +207,7 @@ fn test_the_opcodes_of_clock_accuracy_and_power_control_are_those_of_the_specifi
     test.assert_eq(ll_data.OP_POWER_CHANGE_IND, 0x25)
 
 // An LL_CLOCK_ACCURACY_REQ (0x1D) is answered with the 0x1E response carrying this end's class, and takes the peer's class.
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_clock_accuracy_request_is_answered_with_the_response_opcode()
     var c = connected()
@@ -225,7 +225,7 @@ fn test_a_clock_accuracy_request_is_answered_with_the_response_opcode()
 
 // ── A build without LE Power Control ────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_build_without_power_control_answers_none_of_its_commands_and_the_pdus_with_unknown_response()
     if on()

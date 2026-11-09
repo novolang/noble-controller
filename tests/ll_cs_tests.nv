@@ -8,7 +8,7 @@
 
 use std.test
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_cs
 
 // ── The commands ────────────────────────────────────────────────────
@@ -318,35 +318,35 @@ fn test_the_switch_times_are_0_1_2_4_and_10()
 
 @test
 fn test_each_switch_follows_its_key()
-    let on = noble_controller_config.CTL_CS > 0
+    let on = noble_controller.CONFIG.CTL_CS > 0
     test.assert_eq(ctl_limits.cs_on(), on)
-    test.assert_eq(ctl_limits.cs_initiator_on(), on and (noble_controller_config.CTL_CS_ROLES & 1) != 0)
-    test.assert_eq(ctl_limits.cs_reflector_on(), on and (noble_controller_config.CTL_CS_ROLES & 2) != 0)
-    test.assert_eq(ctl_limits.cs_mode3_on(), on and noble_controller_config.CTL_CS_MODE3)
-    test.assert_eq(ctl_limits.cs_rtt_seq_on(), on and noble_controller_config.CTL_CS_RTT_SEQ)
-    test.assert_eq(ctl_limits.cs_3c_on(), on and noble_controller_config.CTL_CS_3C)
-    test.assert_eq(ctl_limits.cs_ipt_on(), on and noble_controller_config.CTL_CS_IPT and ctl_limits.feat_on())
-    test.assert_eq(ctl_limits.cs_test_on(), on and noble_controller_config.CTL_CS_TEST)
+    test.assert_eq(ctl_limits.cs_initiator_on(), on and (noble_controller.CONFIG.CTL_CS_ROLES & 1) != 0)
+    test.assert_eq(ctl_limits.cs_reflector_on(), on and (noble_controller.CONFIG.CTL_CS_ROLES & 2) != 0)
+    test.assert_eq(ctl_limits.cs_mode3_on(), on and noble_controller.CONFIG.CTL_CS_MODE3)
+    test.assert_eq(ctl_limits.cs_rtt_seq_on(), on and noble_controller.CONFIG.CTL_CS_RTT_SEQ)
+    test.assert_eq(ctl_limits.cs_3c_on(), on and noble_controller.CONFIG.CTL_CS_3C)
+    test.assert_eq(ctl_limits.cs_ipt_on(), on and noble_controller.CONFIG.CTL_CS_IPT and ctl_limits.feat_on())
+    test.assert_eq(ctl_limits.cs_test_on(), on and noble_controller.CONFIG.CTL_CS_TEST)
 
 @test
 fn test_the_keys_that_count_are_zero_with_the_feature_off_and_inside_their_range_with_it_on()
     if not ctl_limits.cs_on()
-        test.assert_eq(noble_controller_config.CTL_CS, 0)
-        test.assert_eq(noble_controller_config.CTL_CS_CONFIGS, 0)
-        test.assert_eq(noble_controller_config.CTL_CS_STEPS, 0)
-        test.assert_eq(noble_controller_config.CTL_CS_ROLES, 0)
-        test.assert_eq(noble_controller_config.CTL_CS_ANT, 0)
-        test.assert(not noble_controller_config.CTL_CS_MODE3)
-        test.assert(not noble_controller_config.CTL_CS_RTT_SEQ)
-        test.assert(not noble_controller_config.CTL_CS_3C)
-        test.assert(not noble_controller_config.CTL_CS_IPT)
-        test.assert(not noble_controller_config.CTL_CS_TEST)
+        test.assert_eq(noble_controller.CONFIG.CTL_CS, 0)
+        test.assert_eq(noble_controller.CONFIG.CTL_CS_CONFIGS, 0)
+        test.assert_eq(noble_controller.CONFIG.CTL_CS_STEPS, 0)
+        test.assert_eq(noble_controller.CONFIG.CTL_CS_ROLES, 0)
+        test.assert_eq(noble_controller.CONFIG.CTL_CS_ANT, 0)
+        test.assert(not noble_controller.CONFIG.CTL_CS_MODE3)
+        test.assert(not noble_controller.CONFIG.CTL_CS_RTT_SEQ)
+        test.assert(not noble_controller.CONFIG.CTL_CS_3C)
+        test.assert(not noble_controller.CONFIG.CTL_CS_IPT)
+        test.assert(not noble_controller.CONFIG.CTL_CS_TEST)
         return
-    test.assert(noble_controller_config.CTL_CS >= 1 and noble_controller_config.CTL_CS <= 2)
-    test.assert(noble_controller_config.CTL_CS_CONFIGS >= 1 and noble_controller_config.CTL_CS_CONFIGS <= ll_cs.CONFIGS_MAX)
-    test.assert(noble_controller_config.CTL_CS_STEPS >= 8 and noble_controller_config.CTL_CS_STEPS <= ll_cs.STEPS_PER_SUBEVENT_MAX)
-    test.assert(noble_controller_config.CTL_CS_ROLES >= 1 and noble_controller_config.CTL_CS_ROLES <= 3)
-    test.assert(noble_controller_config.CTL_CS_ANT >= 1 and noble_controller_config.CTL_CS_ANT <= 4)
+    test.assert(noble_controller.CONFIG.CTL_CS >= 1 and noble_controller.CONFIG.CTL_CS <= 2)
+    test.assert(noble_controller.CONFIG.CTL_CS_CONFIGS >= 1 and noble_controller.CONFIG.CTL_CS_CONFIGS <= ll_cs.CONFIGS_MAX)
+    test.assert(noble_controller.CONFIG.CTL_CS_STEPS >= 8 and noble_controller.CONFIG.CTL_CS_STEPS <= ll_cs.STEPS_PER_SUBEVENT_MAX)
+    test.assert(noble_controller.CONFIG.CTL_CS_ROLES >= 1 and noble_controller.CONFIG.CTL_CS_ROLES <= 3)
+    test.assert(noble_controller.CONFIG.CTL_CS_ANT >= 1 and noble_controller.CONFIG.CTL_CS_ANT <= 4)
     test.assert(ctl_limits.pcl_on())
 
 @test

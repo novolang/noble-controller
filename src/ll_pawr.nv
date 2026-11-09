@@ -17,7 +17,7 @@
 // octets of staged responses follow the keys `ctl_pawr_bufs` and `ctl_pawr_data` (`ctl_limits.pw_bufs()`, `pw_data()`, `pw_rsp()`); the build has the advertiser with `ctl_limits.pawr_adv_on()` and the synchronizer with
 // `ctl_limits.pawr_sync_on()`.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ll_pdu
 use ll_phy
@@ -177,7 +177,7 @@ struct PwBuf
     rs: Int
     rc: Int
     len: Int
-    data: Vec[u8; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then noble_controller_config.CTL_PAWR_DATA else 8]
+    data: Vec[u8; if noble_controller.CONFIG.CTL_PAWR_ADV or noble_controller.CONFIG.CTL_PAWR_SYNC then noble_controller.CONFIG.CTL_PAWR_DATA else 8]
 
 @tier(embedded)
 fn pb_new() -> PwBuf
@@ -215,7 +215,7 @@ struct PwAdv
     delay_us: Int
     spacing_us: Int
     slots: Int
-    bufs: Vec[PwBuf; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then noble_controller_config.CTL_PAWR_BUFS else 1]
+    bufs: Vec[PwBuf; if noble_controller.CONFIG.CTL_PAWR_ADV or noble_controller.CONFIG.CTL_PAWR_SYNC then noble_controller.CONFIG.CTL_PAWR_BUFS else 1]
     next_ask: Int
     air: Int
     ask_owed: Bool
@@ -226,7 +226,7 @@ struct PwAdv
     rep_tx: Int
     rn: Int
     rlen: Int
-    rdata: Vec[u8; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then 2 * noble_controller_config.CTL_PAWR_DATA + 8 else 8]
+    rdata: Vec[u8; if noble_controller.CONFIG.CTL_PAWR_ADV or noble_controller.CONFIG.CTL_PAWR_SYNC then 2 * noble_controller.CONFIG.CTL_PAWR_DATA + 8 else 8]
     cur_rs: Int
     cur_rc: Int
 
@@ -484,7 +484,7 @@ struct PwSync
     subs: Vec[u8; 8]
     txp: Bool
     hsub: Int
-    bufs: Vec[PwBuf; if noble_controller_config.CTL_PAWR_ADV or noble_controller_config.CTL_PAWR_SYNC then noble_controller_config.CTL_PAWR_BUFS else 1]
+    bufs: Vec[PwBuf; if noble_controller.CONFIG.CTL_PAWR_ADV or noble_controller.CONFIG.CTL_PAWR_SYNC then noble_controller.CONFIG.CTL_PAWR_BUFS else 1]
 
 @tier(embedded)
 fn ps_new() -> PwSync

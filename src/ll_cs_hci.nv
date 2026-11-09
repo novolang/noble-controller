@@ -20,7 +20,7 @@ use ll_cs_proc
 use ll_cs_plan
 use ll_cs_radio
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 
 // ── Buffers ─────────────────────────────────────────────────────────
 

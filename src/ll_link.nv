@@ -78,7 +78,7 @@
 //
 // The state is a value with inline storage; no function here allocates.
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ll_pdu
 use ll_data
@@ -304,7 +304,7 @@ const CTRL_SLOTS = 4
 // The octets of a slot of the LL Control queue: 76 in a build with Channel Sounding, 40 otherwise.
 @tier(embedded)
 const fn ctrl_slot() -> Int
-    if noble_controller_config.CTL_CS > 0
+    if noble_controller.CONFIG.CTL_CS > 0
         76
     else
         40
@@ -450,7 +450,7 @@ struct Link
     txq2: Vec[u8; 260]
     txq_head: Int
     txq_count: Int
-    cq: Vec[u8; if noble_controller_config.CTL_CS > 0 then 304 else 160]
+    cq: Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then 304 else 160]
     cq_head: Int
     cq_count: Int
     completed: Int

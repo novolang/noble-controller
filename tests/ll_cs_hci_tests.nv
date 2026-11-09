@@ -6,7 +6,7 @@
 
 use std.test
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ll_cs
 use ll_cs_pdu

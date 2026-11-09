@@ -11,7 +11,7 @@
 
 use ctl_limits
 use std.test
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_hci
 use ll_pdu
 use ll_data
@@ -127,7 +127,7 @@ fn long_packets(var c: ctl_hci.Controller)
     c.links[0].dl_rem_rx_time = 2120
 
 // A Controller with the Host Support bit set, the link encrypted, the peer known to have the feature and long packets.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn ready_link() -> ctl_hci.Controller
     var c = connected()
     ctl_hci.ctl_cs_set_host(var c, true)
@@ -160,7 +160,7 @@ fn pop_queued(var c: ctl_hci.Controller)
     ll_link.link_prepare(var c.links[0])
 
 // The record of slot `rec` of the Controller's tables, copied.
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 fn snap(var c: ctl_hci.Controller, rec: Int) -> ll_cs_proc.Cs
     var cs = ll_cs_proc.cs_new()
     ctl_hci.cs_get(var c, rec, var cs)
@@ -225,8 +225,8 @@ fn sec_req_pdu() -> Pdu
 
 // ── The PDUs of the peer ────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_capabilities_request_is_answered_with_this_controllers_capabilities()
     if not ctl_limits.cs_on()
@@ -249,8 +249,8 @@ fn test_a_capabilities_request_is_answered_with_this_controllers_capabilities()
     var snap1 = snap(var c, rec)
     test.assert(ll_cs_proc.caps_known(var snap1))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_request_is_refused_while_the_host_has_not_set_the_feature_or_the_link_is_not_encrypted()
     if not ctl_limits.cs_on()
@@ -273,8 +273,8 @@ fn test_a_request_is_refused_while_the_host_has_not_set_the_feature_or_the_link_
     peer_sends(var d, var req2)
     test.assert(rejected(var d, ll_cs.OP_CS_CAPABILITIES_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_host_support_bit_the_host_set_reaches_the_record_a_connection_claims_later()
     if not ctl_limits.cs_on()
@@ -289,8 +289,8 @@ fn test_the_host_support_bit_the_host_set_reaches_the_record_a_connection_claims
     test.assert(not snap(var c, rec).host)
     test.assert(not ctl_hci.cs_host_get(var c))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_pdu_of_the_wrong_length_is_dropped_and_a_pdu_of_the_wrong_role_is_not_known()
     if not ctl_limits.cs_on()
@@ -312,8 +312,8 @@ fn test_a_pdu_of_the_wrong_length_is_dropped_and_a_pdu_of_the_wrong_role_is_not_
     test.assert_eq(queued_op(var c), ll_data.OP_UNKNOWN_RSP)
     test.assert_eq(queued_byte(var c, 1), ll_cs.OP_CS_SEC_RSP)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_fae_table_request_is_refused_because_this_build_has_no_table()
     if not ctl_limits.cs_on()
@@ -323,8 +323,8 @@ fn test_a_fae_table_request_is_refused_because_this_build_has_no_table()
     peer_sends(var c, var req)
     test.assert(rejected(var c, ll_cs.OP_CS_FAE_REQ, ll_cs_proc.E_UNSUPPORTED_FEATURE))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_refusal_of_a_request_this_controller_sent_ends_its_procedure()
     if not ctl_limits.cs_on()
@@ -341,8 +341,8 @@ fn test_the_refusal_of_a_request_this_controller_sent_ends_its_procedure()
     var snap2 = snap(var c, rec)
     test.assert(ll_cs_proc.take_owed(var snap2, ll_cs_proc.OWED_CAPS))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_refusal_of_something_else_is_not_a_channel_sounding_matter_and_a_link_without_a_record_ignores_it()
     if not ctl_limits.cs_on()
@@ -360,8 +360,8 @@ fn test_a_refusal_of_something_else_is_not_a_channel_sounding_matter_and_a_link_
 
 // ── The whole sequence ──────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_scripted_central_takes_the_controller_through_security_capabilities_configuration_and_start()
     if not ctl_limits.cs_reflector_on()
@@ -441,8 +441,8 @@ fn test_the_scripted_central_takes_the_controller_through_security_capabilities_
     test.assert_eq(run.conn_event, ev)
     test.assert_eq(run.subevent_len, 2500)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_security_request_before_the_encryption_is_refused()
     if not ctl_limits.cs_on()
@@ -455,8 +455,8 @@ fn test_the_security_request_before_the_encryption_is_refused()
     test.assert(rejected(var c, ll_cs.OP_CS_SEC_REQ, ll_cs_proc.E_INSUFFICIENT_SECURITY))
     test.assert(not ctl_hci.ctl_wants_random(var c))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_central_only_request_to_a_peripheral_cannot_be_started_by_the_host()
     if not ctl_limits.cs_on()
@@ -466,8 +466,8 @@ fn test_a_central_only_request_to_a_peripheral_cannot_be_started_by_the_host()
 
 // ── The Host's requests ─────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_hosts_request_for_capabilities_goes_out_as_a_pdu_and_its_answer_completes_it()
     if not ctl_limits.cs_on()
@@ -486,8 +486,8 @@ fn test_the_hosts_request_for_capabilities_goes_out_as_a_pdu_and_its_answer_comp
     var snap14 = snap(var c, rec)
     test.assert(ll_cs_proc.caps_known(var snap14))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_hosts_request_for_a_configuration_a_table_and_a_start_wait_for_what_they_need()
     if not ctl_limits.cs_on()
@@ -504,8 +504,8 @@ fn test_the_hosts_request_for_a_configuration_a_table_and_a_start_wait_for_what_
     test.assert_eq(queued_len(var c), 13)
     test.assert_eq(queued_op(var c), ll_cs.OP_CS_CHANNEL_MAP_IND)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_request_on_a_link_that_is_not_on_or_whose_queue_is_full_is_refused_with_its_own_status()
     if not ctl_limits.cs_on()
@@ -520,13 +520,13 @@ fn test_a_request_on_a_link_that_is_not_on_or_whose_queue_is_full_is_refused_wit
         let _q = ll_link.ctrl_queue(var c.links[0], var p1)
     test.assert_eq(ctl_hci.ctl_cs_capabilities(var c, 0), ctl_hci.STATUS_COMMAND_DISALLOWED)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_every_record_taken_by_other_links_leaves_none_for_this_one()
     if not ctl_limits.cs_on()
         return
-    if ctl_limits.cs_slots() != 1 or noble_controller_config.CTL_LINKS < 2
+    if ctl_limits.cs_slots() != 1 or noble_controller.CONFIG.CTL_LINKS < 2
         return
     var c = ready_link()
     test.assert_eq(ctl_hci.cs_claim(var c, 1), 0)
@@ -546,7 +546,7 @@ fn test_every_record_taken_by_other_links_leaves_none_for_this_one()
     ctl_hci.cs_release(var c, 1)
     test.assert_eq(ctl_hci.cs_claim(var c, 0), 0)
 
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_status_of_a_request_that_found_no_record_names_the_reason()
     test.assert_eq(ctl_hci.cs_request_status(-1), ctl_hci.STATUS_UNKNOWN_CONNECTION)
@@ -555,8 +555,8 @@ fn test_the_status_of_a_request_that_found_no_record_names_the_reason()
 
 // ── The record follows the connection ───────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_record_is_given_back_when_the_connection_ends_and_when_the_controller_resets()
     if not ctl_limits.cs_on()
@@ -572,8 +572,8 @@ fn test_a_record_is_given_back_when_the_connection_ends_and_when_the_controller_
     test.assert_eq(ctl_hci.cs_find(var d, 0), -1)
     test.assert(not ctl_hci.cs_host_get(var d))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_new_connection_in_a_slot_starts_with_a_clean_record_that_takes_the_hosts_support_bit()
     if not ctl_limits.cs_on()
@@ -590,8 +590,8 @@ fn test_a_new_connection_in_a_slot_starts_with_a_clean_record_that_takes_the_hos
 
 // ── Time ────────────────────────────────────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_request_the_peer_leaves_unanswered_for_40_seconds_ends_the_connection_with_response_timeout()
     if not ctl_limits.cs_on()
@@ -615,8 +615,8 @@ fn test_a_request_the_peer_leaves_unanswered_for_40_seconds_ends_the_connection_
     let _s = ctl_hci.ctl_step(var d)
     test.assert(d.links[0].closing)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_an_idle_connection_is_not_polled_into_a_timeout()
     if not ctl_limits.cs_on()
@@ -629,8 +629,8 @@ fn test_an_idle_connection_is_not_polled_into_a_timeout()
 
 // ── What the procedures read of the link ────────────────────────────
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_environment_of_a_link_is_what_the_link_and_the_controller_say()
     if not ctl_limits.cs_on()
@@ -674,8 +674,8 @@ fn test_the_environment_of_a_link_is_what_the_link_and_the_controller_say()
     set_phy(var c, ll_phy.PHY_CODED, ll_phy.OPT_S8)
     test.assert_eq(ctl_hci.cs_phy_bit(var c, 0), 4)
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_the_peers_enhancement_1_bit_in_its_second_feature_page_is_read_from_the_link()
     if not ctl_limits.cs_on()
@@ -697,7 +697,7 @@ fn fae_req_pdu() -> Pdu
 @test
 fn test_the_slot_of_the_control_queue_holds_the_longest_pdu_of_the_build()
     // A build with no Peripheral connection (the minimum of the schema) has no link to read the queue of.
-    if noble_controller_config.CTL_PERIPHERAL == 0
+    if noble_controller.CONFIG.CTL_PERIPHERAL == 0
         return
     var c = connected()
     if ctl_limits.cs_on()
@@ -745,8 +745,8 @@ fn test_a_pdu_longer_than_the_slot_is_not_queued()
     set_len(var p, 74)
     test.assert(ll_link.ctrl_queue(var c.links[0], var p))
 
-@when(noble_controller_config.CTL_PERIPHERAL > 0)
-@when(noble_controller_config.CTL_CS > 0)
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@when(noble_controller.CONFIG.CTL_CS > 0)
 @test
 fn test_a_peer_that_takes_only_27_octets_gets_the_longest_answer_refused_as_limited_resources()
     if not ctl_limits.cs_on()

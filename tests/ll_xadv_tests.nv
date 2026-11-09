@@ -4,7 +4,7 @@
 
 use std.test
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 use ll_pdu
 use ll_phy
 use ll_adv
@@ -54,7 +54,7 @@ fn test_capacities_match_the_constants()
     test.assert_eq(s.rsp.capacity(), ctl_limits.data_max())
 
 // A build with advertising sets holds a whole chunk of a chain in a data buffer.
-@when(noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_a_chunk_of_a_chain_fits_the_data_buffer()
     test.assert(CHUNK <= ctl_limits.data_max())
@@ -122,7 +122,7 @@ fn t_room(have: Int, len: Int) -> Int
     else
         OK
 
-@when(noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_data_commands_follow_the_operations()
     var s = t_set(0)
@@ -216,7 +216,7 @@ fn test_the_layout_keeps_every_offset_a_multiple_of_the_pointer_unit_and_the_pdu
     test.assert_eq(chunk_len(251, 1), 22)
     test.assert_eq(chunk_len(251, 2), 0)
 
-@when(noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_pdus_of_an_event_carry_their_fields()
     var s = t_set(P_TXP)
@@ -266,7 +266,7 @@ fn test_the_pdus_of_an_event_carry_their_fields()
     test.assert_eq(ll_init.aux_unit_us(var w, v.aux), 300)
     test.assert_eq(ll_init.aux_offset_us(var w, v.aux), 399900)
 
-@when(noble_controller_config.CTL_ADV_SETS > 0)
+@when(noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
 fn test_the_scan_response_and_the_connect_response_have_the_addresses_a_scanner_needs()
     var s = t_set(P_SCAN)

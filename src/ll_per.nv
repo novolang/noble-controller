@@ -18,7 +18,7 @@
 // This module holds no radio.  The trains and the synchronizations are values with inline storage; no function here
 // allocates.  The slots under "The profile" follow the keys of the package configuration (`ctl_limits.padv_n()`, `psync_n()`, `pal_n()`).
 
-use noble_controller_config
+use noble_controller.CONFIG
 use ctl_limits
 use ll_pdu
 use ll_adv
@@ -38,7 +38,7 @@ const fn max1(n: Int) -> Int
 
 // The data of one periodic train: `ctl_adv_data` octets, the length of an advertising set's data, and 8 in a build without
 // extended advertising, which keeps one record because a `Vec` holds at least one element.
-pub alias PerData = Vec[u8; if noble_controller_config.CTL_ADV_SETS > 0 then noble_controller_config.CTL_ADV_DATA else 8]
+pub alias PerData = Vec[u8; if noble_controller.CONFIG.CTL_ADV_SETS > 0 then noble_controller.CONFIG.CTL_ADV_DATA else 8]
 
 // ── Statuses, limits and times ──────────────────────────────────────
 
@@ -544,10 +544,10 @@ fn build_sync_chain(var t: PerAdv, var p: Pdu, at: Int, n: Int, more: Bool, ch: 
 // The entries of the list: the address type, the address and the SID of each.
 @value
 struct PerList
-    used: Vec[Bool; if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1]
-    kind: Vec[u8; if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1]
-    sid: Vec[u8; if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1]
-    addr: Vec[u8; (if noble_controller_config.CTL_PER_ADV > 0 and noble_controller_config.CTL_ADV_SETS > 0 then max1(noble_controller_config.CTL_PER_LIST) else 1) * 6]
+    used: Vec[Bool; if noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0 then max1(noble_controller.CONFIG.CTL_PER_LIST) else 1]
+    kind: Vec[u8; if noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0 then max1(noble_controller.CONFIG.CTL_PER_LIST) else 1]
+    sid: Vec[u8; if noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0 then max1(noble_controller.CONFIG.CTL_PER_LIST) else 1]
+    addr: Vec[u8; (if noble_controller.CONFIG.CTL_PER_ADV > 0 and noble_controller.CONFIG.CTL_ADV_SETS > 0 then max1(noble_controller.CONFIG.CTL_PER_LIST) else 1) * 6]
 
 @tier(embedded)
 fn pal_new() -> PerList

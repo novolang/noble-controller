@@ -60,7 +60,7 @@ use ll_ccm
 use ll_cs
 use ll_cs_plan
 use ll_cs_radio
-use noble_controller_config
+use noble_controller.CONFIG
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -1856,7 +1856,7 @@ fn test_the_subevent_of_plan_subevent_runs_and_its_steps_come_back_by_index()
     var sub = ll_cs_plan.plan_new()
     let code = ll_cs_plan.plan_subevent(var cc, var g, var c, var sub, 0, 0)
     // The subevent holds as many steps as the keys give room for, or as the procedure has for it.
-    let cap = ll_cs_plan.max1(noble_controller_config.CTL_CS_STEPS)
+    let cap = ll_cs_plan.max1(noble_controller.CONFIG.CTL_CS_STEPS)
     // The same plan made into the tests' own storage, which holds all of it.
     var cc2 = ll_ccm.soft_cipher_new()
     var g2 = ll_cs_plan.gen_new()

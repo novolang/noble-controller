@@ -43,7 +43,7 @@ use ll_cs
 use ll_cs_pdu
 use ll_cs_fit
 use ctl_limits
-use noble_controller_config
+use noble_controller.CONFIG
 
 // ── Numbers ─────────────────────────────────────────────────────────
 
@@ -195,8 +195,8 @@ const RES_STEP_OCT = 40
 // The configurations a connection holds: `ctl_cs_configs`, and 1 in a build without the feature.
 @tier(embedded)
 const fn cfg_slots() -> Int
-    if noble_controller_config.CTL_CS > 0
-        noble_controller_config.CTL_CS_CONFIGS
+    if noble_controller.CONFIG.CTL_CS > 0
+        noble_controller.CONFIG.CTL_CS_CONFIGS
     // cov: skip — the build without the feature, which the tests of the feature do not run
     else
         1
@@ -204,8 +204,8 @@ const fn cfg_slots() -> Int
 // The octets of a store: its fixed part and the configurations; 1 in a build without the feature.
 @tier(embedded)
 const fn bulk_octets() -> Int
-    if noble_controller_config.CTL_CS > 0
-        OFF_CFG + CFG_OCT * noble_controller_config.CTL_CS_CONFIGS
+    if noble_controller.CONFIG.CTL_CS > 0
+        OFF_CFG + CFG_OCT * noble_controller.CONFIG.CTL_CS_CONFIGS
     // cov: skip — the build without the feature, which the tests of the feature do not run
     else
         1
@@ -316,7 +316,7 @@ struct Cs
     def_ant: Int
     def_txp: Int
     sec_req: Int
-    bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then 224 + 56 * noble_controller_config.CTL_CS_CONFIGS else 1]
+    bulk: Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then 224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS else 1]
 
 // ── The records in the Controller ───────────────────────────────────
 // The Controller keeps the records of its connections as numbers and octets in two tables, which are `Vec` values and so need no type of their own in a
@@ -372,8 +372,8 @@ fn b2i(v: Bool) -> Int
 
 // Copy the record of `slot` into `cs`.
 @tier(embedded)
-fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
-        var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
+fn load(var words: Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * 38 + 40 else 1],
+        var bulk: Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * (224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS) + 232 + noble_controller.CONFIG.CTL_CS_STEPS * 40 else 1],
         slot: Int, var cs: Cs)
     let w = slot * CS_WORDS
     cs.owner = words[w + WD_OWNER]
@@ -420,8 +420,8 @@ fn load(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_con
 
 // Copy `cs` into the record of `slot`.
 @tier(embedded)
-fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
-         var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1],
+fn store(var words: Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * 38 + 40 else 1],
+         var bulk: Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * (224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS) + 232 + noble_controller.CONFIG.CTL_CS_STEPS * 40 else 1],
          slot: Int, var cs: Cs)
     let w = slot * CS_WORDS
     words[w + WD_OWNER] = cs.owner
@@ -468,10 +468,10 @@ fn store(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_co
 
 // The tables of a Controller with `slots` records, each a new record that no connection owns.  `Vec.new()` has no elements; this fills them.
 @tier(embedded)
-fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * 38 + 40 else 1],
-               var bulk: Vec[u8; if noble_controller_config.CTL_CS > 0 then noble_controller_config.CTL_CS * (224 + 56 * noble_controller_config.CTL_CS_CONFIGS) + 232 + noble_controller_config.CTL_CS_STEPS * 40 else 1])
+fn tables_fill(var words: Vec[Int; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * 38 + 40 else 1],
+               var bulk: Vec[u8; if noble_controller.CONFIG.CTL_CS > 0 then noble_controller.CONFIG.CTL_CS * (224 + 56 * noble_controller.CONFIG.CTL_CS_CONFIGS) + 232 + noble_controller.CONFIG.CTL_CS_STEPS * 40 else 1])
     var cs = cs_new()
-    for slot in 0..noble_controller_config.CTL_CS
+    for slot in 0..noble_controller.CONFIG.CTL_CS
         for _ in 0..CS_WORDS
             let _w = words.push(0)
         for _ in 0..bulk_octets()
@@ -479,7 +479,7 @@ fn tables_fill(var words: Vec[Int; if noble_controller_config.CTL_CS > 0 then no
         store(var words, var bulk, slot, var cs)
     for _ in 0..GLOBAL_WORDS
         let _g = words.push(0)
-    for _ in 0..GLOBAL_OCTETS + noble_controller_config.CTL_CS_STEPS * RES_STEP_OCT
+    for _ in 0..GLOBAL_OCTETS + noble_controller.CONFIG.CTL_CS_STEPS * RES_STEP_OCT
         let _h = bulk.push(0)
 
 // A record for the connection of the link in slot `owner`, as new, with the Host Support bit as the Host set it.
@@ -636,7 +636,7 @@ fn caps_with(var c: CapPdu, roles: Int, ant: Int, configs: Int, mode3: Bool, rtt
 // The capabilities this build reports, from its keys alone (`caps_with`).  The Controller cuts it down with what the radio of the port runs.
 @tier(embedded)
 fn local_caps(var c: CapPdu)
-    caps_with(var c, noble_controller_config.CTL_CS_ROLES, noble_controller_config.CTL_CS_ANT, noble_controller_config.CTL_CS_CONFIGS, ctl_limits.cs_mode3_on(),
+    caps_with(var c, noble_controller.CONFIG.CTL_CS_ROLES, noble_controller.CONFIG.CTL_CS_ANT, noble_controller.CONFIG.CTL_CS_CONFIGS, ctl_limits.cs_mode3_on(),
         ctl_limits.cs_rtt_seq_on(), ctl_limits.cs_ipt_on(), ctl_limits.cs_3c_on())
 
 // Whether the peer's capabilities are in the store.
