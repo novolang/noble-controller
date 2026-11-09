@@ -12841,8 +12841,8 @@ fn ctl_cis_start(var c: Controller, i: Int) -> Int
 
 // The microseconds a Central starts the subevents of every stream after the first of its group before their time on the group's
 // grid.  The PTS dongle (the Lower Tester) places the first event of a later stream from the timeline of the earlier one and
-// listens for it in a window of about 40 us around a time that lies a few microseconds before the Central's nominal one
-// (`bugs/orbit/the-novo-controller-fails-to-establish-the-second-cis-of-a-two-cis-group-with-the-pts-dongle-status-0x3e.md`).
+// listens for it in a window of about 40 us around a time that lies a few microseconds before the Central's nominal one (the
+// open filing on the second CIS of a two-CIS group with the PTS dongle, status 0x3E, holds the runs).
 // Measured 2026-11-08 on the nRF54LM20 DK against the dongle with BAP/UCL/STR/BV-527-C, 529-C, 545-C and 548-C, three runs of the four
 // rows each: 12 of 16 runs ended with LE CIS Established 0x3E for the second stream at 0 us, 2 of 12 at this value; 2026-10-31, the
 // second stream alone moved by -20 us: 2 of 40, by -30 us: 38 of 40.  The value lies inside the 2 x `ll_link.JITTER_US` a Peripheral
