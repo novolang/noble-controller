@@ -10927,3 +10927,13 @@ fn test_the_build_says_whether_it_has_the_request_for_the_peers_clock_accuracy()
     test.assert_eq((r[7 + 43] >>> 2) & 1, on)
     if on == 0
         test.assert_eq(status_of(var c, 0x206D, [1, 0]), 1)
+
+@test
+fn test_stop_rx_with_the_receiver_off_halts_nothing()
+    // The receiver of a scan window is the only one `stop_rx` halts; `rf_new` has none, and a Rf cannot be written from a test.
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    air.state = LISTEN
+    ll_air.stop_rx(var air, var rf)
+    test.assert_eq(air.state, LISTEN)
+    test.assert_eq(rf.rx_on, false)

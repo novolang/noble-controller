@@ -1,6 +1,6 @@
 [package]
 name        = "noble-controller"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "The portable Bluetooth Low Energy Link Layer and HCI command handler of the noble stack: advertising, scanning, connections, encryption, extended and periodic advertising, isochronous channels, power control, subrating and the other LE features of Core 6.3.  Reads the radio, the clock and the cipher only through the noble-radio traits and the HCI seam through noble-hci."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -9,7 +9,7 @@ layer       = "core"
 tags        = ["bluetooth", "ble", "controller", "link-layer", "hci", "isochronous", "embedded"]
 repository  = "https://github.com/novolang/noble-controller"
 maintainers = ["novo-lang"]
-novo        = ">= 0.22.0"
+novo        = ">= 0.24.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and effect-checks every module under `src/` and writes no binary.
 

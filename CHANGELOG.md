@@ -4,9 +4,11 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## Unreleased
+## 0.1.1 — 2026-11-10
 
-2026-11-09: the package reads its configuration as `noble_controller.CONFIG` (`use noble_controller.CONFIG`, `noble_controller.CONFIG.CTL_LINKS`) in place of the module `noble_controller_config`.  The keys, their values and the constants the build writes are unchanged; only the name in the source moved.  A program that wrote `noble_controller_config` builds for one toolchain release with the warning E2947 at each `use` line; write `use noble_controller.CONFIG`.  The source needs a toolchain after 0.23.1, the first with the spelling.
+This release needs `noble-hci` 0.1.1 (the module `hci_cs`), `noble-radio` 0.1.1 (the module `ll_cs_radio`) and a toolchain 0.24.1 or later.
+
+2026-11-09: the package reads its configuration as `noble_controller.CONFIG` (`use noble_controller.CONFIG`, `noble_controller.CONFIG.CTL_LINKS`) in place of the module `noble_controller_config`.  The keys, their values and the constants the build writes are unchanged; only the name in the source moved.  A program that wrote `noble_controller_config` builds for one toolchain release with the warning E2947 at each `use` line; write `use noble_controller.CONFIG`.  The source needs a toolchain 0.24.1 or later, the first release with the spelling.
 
 A Central starts the subevents of every stream after the first of its group 16 microseconds before their time on the group's grid (`ctl_hci.CIS_LATER_TRIM_US`, applied by `ctl_cis_start`).  The PTS dongle, as the Peripheral, places the first event of a later stream from the earlier stream's timeline and listens in a window of about 40 microseconds that lies before the nominal time; with the trim the second stream of a group of two failed to establish (LE CIS Established 0x3E) in 2 of 12 runs of four BAP/UCL/STR rows against 12 of 16 without it.  The trim is measured against that Peripheral only.
 

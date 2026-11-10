@@ -117,6 +117,7 @@ struct CsAir
     skips: Int
     grid_skips: Int
 
+// The record of the Channel Sounding slot at rest: not initialised, no run made, no subevent planned.
 @when(noble_controller.CONFIG.CTL_CS > 0)
 pub @tier(embedded)
 @no_alloc

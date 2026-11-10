@@ -3942,10 +3942,12 @@ fn test_the_program_gives_up_a_series_whose_instance_or_planning_fails_and_a_run
     var air2 = air_sim(0)
     var stg = state()
     test.assert_eq(ctl_hci.ctl_cs_subevent_run(var g, var air2, var stg, 0, 5, 100000), ctl_hci.RUN_NONE)
+    test.assert_eq(ctl_hci.ctl_cs_subevent_skip(var g, var air2, var stg, 0, 5), ctl_hci.RUN_NONE)
     test.assert_eq(ctl_hci.ctl_cs_subevent_plan(var g, var cc, var stg, 0, 0, -1), ctl_hci.RUN_NONE)
     var h = ready()
     exchange_caps(var h)
     test.assert_eq(ctl_hci.ctl_cs_subevent_run(var h, var air2, var stg, 0, 5, 100000), ctl_hci.RUN_NONE)
+    test.assert_eq(ctl_hci.ctl_cs_subevent_skip(var h, var air2, var stg, 0, 5), ctl_hci.RUN_NONE)
     test.assert_eq(ctl_hci.ctl_cs_subevent_plan(var h, var cc, var stg, 0, 0, -1), ctl_hci.RUN_NONE)
 
 // ── The arbiter and the placing, in the Controller ──────────────────
