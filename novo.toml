@@ -32,8 +32,8 @@ sibling_check = "warn"
 coverage_floor = 0
 
 [dependencies]
-noble-hci   = "^0.1.1"
-noble-radio = "^0.1.1"
+noble-hci   = { path = "../noble-hci" }
+noble-radio = { path = "../noble-radio" }
 
 # Package configuration (docs/config.md).  One [config.<key>] table for each limit of the Controller.  A consumer writes a
 # [noble-controller] section in its config file; the generated module is `noble_controller.CONFIG`, read in the sources as
