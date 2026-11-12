@@ -10,4 +10,4 @@ path = "../noble-radio"
 
 [config.main]
 sha256 = "dd5ca8304a129394410a74f5488fa176e6ceb3817229c38fe3207a6dcb29031d"
-schemas = "noble-controller 0.1.1"
+schemas = "noble-controller 0.1.2"

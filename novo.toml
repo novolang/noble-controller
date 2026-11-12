@@ -1,6 +1,6 @@
 [package]
 name        = "noble-controller"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "The portable Bluetooth Low Energy Link Layer and HCI command handler of the noble stack: advertising, scanning, connections, encryption, extended and periodic advertising, isochronous channels, power control, subrating and the other LE features of Core 6.3.  Reads the radio, the clock and the cipher only through the noble-radio traits and the HCI seam through noble-hci."
 license     = "Apache-2.0"
 stability   = "experimental"

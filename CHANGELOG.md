@@ -4,7 +4,7 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## Unreleased
+## 0.1.2 — 2026-11-12
 
 `ll_cs_plan.state_new` is public: the Controller image of noble-examples holds the Channel Sounding planning state and called a
 private function, which the package-privacy check reports.
