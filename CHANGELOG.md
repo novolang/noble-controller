@@ -4,6 +4,11 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## Unreleased
+
+`ll_cs_plan.state_new` is public: the Controller image of noble-examples holds the Channel Sounding planning state and called a
+private function, which the package-privacy check reports.
+
 ## 0.1.1 — 2026-11-10
 
 This release needs `noble-hci` 0.1.1 (the module `hci_cs`), `noble-radio` 0.1.1 (the module `ll_cs_radio`) and a toolchain 0.24.1 or later.

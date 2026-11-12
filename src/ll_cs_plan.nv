@@ -696,7 +696,8 @@ struct CsState
     plan: CsSubevent
 
 // The storage of the planning with a generator for each of `n` connections (`ctl_cs`), none of them keyed, and an empty plan.
-@tier(embedded)
+// A Controller image outside this package (noble-examples' hci_uart) holds the state, so the constructor is public.
+pub @tier(embedded)
 @no_alloc
 fn state_new(n: Int) -> CsState
     var s = CsState { gens: Vec.new(), plan: plan_new() }
