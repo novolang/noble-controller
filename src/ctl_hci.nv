@@ -7393,8 +7393,7 @@ fn forward_acl(var c: Controller, handle: Int, var rx: Pdu)
     if slot == ctl_pool.NO_SLOT
         c.dropped_acl = c.dropped_acl + 1
         return
-    for i in 0..ll_data.dpdu_len(var rx)
-        let _a = ctl_pool.pool_put(var c.pool, slot, ll_data.dpdu_byte(var rx, i))
+    let _a = ctl_pool.pool_put_run(var c.pool, slot, var rx.b, 2, ll_data.dpdu_len(var rx))
     let _b = ctl_pool.acl_send(var c.pool, slot)
 
 // Open the packet of the link in `slot` that `link_rx_fast` took, when the link

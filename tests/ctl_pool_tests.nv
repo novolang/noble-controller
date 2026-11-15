@@ -3,7 +3,7 @@
 //   novo test tests/ctl_pool_tests.nv
 
 use std.test
-use ctl_pool.{ NO_SLOT, SLOTS, SLOT_OCTETS, acl_begin, acl_send, evt_begin, evt_send, iso_begin, iso_send, pool_flush, pool_free, pool_get, pool_give, pool_len, pool_new, pool_put, pool_put_u16, pool_queue, pool_take, pool_tx_next, pool_tx_pending }
+use ctl_pool.{ NO_SLOT, SLOTS, SLOT_OCTETS, acl_begin, acl_send, evt_begin, evt_send, iso_begin, iso_send, pool_flush, pool_free, pool_get, pool_give, pool_len, pool_new, pool_put, pool_put_run, pool_put_u16, pool_queue, pool_take, pool_tx_next, pool_tx_pending }
 
 @test
 fn test_iso_packet_is_framed_with_handle_flags_and_length()
@@ -185,3 +185,39 @@ fn test_u16_is_written_least_significant_octet_first()
     test.assert(pool_put_u16(var p, s, 0x0C03))
     test.assert_eq(pool_get(var p, s, 0), 0x03)
     test.assert_eq(pool_get(var p, s, 1), 0x0C)
+
+@test
+fn test_a_run_of_octets_is_appended_in_one_pass()
+    var p = pool_new()
+    var src: Vec[u8; 260] = Vec.new()
+    for i in 0..260
+        let _ = src.push((i & 0xFF) as u8)
+    let s = pool_take(var p)
+    test.assert(pool_put(var p, s, 0xAA))
+    test.assert(pool_put_run(var p, s, var src, 2, 5))
+    test.assert_eq(pool_len(var p, s), 6)
+    test.assert_eq(pool_get(var p, s, 0), 0xAA)
+    for i in 0..5
+        test.assert_eq(pool_get(var p, s, 1 + i), 2 + i)
+    // A second run follows the first, and an empty one changes nothing.
+    test.assert(pool_put_run(var p, s, var src, 100, 3))
+    test.assert(pool_put_run(var p, s, var src, 0, 0))
+    test.assert_eq(pool_len(var p, s), 9)
+    test.assert_eq(pool_get(var p, s, 8), 102)
+
+@test
+fn test_a_run_of_octets_is_refused_for_a_slot_not_taken_or_without_room()
+    var p = pool_new()
+    var src: Vec[u8; 260] = Vec.new()
+    for i in 0..260
+        let _ = src.push(7)
+    test.assert(not pool_put_run(var p, 0, var src, 0, 4))
+    test.assert(not pool_put_run(var p, NO_SLOT, var src, 0, 4))
+    test.assert(not pool_put_run(var p, SLOTS, var src, 0, 4))
+    let s = pool_take(var p)
+    test.assert(not pool_put_run(var p, s, var src, 0, 0 - 1))
+    test.assert(not pool_put_run(var p, s, var src, 0, SLOT_OCTETS + 1))
+    test.assert_eq(pool_len(var p, s), 0)
+    test.assert(pool_put_run(var p, s, var src, 0, SLOT_OCTETS))
+    test.assert(not pool_put_run(var p, s, var src, 0, 1))
+    test.assert_eq(pool_len(var p, s), SLOT_OCTETS)

@@ -131,6 +131,25 @@ fn pool_put(var p: PacketPool, slot: Int, b: Int) -> Bool
     p.len[slot] = (n + 1) as u16
     true
 
+// Append `n` octets of `src`, from octet `from`, to `slot` in one pass.  False, with nothing written,
+// when the slot is not taken or the octets do not fit.  The caller guarantees that `src` holds them.
+// Octet by octet through `pool_put` the copy of a full data PDU took 547 microseconds on the nRF54LM20
+// (2.2 microseconds an octet, a slot and length check at each), longer than the 244 the Link Layer
+// allows before the next packet of a connection event, and ended the event after every full PDU.
+@no_alloc
+@tier(embedded)
+fn pool_put_run(var p: PacketPool, slot: Int, var src: Vec[u8; 260], from: Int, n: Int) -> Bool
+    if slot < 0 or slot >= SLOTS or not p.busy[slot]
+        return false
+    let len = p.len[slot] as Int
+    if n < 0 or len + n > SLOT_OCTETS
+        return false
+    let at = slot * SLOT_OCTETS + len
+    for i in 0..n
+        p.bytes[at + i] = src[from + i]
+    p.len[slot] = (len + n) as u16
+    true
+
 // Append a 16-bit value to `slot`, least significant octet first.
 @tier(embedded)
 fn pool_put_u16(var p: PacketPool, slot: Int, v: Int) -> Bool

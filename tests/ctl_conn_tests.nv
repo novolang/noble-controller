@@ -235,6 +235,8 @@ fn cen_new(anchor: Int, interval_us: Int) -> Cen
           upd_instant: -1, upd_interval: 0, upd_offset: 0, dle: false, dle_rx: 251, lens: [], phys: [] }
 
 // A data PDU for the Central to send: LLID `llid`, `n` octets starting at `first`.
+const NO_SLOT_TEST = -1
+
 fn data_pdu(llid: Int, n: Int, first: Int) -> Pdu
     var p = ll_pdu.pdu_new()
     ll_data.dpdu_begin(var p, llid)
@@ -1284,6 +1286,27 @@ fn test_data_for_the_host_is_dropped_and_counted_when_the_pool_is_full()
     var rx = data_pdu(ll_data.LLID_START, 4, 0x10)
     ctl_hci.forward_acl(var c, 1, var rx)
     test.assert_eq(c.dropped_acl, 1)
+
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@test
+fn test_a_full_data_pdu_for_the_host_reaches_the_pool_octet_for_octet()
+    var c = connected(24, 200)
+    // The longest payload the build's PDU holds: `pdu_put` refuses the octets past it.
+    var rx = data_pdu(ll_data.LLID_START, 255, 3)
+    let n = ll_data.dpdu_len(var rx)
+    test.assert(n > 27)
+    ctl_hci.forward_acl(var c, 1, var rx)
+    test.assert_eq(c.dropped_acl, 0)
+    var found = NO_SLOT_TEST
+    for k in 0..ctl_pool.SLOTS
+        if ctl_pool.pool_len(var c.pool, k) == 5 + n
+            found = k
+    test.assert(found >= 0)
+    test.assert_eq(ctl_pool.pool_get(var c.pool, found, 0), 0x02)
+    test.assert_eq(ctl_pool.pool_get(var c.pool, found, 3), n & 0xFF)
+    test.assert_eq(ctl_pool.pool_get(var c.pool, found, 4), n >>> 8)
+    for i in 0..n
+        test.assert_eq(ctl_pool.pool_get(var c.pool, found, 5 + i), (3 + i) & 0xFF)
 
 @when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
