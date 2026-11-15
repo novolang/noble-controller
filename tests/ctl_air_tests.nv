@@ -7568,6 +7568,11 @@ fn test_an_encrypted_group_is_opened_with_the_broadcast_code_and_a_wrong_code_en
     test.assert_eq(lost[0][4], 0)
     test.assert_eq(lost[0][5], 0x3D)
     test.assert_eq(e.bigs[0].state, ll_big.B_FREE)
+    // The Host is told that the synchronization was established before it is told that it was lost: the first PDU it heard owed the Established event,
+    // and the MIC Failure of the first payload owes the Lost event on top of it, not in place of it.
+    let est = meta_events(air3.host, 0x1D)
+    test.assert_eq(list.len(est), 1)
+    test.assert_eq(est[0][4], 0)
     // A code for an unencrypted BIG, and none for an encrypted one: Encryption Mode Not Acceptable.
     var f = fresh()
     var rf4 = ll_air.rf_new()
@@ -7577,6 +7582,20 @@ fn test_an_encrypted_group_is_opened_with_the_broadcast_code_and_a_wrong_code_en
     let bad = meta_events(air4.host, 0x1D)
     test.assert_eq(list.len(bad), 1)
     test.assert_eq(bad[0][4], 0x25)
+
+@test
+fn test_a_loss_owes_the_lost_event_on_top_of_the_established_event_not_in_place_of_it()
+    if not ctl_limits.big_on()
+        return
+    // The radio program heard the first BIS PDU (the Established event is owed) and the first payload fails its MIC in the same turn, before the
+    // events were queued: the Host is told of both, in that order.
+    var c = fresh()
+    c.bigs[0].state = ll_big.B_UP
+    c.bigs[0].owed = ll_big.EV_COMPLETE
+    ctl_hci.ctl_big_lost(var c, 0, ll_big.REASON_MIC_FAILURE)
+    test.assert_eq(c.bigs[0].state, ll_big.B_STOP)
+    test.assert_eq(c.bigs[0].reason, ll_big.REASON_MIC_FAILURE)
+    test.assert_eq(c.bigs[0].owed, ll_big.EV_COMPLETE | ll_big.EV_TERMINATED)
 
 @test
 fn test_the_broadcasters_termination_ends_the_synchronization_at_the_instant()

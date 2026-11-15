@@ -14349,9 +14349,7 @@ fn ctl_big_rx_book_us(var c: Controller, g: Int) -> Int
 @tier(embedded)
 fn ctl_big_begin_rx(var c: Controller, g: Int, now: Int) -> Int
     if c.bigs[g].term_req and ll_big.instant_reached(c.bigs[g].ev, c.bigs[g].term_instant)
-        c.bigs[g].state = ll_big.B_STOP
-        c.bigs[g].reason = ll_big.REASON_REMOTE_TERMINATED
-        c.bigs[g].owed = ll_big.EV_TERMINATED
+        ctl_big_lost(var c, g, ll_big.REASON_REMOTE_TERMINATED)
         return -1
     if c.bigs[g].cm_req and ll_big.instant_reached(c.bigs[g].ev, c.bigs[g].cm_instant)
         ll_big.chmap_apply(var c.bigs[g])
@@ -14496,9 +14494,7 @@ fn ctl_big_rx_finish<C: Cipher[e]>(var c: Controller, g: Int, var cc: C, var p: 
                     var ek = ll_cipher.enc_key_new()
                     big_key(var c, g, bis, var ek)
                     if not cc.open(var ek, num, ll_cipher.DIR_CENTRAL | ll_cipher.DIR_BIS, var p)
-                        c.bigs[g].state = ll_big.B_STOP
-                        c.bigs[g].reason = ll_big.REASON_MIC_FAILURE
-                        c.bigs[g].owed = ll_big.EV_TERMINATED
+                        ctl_big_lost(var c, g, ll_big.REASON_MIC_FAILURE)
                         return false
                 ll_iso.rx_note(var c.bis[i], num, true, var p)
                 c.bis[i].n_rx = c.bis[i].n_rx + 1
@@ -14508,12 +14504,14 @@ fn ctl_big_rx_finish<C: Cipher[e]>(var c: Controller, g: Int, var cc: C, var p: 
                 c.bis[i].n_flush_rx = c.bis[i].n_flush_rx + 1
     true
 
-// The synchronization of the group in slot `g` ended with `reason`: the Host is told with LE BIG Sync Lost.
+// The synchronization of the group in slot `g` ended with `reason`: the Host is told with LE BIG Sync Lost.  The event is owed on top of what the group
+// owed already: the first BIS PDU owes LE BIG Sync Established, and the loss can come in the same turn of the program (a MIC Failure at the end of the first
+// event), before the event has been queued; the Host is told the synchronization was established and then that it was lost, never the loss alone.
 @tier(embedded)
 fn ctl_big_lost(var c: Controller, g: Int, reason: Int)
     c.bigs[g].state = ll_big.B_STOP
     c.bigs[g].reason = reason
-    c.bigs[g].owed = ll_big.EV_TERMINATED
+    c.bigs[g].owed = c.bigs[g].owed | ll_big.EV_TERMINATED
 
 // The receiver's event is over (or skipped, `ran` false): the supervision runs, a synchronization that was awaited and did not come in six
 // events fails (0x3E), and the next event follows ISO_Interval after this one's anchor point.
