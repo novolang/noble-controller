@@ -1774,6 +1774,14 @@ fn open_rx<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controlle
     if cc.faults() != f0
         ctl_hci.ctl_conn_fail(var c, slot)
 
+// Hand the data PDU in the receive buffer to the Host: read it, open it when the link receives encrypted, and queue what it carries
+// (`ctl_conn_rx_slow`).  The caller has taken the PDU as new (`link_rx_fast` moved the NESN), so this is what it owes the Central.
+fn take_data<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Controller, var rf: Rf,
+                                                      slot: Int, var cc: C, var rx: Pdu) [e, t, k]
+    if get_data_pdu(var air, ll_radio.BUF_RX, var rx) > 0
+        open_rx(var air, var c, var rf, slot, var cc, var rx)
+        ctl_hci.ctl_conn_rx_slow(var c, slot, var rx)
+
 // One exchange of a connection event: the access address of the Central's
 // packet has arrived.  The radio is armed to answer by itself, T_IFS after the
 // packet; the header of the packet decides which PDU it answers with, and that
@@ -1841,6 +1849,10 @@ fn conn_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Con
     else
         rf.ramp_timeouts = rf.ramp_timeouts + 1
         air.halt()
+        // The answer did not start, but the packet was taken as new and the NESN moved with it: the Central, which heard no answer, sends
+        // the packet again in the next event, and there it is a packet the Controller has already.  The data goes to the Host now or never.
+        if good
+            take_data(var air, var c, var rf, slot, var cc, var rx)
         return false
     air.clear_address()
     let cont = ctl_hci.lk_cont(var c, slot)
@@ -1857,9 +1869,7 @@ fn conn_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Con
     if good
         // The strength the backend latched at the end of the packet.
         ctl_hci.lk_note_rssi(var c, slot, air.rssi_dbm())
-        if get_data_pdu(var air, ll_radio.BUF_RX, var rx) > 0
-            open_rx(var air, var c, var rf, slot, var cc, var rx)
-            ctl_hci.ctl_conn_rx_slow(var c, slot, var rx)
+        take_data(var air, var c, var rf, slot, var cc, var rx)
     if ctl_hci.lk_dirty(var c, slot)
         conn_mirror(var air, var c, var rf, slot, var cc)
     if ctl_hci.lk_closing(var c, slot) or not cont
@@ -1984,9 +1994,7 @@ fn central_exchange<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: 
             rf.ramp_timeouts = rf.ramp_timeouts + 1
             air.halt()
     ctl_hci.lk_note_rssi(var c, slot, air.rssi_dbm())
-    if get_data_pdu(var air, ll_radio.BUF_RX, var rx) > 0
-        open_rx(var air, var c, var rf, slot, var cc, var rx)
-        ctl_hci.ctl_conn_rx_slow(var c, slot, var rx)
+    take_data(var air, var c, var rf, slot, var cc, var rx)
     // The buffers are written again once the packet in them is on air, which the
     // end of the packet above waited for.
     if ctl_hci.lk_dirty(var c, slot)

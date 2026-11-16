@@ -315,6 +315,11 @@ struct SimAir
     var peer_ext: Int
     var rssi: Int
     var peer_f3: Int
+    // The answers armed for the data packets (LLID 1 or 2, with a payload) after the first `miss_skip` of them, and for as many as
+    // `miss_data` of those, are not started: the radio arms the answer after the packet's end when the program was late, so no answer
+    // follows the packet.
+    var miss_skip: Int
+    var miss_data: Int
 
 // An empty data PDU: LLID 1, no payload.
 fn empty_pdu() -> Pdu
@@ -338,7 +343,7 @@ fn sim_new() -> SimAir
              cis_ek: ll_cipher.enc_key_new(), cis_cc: ll_ccm.soft_cipher_new(),
              cis_rx: [], cis_log: [], acl_period: 0, acl_next: 0, cis_lose: 0, cis_deaf: 0, cis_mic_bad: 0, cis_pkts: 0, cis_answers: 0, cis_off: 0,
              white: true, pwr: 0, fast_ok: true, tx_slow: 139, tx_fast: 39, rx_slow: 140, rx_fast: 40, rep_slow: 145, rep_fast: 45, coded_ok: true, octet_ns: 1000,
-             tx_body: [], tx_white: [], peer_f5: 0x20, peer_f4: 0, tx_pwr: [], peer_f7: 0, peer_p1: 0, peer_maxp: 0, peer_ext: 0, rssi: -60, peer_f3: 0x37 }
+             tx_body: [], tx_white: [], peer_f5: 0x20, peer_f4: 0, tx_pwr: [], peer_f7: 0, peer_p1: 0, peer_maxp: 0, peer_ext: 0, rssi: -60, peer_f3: 0x37, miss_skip: 0, miss_data: 0 }
 
 // A peer sends `pdu` on `ch`, its first bit at `t`.
 fn hear(var air: SimAir, t: Int, ch: Int, pdu: Pdu)
@@ -979,6 +984,13 @@ impl Radio[] for SimAir
         self.hdr_pending = true
         self.ans_open = true
         self.ans_last = -1
+        let llid = self.bufs[ll_radio.BUF_RX * 260] & 3
+        if self.miss_data > 0 and self.next == ll_radio.THEN_TX and (llid == 1 or llid == 2) and self.bufs[ll_radio.BUF_RX * 260 + 1] > 0
+            if self.miss_skip > 0
+                self.miss_skip = self.miss_skip - 1
+            else
+                self.miss_data = self.miss_data - 1
+                self.next = ll_radio.THEN_REST
         sim_chain(var self, self.end_t)
         if self.rx_bad
             return ll_radio.RX_BAD
@@ -1523,6 +1535,43 @@ fn test_the_program_sends_and_receives_the_longest_pdus_after_the_length_procedu
     test.assert_eq(rf.chain_cut, 0)
     test.assert_eq(rf.tifs_min_ns, 150000)
     test.assert_eq(rf.tifs_max_ns, 150000)
+
+// A data packet the Controller took as new but could not answer (the radio had not been armed to answer it in time) still reaches the Host: the
+// NESN moved with the packet, so the Central's second sending of it is a packet the Controller has already, and the data goes to the Host at the
+// first.  Lost, it left the Host a byte stream with a hole in it (bugs/orbit/a-burst-of-att-write-commands-loses-the-last-small-write-between-the-pc-and-the-demo-host.md).
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@test
+fn test_a_data_packet_whose_answer_does_not_start_is_still_given_to_the_host()
+    var c = fresh()
+    advertise(var c, 0)
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    var first = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var first, ll_data.LLID_START)
+    for i in 0..8
+        let _a = ll_pdu.pdu_put_data(var first, 0x30 + i)
+    ll_data.dpdu_finish(var first)
+    var second = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var second, ll_data.LLID_START)
+    for i in 0..8
+        let _b = ll_pdu.pdu_put_data(var second, 0x40 + i)
+    ll_data.dpdu_finish(var second)
+    script(var air, [first, second])
+    // The answer to the second packet does not start.
+    air.miss_skip = 1
+    air.miss_data = 1
+    react(var air, ll_pdu.ADV_IND, 37, connect_ind(), 1)
+    run(var c, var rf, var air, 300000)
+    test.assert(c.links[0].live)
+    test.assert_eq(air.miss_data, 0)
+    test.assert_eq(rf.ramp_timeouts, 1)
+    // The Host got each packet once: the second at its first sending, and not again when the Central sends it a second time.
+    let acl = acl_packets(air.host)
+    test.assert_eq(list.len(acl), 2)
+    test.assert_eq(acl[0][5], 0x30)
+    test.assert_eq(acl[1][3] | (acl[1][4] << 8), 8)
+    test.assert_eq(acl[1][5], 0x40)
+    test.assert_eq(acl[1][12], 0x47)
 
 @test
 fn test_the_times_of_an_event_follow_the_phy()
