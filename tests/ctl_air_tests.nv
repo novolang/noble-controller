@@ -7244,7 +7244,10 @@ fn big_sink(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAir, bis: 
         t = t + 10000
         run(var c, var rf, var air, t)
     let up = meta_events(air.host, 0x1D)
-    if list.len(up) > 0 and up[0][4] == 0
+    // A group whose first payload failed its MIC is lost in the turn that established it, and the Host is told of both events
+    // (test_a_loss_owes_the_lost_event_on_top_of_the_established_event_not_in_place_of_it): its BISes are gone, so a path on
+    // one answers Unknown Connection Identifier and the Host sets none.
+    if list.len(up) > 0 and up[0][4] == 0 and list.len(meta_events(air.host, 0x1E)) == 0
         for q in 0..up[0][17]
             test.assert_eq(big_out_path(var c, up[0][18 + 2 * q] | (up[0][19 + 2 * q] << 8)), 0)
     run(var c, var rf, var air, until)
