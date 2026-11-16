@@ -1538,7 +1538,7 @@ fn test_the_program_sends_and_receives_the_longest_pdus_after_the_length_procedu
 
 // A data packet the Controller took as new but could not answer (the radio had not been armed to answer it in time) still reaches the Host: the
 // NESN moved with the packet, so the Central's second sending of it is a packet the Controller has already, and the data goes to the Host at the
-// first.  Lost, it left the Host a byte stream with a hole in it (bugs/orbit/a-burst-of-att-write-commands-loses-the-last-small-write-between-the-pc-and-the-demo-host.md).
+// first.  Lost, it left the Host a byte stream with a hole in it, which dropped the last small write of a burst between the PC and the demo Host.
 @when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_data_packet_whose_answer_does_not_start_is_still_given_to_the_host()
