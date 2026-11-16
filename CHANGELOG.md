@@ -4,7 +4,7 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## Unreleased
+## 0.1.3 — 2026-11-16
 
 A connection event of the Peripheral carries more than one full data PDU.  `ctl_hci.forward_acl` copies the octets of a received PDU into the Host's buffer in one pass, `ctl_pool.pool_put_run`, where it called `pool_put` at each octet: 547 microseconds for the 251 octets of a full PDU on the nRF54LM20 (2.2 microseconds an octet); the whole work after a full PDU took 565 microseconds on average before and 141 after (243 at most, against a limit of 244).  The Link Layer ends an event when the work after a packet is not done 244 microseconds after the answer (`ll_air.chain_late_us`, LE 2M), and the copy alone was over that, so every full data PDU ended its event: one full PDU in each event, the same rate at every ATT_MTU.  With the copy fast, an upload to the firmware update demo through a Central with four requests in flight went from 4.46 to 5.74 kB/s at an interval of 45 ms, and the events that were cut by late work went from 0.87 to 0.01 each.  Filed as `bugs/orbit/ll-event-ends-after-every-full-data-pdu.md`.  `pool_put_run` is new and public in `ctl_pool`; `pool_put` is unchanged.  The Controller still takes three data PDUs from the air in an event (the pool has four packets and the Link Layer refuses one when fewer than two are free): the pool of eight packets lifted the same upload to 7.1 kB/s on the bench, at 1,032 bytes of RAM more, and is not made.
 
