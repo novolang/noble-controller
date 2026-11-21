@@ -103,6 +103,12 @@ const START_WAIT_US = 1000
 // access address) on LE 1M; `answer_wait_us` gives it for a PHY.
 const ANSWER_WAIT_US = 400
 
+// The transmitter of an answer armed for a packet (the CONNECT_IND of an initiator) starts T_IFS after the end of the packet and reads the octets
+// of the answer in the order they go on air, the first of them 40 microseconds after it starts.  A judgement that ends later than this after the
+// end of the advertisement (10 microseconds before the transmitter starts, the time taking it back needs) does not patch the CONNECT_IND: the
+// answer is taken back before it starts, the initiator goes on listening, and the next advertisement is answered with a whole CONNECT_IND.
+const ANSWER_READY_US = 140
+
 // The exchanges of one connection event, at most: a bound the loop of an event
 // cannot reach, since an event ends with the first packet that does not come.
 const MAX_EXCHANGES = 4000000
@@ -173,6 +179,7 @@ struct Rf
     cy_conn: Int
     init_pkts: Int
     init_sent: Int
+    init_cut: Int
     cen_events: Int
     cen_missed: Int
     cen_good: Int
@@ -253,7 +260,7 @@ fn rf_make() -> Rf
          pdu_last: 0, pdu_ch: 0, pdu_gap_min_us: 1000000000, pdu_gap_max_us: 0, order_viol: 0,
          adv_entered: -1, ev_have: false, conn_open: 0, conn_events: 0, conn_missed: 0,
          conn_good: 0, conn_bad: 0, conn_aborts: 0, conn_late: 0, acl_err_n: 0, acl_err_min: 1000000, acl_err_max: -1000000, acl_err_last: 0, an_n: 0, an_min_us: 1000000,
-         an_max_us: -1000000, cy_conn: 0, init_pkts: 0, init_sent: 0, cen_events: 0,
+         an_max_us: -1000000, cy_conn: 0, init_pkts: 0, init_sent: 0, init_cut: 0, cen_events: 0,
          cen_missed: 0, cen_good: 0, cen_bad: 0, cen_aborts: 0,
          seals: 0, opens: 0, seal_max: 0, open_max: 0, mic_fail: 0, seal_sum: 0, open_sum: 0,
          seal_slow: 0, open_slow: 0, owner: -1, chain_cut: 0, post_max: 0, post_sum: 0, post_n: 0, rx_long: 0, rx_len_max: 0,
@@ -2675,7 +2682,10 @@ fn start_rx_init<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var r
 // the Link Layer asks, send the CONNECT_IND, which the radio starts T_IFS after the
 // PDU, and open the connection from the time it ended.  The CONNECT_IND is armed
 // while the PDU arrives, since the header is not yet known, and taken back when the
-// PDU is not one to answer.  The radio is at rest again when this returns.
+// PDU is not one to answer or its judgement ends later than `ANSWER_READY_US` after the packet's end.
+// The connection opens only when the CONNECT_IND went on air to its last bit: one that
+// did not (the radio stopped part way) leaves the state listening, and a transmitter that
+// is on air is never disabled.  The radio is at rest again when this returns.
 fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf,
                                           var rx: Pdu) [e, t]
     air.packet(ll_radio.BUF_ANS)
@@ -2686,6 +2696,7 @@ fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
     rf.init_pkts = rf.init_pkts + 1
     ctl_hci.ctl_set_time(var c, seen)
     var send = false
+    var late = false
     var ext_n = 0
     var ext_mark = 0
     var armed = true
@@ -2707,7 +2718,9 @@ fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
             if got > 0
                 send = ctl_hci.ctl_init_decide(var c, var rx, got)
                 if send
-                    patch_request(var air, true, var c.init.req)
+                    late = air.now_us() - seen > ANSWER_READY_US
+                    if not late
+                        patch_request(var air, true, var c.init.req)
                 note_judge(var air, var rf, seen)
     else
         rf.scan_crc_bad = rf.scan_crc_bad + 1
@@ -2725,19 +2738,36 @@ fn init_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf:
                     air.mark_us(ext_mark) - ll_phy.aa_end_us(rf.rx_phy),
                     at)
         return
+    // A CONNECT_IND whose judgement ended too late to patch it is taken back while the transmitter ramps up.
+    if late
+        abort_answer(var air, var rf)
+        ctl_hci.ctl_init_unsent(var c)
+        return
     // The CONNECT_IND goes T_IFS after the advertisement.  The access address of the
     // advertisement was cleared before the judgement, so one that is seen now is the
     // CONNECT_IND's, started while the judgement ran: it is not cleared.
     if not air.wait_address(air.now_us() + ANSWER_WAIT_US)
         rf.ramp_timeouts = rf.ramp_timeouts + 1
+        // An answer whose access address does not come did not start, or is on air and its event was missed: the radio is
+        // never disabled over a transmitter, so the answer runs to its end before the radio is stopped.
+        air.arm(ll_radio.THEN_REST, false)
+        let _r = air.wait_disabled()
         air.halt()
         ctl_hci.ctl_init_unsent(var c)
         return
     note_turnaround(var air, var rf)
     let on_air = air.mark_us(air.address_mark()) - ll_radio.AA_END_US
+    // The events of the advertisement are cleared: the next end of a packet is the CONNECT_IND's.
+    air.clear_done()
     air.arm(ll_radio.THEN_REST, false)
+    let whole = air.wait_phyend()
     let _w = air.wait_disabled()
     air.disarm()
+    if not whole
+        rf.init_cut = rf.init_cut + 1
+        air.halt()
+        ctl_hci.ctl_init_unsent(var c)
+        return
     rf.init_sent = rf.init_sent + 1
     ctl_hci.ctl_set_time(var c, air.now_us())
     if ctl_hci.ctl_init_sent(var c, on_air + ll_pdu.airtime_us(ll_pdu.CONNECT_PAYLOAD + 2))

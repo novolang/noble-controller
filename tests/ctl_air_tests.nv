@@ -320,6 +320,19 @@ struct SimAir
     // follows the packet.
     var miss_skip: Int
     var miss_data: Int
+    // The transmitter of the next packet the program sends stops this many microseconds after its first bit, before its last (-1: it runs
+    // to its end), and the packets that stopped.
+    var cut_us: Int
+    var cuts: Int
+    // The access address of the next packet the program sends is not reported, though the transmitter runs.
+    var hide_addr: Bool
+    // The times the radio was disabled while a transmitter was on air or had passed its start.
+    var halt_in_tx: Int
+    // The microseconds the program's work takes: a read of a packet while the answer to it is armed (the judgement of a slow program) and each
+    // write to the answer buffer.  `late_writes` counts the writes that came after the transmitter began to read the answer.
+    var read_us: Int
+    var work_us: Int
+    var late_writes: Int
 
 // An empty data PDU: LLID 1, no payload.
 fn empty_pdu() -> Pdu
@@ -343,7 +356,8 @@ fn sim_new() -> SimAir
              cis_ek: ll_cipher.enc_key_new(), cis_cc: ll_ccm.soft_cipher_new(),
              cis_rx: [], cis_log: [], acl_period: 0, acl_next: 0, cis_lose: 0, cis_deaf: 0, cis_mic_bad: 0, cis_pkts: 0, cis_answers: 0, cis_off: 0,
              white: true, pwr: 0, fast_ok: true, tx_slow: 139, tx_fast: 39, rx_slow: 140, rx_fast: 40, rep_slow: 145, rep_fast: 45, coded_ok: true, octet_ns: 1000,
-             tx_body: [], tx_white: [], peer_f5: 0x20, peer_f4: 0, tx_pwr: [], peer_f7: 0, peer_p1: 0, peer_maxp: 0, peer_ext: 0, rssi: -60, peer_f3: 0x37, miss_skip: 0, miss_data: 0 }
+             tx_body: [], tx_white: [], peer_f5: 0x20, peer_f4: 0, tx_pwr: [], peer_f7: 0, peer_p1: 0, peer_maxp: 0, peer_ext: 0, rssi: -60, peer_f3: 0x37, miss_skip: 0, miss_data: 0,
+             cut_us: -1, cuts: 0, hide_addr: false, halt_in_tx: 0, read_us: 0, work_us: 0, late_writes: 0 }
 
 // A peer sends `pdu` on `ch`, its first bit at `t`.
 fn hear(var air: SimAir, t: Int, ch: Int, pdu: Pdu)
@@ -818,6 +832,18 @@ fn sim_cis_start(var a: SimAir, k: Int, var x: ll_iso.Cis, anchor: Int, enc: Boo
     a.cis_ons[k] = true
     a.cis_pends[k] = false
 
+// The transmitter on air stops at the time `cut_us` names, before its last bit: the radio rests with no end of packet.  True when it did.
+fn sim_cut(var a: SimAir) -> Bool
+    if a.cut_us < 0 or a.state != TXING
+        return false
+    a.now = a.tx_first + a.cut_us
+    a.cut_us = -1
+    a.cuts = a.cuts + 1
+    a.addr_ev = false
+    a.next = ll_radio.THEN_REST
+    a.state = IDLE
+    true
+
 impl Timebase[] for SimAir
     fn now_us(var self) -> Int
         self.now
@@ -924,6 +950,8 @@ impl Radio[] for SimAir
         self.addr_ev = false
 
     fn halt(var self)
+        if self.state == TXING or (self.state == TX_START and self.now >= self.tx_first)
+            self.halt_in_tx = self.halt_in_tx + 1
         self.hdr_pending = false
         self.ans_open = false
         self.state = IDLE
@@ -932,6 +960,8 @@ impl Radio[] for SimAir
     fn wait_disabled(var self) -> Bool
         if self.state == TX_START
             let _a = sim_progress(var self, self.tx_first + 100)
+        if sim_cut(var self)
+            return true
         if self.state == TXING or self.state == RXING
             if self.now < self.end_t
                 self.now = self.end_t
@@ -956,6 +986,11 @@ impl Radio[] for SimAir
 
     fn wait_address(var self, limit: Int) -> Bool
         self.ans_open = false
+        if self.hide_addr and self.state == TX_START
+            self.hide_addr = false
+            if self.now < limit
+                self.now = limit
+            return false
         sim_progress(var self, limit)
 
     fn wait_phyend(var self) -> Bool
@@ -963,6 +998,8 @@ impl Radio[] for SimAir
             self.fast_at_end = self.fast_at_end + 1
         if self.state == TX_START
             let _a = sim_progress(var self, self.tx_first + ll_phy.aa_end_us(self.phy) + 100)
+        if sim_cut(var self)
+            return false
         if self.state != TXING
             return false
         if self.now < self.end_t
@@ -1019,6 +1056,8 @@ impl Radio[] for SimAir
 
     fn read(var self, buf: Int, var p: Pdu, from: Int, to: Int)
         sim_note_read(var self, buf)
+        if self.ans_open
+            self.now = self.now + self.read_us
         for i in from..to
             p.b[i] = self.bufs[buf * 260 + i] as u8
 
@@ -1038,6 +1077,9 @@ impl Radio[] for SimAir
             if at <= self.ans_last
                 self.ans_disorder = self.ans_disorder + 1
             self.ans_last = at
+            self.now = self.now + self.work_us
+            if self.now > self.last_end + T_IFS
+                self.late_writes = self.late_writes + 1
         self.bufs[buf * 260 + at] = v
 
 // ── The Host's side and the driver ──────────────────────────────────
@@ -1662,6 +1704,95 @@ fn test_the_connect_ind_is_patched_in_the_order_it_goes_on_air()
     var air = sim_new()
     let _c = central_run(var air, [], 300000)
     test.assert_eq(air.ans_disorder, 0)
+
+// The Controller in the Initiating state against a simulated Peripheral: LE Create Connection to the device 0x30..0x35 is accepted.  Its
+// receiver listens on channel 37 in the windows [0, 10) ms, [30, 40) ms and so on.
+fn initiate(var air: SimAir) -> ctl_hci.Controller
+    var c = fresh()
+    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0x0F, 0, 0, 0, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x0C63, [0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    air.periph = true
+    send(var c, 0x200D, create_connection())
+    let _ran = ctl_hci.ctl_step(var c)
+    let _d = drain(var c)
+    c
+
+// A CONNECT_IND whose transmitter stops before its last bit (no end of packet, no CRC) is not a connection: the advertiser took nothing from
+// it, so the Initiating state goes on, and the next advertisement is answered with a whole CONNECT_IND.
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
+@test
+fn test_a_connect_ind_that_stops_on_air_before_its_last_bit_makes_no_connection_and_the_next_one_is_sent()
+    var air = sim_new()
+    var c = initiate(var air)
+    var rf = ll_air.rf_new()
+    air.cut_us = 250
+    hear(var air, 2000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    hear(var air, 32000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    run(var c, var rf, var air, 20000)
+    test.assert_eq(air.cuts, 1)
+    test.assert_eq(count_tx(var air, ll_pdu.CONNECT_IND), 1)
+    test.assert_eq(rf.init_cut, 1)
+    test.assert_eq(rf.init_sent, 0)
+    test.assert(c.init.enabled)
+    test.assert(not c.init.sent)
+    test.assert(not ll_link.link_live(var c.links[0]))
+    run(var c, var rf, var air, 300000)
+    test.assert_eq(count_tx(var air, ll_pdu.CONNECT_IND), 2)
+    test.assert_eq(air.cuts, 1)
+    test.assert_eq(rf.init_cut, 1)
+    test.assert_eq(rf.init_sent, 1)
+    test.assert(not c.init.enabled)
+    test.assert(c.links[0].live)
+    test.assert(c.links[0].central)
+
+// The transmitter of the CONNECT_IND starts T_IFS after the advertisement and reads the octets in the order they go on air.  A judgement that ends
+// after that is not patched into the answer: the answer is taken back before the transmitter starts and the next advertisement is answered.
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
+@test
+fn test_a_connect_ind_whose_judgement_ends_when_the_transmitter_is_due_is_taken_back_and_the_next_one_is_sent()
+    var air = sim_new()
+    var c = initiate(var air)
+    var rf = ll_air.rf_new()
+    air.read_us = 145
+    air.work_us = 3
+    hear(var air, 2000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    hear(var air, 32000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    run(var c, var rf, var air, 20000)
+    test.assert_eq(count_tx(var air, ll_pdu.CONNECT_IND), 0)
+    test.assert_eq(air.late_writes, 0)
+    test.assert_eq(air.halt_in_tx, 0)
+    test.assert_eq(rf.spec_aborts, 1)
+    test.assert(c.init.enabled)
+    test.assert(not c.init.sent)
+    test.assert(not ll_link.link_live(var c.links[0]))
+    air.read_us = 0
+    run(var c, var rf, var air, 300000)
+    test.assert_eq(count_tx(var air, ll_pdu.CONNECT_IND), 1)
+    test.assert_eq(air.late_writes, 0)
+    test.assert_eq(rf.init_sent, 1)
+    test.assert(c.links[0].live)
+    test.assert(c.links[0].central)
+
+// A CONNECT_IND whose access address the program does not see is on air all the same: the radio is not disabled over it, so the
+// advertiser gets the whole packet; the program has no connection of it and goes on.
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
+@test
+fn test_the_radio_is_not_disabled_over_a_connect_ind_whose_access_address_the_program_missed()
+    var air = sim_new()
+    var c = initiate(var air)
+    var rf = ll_air.rf_new()
+    air.hide_addr = true
+    hear(var air, 2000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    hear(var air, 32000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    run(var c, var rf, var air, 20000)
+    test.assert_eq(rf.ramp_timeouts, 1)
+    test.assert_eq(air.halt_in_tx, 0)
+    test.assert_eq(count_tx(var air, ll_pdu.CONNECT_IND), 1)
+    test.assert(c.init.enabled)
+    test.assert(not c.init.sent)
+    run(var c, var rf, var air, 300000)
+    test.assert_eq(count_tx(var air, ll_pdu.CONNECT_IND), 2)
+    test.assert(c.links[0].live)
 
 @when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test

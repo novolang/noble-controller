@@ -4,6 +4,12 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## Unreleased
+
+An initiator counts a CONNECT_IND as sent only when the transmitter ran to its last bit.  `ll_air.init_packet` took the access address of the answer as the sign that the CONNECT_IND was on air, waited for the radio to rest and opened the Central link; a CONNECT_IND whose transmitter stopped part way (an air trace of the nRF54LM20 DK as Central shows one, 24 of 34 payload octets, no CRC) left a link that no advertiser answered, ended the Initiating state and reached the Host a second later as LE Connection Complete with status 0x3E.  It now clears the events of the advertisement after the access address of the answer, waits for the end of the packet (`Radio.wait_phyend`, bounded by the longest packet the radio was asked for) and, when none comes, counts `Rf.init_cut`, leaves the Initiating state running and answers the next advertisement with a whole CONNECT_IND.
+
+A judgement that ends later than `ll_air.ANSWER_READY_US` (140 microseconds) after the end of the advertisement does not patch the CONNECT_IND: the answer is taken back while the transmitter ramps up (`spec_aborts`) and the next advertisement is answered.  Before, the patch ran whenever the judgement ended, and a transmitter that had started read the answer behind the program.  The wait for the access address of the answer no longer ends in `halt`: when it does not come, the answer runs to its end before the radio is stopped, so the radio is not disabled over a transmitter that is on air.  `Rf` is 8 octets larger (`init_cut`).  `Nrf54Air.wait_phyend` of `orbit/bsp` ends after the longest packet the radio was asked for and a ramp-up, where it spun 4,000,000 reads.
+
 ## 0.1.3 — 2026-11-16
 
 2026-11-16: the helper of `tests/ctl_air_tests.nv` that synchronizes a receiver to a group sets no output data path on the BISes of a group that is lost in the turn that established it, as the Controller has told the Host of both events since 0.1.3; the suite passed only under the default configuration, which links no groups, and failed under every configuration that does.  `novo test` now passes under the minimum and the maximum configuration and under each file of `configs/`.  No source changed.
