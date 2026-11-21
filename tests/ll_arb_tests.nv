@@ -6,7 +6,7 @@ use std.test
 use ll_radio
 use ctl_limits
 use noble_controller.CONFIG
-use ll_arb.{ CLASS_ISO, NONE, ROOM_DUE_US, ROOM_FREE_US, arb_book, arb_book_cs, arb_booked, arb_cancel, arb_clear, arb_clear_class, arb_cs_fits, arb_limit, arb_new, arb_next_start, arb_pick, arb_radio, arb_room, arb_worth_running, class_acl, class_adv, class_cs, class_cs_next, class_per, class_scan, classes, cs_class, lead_of }
+use ll_arb.{ CLASS_ISO, NONE, ROOM_DUE_US, ROOM_FREE_US, arb_book, arb_book_cs, arb_booked, arb_cancel, arb_clear, arb_clear_class, arb_cs_fits, arb_limit, arb_new, arb_next_start, arb_pick, arb_radio, arb_room, arb_worth_running, job_room_us, JOB_MARGIN_US, class_acl, class_adv, class_cs, class_cs_next, class_per, class_scan, classes, cs_class, lead_of }
 
 @test
 fn test_the_room_before_a_booking_stops_a_guard_short_of_its_start()
@@ -20,6 +20,18 @@ fn test_the_room_before_a_booking_stops_a_guard_short_of_its_start()
     test.assert_eq(arb_room(var a, 19500, 350), ROOM_DUE_US)
     // Past its end the booking does not count.
     test.assert_eq(arb_room(var a, 21000, 350), ROOM_FREE_US)
+
+@test
+fn test_a_job_of_the_main_loop_needs_its_own_length_and_a_margin_in_the_room()
+    // A job that took 4,400 microseconds wants the room it took and the margin, where the floor of 3,000 is not enough.
+    test.assert_eq(job_room_us(4400, 3000), 4400 + JOB_MARGIN_US)
+    // A short job keeps the floor.
+    test.assert_eq(job_room_us(957, 3000), 3000)
+    // The job that fills the floor exactly less the margin keeps it, and one microsecond more raises it.
+    test.assert_eq(job_room_us(3000 - JOB_MARGIN_US, 3000), 3000)
+    test.assert_eq(job_room_us(3001 - JOB_MARGIN_US, 3000), 3001)
+    // A job never measured needs the floor.
+    test.assert_eq(job_room_us(0, 3000), 3000)
 
 @test
 fn test_the_room_is_the_least_of_the_bookings()

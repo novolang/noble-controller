@@ -282,6 +282,18 @@ fn arb_room(var a: Arb, now: Int, guard: Int) -> Int
         return 0
     room
 
+// The room (`arb_room`) a job of the main loop must find when it starts, given how long the job takes (`job_us`, measured): the job and
+// `JOB_MARGIN_US`, and never less than `floor_us`, the room that jobs of unknown length get.  A job that ends inside the guard before a
+// booking costs the booking's first subevent, and the longest job of a round of status lines took 4.4 ms where the floor was 3 ms.
+pub @tier(embedded)
+fn job_room_us(job_us: Int, floor_us: Int) -> Int
+    if job_us + JOB_MARGIN_US > floor_us
+        return job_us + JOB_MARGIN_US
+    floor_us
+
+// The microseconds a job of the main loop leaves before the guard of the booking, beyond its own length: the program's lead (about 600).
+const JOB_MARGIN_US = 600
+
 // What `arb_room` answers when nothing is booked, and when a booking is due.
 const ROOM_FREE_US = 1000000
 const ROOM_DUE_US = 30
