@@ -12831,23 +12831,10 @@ fn ctl_cis_phy_back(var c: Controller, i: Int) -> Int
 fn ctl_cis_sub(var c: Controller, i: Int) -> Int
     c.cis[i].sub
 
+// The time the next subevent of the stream in slot `i` starts: its place on the group's grid.
 @tier(embedded)
 fn ctl_cis_start(var c: Controller, i: Int) -> Int
-    let t = ll_iso.sub_start(var c.cis[i], c.cis[i].sub)
-    if c.cis[i].central and c.cis[i].off_cig > 0
-        return t - CIS_LATER_TRIM_US
-    t
-
-// The microseconds a Central starts the subevents of every stream after the first of its group before their time on the group's
-// grid.  The PTS dongle (the Lower Tester) places the first event of a later stream from the timeline of the earlier one and
-// listens for it in a window of about 40 us around a time that lies a few microseconds before the Central's nominal one (the
-// open filing on the second CIS of a two-CIS group with the PTS dongle, status 0x3E, holds the runs).
-// Measured 2026-11-08 on the nRF54LM20 DK against the dongle with BAP/UCL/STR/BV-527-C, 529-C, 545-C and 548-C, three runs of the four
-// rows each: 12 of 16 runs ended with LE CIS Established 0x3E for the second stream at 0 us, 2 of 12 at this value; 2026-10-31, the
-// second stream alone moved by -20 us: 2 of 40, by -30 us: 38 of 40.  The value lies inside the 2 x `ll_link.JITTER_US` a Peripheral
-// widens its window by; it is not a claim about the specification's Central, and not measured against another Peripheral than the
-// dongle.
-const CIS_LATER_TRIM_US = 16
+    ll_iso.sub_start(var c.cis[i], c.cis[i].sub)
 
 // The channel of the next subevent of the stream in slot `i` when the radio program will run it straight after the one just heard
 // (the packet was read at `now`; `good` says its CRC was right), -1 when it will not: the event has no other subevent or the Central
@@ -13075,6 +13062,10 @@ const CIS_SEARCH_EVENTS = 64
 
 // A creation procedure the Peripheral does not answer in 40 seconds fails (Section 5.2).
 const CIS_PROC_TIMEOUT_US = 40000000
+
+// The connection events the first stream of a group is given for each stream of the group still to be created: the request, the
+// Peripheral's response and the indication of a stream take four events when the Peripheral's Host answers within one.
+const CIS_SIBLING_EVENTS = 8
 
 // The raw request of LE Set CIG Parameters for stream `k` of the command into plan `j`.
 @tier(embedded)
@@ -13441,6 +13432,46 @@ fn ctl_iso_central_poll(var c: Controller) -> Bool
                 did = true
     did
 
+// The connection event LL_CIS_IND of the stream in slot `i` names.  The window LL_CIS_RSP accepted starts at the anchor of `off_ev`
+// plus `off_min`, and an indication may name any event whose anchor differs from that by whole ISO intervals; the stream
+// takes the event the request named unless that is too early for the group:
+// - a stream whose group has streams still to be created gets `CIS_SIBLING_EVENTS` events for each of them, the time their
+//   requests, responses and indications take, so that the first stream does not start before the last one has been indicated
+//   (a Peripheral that is told of a stream after another stream of the group has begun has to join a group that is running);
+// - a stream does not start before a stream of its group that has been indicated already.
+@tier(embedded)
+fn cis_instant(var c: Controller, i: Int) -> Int
+    let ls = c.cis[i].acl
+    var ev = c.cis[i].off_ev
+    let conn = ll_link.interval_us(var c.links[ls])
+    let iso = ll_iso.iso_us(var c.cis[i])
+    if iso <= 0
+        return ev
+    var step = 0
+    for s in 1..65
+        if step == 0 and (s * conn) % iso == 0
+            step = s
+    if step == 0
+        return ev
+    var waiting = 0
+    var floor = ev
+    for k in 0..ctl_limits.cis_slots()
+        if k != i and c.cis[k].central and c.cis[k].acl == ls and c.cis[k].cig_id == c.cis[i].cig_id
+            if c.cis[k].state == ll_iso.S_CREATING
+                waiting = waiting + 1
+            else if c.cis[k].state == ll_iso.S_WAIT or c.cis[k].state == ll_iso.S_UP
+                if ((c.cis[k].ind_ev - floor) & 0xFFFF) < 0x8000
+                    floor = c.cis[k].ind_ev
+    var want = floor
+    let by_siblings = (c.links[ls].ev_count + CIS_SIBLING_EVENTS * waiting) & 0xFFFF
+    if waiting > 0 and ((by_siblings - want) & 0xFFFF) < 0x8000
+        want = by_siblings
+    for _ in 0..256
+        if ((ev - want) & 0xFFFF) < 0x8000
+            break
+        ev = (ev + step) & 0xFFFF
+    ev
+
 // LL_CIS_IND for the stream in slot `i`: the offset the response allowed, the event the request named, the access address and
 // the delays; the stream is scheduled at the anchor that gives.  A reference event that has passed, or a connection update
 // before it, fails the stream.  False when the control queue was full and the indication waits.
@@ -13448,12 +13479,16 @@ fn ctl_iso_central_poll(var c: Controller) -> Bool
 @tier(embedded)
 fn cis_send_ind(var c: Controller, i: Int) -> Bool
     let ls = c.cis[i].acl
-    let t = ll_link.link_event_time(var c.links[ls], c.cis[i].off_ev)
+    var ev = cis_instant(var c, i)
+    var t = ll_link.link_event_time(var c.links[ls], ev)
+    if t < 0
+        ev = c.cis[i].off_ev
+        t = ll_link.link_event_time(var c.links[ls], ev)
     if t < 0 or t + c.cis[i].off_min < c.now + CIS_LEAD_US
         cis_close(var c, i, ll_iso.STATUS_FAILED_TO_ESTABLISH)
         return true
     c.cis[i].cis_offset = c.cis[i].off_min
-    c.cis[i].ind_ev = c.cis[i].off_ev
+    c.cis[i].ind_ev = ev
     ll_iso.put_cis_ind(var c.links[ls].tmp, var c.cis[i])
     if not iso_send(var c, ls)
         return false
