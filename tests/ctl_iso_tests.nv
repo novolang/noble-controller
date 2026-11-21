@@ -810,6 +810,7 @@ fn test_the_indication_schedules_the_stream_at_the_offset_from_the_anchor_of_the
     pop_queued(var c)
     // The ACL's event 0 is the one under way, its anchor 6000; the indication names event 3 and an offset of 3 ms.
     ctl_hci.ctl_set_time(var c, 5000)
+    c.links[0].ev_open = true
     c.links[0].ev_anchor = true
     c.links[0].anchor = 6000
     var x = ll_iso.cis_new()
@@ -845,6 +846,7 @@ fn test_an_indication_for_an_event_that_has_passed_fails_the_stream()
     let _s = run(var c, 0x1001, [])
     ctl_hci.ctl_set_time(var c, 5000)
     c.links[0].ev_count = 10
+    c.links[0].ev_open = true
     c.links[0].ev_anchor = true
     c.links[0].anchor = 6000
     var x = ll_iso.cis_new()
@@ -871,6 +873,7 @@ fn test_the_acl_ending_ends_its_streams_with_its_reason()
     let _s = run(var c, 0x1001, [])
     pop_queued(var c)
     ctl_hci.ctl_set_time(var c, 5000)
+    c.links[0].ev_open = true
     c.links[0].ev_anchor = true
     c.links[0].anchor = 6000
     var x = ll_iso.cis_new()

@@ -12,7 +12,7 @@ use ll_sub
 use ll_rate
 use ll_fs
 use ll_feat
-use ll_link.{ AUTO_PHY_EVENTS, CATCH_UP_MAX, CODE_BUSY, CODE_COLLISION, CODE_DIFFERENT_COLLISION, CODE_INVALID_LL_PARAMETERS, CTRL_SLOTS, ENC_C_PAUSE_WAIT_RSP, ENC_IDLE, ENC_NEED_RANDOM, ENC_P_WAIT_LTK, ENC_P_WAIT_START_RSP, EV_APTO, EV_COMPLETED, EV_CONNECTED, EV_DATA_LENGTH, EV_DISCONNECTED, EV_FEATEXT, EV_FEATURES, EV_PARAM_REQUEST, EV_PHY, EV_SUBRATE, EV_UPDATED, EV_VERSION, FEAT1_2M, FEAT1_CODED, FEAT3_PAST, FEATURES_OCTET0, FEATURES_OCTET2, FX_HAVE, FX_LOCAL, FX_PEER, FX_RATE, FX_RATEEV, INSTANT_LEAD, INSTANT_SLACK, K_ACL, K_ACL_PART, K_CTRL, K_EMPTY, LL_COMPANY, LL_SUBVERSION, LL_VERSION, Link, PHYS_SUPPORTED, PHY_DEFERRED, PHY_IDLE, PHY_RESPONDED, PHY_WAIT_IND, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, PROC_PARAM, PROC_PING, PROC_VERSION, REASON_FAILED_TO_ESTABLISH, REASON_INSTANT_PASSED, REASON_LOCAL_HOST, REASON_RESPONSE_TIMEOUT, REASON_TIMEOUT, REASON_UNSUPPORTED_PARAMETER, RX_NOTHING, RX_TO_HOST, STATUS_COMMAND_DISALLOWED, STATUS_INVALID_PARAMETERS, STATUS_SUCCESS, STATUS_UNKNOWN_CONNECTION, STATUS_UNSUPPORTED_FEATURE, STATUS_UNSUPPORTED_REMOTE, anchor_offset, auto_tasks, chan_next, connect_request, connect_valid, csa2_channel, csa2_permute, csa2_prn, ctrl_queue, ctrl_rx, dle_refresh, dle_rec_field, dle_start, dle_wire_time, eff_rx_octets, eff_rx_time, eff_tx_octets, eff_tx_time, enc_begin, features_request_opcode, first_offset, fs_peer_lacks, fx_get, fx_put, interval_us, link_answers_bad, link_auth_rx, link_book_us, link_catch_up, link_close, link_connection_update, link_disconnect, link_ended, link_event_begin, link_event_done, link_event_late, link_first_header, link_host_range, link_is_central, link_listen_end, link_listen_start, link_live, link_new, link_note_rx, link_open, link_open_central, link_owes, link_param_negative, link_param_reply, link_prepare, link_queue_acl, link_read_features, link_read_version, link_released, link_request_min_used, link_reset, link_rx_bad, link_rx_fast, link_rx_slow, link_sent, link_set_apto, link_set_auth, link_set_data_length, link_set_defaults, link_set_host_map, link_set_host_rate, link_set_indicate, link_set_phy, link_set_room, link_start_encryption, link_take_completed, nth_used, pad_map, params_valid, peer_has_phy, phy_begin, phy_best, phy_wanted, pick_interval, popcount, rate_central_start, rate_fetch, rate_fetch_over, rate_host, rate_peer_ok, reverse_octet, sca_ppm, slot_get_cq, sub_can_start, sub_set, tx_limit, wanted_map, widening }
+use ll_link.{ AUTO_PHY_EVENTS, CATCH_UP_MAX, CODE_BUSY, CODE_COLLISION, CODE_DIFFERENT_COLLISION, CODE_INVALID_LL_PARAMETERS, CTRL_SLOTS, ENC_C_PAUSE_WAIT_RSP, ENC_IDLE, ENC_NEED_RANDOM, ENC_P_WAIT_LTK, ENC_P_WAIT_START_RSP, EV_APTO, EV_COMPLETED, EV_CONNECTED, EV_DATA_LENGTH, EV_DISCONNECTED, EV_FEATEXT, EV_FEATURES, EV_PARAM_REQUEST, EV_PHY, EV_SUBRATE, EV_UPDATED, EV_VERSION, FEAT1_2M, FEAT1_CODED, FEAT3_PAST, FEATURES_OCTET0, FEATURES_OCTET2, FX_HAVE, FX_LOCAL, FX_PEER, FX_RATE, FX_RATEEV, INSTANT_LEAD, INSTANT_SLACK, K_ACL, K_ACL_PART, K_CTRL, K_EMPTY, LL_COMPANY, LL_SUBVERSION, LL_VERSION, Link, PHYS_SUPPORTED, PHY_DEFERRED, PHY_IDLE, PHY_RESPONDED, PHY_WAIT_IND, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, PROC_PARAM, PROC_PING, PROC_VERSION, REASON_FAILED_TO_ESTABLISH, REASON_INSTANT_PASSED, REASON_LOCAL_HOST, REASON_RESPONSE_TIMEOUT, REASON_TIMEOUT, REASON_UNSUPPORTED_PARAMETER, RX_NOTHING, RX_TO_HOST, STATUS_COMMAND_DISALLOWED, STATUS_INVALID_PARAMETERS, STATUS_SUCCESS, STATUS_UNKNOWN_CONNECTION, STATUS_UNSUPPORTED_FEATURE, STATUS_UNSUPPORTED_REMOTE, anchor_offset, auto_tasks, chan_next, connect_request, connect_valid, csa2_channel, csa2_permute, csa2_prn, ctrl_queue, ctrl_rx, dle_refresh, dle_rec_field, dle_start, dle_wire_time, eff_rx_octets, eff_rx_time, eff_tx_octets, eff_tx_time, enc_begin, features_request_opcode, first_offset, fs_peer_lacks, fx_get, fx_put, interval_us, link_answers_bad, link_auth_rx, link_book_us, link_catch_up, link_close, link_connection_update, link_disconnect, link_ended, link_event_begin, link_event_done, link_event_late, link_event_time, link_first_header, link_host_range, link_is_central, link_listen_end, link_listen_start, link_live, link_new, link_note_rx, link_open, link_open_central, link_owes, link_param_negative, link_param_reply, link_prepare, link_queue_acl, link_read_features, link_read_version, link_released, link_request_min_used, link_reset, link_rx_bad, link_rx_fast, link_rx_slow, link_sent, link_set_apto, link_set_auth, link_set_data_length, link_set_defaults, link_set_host_map, link_set_host_rate, link_set_indicate, link_set_phy, link_set_room, link_start_encryption, link_take_completed, nth_used, pad_map, params_valid, peer_has_phy, phy_begin, phy_best, phy_wanted, pick_interval, popcount, rate_central_start, rate_fetch, rate_fetch_over, rate_host, rate_peer_ok, reverse_octet, sca_ppm, slot_get_cq, sub_can_start, sub_set, tx_limit, wanted_map, widening }
 
 // An LL Control PDU from the peer: the opcode and the payload octets after it.
 fn t_ctrl(op: Int, rest: [Int]) -> Pdu
@@ -1097,6 +1097,49 @@ fn test_open_central_takes_the_parameters_and_fixes_the_first_anchor()
     test.assert(not link_is_central(var m))
     link_reset(var l)
     test.assert(not link_is_central(var l))
+
+@test
+fn test_the_time_of_a_connection_event_is_counted_from_the_event_under_way_or_from_the_one_due_next()
+    var l = t_central()
+    let iv = interval_us(var l)
+    // Before the first event the event due next is the one counted `ev_count`, at `due`.
+    test.assert_eq(link_event_time(var l, 0), l.due)
+    test.assert_eq(link_event_time(var l, 3), l.due + 3 * iv)
+    let _c0 = link_event_begin(var l)
+    // The Central's anchor is the time it sends at; the event under way is counted from it.
+    test.assert_eq(link_event_time(var l, 0), l.anchor)
+    test.assert_eq(link_event_time(var l, 2), l.anchor + 2 * iv)
+    let anchor0 = l.anchor
+    link_event_done(var l, l.due + 500)
+    // Between two events `ev_count` is the counter of the next one, due at `due`, one interval after the anchor of the event that ended; that anchor is
+    // still in `anchor`, and is no base for the counters after it.
+    test.assert_eq(l.ev_count, 1)
+    test.assert_eq(l.due, anchor0 + iv)
+    test.assert_eq(link_event_time(var l, 1), anchor0 + iv)
+    test.assert_eq(link_event_time(var l, 4), anchor0 + 4 * iv)
+    // An event behind the next one has no time to give.
+    test.assert_eq(link_event_time(var l, 0), -1)
+    let _c1 = link_event_begin(var l)
+    test.assert_eq(link_event_time(var l, 1), l.anchor)
+    test.assert_eq(link_event_time(var l, 1), anchor0 + iv)
+
+@test
+fn test_the_time_of_a_connection_event_of_a_peripheral_follows_the_anchor_heard_in_the_event_and_the_due_time_between()
+    var l = t_link()
+    let iv = interval_us(var l)
+    let due0 = l.due
+    let _c0 = link_event_begin(var l)
+    // The first packet has not come: the anchor is expected at `due`.
+    test.assert_eq(link_event_time(var l, 0), due0)
+    // It comes 30 us late: the event under way and the ones after it are counted from the anchor heard.
+    link_note_rx(var l, due0 + 30, true)
+    test.assert_eq(link_event_time(var l, 0), due0 + 30)
+    test.assert_eq(link_event_time(var l, 2), due0 + 30 + 2 * iv)
+    link_event_done(var l, due0 + 600)
+    // The event that comes next is due an interval after the anchor heard, and counts from there.
+    test.assert_eq(l.ev_count, 1)
+    test.assert_eq(link_event_time(var l, 1), due0 + 30 + iv)
+    test.assert_eq(link_event_time(var l, 3), due0 + 30 + 3 * iv)
 
 @test
 fn test_a_central_listens_at_a_point_without_widening()

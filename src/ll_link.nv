@@ -1321,9 +1321,13 @@ fn link_set_host_iso(var l: Link, on: Bool)
     l.host_iso = on
 
 // The anchor point of the connection event with the counter `evc` (a CIS offset is measured from
-// it, Section 2.4.2.31), as the schedule stands while the event under way is `ev_count`: the anchor
-// of this event and whole intervals on.  -1 when the event is behind this one, -2 when a Connection Update
-// has its instant between the two, which moves the anchors in a way the caller cannot know.
+// it, Section 2.4.2.31), as the schedule stands: `ev_count` is the counter of the event under way
+// (`ev_open`), or of the one that comes next when none is, and the answer counts whole intervals from
+// the anchor of that event.  The anchor of the event under way is the one heard, or sent, once its first
+// packet is there (`ev_anchor`); the one that comes next is due at `due`.  The anchor of an event that is
+// over stays in `anchor` and belongs to the counter before `ev_count`, so it is no base then.  -1 when the
+// event is behind this one, -2 when a Connection Update has its instant between the two, which moves the
+// anchors in a way the caller cannot know.
 @satisfies("REQ-BLE-CTL-055")
 @tier(embedded)
 fn link_event_time(var l: Link, evc: Int) -> Int
@@ -1333,7 +1337,7 @@ fn link_event_time(var l: Link, evc: Int) -> Int
     if l.upd_pending and ((l.upd_instant - l.ev_count) & 0xFFFF) <= ahead
         return -2
     var base = l.due
-    if l.ev_anchor
+    if l.ev_open and l.ev_anchor
         base = l.anchor
     base + ahead * interval_us(var l)
 

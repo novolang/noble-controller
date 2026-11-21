@@ -333,6 +333,10 @@ struct SimAir
     var read_us: Int
     var work_us: Int
     var late_writes: Int
+    // The next `drop_n` LL Control PDUs of the opcode `drop_op` that the Central sends get no answer from the Peripheral's model, as if its receiver
+    // had missed them: the Central sends the same PDU again in the next event.
+    var drop_op: Int
+    var drop_n: Int
 
 // An empty data PDU: LLID 1, no payload.
 fn empty_pdu() -> Pdu
@@ -357,7 +361,7 @@ fn sim_new() -> SimAir
              cis_rx: [], cis_log: [], acl_period: 0, acl_next: 0, cis_lose: 0, cis_deaf: 0, cis_mic_bad: 0, cis_pkts: 0, cis_answers: 0, cis_off: 0,
              white: true, pwr: 0, fast_ok: true, tx_slow: 139, tx_fast: 39, rx_slow: 140, rx_fast: 40, rep_slow: 145, rep_fast: 45, coded_ok: true, octet_ns: 1000,
              tx_body: [], tx_white: [], peer_f5: 0x20, peer_f4: 0, tx_pwr: [], peer_f7: 0, peer_p1: 0, peer_maxp: 0, peer_ext: 0, rssi: -60, peer_f3: 0x37, miss_skip: 0, miss_data: 0,
-             cut_us: -1, cuts: 0, hide_addr: false, halt_in_tx: 0, read_us: 0, work_us: 0, late_writes: 0 }
+             cut_us: -1, cuts: 0, hide_addr: false, halt_in_tx: 0, read_us: 0, work_us: 0, late_writes: 0, drop_op: 0, drop_n: 0 }
 
 // A peer sends `pdu` on `ch`, its first bit at `t`.
 fn hear(var air: SimAir, t: Int, ch: Int, pdu: Pdu)
@@ -442,6 +446,9 @@ fn sim_latch(var a: SimAir)
 // its end, with the sequence numbers the Central's header calls for, the next PDU of its script when the Central
 // acknowledged the one in flight, and an empty one otherwise.
 fn sim_peripheral_answer(var a: SimAir, h: Int, opcode: Int, control: Bool, b2: Int)
+    if control and a.drop_n > 0 and opcode == a.drop_op
+        a.drop_n = a.drop_n - 1
+        return
     let csn = (h >>> 3) & 1
     let cnesn = (h >>> 2) & 1
     // It answers the Controller's LL_LENGTH_REQ and LL_PHY_REQ the way a Controller with the extensions does,
@@ -3406,6 +3413,124 @@ fn test_the_streams_after_the_first_of_a_group_start_their_subevents_early_by_th
     // The trim is a few microseconds, inside the jitter a Peripheral allows for.
     test.assert(ctl_hci.CIS_LATER_TRIM_US > 0)
     test.assert(ctl_hci.CIS_LATER_TRIM_US <= 2 * ll_link.JITTER_US)
+
+// A Central connection of `iv` units (1.25 ms) against the simulated Peripheral, which answers at once.
+fn cis_cen_connect_iv(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAir, iv: Int)
+    test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0xFF, 0x03, 0x00, 0x02, 0, 0]), 0)
+    test.assert_eq(status_of(var c, 0x2074, [32, 1]), 0)
+    air.periph = true
+    var p: [Int] = [16, 0, 16, 0, 0, 0]
+    for i in 0..6
+        list.push(p, 0x30 + i)
+    for b in [0, iv, 0, iv, 0, 0, 0, 200, 0, 0, 0, 0, 0]
+        list.push(p, b)
+    send(var c, 0x200D, p)
+    let _ran = ctl_hci.ctl_step(var c)
+    let _d = drain(var c)
+    hear(var air, 2000, 37, from_peer(ll_pdu.ADV_IND, 5))
+    cis_run(var c, var rf, var air, 200000, 0, 0)
+    test.assert(c.links[0].live)
+    test.assert(c.links[0].central)
+
+// The LL_CIS_IND of the stream with the access address `aa` that the Controller sent, as it went on air: its connEventCount and CIS_Offset, in
+// the order of the copies; empty when there is none.
+fn ind_copies(var air: SimAir, aa: Int) -> [[Int]]
+    var out: [[Int]] = []
+    for i in 0..list.len(air.tx_op)
+        if air.tx_op[i] == ll_data.OP_CIS_IND and (air.tx_h[i] & 3) == 3
+            let b = air.tx_body[i]
+            let got = b[3] | (b[4] << 8) | (b[5] << 16) | (b[6] << 24)
+            if got == aa
+                list.push(out, [b[16] | (b[17] << 8), b[7] | (b[8] << 8) | (b[9] << 16)])
+    out
+
+// The time of the first packet the Controller sent on the access address `aa`, -1 for none.
+fn first_tx_on(var air: SimAir, aa: Int) -> Int
+    for i in 0..list.len(air.tx_t)
+        if air.tx_aa[i] == aa
+            return air.tx_t[i]
+    -1
+
+// The time of the connection event `n` counted from the first, on the connection with the access address `aa`: the first packet the Controller sent on
+// it began event 0, and the events follow every interval; -1 when no packet of the Controller began the event `n` then.
+fn acl_event_time(var air: SimAir, aa: Int, interval_us: Int, n: Int) -> Int
+    let t0 = first_tx_on(var air, aa)
+    let want = t0 + n * interval_us
+    for i in 0..list.len(air.tx_t)
+        if air.tx_aa[i] == aa and air.tx_t[i] == want
+            return want
+    -1
+
+@test
+fn test_every_stream_of_a_group_starts_at_the_event_its_indication_names_when_the_indication_is_queued_between_events_and_sent_twice()
+    if not ctl_limits.iso_on() or ctl_limits.cis_slots() < 2
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    // A connection of 50 ms and two Source-only streams of an ISO interval of 10 ms: the Central sends no data, five ISO events fit one connection interval, and
+    // the instant of the second stream names a connection event that is not the one the first names.
+    cis_cen_connect_iv(var c, var rf, var air, 40)
+    let iv = ll_link.interval_us(var c.links[0])
+    test.assert_eq(iv, 50000)
+    let r = complete_of_ctl(var c, 0x2062, cig_request_full(2, 0, 2, 0, 40, 3, 10000, 10))
+    test.assert_eq(r[6], 0)
+    let hs = handles_of(r, 2)
+    for k in 0..2
+        test.assert_eq(status_of(var c, 0x206E, [hs[k] & 0xFF, hs[k] >>> 8, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+    var create: [Int] = [2]
+    for k in 0..2
+        list.push(create, hs[k] & 0xFF)
+        list.push(create, hs[k] >>> 8)
+        list.push(create, 1)
+        list.push(create, 0)
+    test.assert_eq(cmd_status(var c, 0x2064, create), 0)
+    // The first stream: the Peripheral answers the request and the indication is sent in the event that reads the response.
+    cis_run(var c, var rf, var air, air.now + 2000000, 5, 0)
+    cis_answer_request(var c, var air, 0)
+    let _a0 = sim_cis_declare(var air, c.cis[0].aa)
+    cis_run(var c, var rf, var air, air.now + 2000000, 3, 0)
+    test.assert_eq(c.cis[0].state, ll_iso.S_WAIT)
+    cis_start_peripheral(var c, var air, 0, false, 40)
+    // The second stream: its request goes out and its response is read while the control queue is full, so the indication waits for the program
+    // between two events, and the Peripheral's model misses its first copy, so it goes out twice.
+    cis_run(var c, var rf, var air, air.now + 2000000, 15, 0)
+    test.assert_eq(c.cis[1].state, ll_iso.S_CREATING)
+    let _a1 = sim_cis_declare(var air, c.cis[1].aa)
+    let held = c.links[0].cq_count
+    c.links[0].cq_count = ll_link.CTRL_SLOTS
+    var rsp = ll_pdu.pdu_new()
+    var y = c.cis[1]
+    ll_iso.put_cis_rsp(var rsp, var y)
+    ctl_hci.iso_rsp(var c, 0, var rsp)
+    c.links[0].cq_count = held
+    test.assert_eq(c.cis[1].state, ll_iso.S_IND)
+    air.drop_op = ll_data.OP_CIS_IND
+    air.drop_n = 1
+    let _polled = ctl_hci.ctl_iso_central_poll(var c)
+    test.assert_eq(c.cis[1].state, ll_iso.S_WAIT)
+    cis_start_peripheral(var c, var air, 1, false, 40)
+    cis_run(var c, var rf, var air, air.now + 1500000, 0, 0)
+    test.assert_eq(air.drop_n, 0)
+    // What the indications said, and where the first subevent of each stream fell: the anchor of the connection event they name, counted from the
+    // first event of the connection, plus the offset.
+    let aa_acl = c.links[0].aa
+    test.assert_eq(first_tx_on(var air, aa_acl), c.links[0].first_due)
+    for k in 0..2
+        let copies = ind_copies(var air, c.cis[k].aa)
+        test.assert_eq(list.len(copies), 1 + k)
+        for cp in copies
+            test.assert_eq(cp[0], copies[0][0])
+            test.assert_eq(cp[1], copies[0][1])
+        let anchor_acl = acl_event_time(var air, aa_acl, iv, copies[0][0])
+        test.assert(anchor_acl > 0)
+        var trim = 0
+        if c.cis[k].off_cig > 0
+            trim = ctl_hci.CIS_LATER_TRIM_US
+        test.assert_eq(first_tx_on(var air, c.cis[k].aa), anchor_acl + copies[0][1] - trim)
+    test.assert(c.cis[1].off_cig > 0)
+    test.assert_eq(c.cis[0].state, ll_iso.S_UP)
+    test.assert_eq(c.cis[1].state, ll_iso.S_UP)
 
 @test
 fn test_two_streams_of_one_group_interleaved()
