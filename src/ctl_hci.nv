@@ -545,6 +545,7 @@ struct Controller
     cis_log: ll_iso.CisLog
     iso_dropped: Int
     iso_rr: Int
+    bis_rr: Int
     room_us: Int
     room_skips: Int
     dtm: Dtm
@@ -594,7 +595,7 @@ fn controller_new(caps: Int) -> Controller
         rp_pdu: ll_pdu.pdu_new(), rp_rssi: 0, rp_valid: false, rp_rsp: false, rp_dropped: 0, rq_addr: Vec.new(),
         rq_kind: 0, ci_rpa: Vec.new(), ci_kind: 0, dl_sugg_octets: 27, dl_sugg_time: 328,
         dl_sugg_set: false, phy_def_set: false, phy_def_tx: 7, phy_def_rx: 7,
-        cis: Vec.new(), cigs: Vec.new(), bis: Vec.new(), bigs: Vec.new(), bigk: ll_cmac.cmac_empty(), big_rnd: Vec.new(), big_rnd_n: 0, big_seed: 1, bi: ll_big.info_view_none(), bi_raw: Vec.new(), bi_n: 0, bi_sync: 0, bi_t: 0, bi_owed: false, bi_seen: 0, host_iso: false, cis_log: ll_iso.cis_log_new(), iso_dropped: 0, iso_rr: 0, room_us: 1000000, room_skips: 0, dtm: ll_dtm.dtm_new(), radio: ll_radio.profile_assumed(),
+        cis: Vec.new(), cigs: Vec.new(), bis: Vec.new(), bigs: Vec.new(), bigk: ll_cmac.cmac_empty(), big_rnd: Vec.new(), big_rnd_n: 0, big_seed: 1, bi: ll_big.info_view_none(), bi_raw: Vec.new(), bi_n: 0, bi_sync: 0, bi_t: 0, bi_owed: false, bi_seen: 0, host_iso: false, cis_log: ll_iso.cis_log_new(), iso_dropped: 0, iso_rr: 0, bis_rr: 0, room_us: 1000000, room_skips: 0, dtm: ll_dtm.dtm_new(), radio: ll_radio.profile_assumed(),
         xs: ll_ext.xctx_new(), xv: ll_pdu.pdu_new(), xp: ll_ext.xpri_new(), xview: false,
         xsets: Vec.new(), coded: true, adv_set: -1, adv_base: 0, adv_xset: -1,
         pads: Vec.new(), psyncs: Vec.new(), preq: ll_per.preq_new(), pal: ll_per.pal_new(), per_late: 0,
@@ -5298,6 +5299,12 @@ pub @tier(embedded)
 fn ctl_ll_room(var c: Controller, now: Int) -> Int
     ll_arb.arb_room(var c.arb, now, c.arb.stream_guard)
 
+// The same for the HCI stream of the main loop (`ll_arb.arb_room_stream`): a passive scan window under way does not hold the stream to the
+// microseconds a due booking leaves.  A scan that sends (active, or the Initiating state) is answered inside T_IFS and does.
+pub @tier(embedded)
+fn ctl_stream_room(var c: Controller, now: Int) -> Int
+    ll_arb.arb_room_stream(var c.arb, now, c.arb.stream_guard, c.scan.enabled and c.scan.ty == 0 and not c.init.enabled)
+
 // The soonest the Link Layer wants the radio, `ll_arb.NONE` when it is idle.
 @tier(embedded)
 fn ctl_ll_next_start(var c: Controller) -> Int
@@ -8515,6 +8522,7 @@ fn iso_reset(var c: Controller)
     c.host_iso = false
     c.iso_dropped = 0
     c.iso_rr = 0
+    c.bis_rr = 0
     c.room_skips = 0
 
 // Queue the LL Control PDU in the `tmp` of the ACL link in slot `ls`.
@@ -14091,13 +14099,22 @@ fn flush_big(var c: Controller, g: Int) -> Bool
     var streams = c.bigs[g].num_bis
     if not c.bigs[g].broadcaster
         streams = c.bigs[g].nrx
-    for j in 0..streams
+    // The streams take turns, as the connected ones do (`ctl_flush_events`): the pool holds four packets, and the first stream of a group, served
+    // first every time, filled it while the others' SDUs waited in queues of two and were dropped.  A stream whose SDU found no slot goes
+    // first at the next step, and after a step in which every stream was served the one that went first goes last.
+    var first = 0
+    if streams > 0
+        first = c.bis_rr % streams
+    for k in 0..streams
+        let j = (first + k) % streams
         let i = c.bigs[g].bis0 + j
+        c.bis_rr = j
         for _ in 0..ll_iso.OUT_SLOTS * ll_iso.SDU_FRAGS
             if ll_iso.out_ready(var c.bis[i]) and not ev_bis_data(var c, i)
                 return false
         if (c.bis[i].owed & ll_iso.EV_COMPLETED) != 0 and not ev_bis_completed(var c, i)
             return false
+    c.bis_rr = first + 1
     if (c.bigs[g].owed & ll_big.EV_TERMINATED) != 0
         if c.bigs[g].broadcaster
             return ev_big_terminated(var c, g)

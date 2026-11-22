@@ -261,6 +261,8 @@ struct SimAir
     var react_pdu: Pdu
     var react_count: Int
     var host: [Int]
+    var uart: Int
+    var room_old: Bool
     var multi: Bool
     var m_aa: [Int]
     var m_sn: [Int]
@@ -355,7 +357,7 @@ fn sim_new() -> SimAir
              last_end: 0, last_ty: -1, holds: 0, releases: 0, cfg_aa: 0, phy: 1, s8: true, phy_calls: 0, fast_asked: 0, fast_on: false, fast_at_end: 0, phy_log: [], c_pdus: [], c_cur: empty_pdu(), periph: false, p_sn: 0, p_nesn: 0, p_cur: empty_pdu(), p_pdus: [], tx_t: [], tx_ch: [],
              tx_ty: [], tx_n: [], tx_h: [], central: false, c_sn: 0, c_nesn: 0, c_seen: 0,
              wait_t: 0, hdr_pending: false, late_marks: 0, ans_open: false, ans_last: -1, ans_disorder: 0, needless_reads: 0, in_t: [], in_ch: [], in_pdu: [], in_done: [], in_phy: [], in_aa: [], tx_phy: [], tx_s8: [], react_ty: -1,
-             react_ch: -1, react_pdu: ll_pdu.pdu_new(), react_count: 0, host: [],
+             react_ch: -1, react_pdu: ll_pdu.pdu_new(), react_count: 0, host: [], uart: 0, room_old: false,
              multi: false, m_aa: [], m_sn: [], m_nesn: [], m_cur: [], m_seen: [], m_s_aa: [], m_s_pdu: [],
              m_s_done: [], tx_aa: [], tx_op: [], tx_b2: [],
              cis_ons: [], cis_aas: [], cis_cs: [], cis_pends: [], cis_gens: [], cis_seqs: [], cis_t0: [], cis_enc: false,
@@ -1194,9 +1196,27 @@ fn run(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAir, until: Int
     var guard = 0
     while air.now < until and guard < 400000
         guard = guard + 1
+        // A Host port that takes an octet in `air.uart` microseconds and a turn of the main loop that moves at most the octets the room before
+        // the next booking holds (`move_octets` of the image), 64 at most; 0 is a Host that takes everything at once.
+        var room = 0
+        if air.uart > 0
+            ctl_hci.ctl_set_time(var c, air.now)
+            room = ctl_hci.ctl_stream_room(var c, air.now)
+            if air.room_old
+                room = ctl_hci.ctl_ll_room(var c, air.now)
+            ctl_hci.ctl_set_room(var c, room)
         let _ran = ctl_hci.ctl_step(var c)
-        while ctl_hci.ctl_tx_pending(var c)
-            list.push(air.host, ctl_hci.ctl_tx_next(var c))
+        if air.uart > 0
+            var left = room / air.uart
+            if left > 64
+                left = 64
+            while left > 0 and ctl_hci.ctl_tx_pending(var c)
+                list.push(air.host, ctl_hci.ctl_tx_next(var c))
+                air.now = air.now + air.uart
+                left = left - 1
+        else
+            while ctl_hci.ctl_tx_pending(var c)
+                list.push(air.host, ctl_hci.ctl_tx_next(var c))
         let before = air.now
         ll_air.ll_poll(var air, var c, var rf, var rx, var policy, var cc)
         if air.now == before
@@ -7675,7 +7695,8 @@ fn big_sink(var c: ctl_hci.Controller, var rf: ll_air.Rf, var air: SimAir, bis: 
 fn big_got(var air: SimAir, h: Int) -> [[Int]]
     var out: [[Int]] = []
     for e in iso_packets(air.host)
-        if (e[1] | ((e[2] & 0x0F) << 8)) == h and ((e[2] >>> 4) & 3) == 2
+        // A packet the port has not finished sending when the run ends is cut short: it is not an SDU the Host got.
+        if list.len(e) >= 13 and (e[1] | ((e[2] & 0x0F) << 8)) == h and ((e[2] >>> 4) & 3) == 2
             // 05 handle(2) load(2), the time stamp (4), the sequence number (2), the length with the status (2), the data.
             let lw = e[11] | (e[12] << 8)
             var d0 = 0
@@ -11427,3 +11448,84 @@ fn test_stop_rx_with_the_receiver_off_halts_nothing()
     ll_air.stop_rx(var air, var rf)
     test.assert_eq(air.state, LISTEN)
     test.assert_eq(rf.rx_on, false)
+
+// A broadcaster of two BISes with the numbers the SoftDevice Controller uses (NSE 3, BN 1, IRC 2, PTO 1) that gives an SDU to one BIS in each
+// event in turn, and a receiver of both BISes whose Host port takes an octet in `uart` microseconds (10 is the line at 1 Mbaud).  The answer
+// is the SDUs each BIS handed the Host valid, then the SDUs each dropped for want of room.
+fn big_two_bises(uart: Int, framing: Int, old_room: Bool) -> [Int]
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    big_train(var c, var rf, var air)
+    var pdu = 40
+    if framing == 1
+        pdu = 60
+    test.assert_eq(cmd_status(var c, 0x2069, big_test_params(0, 1, 2, 10000, 8, 3, 40, pdu, 2, 0, framing, 1, 2, 1, 0)), 0)
+    for k in 0..2
+        test.assert_eq(big_path(var c, 0x200 + k), 0)
+    var t = air.now
+    var seq = 10
+    while t < 1100000
+        t = t + 10000
+        run(var c, var rf, var air, t)
+        if (seq % 2) == 0
+            big_feed(var c, 0x200, seq, 1)
+        else
+            big_feed(var c, 0x201, seq, 1)
+        seq = seq + 1
+    var d = fresh()
+    var rf2 = ll_air.rf_new()
+    var air2 = sim_new()
+    air2.uart = 10
+    air2.room_old = old_room
+    big_replay(var air, var air2, [], 0, 0, -1)
+    // The synchronization is made at the speed of the line; the port is the one asked for from the first SDU on.
+    big_sink(var d, var rf2, var air2, [1, 2], 0, 0, 0x64, 500000)
+    air2.uart = uart
+    run(var d, var rf2, var air2, 1100000)
+    let g0 = big_got(var air2, 0x200)
+    let g1 = big_got(var air2, 0x201)
+    test.assert_eq(rf2.big_late, 0)
+    [big_count(g0, 0), big_count(g1, 0), d.bis[0].n_sdu_drop, d.bis[1].n_sdu_drop]
+
+// A Host port that takes the octets at the speed of the line: every SDU of both BISes reaches the Host, unframed and framed.
+@when(noble_controller.CONFIG.CTL_BIS >= 2)
+@test
+fn test_two_bises_with_a_pre_transmission_hand_the_receiving_host_every_sdu_of_each()
+    if not ctl_limits.big_on()
+        return
+    for framing in 0..2
+        let r = big_two_bises(10, framing, false)
+        test.assert(r[0] >= 30)
+        test.assert(r[1] >= 30)
+        test.assert(r[0] - r[1] <= 1 and r[1] - r[0] <= 1)
+        test.assert_eq(r[2] + r[3], 0)
+
+// The receiver scans (the synchronization to the train leaves the scan on) and the Host port takes an octet in 40 microseconds where the line takes
+// 10.  With the room of `ctl_ll_room` the window of the scan, which listens all the time, is a booking that is due, the main loop moves three octets in
+// a turn and the streams of the group share the loss: the first stream, served first at every turn, took each packet slot the port freed and the second
+// stream's SDUs waited in the queue of two and were dropped (24 SDUs of the first against 11 of the second were handed up in the run).
+@when(noble_controller.CONFIG.CTL_BIS >= 2)
+@test
+fn test_two_bises_share_the_loss_when_the_main_loop_has_no_room_for_the_host_port()
+    if not ctl_limits.big_on()
+        return
+    let r = big_two_bises(40, 0, true)
+    test.assert(r[0] >= 10)
+    test.assert(r[1] >= 10)
+    test.assert(r[2] + r[3] >= 10)
+    test.assert(r[0] - r[1] <= 6 and r[1] - r[0] <= 6)
+    test.assert(r[3] - r[2] <= 10 and r[2] - r[3] <= 10)
+
+// The same port with the room of `ctl_stream_room`: a passive scan window under way leaves the stream the time to its end, and both streams hand
+// the Host every SDU.
+@when(noble_controller.CONFIG.CTL_BIS >= 2)
+@test
+fn test_a_passive_scan_that_listens_all_the_time_does_not_stop_two_bises_reaching_the_host()
+    if not ctl_limits.big_on()
+        return
+    let r = big_two_bises(40, 0, false)
+    test.assert(r[0] >= 30)
+    test.assert(r[1] >= 30)
+    test.assert(r[0] - r[1] <= 1 and r[1] - r[0] <= 1)
+    test.assert_eq(r[2] + r[3], 0)

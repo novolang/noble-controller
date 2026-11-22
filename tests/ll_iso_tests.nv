@@ -1844,3 +1844,176 @@ fn test_a_receiver_reads_a_continuation_of_one_octet_and_the_start_behind_it()
     test.assert_eq(x.outd[second * OUT_OCTETS] as Int, 70)
     test.assert_eq(x.outd[second * OUT_OCTETS + 55] as Int, 125)
     test.assert_eq(x.outd[second * OUT_OCTETS + 56] as Int, 120)
+
+// The octet `j` of the SDU `k` of the sender below: its number in the first two, then octets that follow from it.
+fn t_sdu_octet(k: Int, j: Int) -> Int
+    if j == 0
+        return k & 0xFF
+    if j == 1
+        return (k >>> 8) & 0xFF
+    (k * 7 + j) & 0xFF
+
+// The payload of one event of a sender that sends what it has and nothing else, as the SoftDevice Controller does (a Null PDU for
+// an event with nothing to send, no padding), in `p`; false for the Null PDU.  SDU `k` of `len` octets is due at `phase` +
+// k x `sdu_int`; the SDUs due before the event fill its PDU of `pdu` octets in order, a start segment only with the room for a
+// Segmentation Header, a Time_Offset and an octet, a continuation of what is left of the SDU under way first.  `cur` holds the
+// SDU under way and the octets of it sent.
+@tier(app)
+fn t_gen(var cur: Vec[Int; 2], var p: Pdu, anchor: Int, len: Int, sdu_int: Int, phase: Int, pdu: Int) -> Bool
+    var pos = 0
+    p.b[0] = 2
+    for _ in 0..6
+        let at = phase + cur[0] * sdu_int + (cur[0] * 7919 % 5) * 900
+        if at > anchor - 50 or pos + 2 >= pdu
+            break
+        let rem = len - cur[1]
+        var take = rem
+        var h = 0
+        var lead = 2
+        if cur[1] > 0
+            h = 1
+        else
+            lead = 5
+        if take > pdu - pos - lead
+            take = pdu - pos - lead
+        if take < 1
+            break
+        if take == rem
+            h = h | 2
+        p.b[2 + pos] = h as u8
+        p.b[3 + pos] = (take + lead - 2) as u8
+        if lead == 5
+            let toff = anchor - at
+            p.b[4 + pos] = (toff & 0xFF) as u8
+            p.b[5 + pos] = ((toff >>> 8) & 0xFF) as u8
+            p.b[6 + pos] = ((toff >>> 16) & 0xFF) as u8
+        for i in 0..take
+            p.b[2 + pos + lead + i] = t_sdu_octet(cur[0], cur[1] + i) as u8
+        pos = pos + lead + take
+        cur[1] = cur[1] + take
+        if cur[1] == len
+            cur[0] = cur[0] + 1
+            cur[1] = 0
+    p.b[1] = pos as u8
+    p.n = 2 + pos
+    pos > 0
+
+// The SDUs of `x` for the Host: `st` counts the valid ones (0), the reports of a lost SDU (1) and the valid ones with octets that are
+// not the SDU the first two name (2); `st[3]` is the number of the last valid one, which the next must pass.
+fn t_sdc_take(var x: Cis, var st: Vec[Int; 4], len: Int)
+    for _ in 0..4
+        if not out_ready(var x)
+            break
+        let at = x.out_head
+        if x.outs[at] == SDU_VALID
+            let k = (x.outd[at * OUT_OCTETS] as Int) | ((x.outd[at * OUT_OCTETS + 1] as Int) << 8)
+            var good = x.outl[at] == len and k > st[3]
+            for j in 0..len
+                if (x.outd[at * OUT_OCTETS + j] as Int) != t_sdu_octet(k, j)
+                    good = false
+            if good
+                st[0] = st[0] + 1
+            else
+                st[2] = st[2] + 1
+            st[3] = k
+        else
+            st[1] = st[1] + 1
+        out_take(var x)
+
+// A stream of 60-octet SDUs every 10.667 ms (what the SoftDevice Controller takes from a Host that waits for its credits) on an
+// ISO interval of 7.5 ms with PDUs of 64 octets and two subevents, flush timeout 2: each SDU is a segment of 59 octets and one of 1, an
+// event may carry the end of one SDU and the start of the next, and one event in 19 with no SDU open has a Null PDU, so that a payload
+// is flushed unreceived.  Every SDU arrives whole, with its own octets.
+@test
+fn test_sdus_of_a_sender_with_null_pdus_arrive_whole_when_each_is_cut_over_two_payloads()
+    if not ctl_limits.iso_on()
+        return
+    var x = t_framed(false, 6, 8000, 60, 64, 1)
+    t_set(var x, "ft_c", 2)
+    t_set(var x, "ft_p", 2)
+    var st = t_fr_stats()
+    st[3] = -1
+    var cur: Vec[Int; 2] = Vec.new()
+    let _a = cur.push(0)
+    let _b = cur.push(0)
+    var p = ll_pdu.pdu_new()
+    var scratch = ll_pdu.pdu_new()
+    var sent = 0
+    for e in 0..400
+        let anchor = 100000 + e * 7500
+        t_set(var x, "anchor", anchor)
+        t_set(var x, "ev", e)
+        rx_flush(var x, e, 0, var scratch)
+        if (e % 19 != 7 or cur[1] > 0) and t_gen(var cur, var p, anchor, 60, 10667, 95000, 64)
+            rx_note(var x, x.rx_num, true, var p)
+            t_set(var x, "rx_num", x.rx_num + 1)
+        rx_flush(var x, e, 9, var scratch)
+        t_sdc_take(var x, var st, 60)
+    sent = cur[0]
+    test.assert(sent >= 270)
+    test.assert_eq(st[2], 0)
+    test.assert_eq(st[0] + st[1], sent)
+    test.assert_eq(st[1], 0)
+
+// A burst of SDUs after a stretch with none, the payloads of the stretch flushed unreceived: the SDUs the stretch is made up with are
+// reports of lost SDUs, and they do not take the place of the SDUs that follow when the Host has read nothing yet.
+@test
+fn test_reports_of_lost_sdus_give_way_to_an_sdu_with_octets_when_the_host_queue_is_full()
+    if not ctl_limits.iso_on()
+        return
+    var x = t_framed(false, 6, 8000, 20, 64, 1)
+    t_set(var x, "ft_c", 2)
+    t_set(var x, "ft_p", 2)
+    var p = ll_pdu.pdu_new()
+    var scratch = ll_pdu.pdu_new()
+    // SDU 0 whole in payload 0, due at 90000: the Time_Offset is the anchor of event 0 less that.
+    t_set(var x, "anchor", 100000)
+    t_set(var x, "ev", 0)
+    t_set(var x, "rx_num", 0)
+    var cur: Vec[Int; 2] = Vec.new()
+    let _a = cur.push(0)
+    let _b = cur.push(0)
+    test.assert(t_gen(var cur, var p, 100000, 20, 8000, 90000, 64))
+    rx_note(var x, 0, true, var p)
+    t_set(var x, "rx_num", 1)
+    test.assert_eq(x.out_n, 1)
+    // Payloads 1 and 2 are flushed.  SDU 1 is due at 115500, 25.5 ms after SDU 0: the stretch is made up with two reports, one of
+    // which finds no room beside SDU 0, the other taking the last.
+    t_set(var x, "anchor", 130000)
+    t_set(var x, "ev", 4)
+    rx_flush(var x, 4, 0, var scratch)
+    test.assert_eq(x.rx_num, 3)
+    t_set(var x, "anchor", 122500)
+    t_set(var x, "ev", 3)
+    var cur2: Vec[Int; 2] = Vec.new()
+    let _c = cur2.push(1)
+    let _d = cur2.push(0)
+    test.assert(t_gen(var cur2, var p, 122500, 20, 8000, 103900, 64))
+    rx_note(var x, 3, true, var p)
+    // The Host has read nothing: SDU 0 and the SDU that came last are queued, a report gave up its place to it.
+    test.assert_eq(x.out_n, 2)
+    test.assert_eq(x.outs[x.out_head], SDU_VALID)
+    test.assert_eq(x.outs[(x.out_head + 1) % OUT_SLOTS], SDU_VALID)
+    test.assert(x.n_sdu_drop >= 1)
+    test.assert_eq(x.outl[(x.out_head + 1) % OUT_SLOTS], 20)
+
+// A queue full of SDUs with octets has no place for another: the first slot is the Host's, the last holds an SDU that stays.
+@test
+fn test_a_full_host_queue_of_sdus_with_octets_drops_the_one_that_comes()
+    if not ctl_limits.iso_on()
+        return
+    var x = t_framed(false, 6, 8000, 20, 64, 1)
+    var p = ll_pdu.pdu_new()
+    var cur: Vec[Int; 2] = Vec.new()
+    let _a = cur.push(0)
+    let _b = cur.push(0)
+    t_set(var x, "anchor", 100000)
+    t_set(var x, "ev", 0)
+    for n in 0..3
+        t_set(var x, "anchor", 100000 + n * 7500)
+        test.assert(t_gen(var cur, var p, 100000 + n * 7500, 20, 7000, 90000, 64))
+        rx_note(var x, n, true, var p)
+    test.assert_eq(x.out_n, 2)
+    test.assert_eq(x.outs[x.out_head], SDU_VALID)
+    test.assert_eq(x.outs[(x.out_head + 1) % OUT_SLOTS], SDU_VALID)
+    test.assert(x.n_sdu_drop >= 1)

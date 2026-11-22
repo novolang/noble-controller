@@ -270,12 +270,22 @@ fn arb_worth_running(var a: Arb, cls: Int, now: Int) -> Bool
 // that cannot be run must not stop the stream for good), and a large number when nothing is booked.
 @tier(embedded)
 fn arb_room(var a: Arb, now: Int, guard: Int) -> Int
+    arb_room_stream(var a, now, guard, false)
+
+// `arb_room` for the HCI stream, which may stay away from a scan window that is under way: the window listens in the radio and the program
+// is wanted only for the packets it hears and for its end, and a passive scan answers none (`passive`), so the stream has the time to the end of
+// the window (less the guard) and to the start of any booking of another class.  With the stream held to the few microseconds a due booking
+// leaves, a scanner that listens all the time (a window as long as its interval) left the stream three octets in a turn of the main loop.
+@tier(embedded)
+fn arb_room_stream(var a: Arb, now: Int, guard: Int, passive: Bool) -> Int
     var room = ROOM_FREE_US
     for cls in 0..classes()
         if a.on[cls] and now < a.end[cls]
             var r = a.start[cls] - guard - now
             if a.start[cls] - lead_of(var a, cls) <= now
                 r = ROOM_DUE_US
+                if passive and cls == class_scan() and a.end[cls] - guard - now > ROOM_DUE_US
+                    r = a.end[cls] - guard - now
             if r < room
                 room = r
     if room < 0

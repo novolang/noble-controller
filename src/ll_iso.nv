@@ -1905,6 +1905,20 @@ fn fr_start(var x: Cis, ts: Int)
     x.asm_n = 0
     x.asm_bad = false
 
+// Whether the queue for the Host has a slot for an SDU whose first octets come now.  A queue full to its last slot gives that slot up
+// when it holds a report of a lost SDU, which carries no octets: the SDUs that the loss of PDUs is made up with (`fr_start`) are
+// reports, and an SDU of octets outranks one.  The first slot is the one the Host may be reading and is never taken.
+@tier(embedded)
+fn out_room(var x: Cis) -> Bool
+    if x.out_n < OUT_SLOTS
+        return true
+    let last = (x.out_head + x.out_n - 1) % OUT_SLOTS
+    if x.out_n > 1 and x.outs[last] == SDU_LOST
+        x.out_n = x.out_n - 1
+        x.n_sdu_drop = x.n_sdu_drop + 1
+        return true
+    false
+
 // The segments of the framed payload `num` in `p` (Part G, Section 2.2).  A segment with SC 0 starts an SDU (its first 3 octets
 // are the Time_Offset), one with SC 1 continues the SDU under way (and is dropped when there is none: its start was lost);
 // CMPLT 1 ends the SDU, which is valid unless a segment overran Max_SDU.  A payload that is not LLID 2 or whose lengths
@@ -1943,7 +1957,7 @@ fn rx_framed(var x: Cis, num: Int, var p: Pdu)
         // PDUs does not defer the copy: the segments of one payload are several places to put octets.
         if x.asm_n + cnt <= rx_sdu(var x) and x.asm_n + cnt <= SDU_MAX
             if x.asm_n == 0
-                x.asm_ok = x.out_n < OUT_SLOTS
+                x.asm_ok = out_room(var x)
             if x.asm_ok
                 let base = (x.out_head + x.out_n) % OUT_SLOTS * OUT_OCTETS + x.asm_n
                 for k in 0..cnt
