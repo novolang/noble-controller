@@ -624,7 +624,7 @@ fn xadv_tx<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, ch: Int, phy: Int,
         rf.ramp_timeouts = rf.ramp_timeouts + 1
         air.halt()
         return -1
-    let start = air.mark_us(air.address_mark()) - ll_phy.aa_end_us(phy)
+    let start = air.mark_us(air.address_mark()) - air.tx_address_us(phy)
     let err = start - due
     rf.x_adv_pdus = rf.x_adv_pdus + 1
     if err > rf.x_adv_err_max_us
@@ -732,7 +732,7 @@ fn xadv_listen<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Cont
         air.halt()
         return
     note_turnaround(var air, var rf)
-    let rsp_start = air.mark_us(air.address_mark()) - ll_phy.aa_end_us(phy)
+    let rsp_start = air.mark_us(air.address_mark()) - air.tx_address_us(phy)
     air.arm(ll_radio.THEN_REST, false)
     let _d = air.wait_disabled()
     air.disarm()
@@ -2040,7 +2040,7 @@ fn central_event_on<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: 
     rf.cen_events = rf.cen_events + 1
     var go = false
     if air.wait_address(due + START_WAIT_US)
-        let err = air.mark_us(air.address_mark()) - ll_phy.aa_end_us(ctl_hci.lk_phy(var c, slot)) - due
+        let err = air.mark_us(air.address_mark()) - air.tx_address_us(ctl_hci.lk_phy(var c, slot)) - due
         rf.an_n = rf.an_n + 1
         rf.acl_err_n = rf.acl_err_n + 1
         rf.acl_err_last = err
@@ -2320,7 +2320,7 @@ fn cis_subevent_c<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Co
         went = true
         // The packet is on air: the turn-around to the receiver wants the legacy ramp-up.
         air.ramp(false)
-        let err = air.mark_us(air.address_mark()) - ll_phy.aa_end_us(phy) - due
+        let err = air.mark_us(air.address_mark()) - air.tx_address_us(phy) - due
         ctl_hci.ctl_cis_note_err(var c, i, err)
         rf.an_n = rf.an_n + 1
         if err < rf.an_min_us
@@ -2474,7 +2474,7 @@ fn big_send<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, due: Int, buf: In
         rf.ramp_timeouts = rf.ramp_timeouts + 1
         air.halt()
         return false
-    let err = air.mark_us(air.address_mark()) - ll_phy.aa_end_us(phy) - due
+    let err = air.mark_us(air.address_mark()) - air.tx_address_us(phy) - due
     if err > rf.big_err_max_us
         rf.big_err_max_us = err
     true
@@ -2869,7 +2869,7 @@ fn init_aux_packet<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var
         ctl_hci.ctl_init_unsent(var c)
         return
     note_turnaround(var air, var rf)
-    let on_air = air.mark_us(air.address_mark()) - ll_phy.aa_end_us(phy)
+    let on_air = air.mark_us(air.address_mark()) - air.tx_address_us(phy)
     // The receiver for the AUX_CONNECT_RSP starts T_IFS after the request.  The end of the AUX_ADV_IND is still flagged: forget
     // it, so the wait below is for the end of the request.
     air.clear_packet()

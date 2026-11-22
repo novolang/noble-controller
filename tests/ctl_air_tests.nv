@@ -337,6 +337,8 @@ struct SimAir
     // had missed them: the Central sends the same PDU again in the next event.
     var drop_op: Int
     var drop_n: Int
+    // The microseconds by which the ADDRESS event of a packet sent on LE Coded comes before the receiver's (`Radio.tx_address_us`).
+    var tx_early: Int
 
 // An empty data PDU: LLID 1, no payload.
 fn empty_pdu() -> Pdu
@@ -361,7 +363,7 @@ fn sim_new() -> SimAir
              cis_rx: [], cis_log: [], acl_period: 0, acl_next: 0, cis_lose: 0, cis_deaf: 0, cis_mic_bad: 0, cis_pkts: 0, cis_answers: 0, cis_off: 0,
              white: true, pwr: 0, fast_ok: true, tx_slow: 139, tx_fast: 39, rx_slow: 140, rx_fast: 40, rep_slow: 145, rep_fast: 45, coded_ok: true, octet_ns: 1000,
              tx_body: [], tx_white: [], peer_f5: 0x20, peer_f4: 0, tx_pwr: [], peer_f7: 0, peer_p1: 0, peer_maxp: 0, peer_ext: 0, rssi: -60, peer_f3: 0x37, miss_skip: 0, miss_data: 0,
-             cut_us: -1, cuts: 0, hide_addr: false, halt_in_tx: 0, read_us: 0, work_us: 0, late_writes: 0, drop_op: 0, drop_n: 0 }
+             cut_us: -1, cuts: 0, hide_addr: false, halt_in_tx: 0, read_us: 0, work_us: 0, late_writes: 0, drop_op: 0, drop_n: 0, tx_early: 0 }
 
 // A peer sends `pdu` on `ch`, its first bit at `t`.
 fn hear(var air: SimAir, t: Int, ch: Int, pdu: Pdu)
@@ -409,6 +411,12 @@ fn sim_react(var a: SimAir, end: Int)
             a.react_count = a.react_count - 1
         hear(var a, end + T_IFS, a.ch, a.react_pdu)
 
+// The microseconds from the first bit of a packet sent on `phy` to its ADDRESS event.
+fn sim_tx_address(a: SimAir, phy: Int) -> Int
+    if phy == ll_phy.PHY_CODED
+        return ll_phy.aa_end_us(phy) - a.tx_early
+    ll_phy.aa_end_us(phy)
+
 // Latch the packet of the buffer `ptr` names, as the transmitter starts.
 fn sim_latch(var a: SimAir)
     let at = a.ptr * 260
@@ -430,7 +438,7 @@ fn sim_latch(var a: SimAir)
         list.push(body, a.bufs[at + k])
     list.push(a.tx_body, body)
     a.last_ty = a.bufs[at] & 0x0F
-    a.addr_t = a.tx_first + ll_phy.aa_end_us(a.phy)
+    a.addr_t = a.tx_first + sim_tx_address(a, a.phy)
     a.end_t = a.tx_first + ll_phy.air_us(a.phy, a.s8, n)
     a.state = TXING
     a.addr_ev = true
@@ -1054,8 +1062,11 @@ impl Radio[] for SimAir
     fn rx_stamp_us(var self) -> Int
         0
 
+    fn tx_address_us(var self, phy: Int) -> Int
+        sim_tx_address(self, phy)
+
     fn turnaround_ns(var self) -> Int
-        (self.addr_t - self.last_end) * 1000 - ll_phy.aa_end_us(self.phy) * 1000
+        (self.addr_t - self.last_end) * 1000 - sim_tx_address(self, self.phy) * 1000
 
     fn put(var self, buf: Int, var p: Pdu)
         for i in 0..p.n
@@ -5154,6 +5165,34 @@ fn test_an_advertising_data_of_251_octets_goes_in_an_aux_adv_ind_and_a_chain_pdu
 
 @when(noble_controller.CONFIG.CTL_ADV_SETS > 0)
 @test
+fn test_a_chain_pdu_on_le_coded_is_sent_where_the_pointer_of_the_aux_adv_ind_says_whatever_the_transmitters_address_event()
+    // The ADDRESS event of a packet the nRF54 sends on LE Coded comes 50 microseconds before the receiver's: the start of the AUX_ADV_IND
+    // the chain is counted from is the event less the figure of the transmitter.
+    for early in [0, 50]
+        var c = fresh()
+        var rf = ll_air.rf_new()
+        var air = sim_new()
+        air.tx_early = early
+        test.assert_eq(status_of(var c, 0x2001, [0xFF, 0xFF, 0x3F, 0, 0, 0, 0, 0]), 0)
+        test.assert_eq(status_of(var c, 0x2036, xa_params(1, 0, 0x20, 7, 0, 3, 2, 0)), 0)
+        test.assert_eq(status_of(var c, 0x2037, xa_data(1, 1, count_from(0, 100))), 0)
+        test.assert_eq(status_of(var c, 0x2037, xa_data(1, 0, count_from(100, 100))), 0)
+        test.assert_eq(status_of(var c, 0x2037, xa_data(1, 2, count_from(200, 51))), 0)
+        test.assert_eq(status_of(var c, 0x2039, xa_enable(1, 1, 0, 0)), 0)
+        run(var c, var rf, var air, 15000)
+        let pdus = tx_of(var air, 7)
+        test.assert_eq(list.len(pdus), 5)
+        var aux = tx_pdu(air, pdus[3])
+        let xa = ll_ext.ext_parse(var aux)
+        test.assert(xa.ok)
+        test.assert(xa.aux >= 0)
+        let off = ll_init.aux_offset_us(var aux, xa.aux)
+        test.assert_eq(air.tx_phy[pdus[4]], ll_phy.PHY_CODED)
+        test.assert_eq(air.tx_t[pdus[4]], air.tx_t[pdus[3]] + off)
+        test.assert_eq(rf.x_adv_chain, 1)
+
+@when(noble_controller.CONFIG.CTL_ADV_SETS > 0)
+@test
 fn test_a_scannable_set_answers_a_scan_request_with_the_scan_response_and_its_chain_and_tells_the_host()
     var c = fresh()
     var rf = ll_air.rf_new()
@@ -5662,6 +5701,27 @@ fn test_the_initiator_follows_a_connectable_adv_ext_ind_on_le_coded_and_connects
     // The first connection event is due 3.75 ms after the end of the request.
     let d = first_data_tx(var air)
     test.assert_eq(air.tx_t[d], air.tx_t[k] + ll_phy.air_us(3, true, 36) + 3750)
+
+@when(noble_controller.CONFIG.CTL_CENTRAL > 0)
+@test
+fn test_the_first_connection_event_after_an_aux_connect_req_on_le_coded_is_3_75_ms_after_its_end_whatever_the_transmitters_address_event()
+    // A transmitter that raises ADDRESS 50 microseconds before the receiver's does on LE Coded (the nRF54): the start of the request is
+    // taken from the event less the figure of the transmitter, so the window opens where the end of the request puts it.
+    for early in [0, 50]
+        var c = fresh()
+        var rf = ll_air.rf_new()
+        var air = sim_new()
+        air.tx_early = early
+        ext_start(var c, var air, ext_create_phys(4))
+        hear_phy(var air, 2000, 37, ext_pdu(7, 1, 0x18, 0, 0, 12, 100, 2), 3)
+        hear_phy(var air, 5000, 12, ext_pdu(7, 1, 0x09, 0x30, 0x10, 0, 0, 0), 3)
+        react(var air, 5, 12, ext_pdu(8, 0, 0x03, 0x30, 0x10, 0, 0, 0), 1)
+        run(var c, var rf, var air, 300000)
+        test.assert_eq(c.init.aux_connects, 1)
+        let k = last_tx_of(var air, 5)
+        test.assert(k >= 0)
+        let d = first_data_tx(var air)
+        test.assert_eq(air.tx_t[d], air.tx_t[k] + ll_phy.air_us(3, true, 36) + 3750)
 
 @when(noble_controller.CONFIG.CTL_CENTRAL > 0)
 @test
