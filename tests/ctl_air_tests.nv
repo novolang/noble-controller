@@ -1411,6 +1411,54 @@ fn connect_ind() -> Pdu
     ll_pdu.pdu_finish(var p)
     p
 
+// The same CONNECT_IND with the Peripheral latency `latency`.
+fn connect_ind_latency(latency: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0x10 + i)
+    for b in [0x12, 0x5A, 0x65, 0x50, 0x11, 0x22, 0x33, 2]
+        let _c = ll_pdu.pdu_put(var p, b)
+    for v in [0, 24, latency, 100]
+        let _d = ll_pdu.pdu_put(var p, v & 0xFF)
+        let _e = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+    for b in [0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 7]
+        let _f = ll_pdu.pdu_put(var p, b)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A Peripheral connection granted a latency of 4, against a Central that sends at every event (a PC's adapter does): with the key `ctl_latency` the Peripheral
+// opens its receiver at one event in five once the Central has acknowledged its first packet, hears every one it opens for, and the link lives; with the key off
+// it listens at every event, as it did.
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@test
+fn test_a_peripheral_connection_with_a_latency_listens_at_one_event_in_five_and_loses_none()
+    var c = fresh()
+    advertise(var c, 0)
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    air.central = true
+    react(var air, ll_pdu.ADV_IND, 37, connect_ind_latency(4), 1)
+    // The Peripheral asks for the data length once; the Central answers, and no procedure waits for the peer.
+    list.push(air.c_pdus, length_rsp(27, 328))
+    run(var c, var rf, var air, 1600000)
+    test.assert_eq(rf.conn_open, 1)
+    test.assert(c.links[0].live)
+    test.assert_eq(rf.conn_missed, 0)
+    if not noble_controller.CONFIG.CTL_LATENCY
+        test.assert_eq(c.links[0].lat_total, 0)
+        test.assert(rf.conn_events >= 45)
+        return
+    // 1.6 s is about 52 events of 30 ms: the first three are heard (the window, the packet and the one that acknowledges), then one in five.
+    test.assert(c.links[0].lat_total >= 30)
+    test.assert(rf.conn_events <= 20)
+    test.assert(rf.conn_events >= 8)
+    test.assert_eq(rf.conn_good, rf.conn_events)
+    test.assert_eq(rf.conn_bad, 0)
+    test.assert_eq(rf.conn_late, 0)
+
 // An advertiser that listens after a scannable PDU has its scan response armed; a CONNECT_IND is not answered with it, so the
 // response is taken back before the CONNECT_IND is read and judged.
 @when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)

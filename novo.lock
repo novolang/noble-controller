@@ -9,5 +9,5 @@ source = "path"
 path = "../noble-radio"
 
 [config.main]
-sha256 = "dd5ca8304a129394410a74f5488fa176e6ceb3817229c38fe3207a6dcb29031d"
+sha256 = "c900d47ea6a684fdfab18b1065097690d6090e42afc55bc4447c02d313c4d25d"
 schemas = "noble-controller 0.1.3"

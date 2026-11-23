@@ -156,6 +156,11 @@ default  = false
 requires = ["ctl_per_adv"]
 doc      = "on when the Controller sends and receives Periodic Advertising Sync Transfer (ll_past.nv), off for a build without it, which then answers none of its commands and leaves LE features 24 and 25 clear; needs CTL_PER_ADV"
 
+[config.ctl_latency]
+type    = "bool"
+default = false
+doc     = "on when the Peripheral role of the Link Layer skips connection events under the latency the Central granted (ll_link.nv, `lat_events`): it listens at every event until a packet with the NESN set to one has come, after an event with no valid packet, with anything to send or unacknowledged, around the instant of a procedure and while one waits for the peer, and otherwise passes over up to `latency` events, so a Controller that sleeps (ctl_idle_sleep) sleeps over them.  Off keeps the Peripheral listening at every event, which is the behaviour of the earlier releases.  A build with isochronous channels or Channel Sounding does not skip"
+
 [config.ctl_pcl]
 type    = "bool"
 default = false

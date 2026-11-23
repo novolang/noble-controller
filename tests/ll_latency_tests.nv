@@ -1,0 +1,411 @@
+// tests/ll_latency_tests.nv — the Peripheral's latency (ll_link.nv, "Peripheral latency"): the rules that bound the events it may leave unheard
+// ([Vol 6] Part B, Sections 4.5.1, 4.5.2, 4.5.5 and 5.5), the plan after an event, the commit at the next one, and the window it leaves.
+//
+//   novo test tests/ll_latency_tests.nv
+//   novo test --config configs/ctl_latency.toml tests/ll_latency_tests.nv     (the plan and the commit run only with the key on)
+
+use std.test
+use noble_controller.CONFIG
+use ll_pdu
+use ll_data
+use ll_link.{ ENC_IDLE, ENC_P_WAIT_LTK, K_EMPTY, Link, PHY_IDLE, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, chan_next, ctrl_queue, interval_us, lat_commit, lat_due, lat_events, lat_instant_room, lat_plan, link_event_begin, link_event_done, link_listen_end, link_listen_start, link_new, link_note_rx, link_open, link_queue_acl, link_rx_fast, link_rx_slow, widening }
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn t_put16(var p: Pdu, v: Int)
+    let _a = ll_pdu.pdu_put(var p, v & 0xFF)
+    let _b = ll_pdu.pdu_put(var p, (v >>> 8) & 0xFF)
+
+// A CONNECT_IND: interval of `interval` units, `latency`, `timeout` units of 10 ms, a transmit window of 2 units at 0, all 37 channels, hop 7, SCA class 0 (500 ppm).
+fn t_connect(interval: Int, latency: Int, timeout: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_pdu.pdu_begin(var p, ll_pdu.CONNECT_IND, 1, 0)
+    for i in 0..6
+        let _a = ll_pdu.pdu_put(var p, 0x40 + i)
+    for i in 0..6
+        let _b = ll_pdu.pdu_put(var p, 0x10 + i)
+    t_put16(var p, 0x5A12)
+    t_put16(var p, 0x5065)
+    t_put16(var p, 0x2211)
+    let _c = ll_pdu.pdu_put(var p, 0x33)
+    let _d = ll_pdu.pdu_put(var p, 2)
+    t_put16(var p, 0)
+    t_put16(var p, interval)
+    t_put16(var p, latency)
+    t_put16(var p, timeout)
+    let map = 0x1FFFFFFFFF
+    for k in 0..5
+        let _g = ll_pdu.pdu_put(var p, (map >>> (8 * k)) & 0xFF)
+    let _h = ll_pdu.pdu_put(var p, 7)
+    ll_pdu.pdu_finish(var p)
+    p
+
+// A Peripheral link on an interval of 7.5 ms with the `latency` the Central granted and a supervision timeout of 2 s, opened at time 1000.
+fn t_link(latency: Int) -> Link
+    var l = link_new()
+    var p = t_connect(6, latency, 200)
+    link_open(var l, 1, var p, 1000)
+    l
+
+fn t_data(llid: Int, n: Int) -> Pdu
+    var p = ll_pdu.pdu_new()
+    ll_data.dpdu_begin(var p, llid)
+    for i in 0..n
+        let _a = ll_pdu.pdu_put(var p, 0xA0 + i)
+    ll_data.dpdu_finish(var p)
+    p
+
+// An event in which the Central's empty packet with `sn` and `nesn` arrived at `t`, and the event ended a millisecond later.
+fn t_heard(var l: Link, t: Int, sn: Int, nesn: Int)
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, t, true)
+    var rx = t_data(1, 0)
+    let _h = link_rx_fast(var l, 1 | (nesn << 2) | (sn << 3))
+    let _s = link_rx_slow(var l, var rx)
+    link_event_done(var l, t + 1000)
+
+// An event in which nothing was heard.
+fn t_missed(var l: Link)
+    let _c = link_event_begin(var l)
+    link_event_done(var l, l.due + 3000)
+
+// The Peripheral's state after two heard events, the second acknowledging its first packet: it listens at every event up to here (rule 1).
+fn t_settled(latency: Int) -> Link
+    var l = t_link(latency)
+    t_heard(var l, 3000, 0, 0)
+    t_heard(var l, l.due, 1, 1)
+    l
+
+fn t_set_state(var l: Link, armed: Bool, got: Bool)
+    l.lat_armed = armed
+    l.lat_got = got
+
+fn t_set_upd(var l: Link, instant: Int)
+    l.upd_pending = true
+    l.upd_instant = instant
+
+fn t_set_chm(var l: Link, instant: Int)
+    l.chm_pending = true
+    l.chm_instant = instant
+
+fn t_set_phy(var l: Link, instant: Int)
+    l.phy_pending = true
+    l.phy_instant = instant
+
+fn t_set_proc(var l: Link, p: Int)
+    l.proc = p
+
+fn t_set_enc(var l: Link, e: Int)
+    l.enc_ph = e
+
+fn t_set_phy_state(var l: Link, s: Int)
+    l.phy_state = s
+
+fn t_set_central(var l: Link)
+    l.central = true
+
+fn t_set_term(var l: Link)
+    l.term_sent = true
+
+fn t_set_sub(var l: Link, f: Int)
+    l.sub_factor = f as u16
+
+fn t_set_timeout(var l: Link, units: Int)
+    l.timeout = units
+
+fn t_set_ev(var l: Link, v: Int)
+    l.ev_count = v
+
+fn t_set_skip(var l: Link, n: Int)
+    l.lat_skip = n
+
+// A link ready to skip: heard twice, nothing to send, no procedure.
+fn t_idle(latency: Int) -> Link
+    var l = t_settled(latency)
+    t_set_state(var l, true, true)
+    l
+
+// ── Rule 1 and 2: the Peripheral listens until a packet with NESN one came, and after an event it missed ──
+
+@test
+fn test_the_peripheral_listens_at_every_event_until_the_central_acknowledged_its_first_packet()
+    // The flags are kept only by a build with the key.
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var l = t_link(4)
+    // Before the first event, and after one whose packet carried NESN zero.
+    test.assert_eq(lat_events(var l), 0)
+    t_heard(var l, 3000, 0, 0)
+    test.assert(l.lat_got)
+    test.assert(not l.lat_armed)
+    test.assert_eq(lat_events(var l), 0)
+    // The Central's next packet carries NESN one.
+    t_heard(var l, l.due, 1, 1)
+    test.assert(l.lat_armed)
+    test.assert_eq(lat_events(var l), 4)
+
+@test
+fn test_after_an_event_with_no_valid_packet_the_peripheral_listens_at_the_next_one()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var l = t_idle(4)
+    test.assert_eq(lat_events(var l), 4)
+    t_missed(var l)
+    test.assert(not l.lat_got)
+    test.assert_eq(lat_events(var l), 0)
+    test.assert_eq(l.lat_skip, 0)
+    // A packet with a bad CRC is not a valid packet either.
+    let _c = link_event_begin(var l)
+    link_note_rx(var l, l.due, false)
+    link_event_done(var l, l.due + 1000)
+    test.assert_eq(lat_events(var l), 0)
+    // The next event heard ends it.
+    t_heard(var l, l.due, l.nesn, l.sn ^ 1)
+    test.assert_eq(lat_events(var l), 4)
+
+@test
+fn test_a_latency_of_zero_and_the_central_role_skip_nothing()
+    var l = t_idle(0)
+    test.assert_eq(lat_events(var l), 0)
+    var c = t_idle(4)
+    t_set_central(var c)
+    test.assert_eq(lat_events(var c), 0)
+
+// ── Rule 3: something to send, or something unacknowledged ──────────
+
+@test
+fn test_a_peripheral_with_data_or_a_control_pdu_to_send_skips_nothing_and_a_queued_packet_ends_the_skip()
+    var l = t_idle(4)
+    var d: Vec[u8; 260] = Vec.new()
+    for _ in 0..260
+        let _p = d.push(0)
+    test.assert(link_queue_acl(var l, true, var d, 5))
+    test.assert_eq(lat_events(var l), 0)
+    var m = t_idle(4)
+    var p = t_data(3, 0)
+    ll_data.ctrl_begin(var p, ll_data.OP_PING_REQ)
+    ll_data.dpdu_finish(var p)
+    test.assert(ctrl_queue(var m, var p))
+    test.assert_eq(lat_events(var m), 0)
+    // A skip that was planned ends when a packet is queued (a build without the key plans none).
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var k = t_idle(4)
+    t_set_skip(var k, 3)
+    test.assert(link_queue_acl(var k, true, var d, 5))
+    test.assert_eq(k.lat_skip, 0)
+    var n = t_idle(4)
+    t_set_skip(var n, 3)
+    var q = t_data(3, 0)
+    ll_data.ctrl_begin(var q, ll_data.OP_PING_REQ)
+    ll_data.dpdu_finish(var q)
+    test.assert(ctrl_queue(var n, var q))
+    test.assert_eq(n.lat_skip, 0)
+
+@test
+fn test_a_pdu_in_flight_that_the_central_has_not_acknowledged_keeps_the_peripheral_listening()
+    var l = t_idle(4)
+    var d: Vec[u8; 260] = Vec.new()
+    for _ in 0..260
+        let _p = d.push(0)
+    // The queued PDU waits in `nxt` until the Central acknowledges the empty PDU in flight; the event that does moves it to `cur`, the PDU in flight.
+    test.assert(link_queue_acl(var l, true, var d, 5))
+    test.assert(l.nxt_kind != K_EMPTY)
+    test.assert_eq(lat_events(var l), 0)
+    t_heard(var l, l.due, l.nesn, l.sn ^ 1)
+    test.assert(l.cur_kind != K_EMPTY)
+    test.assert_eq(lat_events(var l), 0)
+    // The Central's next packet does not acknowledge it (the same NESN): it stays in flight.
+    t_heard(var l, l.due, l.nesn, l.sn)
+    test.assert(l.cur_kind != K_EMPTY)
+    test.assert_eq(lat_events(var l), 0)
+    // The acknowledgement empties the flight and the skip comes back.
+    t_heard(var l, l.due, l.nesn, l.sn ^ 1)
+    test.assert_eq(l.cur_kind, K_EMPTY)
+    test.assert_eq(lat_events(var l), 4)
+
+// ── Rule 4: the instants of the procedures ──────────────────────────
+
+@test
+fn test_the_event_before_an_instant_and_the_instant_are_listened_to_whatever_the_latency()
+    var l = t_idle(20)
+    t_set_ev(var l, 100)
+    // The instant at 107: events 100 to 105 may be skipped, 106 and 107 are heard.
+    t_set_upd(var l, 107)
+    test.assert_eq(lat_instant_room(var l, 107), 6)
+    test.assert_eq(lat_events(var l), 6)
+    // At 103: 100 and 101 are skipped.  At 102: 100.  At 101, 100 and a passed instant: the next event is heard or has no bound.
+    t_set_upd(var l, 103)
+    test.assert_eq(lat_events(var l), 2)
+    t_set_upd(var l, 102)
+    test.assert_eq(lat_events(var l), 1)
+    t_set_upd(var l, 101)
+    test.assert_eq(lat_events(var l), 0)
+    t_set_upd(var l, 100)
+    test.assert_eq(lat_events(var l), 0)
+    t_set_upd(var l, 99)
+    test.assert_eq(lat_events(var l), 20)
+
+@test
+fn test_the_channel_map_and_the_phy_instants_bound_the_skip_as_the_update_does_and_the_least_wins()
+    var l = t_idle(20)
+    t_set_ev(var l, 65530)
+    // The counter wraps at 65536: an instant at 4 is 10 events ahead.
+    t_set_chm(var l, 4)
+    test.assert_eq(lat_instant_room(var l, 4), 9)
+    test.assert_eq(lat_events(var l), 9)
+    t_set_phy(var l, 65533)
+    test.assert_eq(lat_events(var l), 2)
+    t_set_upd(var l, 65532)
+    test.assert_eq(lat_events(var l), 1)
+
+// ── A procedure that waits for the peer, and the states that are not idle ───
+
+@test
+fn test_a_procedure_that_waits_for_the_peer_an_encryption_start_a_phy_update_and_a_termination_keep_the_peripheral_listening()
+    var a = t_idle(4)
+    t_set_proc(var a, PROC_FEATURES)
+    test.assert_eq(lat_events(var a), 0)
+    t_set_proc(var a, PROC_NONE)
+    test.assert_eq(lat_events(var a), 4)
+    var b = t_idle(4)
+    t_set_enc(var b, ENC_P_WAIT_LTK)
+    test.assert_eq(lat_events(var b), 0)
+    t_set_enc(var b, ENC_IDLE)
+    test.assert_eq(lat_events(var b), 4)
+    var c = t_idle(4)
+    t_set_phy_state(var c, PHY_WAIT_RSP)
+    test.assert_eq(lat_events(var c), 0)
+    t_set_phy_state(var c, PHY_IDLE)
+    test.assert_eq(lat_events(var c), 4)
+    var d = t_idle(4)
+    t_set_term(var d)
+    test.assert_eq(lat_events(var d), 0)
+
+@test
+fn test_a_subrated_connection_keeps_its_own_gaps_and_skips_nothing_further()
+    var l = t_idle(4)
+    t_set_sub(var l, 2)
+    test.assert_eq(lat_events(var l), 0)
+
+// ── Rule 5: the supervision timeout ─────────────────────────────────
+
+@test
+fn test_the_skip_is_cut_so_that_one_listened_event_falls_in_each_half_of_the_supervision_timeout()
+    // 2 s at 7.5 ms: 133 events fit in the half of it, the skip is the latency up to 132.
+    var l = t_idle(20)
+    test.assert_eq(lat_events(var l), 20)
+    t_set_timeout(var l, 10)
+    // 100 ms: half is 50 ms, 6 intervals of 7.5 ms, so 5 may be skipped.
+    test.assert_eq(lat_events(var l), 5)
+    t_set_timeout(var l, 3)
+    test.assert_eq(lat_events(var l), 1)
+    t_set_timeout(var l, 2)
+    test.assert_eq(lat_events(var l), 0)
+
+// ── The plan and the commit (the key `ctl_latency` on) ──────────────
+
+@test
+fn test_the_event_after_a_heard_event_plans_the_skip_and_the_window_is_that_of_the_event_after_the_skipped_ones()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        var off = t_settled(4)
+        test.assert_eq(off.lat_skip, 0)
+        return
+    var l = t_settled(4)
+    test.assert_eq(l.lat_skip, 4)
+    let step = interval_us(var l)
+    test.assert_eq(step, 7500)
+    test.assert_eq(lat_due(var l), l.due + 4 * step)
+    // The window opens before the due time of the fifth event and is widened by the time since the last anchor.
+    let w = widening(var l)
+    test.assert_eq(w, (500 + 50) * (lat_due(var l) - l.t_ref) / 1000000 + 32)
+    test.assert_eq(link_listen_start(var l), lat_due(var l) - w)
+    test.assert_eq(link_listen_end(var l), lat_due(var l) + l.win_len + w)
+    // The anchor was 5 intervals ago, the widening is that of 5 intervals and not 1.
+    test.assert(w > (500 + 50) * step / 1000000 + 32)
+
+@test
+fn test_the_commit_takes_the_channels_of_the_skipped_events_and_moves_the_counter_and_the_schedule()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    // Two links in step; the second hears every event, the first skips four.
+    var a = t_settled(4)
+    var b = t_settled(4)
+    test.assert_eq(a.lat_skip, 4)
+    t_set_skip(var b, 0)
+    test.assert_eq(a.ev_count, b.ev_count)
+    let due_a = a.due
+    let ev_a = a.ev_count
+    // `b` takes the four events one by one and then the fifth.
+    var last = 0
+    for _ in 0..4
+        let _c = link_event_begin(var b)
+        link_event_done(var b, b.due + 3000)
+    last = link_event_begin(var b)
+    // `a` begins the fifth event at once: the commit and the begin.
+    let ch = link_event_begin(var a)
+    test.assert_eq(ch, last)
+    test.assert_eq(a.ev_count, ev_a + 4)
+    test.assert_eq(a.lat_skip, 0)
+    test.assert_eq(a.lat_total, 4)
+    test.assert_eq(a.unmapped, b.unmapped)
+    test.assert_eq(a.ev_count, b.ev_count)
+
+@test
+fn test_a_packet_queued_after_the_plan_brings_the_window_back_to_the_next_event()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var l = t_settled(4)
+    let skipping = link_listen_start(var l)
+    var d: Vec[u8; 260] = Vec.new()
+    for _ in 0..260
+        let _p = d.push(0)
+    test.assert(link_queue_acl(var l, true, var d, 5))
+    test.assert_eq(l.lat_skip, 0)
+    test.assert(link_listen_start(var l) < skipping)
+    test.assert_eq(link_listen_start(var l), l.due - widening(var l))
+    // Nothing was committed: the counter did not move.
+    test.assert_eq(l.lat_total, 0)
+
+@test
+fn test_a_missed_event_after_a_skip_listens_at_every_event_again_and_counts_what_was_skipped()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var l = t_settled(4)
+    test.assert_eq(l.lat_skip, 4)
+    let ev0 = l.ev_count
+    // The fifth event is missed.
+    t_missed(var l)
+    test.assert_eq(l.lat_total, 4)
+    test.assert_eq(l.ev_count, ev0 + 5)
+    test.assert_eq(l.lat_skip, 0)
+    // And the next is heard at its own time.
+    t_heard(var l, l.due, l.nesn, l.sn ^ 1)
+    test.assert_eq(l.lat_skip, 4)
+
+@test
+fn test_an_update_whose_instant_is_pending_makes_the_plan_stop_before_the_event_ahead_of_it()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var l = t_settled(10)
+    test.assert_eq(l.lat_skip, 10)
+    // A Connection Update arrives in a heard event with its instant 5 events away: the plan at the end of that event.
+    t_set_upd(var l, (l.ev_count + 6) & 0xFFFF)
+    lat_plan(var l)
+    test.assert_eq(l.lat_skip, 5)
+    test.assert_eq(lat_instant_room(var l, l.upd_instant), 5)
+
+@test
+fn test_the_chain_of_skips_and_heard_events_keeps_one_listened_event_in_each_latency_plus_one()
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    var l = t_settled(3)
+    var heard = 0
+    var total = 0
+    for _ in 0..40
+        t_heard(var l, lat_due(var l), l.nesn, l.sn ^ 1)
+        heard = heard + 1
+    total = l.lat_total
+    // `t_settled` planned 3 events to skip; each of the 40 heard events passes over 3 and plans 3 again: 120 skipped, 40 heard, and the 2 events of the setting.
+    test.assert_eq(total, 3 * 40)
+    test.assert_eq(l.ev_count, 2 + 40 + total)

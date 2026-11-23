@@ -602,6 +602,10 @@ struct Link
     sub_host: Bool
     sub_status: u8
     fx: Int
+    lat_skip: Int
+    lat_armed: Bool
+    lat_got: Bool
+    lat_total: Int
 
 // A link with no connection.
 @tier(embedded)
@@ -643,7 +647,7 @@ fn link_new() -> Link
         ctl_in: false, cis_dropped: 0, host_iso: false, no_coded: false,
         host_sub: false, sub_factor: 1, sub_res: 0, sub_cont: 0, sub_left: 0, sub_busy: false, sub_gap: 1, sub_tr: false, sub_nf: 1, sub_nres: 0,
         sub_ncont: 0, sub_nlat: 0, sub_nto: 0, sub_owed: false, sub_host: false, sub_status: 0,
-        fx: (ctl_limits.page1_bits() & 0xFFFF) << FX_LOCAL }
+        fx: (ctl_limits.page1_bits() & 0xFFFF) << FX_LOCAL, lat_skip: 0, lat_armed: false, lat_got: false, lat_total: 0 }
     for _ in 0..DLE_REC_WORDS
         let _w = l.dl_rec.push(0)
     link_reset_data(var l)
@@ -729,6 +733,9 @@ fn link_reset(var l: Link)
     l.ev_open = false
     l.ev_anchor = false
     l.synced = false
+    l.lat_skip = 0
+    l.lat_armed = false
+    l.lat_got = false
     l.room = true
     l.sn = 0
     l.nesn = 0
@@ -1116,6 +1123,8 @@ fn ctrl_queue(var l: Link, var p: Pdu) -> Bool
         return false
     slot_put_cq(var l, (l.cq_head + l.cq_count) % CTRL_SLOTS, var p)
     l.cq_count = l.cq_count + 1
+    if noble_controller.CONFIG.CTL_LATENCY
+        l.lat_skip = 0
     if l.proc != PROC_NONE
         l.proc_t0 = l.now
     true
@@ -1146,6 +1155,8 @@ fn link_queue_acl(var l: Link, start: Bool, var data: Vec[u8; 260], n: Int) -> B
     else
         l.txq2 = data
     l.txq_count = l.txq_count + 1
+    if noble_controller.CONFIG.CTL_LATENCY
+        l.lat_skip = 0
     link_prepare(var l)
     true
 
@@ -1286,6 +1297,122 @@ fn chan_next(var l: Link) -> Int
         return l.unmapped
     nth_used(l.chmap, l.unmapped % l.n_used)
 
+// ── Peripheral latency ───────────────────────────────────────────────
+//
+// [Vol 6] Part B, Section 4.5.1: connPeripheralLatency is the number of consecutive connection events the Peripheral is not required to listen
+// for, and every event counts whether it is heard or not.  The rules that bound the skip, each from the text of 4.5.1, 4.5.2, 4.5.5 and 5.5:
+//
+//   1. The Peripheral listens at every event until it has received a packet from the Central with the NESN set to one (4.5.5): `lat_armed`.
+//   2. After an event in which it received no valid packet it listens at every event until it receives one (4.5.1): `lat_got`.
+//   3. It does not skip while it has something to send or a PDU the Central has not acknowledged (the empty PDU in flight is nothing), and a PDU
+//      that is queued while it skips ends the skip (`ctrl_queue` and `link_queue_acl` clear `lat_skip`).
+//   4. It listens at the event of the instant of a procedure and at the event before it (5.5, whatever the latency): a pending Connection Update, channel
+//      map update or PHY update ends the skip at the second event before the instant, the last that may be passed over.  A procedure that waits for the peer (a request
+//      sent, an encryption start, a termination) keeps it listening at every event.
+//   5. It listens at least once in each supervision timeout (4.5.2): (1 + n) x interval x 2 is below the timeout, which `params_valid` holds for the
+//      latency the Central grants, and the skip is cut to it again here.
+//   6. A subrated connection (`sub_factor` above 1) keeps its own gaps and does not skip further, and a build with isochronous channels or Channel
+//      Sounding does not skip: their events are timed from the schedule `due` says.
+//
+// The skipped events are not committed when the skip is planned: `due` and `ev_count` stay at the first of them, `lat_skip` says how many of them the
+// next event passes over, and the listening window (`link_listen_start`, `link_listen_end`) and its widening are those of the event after them.  The
+// commit (`lat_commit`) is the first act of `link_event_begin`: it takes the channels of the skipped events (algorithm #1 hops in each), counts them
+// and moves the schedule.  A Host packet or a control PDU that is queued before the commit clears `lat_skip` and the Peripheral listens at the next event.
+
+// The time of the next event the receiver listens for: the schedule's `due` less the events that are skipped.
+@tier(embedded)
+fn lat_due(var l: Link) -> Int
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return l.due
+    l.due + l.lat_skip * interval_us(var l)
+
+// The intervals between the event that ended and the one the receiver listens for: the subrating's gap and the events skipped.
+@tier(embedded)
+fn lat_gap(var l: Link) -> Int
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return l.sub_gap as Int
+    l.sub_gap as Int + l.lat_skip
+
+// The most events that may be skipped before the event of `instant` (rule 4): the second event before the instant is the last that may be skipped,
+// so the one before the instant is listened to.  An instant already passed does not bound the skip.
+@no_alloc
+@tier(embedded)
+fn lat_instant_room(var l: Link, instant: Int) -> Int
+    let ahead = (instant - l.ev_count) & 0xFFFF
+    if ahead >= 0x8000
+        return LAT_MAX
+    if ahead < 2
+        return 0
+    ahead - 1
+
+// The number of connection events the Peripheral may leave unheard from the event that comes next, by the rules above; 0 when a rule says none.  It
+// does not read the configuration: `lat_plan` does.
+@satisfies("REQ-BLE-CTL-017")
+@no_alloc
+@tier(embedded)
+fn lat_events(var l: Link) -> Int
+    if l.central or not l.live or l.closing or not l.synced or l.latency <= 0
+        return 0
+    if not l.lat_armed or not l.lat_got
+        return 0
+    if l.sub_factor > 1 or l.sub_tr
+        return 0
+    if l.txq_count > 0 or l.cq_count > 0 or l.nxt_kind != K_EMPTY or ll_data.dpdu_len(var l.cur) > 0 or l.cur_md != 0 or l.nxt_md != 0
+        return 0
+    if l.term_sent or l.proc != PROC_NONE or l.enc_ph != ENC_IDLE or l.enc_wait or l.phy_state != PHY_IDLE or l.dl_wait or l.rq_wait or l.res_wait
+        return 0
+    var n = l.latency
+    if n > LAT_MAX
+        n = LAT_MAX
+    // At least one listened event in each half of the supervision timeout: (1 + n) intervals are less than half of it.
+    let half = l.timeout * TIMEOUT_UNIT_US / 2
+    let fits = half / interval_us(var l) - 1
+    if fits < n
+        n = fits
+    if l.upd_pending
+        let r = lat_instant_room(var l, l.upd_instant)
+        if r < n
+            n = r
+    if l.chm_pending
+        let r = lat_instant_room(var l, l.chm_instant)
+        if r < n
+            n = r
+    if l.phy_pending
+        let r = lat_instant_room(var l, l.phy_instant)
+        if r < n
+            n = r
+    if n < 0
+        return 0
+    n
+
+// Plan the skip after an event: the events `lat_events` allows when the build has the key `ctl_latency` and no isochronous channels or Channel
+// Sounding, none otherwise.
+@tier(embedded)
+fn lat_plan(var l: Link)
+    l.lat_skip = 0
+    if not noble_controller.CONFIG.CTL_LATENCY
+        return
+    if ctl_limits.iso_on() or noble_controller.CONFIG.CTL_CS > 0
+        return
+    l.lat_skip = lat_events(var l)
+
+// The event comes: the skipped events are over.  Each takes its channel (algorithm #1 hops once for every event, #2 reads the counter), the counter moves and
+// the schedule with it.
+@tier(embedded)
+fn lat_commit(var l: Link)
+    let n = l.lat_skip
+    l.lat_skip = 0
+    for k in 0..LAT_MAX
+        if k >= n
+            break
+        let _c = chan_next(var l)
+        l.ev_count = (l.ev_count + 1) & 0xFFFF
+        l.due = l.due + interval_us(var l)
+    l.lat_total = l.lat_total + n
+
+// The largest Peripheral latency the Link Layer accepts: 499 (Section 2.4.2.18).
+const LAT_MAX = 499
+
 // ── The window ───────────────────────────────────────────────────────
 
 // The window widening of the next event, [Vol 6] Part B, Section 4.5.7:
@@ -1297,9 +1424,9 @@ fn chan_next(var l: Link) -> Int
 fn widening(var l: Link) -> Int
     if l.central
         return 0
-    let elapsed = l.due - l.t_ref
+    let elapsed = lat_due(var l) - l.t_ref
     var w = (sca_ppm(l.sca) + OWN_PPM) * elapsed / 1000000 + JITTER_US
-    let cap = l.sub_gap as Int * interval_us(var l) / 2 - T_IFS_US
+    let cap = lat_gap(var l) * interval_us(var l) / 2 - T_IFS_US
     if w > cap
         w = cap
     w
@@ -1307,12 +1434,12 @@ fn widening(var l: Link) -> Int
 // The time the receiver must be listening from.
 @tier(embedded)
 fn link_listen_start(var l: Link) -> Int
-    l.due - widening(var l)
+    lat_due(var l) - widening(var l)
 
 // The time the receiver gives up, when no packet has started.
 @tier(embedded)
 fn link_listen_end(var l: Link) -> Int
-    l.due + l.win_len + widening(var l)
+    lat_due(var l) + l.win_len + widening(var l)
 
 // The Connected Isochronous Stream (Host Support) feature bit, as the Host set it with LE Set Host
 // Feature: it goes to the peer in the feature set.
@@ -1375,6 +1502,10 @@ fn instant_passed(var l: Link, instant: Int) -> Bool
 @satisfies("REQ-BLE-CTL-016")
 @tier(embedded)
 fn link_event_begin(var l: Link) -> Int
+    if noble_controller.CONFIG.CTL_LATENCY
+        if l.lat_skip > 0
+            lat_commit(var l)
+        l.lat_got = false
     if l.chm_pending and (l.ev_count & 0xFFFF) == l.chm_instant
         l.chmap = l.chm_map
         l.n_used = popcount(l.chmap)
@@ -1423,6 +1554,8 @@ fn link_note_rx(var l: Link, start_us: Int, good: Bool)
     if good
         l.last_rx = start_us
         l.bad_run = 0
+        if noble_controller.CONFIG.CTL_LATENCY
+            l.lat_got = true
     else
         l.bad_run = l.bad_run + 1
 
@@ -1476,6 +1609,8 @@ fn link_event_done(var l: Link, now: Int)
         link_close(var l, REASON_RESPONSE_TIMEOUT)
     if l.live and not l.closing
         link_tasks(var l)
+    if noble_controller.CONFIG.CTL_LATENCY
+        lat_plan(var l)
 
 // ── The packet ───────────────────────────────────────────────────────
 
@@ -1595,6 +1730,8 @@ fn acked_done(var l: Link)
 // Move `nxt` to `cur` once the Central has acknowledged `cur`.
 @tier(embedded)
 fn promote(var l: Link)
+    if noble_controller.CONFIG.CTL_LATENCY
+        l.lat_armed = true
     acked_done(var l)
     if l.enc_tx and ll_data.dpdu_len(var l.cur) > 0
         l.tx_ctr = l.tx_ctr + 1
