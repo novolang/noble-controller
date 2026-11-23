@@ -2356,11 +2356,15 @@ fn unseg_pdu(sdu: Int, sdu_int: Int, iso: Int) -> Int
 fn opportunities(nse: Int, ft: Int, bn: Int) -> Int
     nse * ft - nse / bn * (bn - 1)
 
-// The PDU size of a direction with SDUs of `sdu` octets: the SDU itself up to 251 octets (UPPS 1), 251 beyond; 0
-// for a direction no data flows in.
+// The PDU size of a direction with SDUs of `sdu` octets: the SDU itself up to 251 octets (UPPS 1), and beyond it the SDU cut into the
+// fewest PDUs of equal size (310 octets: two PDUs of 155, not 251 and 59); 0 for a direction no data flows in.  The PDUs of an SDU are as
+// long on the air as the longest of them, and a packet's chance of an error grows with its length.
 @tier(embedded)
 fn plan_pdu(sdu: Int) -> Int
-    ll_phy.lesser(sdu, ll_data.PAYLOAD_EXT_MAX)
+    if sdu <= ll_data.PAYLOAD_EXT_MAX
+        return ll_phy.lesser(sdu, ll_data.PAYLOAD_EXT_MAX)
+    let parts = (sdu + ll_data.PAYLOAD_EXT_MAX - 1) / ll_data.PAYLOAD_EXT_MAX
+    (sdu + parts - 1) / parts
 
 // BN of a direction: UPPS payloads for each of the USPI SDUs of an ISO interval (Part G, Section 2.1).
 @tier(embedded)

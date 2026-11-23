@@ -955,13 +955,13 @@ fn test_an_sdu_over_251_octets_is_cut_into_several_payloads_and_a_burst_per_even
     test.assert_eq(plan_cig(var p, 1, 10000, 10000, 20, 20, 0, ll_radio.profile_assumed(), var g), 0)
     test.assert_eq(p[0].pdu_c, 240)
     test.assert_eq(p[0].bn_c, 1)
-    // 310 octets (two channels of an LC3 stream at 48 kHz) are two payloads of the longest PDU: BN 2, and the subevent
-    // holds the 251 octets.
+    // 310 octets (two channels of an LC3 stream at 48 kHz) are two payloads of 155 octets: BN 2, and the subevent holds
+    // the 155 octets.
     var w = t_plans()
     t_plan_set(var w, 0, 310, 0, 0, 0, 2)
     var gw = group_plan_new()
     test.assert_eq(plan_cig(var w, 1, 10000, 10000, 20, 20, 0, ll_radio.profile_assumed(), var gw), 0)
-    test.assert_eq(w[0].pdu_c, 251)
+    test.assert_eq(w[0].pdu_c, 155)
     test.assert_eq(w[0].bn_c, 2)
     test.assert(w[0].nse >= 2)
     // 503 octets are three payloads: BN 3.
@@ -984,29 +984,43 @@ fn test_an_sdu_over_251_octets_is_cut_into_several_payloads_and_a_burst_per_even
     test.assert_eq(k.iso_us, 5000)
 
 @test
+fn test_an_sdu_over_251_octets_is_cut_into_the_fewest_pdus_of_equal_size()
+    test.assert_eq(plan_pdu(0), 0)
+    test.assert_eq(plan_pdu(30), 30)
+    test.assert_eq(plan_pdu(251), 251)
+    test.assert_eq(plan_pdu(252), 126)
+    test.assert_eq(plan_pdu(310), 155)
+    test.assert_eq(plan_pdu(502), 251)
+    test.assert_eq(plan_pdu(503), 168)
+    // The payloads of an SDU number as before: UPPS of the SDU over the PDU.
+    test.assert_eq(upps(310, plan_pdu(310), 1), 2)
+    test.assert_eq(upps(503, plan_pdu(503), 1), 3)
+    test.assert_eq(upps(251, plan_pdu(251), 1), 1)
+
+@test
 fn test_a_radio_that_reports_its_work_on_octets_gets_the_spacing_the_payloads_need()
-    // 251 octets each way: the program's work on 502 octets at 1 microsecond is 502, and the subevents of the stream are that
+    // 155 octets each way: the program's work on 310 octets at 1 microsecond is 310, and the subevents of the stream are that
     // much further apart than SE_Length.
     let prof = ll_radio.profile_new(true, 145, 45)
     var p = t_plans()
     t_plan_set(var p, 0, 310, 310, 2, 2, 3)
     var g = group_plan_new()
     test.assert_eq(plan_cig(var p, 1, 10000, 10000, 40, 40, 0, prof, var g), 0)
-    test.assert_eq(p[0].pdu_c, 251)
-    test.assert_eq(p[0].sub_int, plan_se_len(2, 251, 251) + 502)
+    test.assert_eq(p[0].pdu_c, 155)
+    test.assert_eq(p[0].sub_int, plan_se_len(2, 155, 155) + 310)
     // A radio not asked adds nothing, so the specification's SE_Length stays the spacing.
     var q = t_plans()
     t_plan_set(var q, 0, 310, 310, 2, 2, 3)
     var h = group_plan_new()
     test.assert_eq(plan_cig(var q, 1, 10000, 10000, 40, 40, 0, ll_radio.profile_assumed(), var h), 0)
-    test.assert_eq(q[0].sub_int, plan_se_len(2, 251, 251))
+    test.assert_eq(q[0].sub_int, plan_se_len(2, 155, 155))
     // A slower CPU, 2 microseconds an octet, doubles the extra.
     let slow = ll_radio.profile_for(true, 145, 45, 2000)
     var r = t_plans()
     t_plan_set(var r, 0, 310, 310, 2, 2, 3)
     var k = group_plan_new()
     test.assert_eq(plan_cig(var r, 1, 10000, 10000, 40, 40, 0, slow, var k), 0)
-    test.assert_eq(r[0].sub_int, plan_se_len(2, 251, 251) + 1004)
+    test.assert_eq(r[0].sub_int, plan_se_len(2, 155, 155) + 620)
     // Streams in sequence start one slot apart, the slot being the spacing of the stream and not SE_Length.
     var two = t_plans()
     t_plan_set(var two, 0, 100, 100, 1, 1, 3)

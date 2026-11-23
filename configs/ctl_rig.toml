@@ -8,6 +8,7 @@ ctl_past = true
 ctl_subrate = false
 ctl_featpages = false
 ctl_ploss = false
+ctl_cis_diag = false
 ctl_peersca = false
 ctl_connrate = false
 ctl_framespace = false

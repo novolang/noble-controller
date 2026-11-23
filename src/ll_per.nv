@@ -108,9 +108,11 @@ const SYNC_BOOK_US = 3000
 // counter and the channels of the chain.  The data is `data`, `dlen` octets, `dhave` whether the Host gave any and `dasm`
 // that a fragmented data is being assembled.  `none` is six octets of zero for the builders of PDUs that name no address.
 // `big` is the slot of the broadcast isochronous group that rides the train (-1 for none), `acad` the ACAD of the next AUX_SYNC_IND,
-// the BIGInfo of that group as an AD structure, `acad_n` its octets (0 when the group is not announced).  `last_ctr` and `last_at` are
+// the BIGInfo of that group as an AD structure, `acad_n` its octets (0 when the group is not announced) and `info_due` the start of the event
+// the BIGInfo in `acad` was built for (-1 for none): it is built when the event before ends, and the event keeps it when its start is that one.  `last_ctr` and `last_at` are
 // the paEventCounter and the start (microseconds) of the last event sent, the one LL_PERIODIC_SYNC_IND names as sent; `sent` says
-// one was sent since the train started.
+// one was sent since the train started.  `pv` is the AUX_SYNC_IND of the event that starts at `pv_due` (-1 for none) built for the PHY `pv_phy` and
+// the Tx Power `pv_txp`, when the event before ended; the data of the train or its definition changing takes it back.
 //
 // A train with responses (`pawr`, [Vol 6] Part B, Section 4.4.2.2.4) has `n_sub` subevents, `si_us` microseconds apart, in each event instead of
 // one AUX_SYNC_IND: `due` is the start of the next subevent, `sub` its number, `counter` the paEventCounter of its event and `ev_start` the start
@@ -143,6 +145,11 @@ struct PerAdv
     big: Int
     acad: Vec[u8; 64]
     acad_n: Int
+    info_due: Int
+    pv: Pdu
+    pv_due: Int
+    pv_phy: Int
+    pv_txp: Int
     last_ctr: Int
     last_at: Int
     sent: Bool
@@ -157,7 +164,8 @@ fn padv_new() -> PerAdv
     var t = PerAdv { used: false, handle: 0, on: false, run: false, props: 0, int_min: INTERVAL_MIN, int_max: INTERVAL_MIN,
                      interval: INTERVAL_MIN, aa: 0, crc: 0, chmap: ll_init.CHMAP_ALL, n_used: 37, counter: 0, due: 0,
                      events: 0, late: 0, rng: 0x1B873593, data: Vec.new(), dlen: 0, dhave: false, dasm: false,
-                     none: Vec.new(), si: Vec.new(), big: -1, acad: Vec.new(), acad_n: 0,
+                     none: Vec.new(), si: Vec.new(), big: -1, acad: Vec.new(), acad_n: 0, info_due: -1,
+                     pv: ll_pdu.pdu_new(), pv_due: -1, pv_phy: 0, pv_txp: 0,
                      last_ctr: 0, last_at: 0, sent: false, pawr: false, sub: 0, ev_start: 0, n_sub: 0, si_us: 0 }
     for _ in 0..6
         let _a = t.none.push(0)
@@ -182,6 +190,8 @@ fn padv_clear(var t: PerAdv)
     t.late = 0
     t.big = -1
     t.acad_n = 0
+    t.info_due = -1
+    t.pv_due = -1
     t.sent = false
     if ctl_limits.pawr_adv_on()
         t.pawr = false
@@ -211,6 +221,7 @@ fn padv_define(var t: PerAdv, handle: Int, props: Int, int_min: Int, int_max: In
     t.used = true
     t.handle = handle
     t.props = props
+    t.pv_due = -1
     t.int_min = int_min
     t.int_max = int_max
     if ctl_limits.pawr_adv_on()
@@ -257,6 +268,7 @@ fn pdata_status(var t: PerAdv, op: Int, len: Int) -> Int
 @satisfies("REQ-BLE-CTL-093")
 @tier(embedded)
 fn pdata_begin(var t: PerAdv, op: Int)
+    t.pv_due = -1
     if op == ll_xadv.OP_FIRST or op == OP_COMPLETE
         t.dlen = 0
     t.dasm = op == ll_xadv.OP_FIRST or op == ll_xadv.OP_MIDDLE
@@ -529,6 +541,18 @@ fn build_sync_ind(var t: PerAdv, var p: Pdu, at: Int, n: Int, more: Bool, ch: In
     var no_target = t.none   // a second name for the six zero octets: one place is not given to two var parameters
     ll_xadv.ext_build_acad(var p, ll_init.EXT_ADV, 0, 0, 0, false, var t.none, false, var no_target, false, 0, 0,
                            more, ch, off, phy, (t.props & ll_xadv.P_TXP) != 0, txp, false, var t.si, var t.data, at, n, var t.acad, t.acad_n)
+
+// The AUX_SYNC_IND of the event that starts at `due`, built into `pv` for a train whose event is this one PDU: the PDU `build_sync_ind` builds,
+// kept for the event, which then copies it to the radio.
+@satisfies("REQ-BLE-CTL-093")
+@tier(embedded)
+fn padv_prebuild(var t: PerAdv, due: Int, n0: Int, phy: Int, txp: Int)
+    var no_target = t.none   // a second name for the six zero octets: one place is not given to two var parameters
+    ll_xadv.ext_build_acad(var t.pv, ll_init.EXT_ADV, 0, 0, 0, false, var t.none, false, var no_target, false, 0, 0,
+                           false, 0, 0, phy, (t.props & ll_xadv.P_TXP) != 0, txp, false, var t.si, var t.data, 0, n0, var t.acad, t.acad_n)
+    t.pv_due = due
+    t.pv_phy = phy
+    t.pv_txp = txp
 
 // A PDU of the chain behind it: only the pointer to the next, when `more`.
 @satisfies("REQ-BLE-CTL-093")

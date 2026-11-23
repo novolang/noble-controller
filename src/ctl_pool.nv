@@ -47,6 +47,9 @@ const NO_SLOT = -1
 // `rest` the data octets of it that follow the piece being sent.  `hlen` of
 // 0 means the Host gave no size: nothing is cut and nothing is counted
 // ([Vol 4] Part E, Sections 7.3.38 to 7.3.40).
+//
+// A transport that takes a packet whole (`pool_tx_begin`) leaves `sent` at 0 and keeps in `flight` the octets of the piece it was
+// handed: the slot stays in the queue, and busy, until `pool_tx_end` says the piece has gone.
 @value
 struct PacketPool
     bytes: Vec[u8; 1032]
@@ -62,6 +65,7 @@ struct PacketPool
     hout: u16
     cut: u16
     rest: u16
+    flight: u16
 
 // A pool with every slot free.
 @satisfies("REQ-BLE-CTL-003")
@@ -69,7 +73,7 @@ struct PacketPool
 fn pool_new() -> PacketPool
     var p = PacketPool {
         bytes: Vec.new(), len: Vec.new(), busy: Vec.new(), queue: Vec.new(),
-        head: 0, queued: 0, sent: 0, hfc: false, hlen: 0, htotal: 0, hout: 0, cut: 0, rest: 0 }
+        head: 0, queued: 0, sent: 0, hfc: false, hlen: 0, htotal: 0, hout: 0, cut: 0, rest: 0, flight: 0 }
     for _ in 0..SLOTS * SLOT_OCTETS
         let _a = p.bytes.push(0)
     for _ in 0..SLOTS
@@ -341,6 +345,50 @@ fn pool_tx_next(var p: PacketPool) -> Int
             p.len[slot] = 0
     b
 
+// The piece of the packet at the front of the queue that goes next, handed whole to a transport that sends a packet by itself: the
+// offset of its first octet in `bytes`, with the octets of it in `pool_tx_flight` until `pool_tx_end`.  -1 when the queue holds no packet
+// that may start or a piece is on its way.  Octets and packets are not mixed: a packet begun by `pool_tx_next` is not begun again.
+@no_alloc
+@tier(embedded)
+fn pool_tx_begin(var p: PacketPool) -> Int
+    if p.queued == 0 or p.flight > 0 or p.sent > 0
+        return -1
+    if not pool_tx_start(var p)
+        return -1
+    p.flight = p.cut
+    let slot = p.queue[p.head as Int] as Int
+    slot * SLOT_OCTETS
+
+// The octets of the piece `pool_tx_begin` handed on, 0 when none is on its way.
+@no_alloc
+@tier(embedded)
+fn pool_tx_flight(var p: PacketPool) -> Int
+    p.flight as Int
+
+// The piece `pool_tx_begin` handed on has gone: what follows of the packet moves to the front of its slot, or the slot is free.
+@no_alloc
+@tier(embedded)
+fn pool_tx_end(var p: PacketPool)
+    if p.flight == 0
+        return
+    p.flight = 0
+    let slot = p.queue[p.head as Int] as Int
+    if p.rest > 0
+        pool_tx_continue(var p, slot)
+    else
+        p.head = ((p.head as Int + 1) % SLOTS) as u8
+        p.queued = p.queued - 1
+        p.busy[slot] = false
+        p.len[slot] = 0
+
+// Whether a packet may be handed whole now: none is on its way and the queue holds one that may start.
+@no_alloc
+@tier(embedded)
+fn pool_tx_ready(var p: PacketPool) -> Bool
+    if p.flight > 0 or p.sent > 0
+        return false
+    pool_tx_pending(var p)
+
 // Drop every packet that has not begun to be sent, and give its slot back.
 // The packet the transport is in the middle of stays, so the stream keeps
 // its framing.
@@ -348,7 +396,7 @@ fn pool_tx_next(var p: PacketPool) -> Int
 fn pool_flush(var p: PacketPool)
     if p.queued == 0
         return
-    let keep = if p.sent > 0
+    let keep = if p.sent > 0 or p.flight > 0
         1
     else
         0

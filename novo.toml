@@ -186,6 +186,12 @@ default  = false
 requires = ["ctl_pcl"]
 doc      = "on when the Controller monitors the path loss of a connection (ll_ploss.nv: LE Set Path Loss Reporting Parameters, LE Set Path Loss Reporting Enable and the LE Path Loss Threshold event, from the transmit level LE Power Control learns and the received signal strength), off for a build without it, which then answers none of its commands and leaves LE feature 35 clear; needs CTL_PCL"
 
+[config.ctl_cis_diag]
+type     = "bool"
+default  = false
+requires = ["ctl_cis"]
+doc      = "on when the Controller counts the packets a Central hears in the subevents of its streams by subevent, data channel and length sent, and those with a bad CRC (ll_air.nv: `CisBad`, `cis_note_heard`; the status line `ll cisbad` of the example image), off for a build without it, which holds one entry of the table of channels and none of the code"
+
 [config.ctl_peersca]
 type     = "bool"
 default  = false

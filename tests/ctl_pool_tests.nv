@@ -3,7 +3,7 @@
 //   novo test tests/ctl_pool_tests.nv
 
 use std.test
-use ctl_pool.{ NO_SLOT, SLOTS, SLOT_OCTETS, acl_begin, acl_send, evt_begin, evt_send, iso_begin, iso_send, pool_flush, pool_free, pool_get, pool_give, pool_len, pool_new, pool_put, pool_put_run, pool_put_u16, pool_queue, pool_take, pool_tx_next, pool_tx_pending }
+use ctl_pool.{ NO_SLOT, SLOTS, SLOT_OCTETS, acl_begin, acl_send, evt_begin, evt_send, iso_begin, iso_send, pool_flush, pool_free, pool_get, pool_give, pool_host_size, pool_len, pool_new, pool_put, pool_put_run, pool_put_u16, pool_queue, pool_take, pool_tx_begin, pool_tx_end, pool_tx_flight, pool_tx_next, pool_tx_pending, pool_tx_ready }
 
 @test
 fn test_iso_packet_is_framed_with_handle_flags_and_length()
@@ -221,3 +221,81 @@ fn test_a_run_of_octets_is_refused_for_a_slot_not_taken_or_without_room()
     test.assert(pool_put_run(var p, s, var src, 0, SLOT_OCTETS))
     test.assert(not pool_put_run(var p, s, var src, 0, 1))
     test.assert_eq(pool_len(var p, s), SLOT_OCTETS)
+
+// The packet handed whole: the offset of its slot, its octets in flight, the slot free after the end.
+@test
+fn test_a_packet_handed_whole_keeps_its_slot_until_it_has_gone()
+    var p = pool_new()
+    test.assert_eq(pool_tx_begin(var p), -1)
+    test.assert(not pool_tx_ready(var p))
+    let a = evt_begin(var p, 0x10)
+    let _x = pool_put(var p, a, 0x01)
+    test.assert(evt_send(var p, a))
+    let b = evt_begin(var p, 0x11)
+    test.assert(evt_send(var p, b))
+    test.assert(pool_tx_ready(var p))
+    let at = pool_tx_begin(var p)
+    test.assert_eq(at, a * SLOT_OCTETS)
+    test.assert_eq(pool_tx_flight(var p), 4)
+    test.assert_eq(pool_get(var p, a, 1), 0x10)
+    // While the packet is on its way no other begins, the queue is not ready and the slot is not free.
+    test.assert_eq(pool_tx_begin(var p), -1)
+    test.assert(not pool_tx_ready(var p))
+    test.assert_eq(pool_free(var p), SLOTS - 2)
+    pool_tx_end(var p)
+    test.assert_eq(pool_tx_flight(var p), 0)
+    test.assert_eq(pool_free(var p), SLOTS - 1)
+    // The next packet follows, and the end of a queue with nothing on its way changes nothing.
+    test.assert_eq(pool_tx_begin(var p), b * SLOT_OCTETS)
+    test.assert_eq(pool_tx_flight(var p), 3)
+    pool_tx_end(var p)
+    pool_tx_end(var p)
+    test.assert_eq(pool_free(var p), SLOTS)
+    test.assert(not pool_tx_ready(var p))
+
+@test
+fn test_an_acl_packet_longer_than_the_hosts_buffer_is_handed_whole_in_pieces_each_with_its_own_header()
+    var p = pool_new()
+    pool_host_size(var p, 4, 8)
+    let s = acl_begin(var p, 0x0041, 2)
+    for i in 0..10
+        test.assert(pool_put(var p, s, 0x30 + i))
+    test.assert(acl_send(var p, s))
+    // The first piece: the header with the Host's length and 4 octets of data.
+    test.assert_eq(pool_tx_begin(var p), s * SLOT_OCTETS)
+    test.assert_eq(pool_tx_flight(var p), 9)
+    test.assert_eq(pool_get(var p, s, 3), 4)
+    test.assert_eq(pool_get(var p, s, 5), 0x30)
+    pool_tx_end(var p)
+    // The second continues the packet: the flag of a continuing fragment, the next 4 octets.
+    test.assert_eq(pool_free(var p), SLOTS - 1)
+    test.assert_eq(pool_tx_begin(var p), s * SLOT_OCTETS)
+    test.assert_eq(pool_tx_flight(var p), 9)
+    test.assert_eq(pool_get(var p, s, 2), 0x10)
+    test.assert_eq(pool_get(var p, s, 5), 0x34)
+    pool_tx_end(var p)
+    // The third: the 2 octets that are left.
+    test.assert_eq(pool_tx_begin(var p), s * SLOT_OCTETS)
+    test.assert_eq(pool_tx_flight(var p), 7)
+    test.assert_eq(pool_get(var p, s, 5), 0x38)
+    pool_tx_end(var p)
+    test.assert_eq(pool_free(var p), SLOTS)
+
+@test
+fn test_flush_keeps_the_packet_handed_whole_and_a_packet_begun_by_octets_is_not_begun_again()
+    var p = pool_new()
+    let a = evt_begin(var p, 0x10)
+    test.assert(evt_send(var p, a))
+    let b = evt_begin(var p, 0x11)
+    test.assert(evt_send(var p, b))
+    test.assert(pool_tx_begin(var p) >= 0)
+    pool_flush(var p)
+    test.assert_eq(pool_free(var p), SLOTS - 1)
+    pool_tx_end(var p)
+    test.assert_eq(pool_free(var p), SLOTS)
+    // A packet the octet transport has begun stays its own.
+    let c = evt_begin(var p, 0x12)
+    test.assert(evt_send(var p, c))
+    test.assert_eq(pool_tx_next(var p), 0x04)
+    test.assert_eq(pool_tx_begin(var p), -1)
+    test.assert(not pool_tx_ready(var p))

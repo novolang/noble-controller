@@ -113,6 +113,103 @@ const ANSWER_READY_US = 140
 // cannot reach, since an event ends with the first packet that does not come.
 const MAX_EXCHANGES = 4000000
 
+// Where the packets a Central heard in the subevents of its streams had a bad CRC: by the number of the subevent in its event (1 to 8), by
+// data channel, by the length of the payload the Central sent in the subevent (none, up to 99 octets, 100 to 199, 200 and over) and, for the
+// bad packets, by the length their header gives (the same bounds); `all` counts every packet heard, good or bad.  `after_bad` counts the bad
+// packets heard straight after a bad one.  The counts run from the start of the image.
+pub @value
+struct CisBad
+    sub_all: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 8 else 1]
+    sub_bad: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 8 else 1]
+    ch_all: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 40 else 1]
+    ch_bad: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 40 else 1]
+    tx_all: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 4 else 1]
+    tx_bad: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 4 else 1]
+    rx_bad: Vec[Int; if noble_controller.CONFIG.CTL_CIS_DIAG then 4 else 1]
+    after_bad: Int
+    prev_bad: Bool
+
+// The tables empty, and filled with zeros in a build with `ctl_cis_diag`: the build without it never reads them.
+@tier(embedded)
+fn cis_bad_new() -> CisBad
+    var b = CisBad { sub_all: Vec.new(), sub_bad: Vec.new(), ch_all: Vec.new(), ch_bad: Vec.new(), tx_all: Vec.new(), tx_bad: Vec.new(),
+                     rx_bad: Vec.new(), after_bad: 0, prev_bad: false }
+    if noble_controller.CONFIG.CTL_CIS_DIAG
+        for _ in 0..8
+            let _a = b.sub_all.push(0)
+            let _b = b.sub_bad.push(0)
+        for _ in 0..40
+            let _c = b.ch_all.push(0)
+            let _d = b.ch_bad.push(0)
+        for _ in 0..4
+            let _e = b.tx_all.push(0)
+            let _f = b.tx_bad.push(0)
+            let _g = b.rx_bad.push(0)
+    b
+
+// The bucket of a payload length: 0 for none, 1 up to 99 octets, 2 for 100 to 199, 3 for 200 and over.
+@when(noble_controller.CONFIG.CTL_CIS_DIAG)
+@tier(embedded)
+fn cis_len_bucket(n: Int) -> Int
+    if n <= 0
+        return 0
+    if n < 100
+        return 1
+    if n < 200
+        return 2
+    3
+
+// The histograms of `CisBad` by number: `HIST_SUB`, `HIST_TX` and `HIST_CH`, the count of the entry `k` of each for all packets heard and for the bad ones.
+pub const HIST_SUB = 0
+pub const HIST_TX = 1
+pub const HIST_CH = 2
+
+@when(noble_controller.CONFIG.CTL_CIS_DIAG)
+pub @tier(embedded)
+fn cis_hist_all(var b: CisBad, which: Int, k: Int) -> Int
+    if which == HIST_SUB
+        return b.sub_all[k]
+    if which == HIST_TX
+        return b.tx_all[k]
+    b.ch_all[k]
+
+@when(noble_controller.CONFIG.CTL_CIS_DIAG)
+pub @tier(embedded)
+fn cis_hist_bad(var b: CisBad, which: Int, k: Int) -> Int
+    if which == HIST_SUB
+        return b.sub_bad[k]
+    if which == HIST_TX
+        return b.tx_bad[k]
+    b.ch_bad[k]
+
+// A packet heard by the Central in subevent `sub` (from 1) of its event, on data channel `ch`, after it sent a payload of `tx_len` octets:
+// `good` says its CRC was right and `rx_len` is the length its header gave.
+@when(noble_controller.CONFIG.CTL_CIS_DIAG)
+@tier(embedded)
+fn cis_note_heard(var b: CisBad, sub: Int, ch: Int, tx_len: Int, good: Bool, rx_len: Int)
+    var s = sub - 1
+    if s < 0
+        s = 0
+    if s > 7
+        s = 7
+    let t = cis_len_bucket(tx_len)
+    b.sub_all[s] = b.sub_all[s] + 1
+    b.tx_all[t] = b.tx_all[t] + 1
+    if ch >= 0 and ch < b.ch_all.len()
+        b.ch_all[ch] = b.ch_all[ch] + 1
+    if good
+        b.prev_bad = false
+        return
+    b.sub_bad[s] = b.sub_bad[s] + 1
+    b.tx_bad[t] = b.tx_bad[t] + 1
+    if ch >= 0 and ch < b.ch_all.len()
+        b.ch_bad[ch] = b.ch_bad[ch] + 1
+    let r = cis_len_bucket(rx_len)
+    b.rx_bad[r] = b.rx_bad[r] + 1
+    if b.prev_bad
+        b.after_bad = b.after_bad + 1
+    b.prev_bad = true
+
 // `rx_on` says the receiver runs for a scan window, on `rx_ch` and the PHY `rx_phy`.  `held` says
 // the radio's power state is held.  The counters follow.
 pub @value
@@ -230,6 +327,8 @@ struct Rf
     x_adv_aux: Int
     x_adv_events: Int
     x_per_events: Int
+    x_per_err_max_us: Int
+    x_per_work_max_us: Int
     x_per_heard: Int
     x_pawr_rsp: Int
     x_pawr_tx: Int
@@ -242,6 +341,7 @@ struct Rf
     big_bad: Int
     big_missed: Int
     big_work_max: Int
+    cb: CisBad
     sc: Pdu
 
 // The state of the radio program at rest: the receiver off and every counter at its starting value.
@@ -265,7 +365,7 @@ fn rf_make() -> Rf
          seals: 0, opens: 0, seal_max: 0, open_max: 0, mic_fail: 0, seal_sum: 0, open_sum: 0,
          seal_slow: 0, open_slow: 0, owner: -1, chain_cut: 0, post_max: 0, post_sum: 0, post_n: 0, rx_long: 0, rx_len_max: 0,
          cis_subs: 0, cis_missed: 0, cis_aborts: 0, cis_good: 0, cis_bad: 0, cis_chained: 0, cis_late: 0, cis_late_max: 0, cis_end: 0, cis_work_n: 0, cis_work_sum: 0, cis_work_max: 0, cis_gap_min: 1000000, dtm_on: false, dtm_next: 0, aux_rsp_min_us: 1000000, aux_rsp_max_us: 0, x_t0: 0, x_pdus: 0, x_chains: 0, x_asks: 0, x_slack_min_us: 1000000,
-         x_adv_pdus: 0, x_adv_err_min_us: 1000000, x_adv_err_max_us: -1000000, x_adv_chain: 0, x_adv_aux: 0, x_adv_events: 0, x_per_events: 0, x_per_heard: 0, x_pawr_rsp: 0, x_pawr_tx: 0, big_events: 0, big_subs: 0, big_late: 0, big_skipped: 0, big_err_max_us: -1000000, big_good: 0, big_bad: 0, big_missed: 0, big_work_max: 0, sc: ll_pdu.pdu_new() }
+         x_adv_pdus: 0, x_adv_err_min_us: 1000000, x_adv_err_max_us: -1000000, x_adv_chain: 0, x_adv_aux: 0, x_adv_events: 0, x_per_events: 0, x_per_err_max_us: -1000000, x_per_work_max_us: 0, x_per_heard: 0, x_pawr_rsp: 0, x_pawr_tx: 0, big_events: 0, big_subs: 0, big_late: 0, big_skipped: 0, big_err_max_us: -1000000, big_good: 0, big_bad: 0, big_missed: 0, big_work_max: 0, cb: cis_bad_new(), sc: ll_pdu.pdu_new() }
 
 // ── Packets in and out of the radio's buffers ───────────────────────
 
@@ -372,6 +472,8 @@ pub fn reset_window(var rf: Rf)
     rf.an_max_us = -1000000
     rf.cy_conn = 0
     rf.cis_late_max = 0
+    rf.x_per_err_max_us = -1000000
+    rf.x_per_work_max_us = 0
     rf.cis_work_n = 0
     rf.cis_work_sum = 0
     rf.cis_work_max = 0
@@ -918,6 +1020,33 @@ fn padv_chain<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
         at = start + next_off
         on = next_ch
 
+// The time between the grant of the radio to an event of a train and the start of its transmitter that the program needs.  An event with no
+// BIGInfo needs `PADV_WORK_US`, the PDU and its copy to the radio.  An event that carries the BIGInfo of a group has it, and the PDU, built when the event
+// before ended (`ctl_hci.ctl_padv_prepare`) and needs `PADV_WORK_PDU_US`, the copy to the radio; with the BIGInfo built and the PDU not (an event of
+// several PDUs) it needs `PADV_WORK_INFO_US`, and with neither built `PADV_WORK_BIG_US` (`Rf.x_per_work_max_us`: 163 microseconds on the
+// nRF54LM20 with a group of two streams, 85 of them the BIGInfo).  An event granted with less than this and the ramp-up before its time
+// would start late, and is given up.
+pub const PADV_WORK_BIG_US = 200
+pub const PADV_WORK_INFO_US = 100
+pub const PADV_WORK_PDU_US = 40
+pub const PADV_WORK_US = 60
+
+// The work an event needs before its transmitter starts; `big` says the event carries a BIGInfo, `info` that it was built before and `pdu` that
+// the PDU was built with it.
+pub fn padv_work_us(big: Bool, info: Bool, pdu: Bool) -> Int
+    if not big
+        return PADV_WORK_US
+    if pdu
+        return PADV_WORK_PDU_US
+    if info
+        return PADV_WORK_INFO_US
+    PADV_WORK_BIG_US
+
+// Whether an event of a train due at `due` can start on time when the radio is granted at `now` and needs `work` microseconds of work before its
+// transmitter, after the transmitter's ramp-up.
+pub fn padv_has_time(now: Int, tx_lead: Int, due: Int, work: Int) -> Bool
+    now + tx_lead + work <= due
+
 // Run the event of the train in slot `k`.
 @satisfies("REQ-BLE-CTL-093")
 fn padv_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: Rf, k: Int) [e, t]
@@ -925,11 +1054,18 @@ fn padv_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
     hold(var air, var rf)
     ctl_hci.ctl_set_time(var c, air.now_us())
     let due = c.pads[k].due
-    if i < 0 or air.now_us() + air.tx_lead_us() + 60 > due
+    let big = ctl_hci.padv_announces(var c, k)
+    var pdu = false
+    if i >= 0
+        pdu = ctl_hci.ctl_padv_pdu_ready(var c, k, due, c.xsets[i].sphy as Int, c.xsets[i].txp)
+    let work_us = padv_work_us(big, ctl_hci.ctl_padv_info_ready(var c, k, due), pdu)
+    if i < 0 or not padv_has_time(air.now_us(), air.tx_lead_us(), due, work_us)
         ctl_hci.ctl_padv_late(var c, k)
         release(var air, var rf)
+        ctl_hci.ctl_padv_prepare(var c, k)
         return
     let phy = c.xsets[i].sphy as Int
+    let t_work = air.now_us()
     ctl_hci.ctl_padv_big(var c, k, due)
     let ch = ll_per.padv_channel(var c.pads[k], c.pads[k].counter)
     let total = ll_per.event_pdus(var c.pads[k])
@@ -940,8 +1076,14 @@ fn padv_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
     if more
         ch1 = ll_per.chain_channel(var c.pads[k])
         off0 = ll_xadv.next_rel_us(phy, ll_per.sync_octets(var c.pads[k], n0, true))
-    ll_per.build_sync_ind(var c.pads[k], var c.xv, 0, n0, more, ch1, off0, phy, c.xsets[i].txp)
-    air.put(ll_radio.BUF_TX, var c.xv)
+    if pdu
+        air.put(ll_radio.BUF_TX, var c.pads[k].pv)
+    else
+        ll_per.build_sync_ind(var c.pads[k], var c.xv, 0, n0, more, ch1, off0, phy, c.xsets[i].txp)
+        air.put(ll_radio.BUF_TX, var c.xv)
+    let work = air.now_us() - t_work
+    if work > rf.x_per_work_max_us
+        rf.x_per_work_max_us = work
     let st = xadv_tx(var air,
         var rf,
         ch,
@@ -953,6 +1095,8 @@ fn padv_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
         c.pads[k].aa,
         c.pads[k].crc)
     if st >= 0
+        if st - due > rf.x_per_err_max_us
+            rf.x_per_err_max_us = st - due
         let _e = xadv_wait_end(var air)
         rf.x_per_events = rf.x_per_events + 1
         if more
@@ -961,6 +1105,7 @@ fn padv_event<R: Radio[e] + Timebase[t]>(var air: R, var c: Controller, var rf: 
     ctl_hci.ctl_padv_done(var c, k)
     release(var air, var rf)
     adv_radio_setup(var air)
+    ctl_hci.ctl_padv_prepare(var c, k)
 
 // ── Periodic synchronization ────────────────────────────────────────
 //
@@ -2358,6 +2503,8 @@ fn cis_subevent_c<R: Radio[e] + Timebase[t], C: Cipher[k]>(var air: R, var c: Co
         ctl_hci.ctl_cis_done(var c, i, air.now_us())
         return
     let good = verdict == ll_radio.RX_GOOD
+    if noble_controller.CONFIG.CTL_CIS_DIAG
+        cis_note_heard(var rf.cb, ctl_hci.ctl_cis_sub(var c, i), ch, ll_data.dpdu_len(var rf.sc), good, air.octet(ll_radio.BUF_RX, 1))
     let began = air.mark_us(addr_mark) - ll_phy.aa_end_us(phy)
     if get_data_pdu(var air, ll_radio.BUF_RX, var rx) > 0
         let _h = ctl_hci.ctl_cis_rx_fast(var c, i, air.octet(ll_radio.BUF_RX, 0), -1, -1)

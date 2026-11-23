@@ -4964,6 +4964,33 @@ fn ctl_tx_drain<P: HostTx[e]>(var c: Controller, var port: P, most: Int) -> Int 
         sent = sent + 1
     sent
 
+// The Host's port of a transport that sends a packet by itself (a UART with DMA).  The Controller hands it the packet whole and the port
+// takes no further call for it: the octets stay in the pool's buffer, unchanged, until `idle` answers true.  The packet then takes the
+// time of the line (2.6 ms for 259 octets at 1 Mbaud, longer while the Host's flow control holds it) and none of the main loop's.
+pub trait HostPacketTx[e]
+    // Whether the transmit before has ended, so that the octets it was handed are free and the port can take another packet.
+    fn idle(var self) -> Bool [e]
+    // Start sending the `n` octets at offset `at` of the pool's buffer (`PacketPool.bytes`); called only after `idle` answered true.
+    fn start(var self, var pool: ctl_pool.PacketPool, at: Int, n: Int) [e]
+
+// Hand the port the next packet of the queue when the port is idle, and take back the slot of the packet it has sent: one call a turn
+// of the main loop.  A packet that the Host's buffer size cuts (an ACL packet longer than the Host takes) goes in pieces, one for each
+// call.  True when a packet was handed on.
+pub @satisfies("REQ-BLE-CTL-078")
+@no_alloc
+@tier(embedded)
+fn ctl_tx_packet<P: HostPacketTx[e]>(var c: Controller, var port: P) -> Bool [e]
+    if ctl_pool.pool_tx_flight(var c.pool) == 0 and not ctl_pool.pool_tx_ready(var c.pool)
+        return false
+    if not port.idle()
+        return false
+    ctl_pool.pool_tx_end(var c.pool)
+    let at = ctl_pool.pool_tx_begin(var c.pool)
+    if at < 0
+        return false
+    port.start(var c.pool, at, ctl_pool.pool_tx_flight(var c.pool))
+    true
+
 // The work the hardware owes: `PEND_NONE`, `PEND_ENCRYPT` or `PEND_RAND`.
 pub @tier(embedded)
 fn ctl_async_kind(var c: Controller) -> Int
@@ -5932,6 +5959,10 @@ fn ctl_scan_rx(var c: Controller, var rx: Pdu, got: Int, rssi: Int) -> Int
 // A PDU received with a good CRC as the answer to the SCAN_REQ.
 pub @tier(embedded)
 fn ctl_scan_rsp_rx(var c: Controller, var rx: Pdu, got: Int, rssi: Int) -> Int
+    // A response the Host cannot be told of is not received (see `ctl_xscan_rsp`): the device is asked again at its next advertisement.
+    if c.scan.waiting and not c.scan.ext and le_event_enabled(var c, SUB_LE_ADVERTISING_REPORT) and ctl_pool.pool_free(var c.pool) < 2
+        c.dropped_events = c.dropped_events + 1
+        return 0
     let st = privacy_sender(var c, var rx)
     if st == 1
         ll_link.pdu_copy(var c.view, var rx)
@@ -6109,6 +6140,12 @@ fn ctl_xscan_rsp(var c: Controller, var rx: Pdu, rssi: Int, pphy: Int, sphy: Int
     let x = ll_ext.ext_parse(var rx)
     if not x.ok or not c.scan.waiting or not ll_ext.legacy_view(var rx, x, var c.xp, var c.xv)
         return 0
+    // A response the Host cannot be told of is not received: the scanner has no answer from the device and asks it again at its next
+    // advertisement (the judgement below marks the device as answered, and a device that has answered is not asked again).
+    let more = x.aux >= 0
+    if not xscan_pool_ok(var c, x.data_len, more)
+        c.dropped_events = c.dropped_events + 1
+        return 0
     c.xv.b[0] = ((c.xv.b[0] as Int & 0xF0) | ll_pdu.SCAN_RSP) as u8
     let st = privacy_sender(var c, var c.xv)
     var key = 0x8000
@@ -6122,10 +6159,6 @@ fn ctl_xscan_rsp(var c: Controller, var rx: Pdu, rssi: Int, pphy: Int, sphy: Int
         act = ll_scan.scan_rsp_rx(var c.scan, var c.xv, c.xv.n)
     c.scan.cur_did = 0
     if (act & ll_scan.ACT_REPORT) == 0
-        return 0
-    let more = x.aux >= 0
-    if not xscan_pool_ok(var c, x.data_len, more)
-        c.dropped_events = c.dropped_events + 1
         return 0
     if st == 1
         ll_ext.xctx_extended(var c.xs,
@@ -14825,18 +14858,56 @@ fn ctl_big_end(var c: Controller, g: Int, sent: Bool)
     c.bigs[g].anchor = c.bigs[g].anchor + ll_big.iso_us(var c.bigs[g])
     c.bigs[g].ev_open = false
 
+// Whether the train in slot `k` announces its group in the event that starts at `due`: the group is there, keyed and not ended.
+@tier(embedded)
+fn padv_announces(var c: Controller, k: Int) -> Bool
+    if not ctl_limits.big_on() or c.pads[k].big < 0
+        return false
+    let g = c.pads[k].big
+    let st = c.bigs[g].state
+    (st == ll_big.B_CREATE or st == ll_big.B_UP or st == ll_big.B_TERM) and c.bigs[g].key_ok
+
+// Whether the BIGInfo in the ACAD of the train in slot `k` is the one of the event that starts at `due`: it was built when the event
+// before ended (`ctl_padv_prepare`) and the group is still announced.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn ctl_padv_info_ready(var c: Controller, k: Int, due: Int) -> Bool
+    c.pads[k].info_due == due and c.pads[k].acad_n > 0 and padv_announces(var c, k)
+
 // The BIGInfo for the AUX_SYNC_IND of the train in slot `k` that starts at `due`: the offset to the next anchor point of its group and the
 // payload count there.  The BIGInfo is in the ACAD of the PDU the radio program builds next; a group that is not announced (none, not yet
-// keyed, ended) leaves the ACAD empty.
+// keyed, ended) leaves the ACAD empty.  The BIGInfo built when the event before ended (`ctl_padv_prepare`) is kept: the anchor point and the
+// event counter of a group move together, so the offset and the count it holds are those of `due` whatever the group did meanwhile.
 @satisfies("REQ-BLE-CTL-100")
 @tier(embedded)
 fn ctl_padv_big(var c: Controller, k: Int, due: Int)
+    if ctl_padv_info_ready(var c, k, due)
+        return
     c.pads[k].acad_n = 0
-    if not ctl_limits.big_on() or c.pads[k].big < 0
+    c.pads[k].info_due = -1
+    if not padv_announces(var c, k)
         return
     let g = c.pads[k].big
-    let st = c.bigs[g].state
-    if st != ll_big.B_CREATE and st != ll_big.B_UP and st != ll_big.B_TERM or not c.bigs[g].key_ok
-        return
     let _a = ll_big.info_for(var c.bigs[g], due, ll_big.INFO_PHASE_US)
     ll_per.acad_put(var c.pads[k], var c.bigs[g].info, c.bigs[g].info_n)
+    c.pads[k].info_due = due
+
+// Whether the AUX_SYNC_IND of the event of the train in slot `k` that starts at `due` was built when the event before ended, for the PHY `phy`
+// and the Tx Power `txp` of its set, and is still the one the train would build: the BIGInfo in it is the one of that start.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn ctl_padv_pdu_ready(var c: Controller, k: Int, due: Int, phy: Int, txp: Int) -> Bool
+    c.pads[k].pv_due == due and c.pads[k].pv_phy == phy and c.pads[k].pv_txp == txp and ctl_padv_info_ready(var c, k, due)
+
+// The event of the train in slot `k` has ended or was given up: the BIGInfo of the event that follows is built now, while the radio is idle,
+// and, when the event is one PDU, the PDU with it, so that the event has only the copy of the PDU to the radio before its transmitter starts.
+@satisfies("REQ-BLE-CTL-100")
+@tier(embedded)
+fn ctl_padv_prepare(var c: Controller, k: Int)
+    if not padv_announces(var c, k)
+        return
+    let due = c.pads[k].due
+    ctl_padv_big(var c, k, due)
+    let i = ctl_padv_set(var c, k)
+    if i >= 0 and ll_per.event_pdus(var c.pads[k]) == 1
+        ll_per.padv_prebuild(var c.pads[k], due, ll_xadv.chunk_len(c.pads[k].dlen, 0), c.xsets[i].sphy as Int, c.xsets[i].txp)

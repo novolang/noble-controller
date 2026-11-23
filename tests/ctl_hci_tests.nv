@@ -721,6 +721,77 @@ fn test_the_drain_stops_at_its_bound_and_an_empty_queue_asks_the_port_nothing()
     test.assert_eq(ctl_hci.ctl_tx_drain(var c, var port, 2), 2)
     test.assert(ctl_hci.ctl_tx_pending(var c))
 
+// ── The Host's port takes a packet whole ────────────────────────────
+
+// A port that takes a packet in one transfer and is busy for `busy` asks of `idle` after each start, as a UART is while the packet is on the line.
+@value
+struct PacketPort
+    busy: Int
+    left: Int
+    starts: Int
+    asked: Int
+    got: Vec[Int; 64]
+
+fn packet_port(busy: Int) -> PacketPort
+    PacketPort { busy: busy, left: 0, starts: 0, asked: 0, got: Vec.new() }
+
+impl HostPacketTx[] for PacketPort
+    fn idle(var self) -> Bool
+        self.asked = self.asked + 1
+        if self.left > 0
+            self.left = self.left - 1
+            return false
+        true
+
+    fn start(var self, var pool: ctl_pool.PacketPool, at: Int, n: Int)
+        self.starts = self.starts + 1
+        self.left = self.busy
+        for i in 0..n
+            let _p = self.got.push(pool.bytes[at + i] as Int)
+
+@test
+fn test_a_port_that_takes_a_packet_whole_gets_it_once_and_the_slot_is_free_when_it_is_idle_again()
+    var c = fresh()
+    var port = packet_port(2)
+    // An empty queue asks the port nothing.
+    test.assert(not ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert_eq(port.asked, 0)
+    send(var c, ctl_hci.OP_RESET, [])
+    let _a = ctl_hci.ctl_step(var c)
+    test.assert(ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert_eq(heard_packet(port), bytes_of(ctl_hci.OP_RESET, 0))
+    // The port is busy for two asks: the packet stays in its slot, and nothing is handed on.
+    test.assert(not ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert(not ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert(ctl_pool.pool_free(var c.pool) < ctl_pool.SLOTS)
+    test.assert(not ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert_eq(port.starts, 1)
+    test.assert_eq(ctl_pool.pool_free(var c.pool), ctl_pool.SLOTS)
+    test.assert(not ctl_hci.ctl_tx_pending(var c))
+
+fn heard_packet(p: PacketPort) -> [Int]
+    var got: [Int] = []
+    for i in 0..p.got.len()
+        list.push(got, p.got[i])
+    got
+
+@test
+fn test_a_port_that_is_idle_takes_the_next_packet_in_the_turn_that_gives_the_slot_back()
+    var c = fresh()
+    var port = packet_port(0)
+    send(var c, ctl_hci.OP_RESET, [])
+    let _a = ctl_hci.ctl_step(var c)
+    test.assert(ctl_hci.ctl_tx_packet(var c, var port))
+    send(var c, ctl_hci.OP_RESET, [])
+    let _b = ctl_hci.ctl_step(var c)
+    // The call that gives the first slot back hands on the second packet.
+    test.assert(ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert_eq(port.starts, 2)
+    test.assert_eq(ctl_pool.pool_free(var c.pool), ctl_pool.SLOTS - 1)
+    test.assert(not ctl_hci.ctl_tx_packet(var c, var port))
+    test.assert_eq(port.starts, 2)
+    test.assert_eq(ctl_pool.pool_free(var c.pool), ctl_pool.SLOTS)
+
 // ── Flow control toward the Host ────────────────────────────────────
 //
 // The mock Hosts here are the commands a Host would send: Host Buffer Size,

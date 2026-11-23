@@ -28,6 +28,7 @@ use noble_controller.CONFIG
 use ctl_limits
 use std.test
 use ctl_hci
+use ctl_pool
 use ll_pdu
 use ll_pcl
 use ll_feat
@@ -1358,6 +1359,32 @@ fn test_an_active_scanner_asks_t_ifs_after_the_advertisement_and_reports_the_ans
     let r = reports(air.host)
     test.assert_eq(list.len(r), 2)
     test.assert_eq(r[0][5], 0)
+    test.assert_eq(r[1][5], 4)
+
+@test
+fn test_a_scan_response_the_pool_has_no_room_for_does_not_stop_the_scanner_asking_the_device_again()
+    var c = fresh()
+    scan_on(var c, 1)
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    var held: [Int] = []
+    for _ in 0..64
+        if ctl_pool.pool_free(var c.pool) > 1
+            list.push(held, ctl_pool.pool_take(var c.pool))
+    react(var air, ll_pdu.SCAN_REQ, 37, from_peer(ll_pdu.SCAN_RSP, 4), 2)
+    hear(var air, 2000, 37, from_peer(ll_pdu.ADV_IND, 2))
+    run(var c, var rf, var air, 9000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 1)
+    test.assert(c.dropped_events >= 1)
+    test.assert_eq(list.len(reports(air.host)), 0)
+    // The pool has room again and the device advertises once more (the scanner is on channel 37 again from 30 ms): it is asked again.
+    for k in held
+        ctl_pool.pool_give(var c.pool, k)
+    hear(var air, 32000, 37, from_peer(ll_pdu.ADV_IND, 2))
+    run(var c, var rf, var air, 40000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 2)
+    let r = reports(air.host)
+    test.assert_eq(list.len(r), 2)
     test.assert_eq(r[1][5], 4)
 
 @test
@@ -4055,7 +4082,7 @@ fn test_sdus_over_one_payload_are_cut_and_put_together_in_both_directions_on_le_
     var c = fresh()
     var rf = ll_air.rf_new()
     var air = sim_new()
-    // 310 octets (two channels of an LC3 frame at 48 kHz) from the Host and 280 from the Peripheral: two payloads of the longest PDU, 251
+    // 310 octets (two channels of an LC3 frame at 48 kHz) from the Host and 280 from the Peripheral: two payloads of 155 and of 140
     // octets, BN 2, in an ISO interval of 10 ms; the Host sends each in two HCI packets and hears each in two.
     cis_cen_up_req(var c,
         var rf,
@@ -4067,8 +4094,8 @@ fn test_sdus_over_one_payload_are_cut_and_put_together_in_both_directions_on_le_
         false,
         cig_request_full(1, 0, 2, 310, 280, 3, 10000, 40))
     test.assert_eq(c.cis[0].phy, 2)
-    test.assert_eq(c.cis[0].max_pdu_c, 251)
-    test.assert_eq(c.cis[0].max_pdu_p, 251)
+    test.assert_eq(c.cis[0].max_pdu_c, 155)
+    test.assert_eq(c.cis[0].max_pdu_p, 140)
     test.assert_eq(c.cis[0].bn_c, 2)
     test.assert_eq(c.cis[0].bn_p, 2)
     cen_group_check(var c, var rf, var air, 1, 310, 280, 100)
@@ -4925,6 +4952,42 @@ fn test_an_active_extended_scan_asks_a_scannable_aux_adv_ind_and_reports_the_res
     test.assert_eq(x_len(ev[2]), 10)
     test.assert_eq(ev[2][29], 20)
     test.assert_eq(c.scan.responses, 1)
+
+@test
+fn test_an_extended_scan_response_the_pool_has_no_room_for_does_not_stop_the_scanner_asking_the_device_again()
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    xscan_on(var c, 1, 0)
+    // The Host's pool is full but for one slot: the response of the first advertisement is received and cannot be reported.
+    var held: [Int] = []
+    for _ in 0..64
+        if ctl_pool.pool_free(var c.pool) > 1
+            list.push(held, ctl_pool.pool_take(var c.pool))
+    hear(var air, 2000, 37, xp(2, -1, 3, 4, 12, 100, 0, -200, []))
+    hear(var air, 5000, 12, xp(2, 0x30, 3, 4, -1, 0, 0, -200, []))
+    react(var air, ll_pdu.SCAN_REQ, 12, xp(0, 0x30, 3, 4, -1, 0, 0, -200, count_from(0, 20)), 2)
+    run(var c, var rf, var air, 15000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 1)
+    test.assert(c.dropped_events >= 1)
+    var seen = 0
+    for e in xreports(air.host)
+        if (x_et(e) & 0x1F) == 0x000A
+            seen = seen + 1
+    test.assert_eq(seen, 0)
+    // The pool has room again and the device advertises once more: it is asked again, and its response is reported.
+    for k in held
+        ctl_pool.pool_give(var c.pool, k)
+    // The scanner is on channel 37 again from 30 ms.
+    hear(var air, 32000, 37, xp(2, -1, 3, 4, 12, 100, 0, -200, []))
+    hear(var air, 35000, 12, xp(2, 0x30, 3, 4, -1, 0, 0, -200, []))
+    run(var c, var rf, var air, 55000)
+    test.assert_eq(count_tx(var air, ll_pdu.SCAN_REQ), 2)
+    var after = 0
+    for e in xreports(air.host)
+        if (x_et(e) & 0x1F) == 0x000A
+            after = after + 1
+    test.assert_eq(after, 1)
 
 @test
 fn test_a_passive_extended_scan_does_not_ask_and_an_active_one_does_not_ask_a_connectable_aux_adv_ind()
@@ -8642,6 +8705,83 @@ fn test_the_sender_names_an_event_of_its_own_train_from_a_connection_event_the_l
     test.assert_eq(c.per_late, 0)
 
 @test
+fn test_an_event_of_a_train_is_given_up_when_the_radio_is_granted_too_late_for_the_work_before_its_transmitter()
+    // An event whose BIGInfo is not built needs the 200 microseconds of the BIGInfo and the PDU, and the ramp-up of the transmitter, before its time.
+    let nothing = ll_air.padv_work_us(true, false, false)
+    test.assert_eq(nothing, ll_air.PADV_WORK_BIG_US)
+    test.assert(ll_air.padv_has_time(10000, 139, 10000 + 139 + nothing, nothing))
+    test.assert(not ll_air.padv_has_time(10000, 139, 10000 + 139 + nothing - 1, nothing))
+    // The BIGInfo built when the event before ended leaves the PDU, and the PDU built with it the copy to the radio; an event with no BIGInfo needs the 60 of the PDU.
+    test.assert_eq(ll_air.padv_work_us(true, true, false), ll_air.PADV_WORK_INFO_US)
+    test.assert_eq(ll_air.padv_work_us(true, true, true), ll_air.PADV_WORK_PDU_US)
+    test.assert_eq(ll_air.padv_work_us(false, false, false), ll_air.PADV_WORK_US)
+    test.assert(ll_air.PADV_WORK_BIG_US > ll_air.PADV_WORK_INFO_US and ll_air.PADV_WORK_INFO_US > ll_air.PADV_WORK_US and ll_air.PADV_WORK_US > ll_air.PADV_WORK_PDU_US)
+
+@test
+fn test_the_biginfo_of_the_next_event_of_a_train_is_built_when_the_event_before_ends_and_goes_with_the_group()
+    if not ctl_limits.big_on()
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    big_train(var c, var rf, var air)
+    test.assert(not ctl_hci.ctl_padv_info_ready(var c, 0, c.pads[0].due))
+    test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 1, 10000, 60, 20, 0, 3, 0, 0)), 0)
+    run(var c, var rf, var air, 600000)
+    // The event that ended last left the BIGInfo of the next one in the ACAD, for the start of that event and no other.
+    test.assert(ctl_hci.ctl_padv_info_ready(var c, 0, c.pads[0].due))
+    test.assert(not ctl_hci.ctl_padv_info_ready(var c, 0, c.pads[0].due + 1))
+    test.assert_eq(c.pads[0].acad_n, c.bigs[0].info_n)
+    // The PDU of an event of one PDU was built with it, for the PHY and the Tx Power of the set, and the data of the train taking it back.
+    let i = ctl_hci.ctl_padv_set(var c, 0)
+    let phy = c.xsets[i].sphy as Int
+    let txp = c.xsets[i].txp
+    test.assert(ctl_hci.ctl_padv_pdu_ready(var c, 0, c.pads[0].due, phy, txp))
+    test.assert(not ctl_hci.ctl_padv_pdu_ready(var c, 0, c.pads[0].due, phy + 1, txp))
+    test.assert(not ctl_hci.ctl_padv_pdu_ready(var c, 0, c.pads[0].due, phy, txp + 1))
+    // It is the PDU the event would build, octet for octet.
+    var q = ll_pdu.pdu_new()
+    ll_per.build_sync_ind(var c.pads[0], var q, 0, ll_xadv.chunk_len(c.pads[0].dlen, 0), false, 0, 0, phy, txp)
+    test.assert_eq(c.pads[0].pv.n, q.n)
+    test.assert(q.n > 20)
+    for k in 0..q.n
+        test.assert_eq(c.pads[0].pv.b[k] as Int, q.b[k] as Int)
+    ll_per.pdata_begin(var c.pads[0], ll_per.OP_COMPLETE)
+    test.assert(not ctl_hci.ctl_padv_pdu_ready(var c, 0, c.pads[0].due, phy, txp))
+    test.assert(ctl_hci.ctl_padv_info_ready(var c, 0, c.pads[0].due))
+    // The event takes it as it stands: asking for the BIGInfo of the same start again builds nothing.
+    let at = c.pads[0].due
+    c.pads[0].acad_n = 7
+    ctl_hci.ctl_padv_big(var c, 0, at)
+    test.assert_eq(c.pads[0].acad_n, 7)
+    // For another start it is built again, from the group.
+    ctl_hci.ctl_padv_big(var c, 0, at + 10000)
+    test.assert_eq(c.pads[0].acad_n, c.bigs[0].info_n)
+    test.assert_eq(c.pads[0].info_due, at + 10000)
+    // A group that has ended leaves the event none.
+    c.bigs[0].state = ll_big.B_FREE
+    test.assert(not ctl_hci.ctl_padv_info_ready(var c, 0, at + 10000))
+    ctl_hci.ctl_padv_big(var c, 0, at + 10000)
+    test.assert_eq(c.pads[0].acad_n, 0)
+    test.assert_eq(c.pads[0].info_due, -1)
+    ctl_hci.ctl_padv_prepare(var c, 0)
+    test.assert_eq(c.pads[0].acad_n, 0)
+    // An event of several PDUs, or of a train whose set is gone, is given no PDU in advance.
+    c.bigs[0].state = ll_big.B_UP
+    c.pads[0].pv_due = -1
+    c.pads[0].dlen = 400
+    ctl_hci.ctl_padv_prepare(var c, 0)
+    test.assert_eq(c.pads[0].pv_due, -1)
+    test.assert_eq(c.pads[0].info_due, c.pads[0].due)
+    c.pads[0].dlen = 20
+    let handle = c.pads[0].handle
+    c.pads[0].handle = 0x77
+    c.pads[0].info_due = -1
+    ctl_hci.ctl_padv_prepare(var c, 0)
+    test.assert_eq(c.pads[0].pv_due, -1)
+    c.pads[0].handle = handle
+
+@test
 fn test_the_sender_describes_a_train_with_responses_by_ll_periodic_sync_wr_ind_with_the_timing_of_its_subevents()
     // [Vol 6] Part B, Section 5.1.13: for PAwR the LL_PERIODIC_SYNC_WR_IND PDU shall be used; its tail is the timing the AUX_ADV_IND announces.
     if not ctl_limits.past_on() or not ctl_limits.pawr_adv_on()
@@ -11577,3 +11717,41 @@ fn test_a_passive_scan_that_listens_all_the_time_does_not_stop_two_bises_reachin
     test.assert(r[1] >= 30)
     test.assert(r[0] - r[1] <= 1 and r[1] - r[0] <= 1)
     test.assert_eq(r[2] + r[3], 0)
+
+@when(noble_controller.CONFIG.CTL_CIS_DIAG)
+@test
+fn test_the_central_counts_the_packets_it_heard_by_subevent_channel_and_length_sent_and_those_with_a_bad_crc()
+    var b = ll_air.cis_bad_new()
+    // Two good packets, then a bad one in subevent 2 on channel 17 after a payload of 155 octets whose header says 64, then another bad one right after.
+    ll_air.cis_note_heard(var b, 1, 5, 0, true, 0)
+    ll_air.cis_note_heard(var b, 2, 17, 155, true, 155)
+    ll_air.cis_note_heard(var b, 2, 17, 155, false, 64)
+    test.assert_eq(b.after_bad, 0)
+    ll_air.cis_note_heard(var b, 12, 99, 251, false, 251)
+    test.assert_eq(b.after_bad, 1)
+    ll_air.cis_note_heard(var b, 0, 3, 40, true, 0)
+    ll_air.cis_note_heard(var b, 1, 3, 10, false, 0)
+    test.assert_eq(b.after_bad, 1)
+    // The subevents count from 1, and one beyond 8 or below 1 is put in the last or the first.
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_SUB, 0), 3)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_SUB, 0), 1)
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_SUB, 1), 2)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_SUB, 1), 1)
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_SUB, 7), 1)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_SUB, 7), 1)
+    // The length sent: none, up to 99, 100 to 199, 200 and over.
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_TX, 0), 1)
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_TX, 1), 2)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_TX, 1), 1)
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_TX, 2), 2)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_TX, 2), 1)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_TX, 3), 1)
+    // The channel, when it is a data channel or one of the 40 the table has.
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_CH, 17), 2)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_CH, 17), 1)
+    test.assert_eq(ll_air.cis_hist_all(var b, ll_air.HIST_CH, 3), 2)
+    test.assert_eq(ll_air.cis_hist_bad(var b, ll_air.HIST_CH, 3), 1)
+    // The length of the header of a bad packet.
+    test.assert_eq(b.rx_bad[0], 1)
+    test.assert_eq(b.rx_bad[1], 1)
+    test.assert_eq(b.rx_bad[3], 1)

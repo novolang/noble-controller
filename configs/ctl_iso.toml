@@ -10,6 +10,7 @@ ctl_pcl = true
 ctl_subrate = true
 ctl_featpages = true
 ctl_ploss = true
+ctl_cis_diag = true
 ctl_peersca = true
 ctl_connrate = true
 ctl_framespace = true
