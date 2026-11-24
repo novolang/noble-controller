@@ -656,6 +656,92 @@ fn test_a_request_without_the_host_support_bit_is_rejected_with_unsupported_remo
     test.assert_eq(queued_byte(var c, 2), 0x1A)
     test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
 
+// The Controller of a chip whose cipher cannot carry an isochronous stream (`CAP_NO_ISO_ENC`), over the link in slot 0 encrypted or not.
+fn plain_only(var c: ctl_hci.Controller, encrypted: Bool)
+    c.caps = (c.caps as Int | ctl_hci.CAP_NO_ISO_ENC) as u8
+    c.links[0].enc_tx = encrypted
+    c.links[0].enc_rx = encrypted
+
+@test
+fn test_a_request_over_an_encrypted_link_is_rejected_with_unsupported_remote_feature_when_the_cipher_cannot_carry_it()
+    if not iso_on()
+        return
+    var c = connected()
+    plain_only(var c, true)
+    var p = req_pdu()
+    deliver(var c, var p)
+    test.assert_eq(queued_op(var c), ll_data.OP_REJECT_EXT_IND)
+    test.assert_eq(queued_byte(var c, 1), ll_data.OP_CIS_REQ)
+    test.assert_eq(queued_byte(var c, 2), 0x1A)
+    test.assert_eq(c.cis[0].state, ll_iso.S_FREE)
+    test.assert_eq(c.cis_log.rejected, 1)
+    test.assert_eq(c.cis_log.code, 0x1A)
+    test.assert_eq(c.cis_log.why, ll_iso.WHY_ISO_ENC)
+    // The Host is not asked, and the link stays up.
+    let r = run(var c, 0x1001, [])
+    test.assert_eq(list.len(meta_events(r, 0x1A)), 0)
+    test.assert(c.links[0].live)
+
+@test
+fn test_a_request_over_an_unencrypted_link_is_taken_when_the_cipher_cannot_carry_an_encrypted_one()
+    if not iso_on()
+        return
+    var c = connected()
+    plain_only(var c, false)
+    var p = req_pdu()
+    deliver(var c, var p)
+    test.assert_eq(c.cis[0].state, ll_iso.S_REQUESTED)
+    test.assert_eq(c.cis_log.rejected, 0)
+    let r = run(var c, 0x1001, [])
+    test.assert_eq(list.len(meta_events(r, 0x1A)), 1)
+
+@test
+fn test_a_request_over_an_encrypted_link_is_taken_when_the_cipher_carries_it()
+    if not iso_on()
+        return
+    var c = connected()
+    c.links[0].enc_tx = true
+    c.links[0].enc_rx = true
+    var p = req_pdu()
+    deliver(var c, var p)
+    test.assert_eq(c.cis[0].state, ll_iso.S_REQUESTED)
+    test.assert_eq(c.cis_log.rejected, 0)
+
+@test
+fn test_an_indication_after_the_link_began_to_be_encrypted_fails_the_stream_when_the_cipher_cannot_carry_it()
+    if not iso_on()
+        return
+    var c = connected()
+    plain_only(var c, false)
+    var p = req_pdu()
+    deliver(var c, var p)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(cmd_status(var c, 0x2066, [h & 0xFF, h >>> 8]), 0)
+    let _s = run(var c, 0x1001, [])
+    pop_queued(var c)
+    // The link is encrypted while the Host's answer is on its way back: the indication starts nothing.
+    c.links[0].enc_tx = true
+    c.links[0].enc_rx = true
+    ctl_hci.ctl_set_time(var c, 5000)
+    c.links[0].ev_open = true
+    c.links[0].ev_anchor = true
+    c.links[0].anchor = 6000
+    var x = ll_iso.cis_new()
+    t_set(var x, "aa", 0x71B2E5A4)
+    t_set(var x, "cis_offset", 3000)
+    t_set(var x, "ind_ev", 3)
+    var q = ll_pdu.pdu_new()
+    ll_iso.put_cis_ind(var q, var x)
+    deliver(var c, var q)
+    test.assert(c.cis[0].state != ll_iso.S_WAIT)
+    test.assert_eq(c.cis[0].state, ll_iso.S_CLOSING)
+    test.assert_eq(c.cis[0].status, 0x11)
+    let r = run(var c, 0x1001, [])
+    let est = meta_events(r, 0x2A)
+    test.assert_eq(list.len(est), 1)
+    test.assert_eq(est[0][4], 0x11)
+    test.assert(c.links[0].live)
+
 @test
 fn test_a_request_the_controller_cannot_take_is_rejected_with_the_code_of_the_reason()
     if not iso_on()

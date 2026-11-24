@@ -886,6 +886,7 @@ const WHY_NO_SLOT = 21
 const WHY_DUPLICATE = 22
 const WHY_ACCEPT_TIMEOUT = 23
 const WHY_HOST_REJECT = 24
+const WHY_ISO_ENC = 25
 
 // What the Controller kept of the LL_CIS_REQ PDUs it saw: how many, how many it refused, how many the Link Layer dropped
 // before the Controller (a payload of the wrong length), the code and the branch of the last refusal and the fields of

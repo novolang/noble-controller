@@ -440,6 +440,21 @@ fn connected(interval: Int, timeout: Int) -> ctl_hci.Controller
     test.assert(ctl_hci.ctl_connect_ind(var c, var pol, var p, 5000))
     c
 
+// A connection that was just opened is not booked until the Link Layer is polled, and the room the HCI stream gets is the whole of the time
+// until then: the main loop books it (`ctl_ll_book`) once the radio program returns with a connection opened, so that the turn that moves the
+// Connection Complete event is bounded by the first transmit window.
+@when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
+@test
+fn test_the_room_of_the_stream_after_a_connection_opened_is_bounded_once_it_is_booked()
+    var c = connected(24, 100)
+    ctl_hci.ctl_set_time(var c, 5300)
+    let open_room = ctl_hci.ctl_stream_room(var c, 5300)
+    ctl_hci.ctl_ll_book(var c)
+    let booked = ctl_hci.ctl_stream_room(var c, 5300)
+    test.assert(booked < open_room)
+    // The transmit window opens 1.25 ms after the CONNECT_IND (at 5000): the room ends before it.
+    test.assert(booked < 1250)
+
 // The Central for `connected`: its first packet 1.25 ms and 300 microseconds into
 // the transmit window.
 fn first_central(interval: Int) -> Cen

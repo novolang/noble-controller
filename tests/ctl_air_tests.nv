@@ -11718,6 +11718,111 @@ fn test_a_passive_scan_that_listens_all_the_time_does_not_stop_two_bises_reachin
     test.assert(r[0] - r[1] <= 1 and r[1] - r[0] <= 1)
     test.assert_eq(r[2] + r[3], 0)
 
+// ── A cipher that cannot carry an isochronous stream (`CAP_NO_ISO_ENC`) ──────────────
+
+fn no_iso_enc(var c: ctl_hci.Controller)
+    c.caps = (c.caps as Int | ctl_hci.CAP_NO_ISO_ENC) as u8
+
+fn link_encrypted_now(var c: ctl_hci.Controller)
+    c.links[0].enc_tx = true
+    c.links[0].enc_rx = true
+
+@test
+fn test_create_cis_over_an_encrypted_link_is_refused_with_unsupported_feature_when_the_cipher_cannot_carry_it()
+    if not ctl_limits.iso_on() or ctl_limits.cis_slots() < 1
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    cis_cen_connect(var c, var rf, var air)
+    no_iso_enc(var c)
+    let r = complete_of_ctl(var c, 0x2062, cig_request(1, 0))
+    test.assert_eq(r[6], 0)
+    let h = ll_iso.HANDLE_BASE
+    // The link is encrypted: Unsupported Feature or Parameter Value, the stream stays a configuration and the link stays up.
+    link_encrypted_now(var c)
+    test.assert_eq(cmd_status(var c, 0x2064, [1, h & 0xFF, h >>> 8, 1, 0]), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(c.cis[0].state, ll_iso.S_CONFIG)
+    test.assert(c.links[0].live)
+    // The same link, not encrypted: the stream is created.
+    c.links[0].enc_tx = false
+    c.links[0].enc_rx = false
+    test.assert_eq(cmd_status(var c, 0x2064, [1, h & 0xFF, h >>> 8, 1, 0]), 0)
+
+@test
+fn test_create_cis_over_an_encrypted_link_is_taken_when_the_cipher_carries_it()
+    if not ctl_limits.iso_on() or ctl_limits.cis_slots() < 1
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    cis_cen_connect(var c, var rf, var air)
+    let r = complete_of_ctl(var c, 0x2062, cig_request(1, 0))
+    test.assert_eq(r[6], 0)
+    let h = ll_iso.HANDLE_BASE
+    link_encrypted_now(var c)
+    test.assert_eq(cmd_status(var c, 0x2064, [1, h & 0xFF, h >>> 8, 1, 0]), 0)
+
+@test
+fn test_an_indication_is_not_sent_for_a_link_that_began_to_be_encrypted_when_the_cipher_cannot_carry_a_stream()
+    if not ctl_limits.iso_on() or ctl_limits.cis_slots() < 1
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    cis_cen_connect(var c, var rf, var air)
+    no_iso_enc(var c)
+    let r = complete_of_ctl(var c, 0x2062, cig_request(1, 0))
+    test.assert_eq(r[6], 0)
+    let h = ll_iso.HANDLE_BASE
+    test.assert_eq(cmd_status(var c, 0x2064, [1, h & 0xFF, h >>> 8, 1, 0]), 0)
+    cis_run(var c, var rf, var air, air.now + 2000000, 5, 0)
+    // The link is encrypted while the request is out: the Peripheral's response is answered with no indication, the Host is told with
+    // Unsupported Feature or Parameter Value, the stream is a configuration again and the link stays up.
+    link_encrypted_now(var c)
+    var x = c.cis[0]
+    var rsp = ll_pdu.pdu_new()
+    ll_iso.put_cis_rsp(var rsp, var x)
+    ctl_hci.ctl_iso_ctrl(var c, 0, var rsp)
+    cis_run(var c, var rf, var air, air.now + 100000, 0, 0)
+    let est = meta_events(air.host, 0x2A)
+    test.assert_eq(list.len(est), 1)
+    test.assert_eq(est[0][4], 0x11)
+    test.assert_eq(c.cis[0].state, ll_iso.S_CONFIG)
+    test.assert(c.links[0].live)
+
+@when(noble_controller.CONFIG.CTL_BIS >= 2)
+@test
+fn test_an_encrypted_group_is_refused_with_unsupported_feature_when_the_cipher_cannot_carry_it()
+    if not ctl_limits.big_on()
+        return
+    var c = fresh()
+    var rf = ll_air.rf_new()
+    var air = sim_new()
+    big_train(var c, var rf, var air)
+    no_iso_enc(var c)
+    // LE Create BIG with the Encryption parameter 1: refused; an unencrypted group is made.
+    test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 2, 10000, 100, 20, 1, 2, 0, 1)), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    // LE Create BIG Test: the same.
+    var t: [Int] = [0, 1, 2, 0x10, 0x27, 0, 8, 0, 2, 100, 0, 100, 0, 2, 0, 0, 1, 2, 0, 1]
+    for i in 0..16
+        list.push(t, 0x40 + i)
+    test.assert_eq(cmd_status(var c, 0x2069, t), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(cmd_status(var c, 0x2068, big_params(0, 1, 2, 10000, 100, 20, 1, 2, 0, 0)), 0)
+
+@when(noble_controller.CONFIG.CTL_BIS >= 2)
+@test
+fn test_le_big_create_sync_for_an_encrypted_group_is_refused_with_unsupported_feature_when_the_cipher_cannot_carry_it()
+    if not ctl_limits.big_on()
+        return
+    var d = fresh()
+    no_iso_enc(var d)
+    // Encryption 1: refused before the synchronization is looked up; Encryption 0: the unknown synchronization is still the answer.
+    test.assert_eq(cmd_status(var d, 0x206B, big_sync_params(0, 5, 0, 0x64, [1])), ctl_hci.STATUS_UNSUPPORTED_FEATURE)
+    test.assert_eq(cmd_status(var d, 0x206B, big_sync_params(0, 0, 0, 0x64, [1])), 0x42)
+    var e = fresh()
+    test.assert_eq(cmd_status(var e, 0x206B, big_sync_params(0, 5, 0, 0x64, [1])), 0x42)
+
 @when(noble_controller.CONFIG.CTL_CIS_DIAG)
 @test
 fn test_the_central_counts_the_packets_it_heard_by_subevent_channel_and_length_sent_and_those_with_a_bad_crc()

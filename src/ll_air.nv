@@ -323,6 +323,7 @@ struct Rf
     x_adv_pdus: Int
     x_adv_err_min_us: Int
     x_adv_err_max_us: Int
+    x_adv_slack_min_us: Int
     x_adv_chain: Int
     x_adv_aux: Int
     x_adv_events: Int
@@ -365,7 +366,7 @@ fn rf_make() -> Rf
          seals: 0, opens: 0, seal_max: 0, open_max: 0, mic_fail: 0, seal_sum: 0, open_sum: 0,
          seal_slow: 0, open_slow: 0, owner: -1, chain_cut: 0, post_max: 0, post_sum: 0, post_n: 0, rx_long: 0, rx_len_max: 0,
          cis_subs: 0, cis_missed: 0, cis_aborts: 0, cis_good: 0, cis_bad: 0, cis_chained: 0, cis_late: 0, cis_late_max: 0, cis_end: 0, cis_work_n: 0, cis_work_sum: 0, cis_work_max: 0, cis_gap_min: 1000000, dtm_on: false, dtm_next: 0, aux_rsp_min_us: 1000000, aux_rsp_max_us: 0, x_t0: 0, x_pdus: 0, x_chains: 0, x_asks: 0, x_slack_min_us: 1000000,
-         x_adv_pdus: 0, x_adv_err_min_us: 1000000, x_adv_err_max_us: -1000000, x_adv_chain: 0, x_adv_aux: 0, x_adv_events: 0, x_per_events: 0, x_per_err_max_us: -1000000, x_per_work_max_us: 0, x_per_heard: 0, x_pawr_rsp: 0, x_pawr_tx: 0, big_events: 0, big_subs: 0, big_late: 0, big_skipped: 0, big_err_max_us: -1000000, big_good: 0, big_bad: 0, big_missed: 0, big_work_max: 0, cb: cis_bad_new(), sc: ll_pdu.pdu_new() }
+         x_adv_pdus: 0, x_adv_err_min_us: 1000000, x_adv_err_max_us: -1000000, x_adv_slack_min_us: 1000000, x_adv_chain: 0, x_adv_aux: 0, x_adv_events: 0, x_per_events: 0, x_per_err_max_us: -1000000, x_per_work_max_us: 0, x_per_heard: 0, x_pawr_rsp: 0, x_pawr_tx: 0, big_events: 0, big_subs: 0, big_late: 0, big_skipped: 0, big_err_max_us: -1000000, big_good: 0, big_bad: 0, big_missed: 0, big_work_max: 0, cb: cis_bad_new(), sc: ll_pdu.pdu_new() }
 
 // ── Packets in and out of the radio's buffers ───────────────────────
 
@@ -719,6 +720,10 @@ fn xadv_tx<R: Radio[e] + Timebase[t]>(var air: R, var rf: Rf, ch: Int, phy: Int,
     air.packet(ll_radio.BUF_TX)
     air.clear_all()
     air.arm(next, false)
+    // The time the program had left, when its set-up ended, before the transmitter had to start: the figure that says whether the work between two PDUs fits.
+    let slack = due - air.tx_lead_us() - air.now_us()
+    if slack < rf.x_adv_slack_min_us
+        rf.x_adv_slack_min_us = slack
     air.wait_until(due - air.tx_lead_us())
     air.start_tx()
     rf.adv_pdus = rf.adv_pdus + 1
@@ -815,15 +820,19 @@ fn xadv_listen<R: Radio[e] + Timebase[t], P: LinkPolicy>(var air: R, var c: Cont
         addr_mark = air.address_mark()
         let got = get_pdu(var air, ll_radio.BUF_RX, var rx)
         if got > 0
-            act = ctl_hci.ctl_adv_rx(var c, var rx, got)
-            note_judge(var air, var rf, seen)
-            if act == ll_adv.RX_CONNECT_IND
-                // The AUX_CONNECT_RSP names the initiator: its type as RxAdd and its address as TargetA.
+            // The AUX_CONNECT_RSP names the initiator: its type as RxAdd and its address as TargetA.  The names are the request's own and
+            // do not depend on the judgement, so they are written before it: the radio starts the answer T_IFS after the request
+            // and reads its octets as it sends them, and a judgement that takes longer than the interframe space (190 microseconds on
+            // the nRF52840's 64 MHz core, for the request of an initiator that uses a Resolvable Private Address) would write them
+            // after the radio had read them.
+            if (air.octet(ll_radio.BUF_RX, 0) & 0x0F) == ll_pdu.CONNECT_IND
                 air.set_octet(ll_radio.BUF_ANS,
                     0,
                     (air.octet(ll_radio.BUF_ANS, 0) & 0x7F) | ((air.octet(ll_radio.BUF_RX, 0) & 0x40) << 1))
                 for k in 0..6
                     air.set_octet(ll_radio.BUF_ANS, 10 + k, air.octet(ll_radio.BUF_RX, 2 + k))
+            act = ctl_hci.ctl_adv_rx(var c, var rx, got)
+            note_judge(var air, var rf, seen)
     if act == ll_adv.RX_NONE
         abort_answer(var air, var rf)
         return

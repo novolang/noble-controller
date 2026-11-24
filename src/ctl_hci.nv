@@ -356,6 +356,10 @@ pub const CAP_RNG = 2
 pub const CAP_LL = 4
 // The hardware has a P-256 ECDH engine.
 pub const CAP_ECDH = 8
+// The cipher cannot carry an isochronous stream: the time it takes to seal and to open a PDU is longer than the room a subevent leaves.  The
+// Controller refuses a stream over an encrypted link and an encrypted broadcast group, and carries the unencrypted ones.  Absent on a chip
+// whose cipher is fast enough (the nRF54L's CCM), which is every build that does not name it.
+pub const CAP_NO_ISO_ENC = 16
 
 // The transmit power the radio is set to for advertising channel PDUs, in
 // dBm, and the range the part supports (LE Read Transmit Power).
@@ -12287,6 +12291,17 @@ fn cis_acl_lost(var c: Controller, ls: Int, reason: Int)
 
 // ── The LL Control PDUs ──────────────────────────────────────────────
 
+// Whether a stream over the link in slot `ls` is one this Controller does not carry: the link is encrypted and the chip's cipher is too slow
+// for the payloads of a subevent (`CAP_NO_ISO_ENC`).
+@tier(embedded)
+fn iso_link_refused(var c: Controller, ls: Int) -> Bool
+    (c.caps as Int & CAP_NO_ISO_ENC) != 0 and ll_link.link_encrypted(var c.links[ls])
+
+// Whether the Host's encrypted broadcast group is one this Controller does not carry (`CAP_NO_ISO_ENC`).
+@tier(embedded)
+fn iso_big_refused(var c: Controller, enc: Int) -> Bool
+    enc == 1 and (c.caps as Int & CAP_NO_ISO_ENC) != 0
+
 // LL_CIS_REQ on the link `ls` (Peripheral), read from `rx`: the stream is taken into a free slot and the Host is
 // asked, or the Central is told why not.  Section 5.1.15 lists the reasons: the Host support bit not set, a PHY
 // or framing the Controller lacks, BN, FT and NSE out of its range.
@@ -12299,6 +12314,9 @@ fn iso_req(var c: Controller, ls: Int, var rx: Pdu)
         return
     if not le_event_enabled(var c, SUB_LE_CIS_REQUEST)
         iso_req_refuse(var c, ls, STATUS_UNSUPPORTED_REMOTE, ll_iso.WHY_EVENT_MASK)
+        return
+    if iso_link_refused(var c, ls)
+        iso_req_refuse(var c, ls, ll_iso.STATUS_UNSUPPORTED_REMOTE, ll_iso.WHY_ISO_ENC)
         return
     let i = cis_free_slot(var c)
     if i < 0
@@ -12364,6 +12382,10 @@ fn cis_find_dup(var c: Controller, i: Int) -> Int
 fn iso_ind(var c: Controller, ls: Int, var rx: Pdu)
     let i = cis_on_acl(var c, ls, ll_iso.S_ACCEPTED)
     if i < 0 or (c.cis[i].owed & ll_iso.EV_SEND_RSP) != 0
+        return
+    // The link began to be encrypted after the Host accepted the stream: it is not made.
+    if iso_link_refused(var c, ls)
+        cis_close(var c, i, STATUS_UNSUPPORTED_FEATURE)
         return
     ll_iso.get_cis_ind(var rx, var c.cis[i])
     ll_iso.cis_log_ind(var c.cis_log, var c.cis[i], c.links[ls].interval)
@@ -13355,6 +13377,8 @@ fn cmd_le_create_cis(var c: Controller)
                 status = 0x0B
             else if not slot_central(var c, ls) or c.links[ls].closing
                 status = STATUS_COMMAND_DISALLOWED
+            else if iso_link_refused(var c, ls)
+                status = STATUS_UNSUPPORTED_FEATURE
             for j in 0..k
                 if (param_u16(var c, 1 + 4 * j) & 0x0FFF) == ch
                     status = STATUS_INVALID_PARAMETERS
@@ -13520,6 +13544,10 @@ fn cis_instant(var c: Controller, i: Int) -> Int
 @tier(embedded)
 fn cis_send_ind(var c: Controller, i: Int) -> Bool
     let ls = c.cis[i].acl
+    // The link began to be encrypted after the request: the stream is not made.
+    if iso_link_refused(var c, ls)
+        cis_close(var c, i, STATUS_UNSUPPORTED_FEATURE)
+        return true
     var ev = cis_instant(var c, i)
     var t = ll_link.link_event_time(var c.links[ls], ev)
     if t < 0
@@ -13836,7 +13864,7 @@ fn cmd_le_create_big(var c: Controller, test: Bool)
     var status = STATUS_SUCCESS
     if handle > 0xEF or ah > 0xEF or enc > 1
         status = STATUS_INVALID_PARAMETERS
-    else if (phys & 0xF8) != 0
+    else if (phys & 0xF8) != 0 or iso_big_refused(var c, enc)
         status = STATUS_UNSUPPORTED_FEATURE
     else if big_slot(var c, handle) >= 0
         status = STATUS_COMMAND_DISALLOWED
@@ -14256,6 +14284,8 @@ fn cmd_le_big_create_sync(var c: Controller)
         status = STATUS_INVALID_PARAMETERS
     else if handle > 0xEF or sync_handle > 0xEFF or enc > 1 or mse > ll_big.NSE_MAX or timeout < 0x0A or timeout > 0x4000
         status = STATUS_INVALID_PARAMETERS
+    else if iso_big_refused(var c, enc)
+        status = STATUS_UNSUPPORTED_FEATURE
     else
         for k in 0..num
             let n = h4_rx.h4_param(var c.rx, 24 + k)
