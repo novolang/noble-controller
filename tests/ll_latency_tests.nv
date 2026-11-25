@@ -2,10 +2,11 @@
 // ([Vol 6] Part B, Sections 4.5.1, 4.5.2, 4.5.5 and 5.5), the plan after an event, the commit at the next one, and the window it leaves.
 //
 //   novo test tests/ll_latency_tests.nv
-//   novo test --config configs/ctl_latency.toml tests/ll_latency_tests.nv     (the plan and the commit run only with the key on)
+//   novo test --config configs/ctl_latency.toml tests/ll_latency_tests.nv     (the plan and the commit run only with the key on and without isochronous channels or Channel Sounding)
 
 use std.test
 use noble_controller.CONFIG
+use ctl_limits
 use ll_pdu
 use ll_data
 use ll_link.{ ENC_IDLE, ENC_P_WAIT_LTK, K_EMPTY, Link, PHY_IDLE, PHY_WAIT_RSP, PROC_FEATURES, PROC_NONE, chan_next, ctrl_queue, interval_us, lat_commit, lat_due, lat_events, lat_instant_room, lat_plan, link_event_begin, link_event_done, link_listen_end, link_listen_start, link_new, link_note_rx, link_open, link_queue_acl, link_rx_fast, link_rx_slow, widening }
@@ -303,11 +304,16 @@ fn test_the_skip_is_cut_so_that_one_listened_event_falls_in_each_half_of_the_sup
     t_set_timeout(var l, 2)
     test.assert_eq(lat_events(var l), 0)
 
-// ── The plan and the commit (the key `ctl_latency` on) ──────────────
+// The plan runs only in a build with the key `ctl_latency` and with neither isochronous channels nor Channel Sounding (`lat_plan`); the rules
+// of `lat_events` hold in every build.
+fn t_plans() -> Bool
+    noble_controller.CONFIG.CTL_LATENCY and not ctl_limits.iso_on() and noble_controller.CONFIG.CTL_CS == 0
+
+// ── The plan and the commit (the key `ctl_latency` on, and neither isochronous channels nor Channel Sounding) ──────────────
 
 @test
 fn test_the_event_after_a_heard_event_plans_the_skip_and_the_window_is_that_of_the_event_after_the_skipped_ones()
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not t_plans()
         var off = t_settled(4)
         test.assert_eq(off.lat_skip, 0)
         return
@@ -325,8 +331,25 @@ fn test_the_event_after_a_heard_event_plans_the_skip_and_the_window_is_that_of_t
     test.assert(w > (500 + 50) * step / 1000000 + 32)
 
 @test
+fn test_a_build_with_isochronous_channels_or_channel_sounding_plans_no_skip_whatever_the_latency()
+    var l = t_settled(4)
+    if t_plans()
+        test.assert_eq(l.lat_skip, 4)
+        return
+    test.assert_eq(l.lat_skip, 0)
+    test.assert_eq(lat_due(var l), l.due)
+    lat_plan(var l)
+    test.assert_eq(l.lat_skip, 0)
+    // The rules still count the events that may be skipped; only the plan leaves them listened to.
+    if noble_controller.CONFIG.CTL_LATENCY
+        var k = t_idle(4)
+        test.assert_eq(lat_events(var k), 4)
+        lat_plan(var k)
+        test.assert_eq(k.lat_skip, 0)
+
+@test
 fn test_the_commit_takes_the_channels_of_the_skipped_events_and_moves_the_counter_and_the_schedule()
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not t_plans()
         return
     // Two links in step; the second hears every event, the first skips four.
     var a = t_settled(4)
@@ -353,7 +376,7 @@ fn test_the_commit_takes_the_channels_of_the_skipped_events_and_moves_the_counte
 
 @test
 fn test_a_packet_queued_after_the_plan_brings_the_window_back_to_the_next_event()
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not t_plans()
         return
     var l = t_settled(4)
     let skipping = link_listen_start(var l)
@@ -369,7 +392,7 @@ fn test_a_packet_queued_after_the_plan_brings_the_window_back_to_the_next_event(
 
 @test
 fn test_a_missed_event_after_a_skip_listens_at_every_event_again_and_counts_what_was_skipped()
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not t_plans()
         return
     var l = t_settled(4)
     test.assert_eq(l.lat_skip, 4)
@@ -385,7 +408,7 @@ fn test_a_missed_event_after_a_skip_listens_at_every_event_again_and_counts_what
 
 @test
 fn test_an_update_whose_instant_is_pending_makes_the_plan_stop_before_the_event_ahead_of_it()
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not t_plans()
         return
     var l = t_settled(10)
     test.assert_eq(l.lat_skip, 10)
@@ -397,7 +420,7 @@ fn test_an_update_whose_instant_is_pending_makes_the_plan_stop_before_the_event_
 
 @test
 fn test_the_chain_of_skips_and_heard_events_keeps_one_listened_event_in_each_latency_plus_one()
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not t_plans()
         return
     var l = t_settled(3)
     var heard = 0

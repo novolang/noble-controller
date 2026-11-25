@@ -1457,8 +1457,8 @@ fn connect_ind_latency(latency: Int) -> Pdu
     p
 
 // A Peripheral connection granted a latency of 4, against a Central that sends at every event (a PC's adapter does): with the key `ctl_latency` the Peripheral
-// opens its receiver at one event in five once the Central has acknowledged its first packet, hears every one it opens for, and the link lives; with the key off
-// it listens at every event, as it did.
+// opens its receiver at one event in five once the Central has acknowledged its first packet, hears every one it opens for, and the link lives; with the key off,
+// or in a build with isochronous channels or Channel Sounding, which plans no skip (`lat_plan`), it listens at every event, as it did.
 @when(noble_controller.CONFIG.CTL_PERIPHERAL > 0)
 @test
 fn test_a_peripheral_connection_with_a_latency_listens_at_one_event_in_five_and_loses_none()
@@ -1474,7 +1474,7 @@ fn test_a_peripheral_connection_with_a_latency_listens_at_one_event_in_five_and_
     test.assert_eq(rf.conn_open, 1)
     test.assert(c.links[0].live)
     test.assert_eq(rf.conn_missed, 0)
-    if not noble_controller.CONFIG.CTL_LATENCY
+    if not noble_controller.CONFIG.CTL_LATENCY or ctl_limits.iso_on() or noble_controller.CONFIG.CTL_CS > 0
         test.assert_eq(c.links[0].lat_total, 0)
         test.assert(rf.conn_events >= 45)
         return
