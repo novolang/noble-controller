@@ -4,7 +4,7 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
-## Unreleased
+## 0.1.4 — 2026-11-25
 
 The capability bit `CAP_NO_ISO_ENC` of `controller_new` (set through `ChipParts.caps` by a chip whose cipher is too slow for the payloads of a subevent) makes the Controller refuse an encrypted isochronous stream: LE Create CIS over an encrypted link, LE Create BIG and LE Create BIG Test with Encryption 1 and LE BIG Create Sync with Encryption 1 answer Unsupported Feature or Parameter Value (0x11); an LL_CIS_REQ over an encrypted link is rejected with Unsupported Remote Feature (0x1A) and `WHY_ISO_ENC` in the request log; a stream whose link began to be encrypted after the request fails with 0x11 at the indication, in both roles.  A build that does not name the bit carries encrypted streams as before.
 
